@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# Equal-work head-to-head: Kottos vs LiteLLM, BOTH doing the full OpenAI<->Anthropic
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Equal-work head-to-head: llmbridge vs LiteLLM, BOTH doing the full OpenAI<->Anthropic
 # round-trip (the work LiteLLM's transform_request/transform_response is built
 # around), against the same mock backend, same open-loop loadgen.
 #
 #   - mock_provider.py --format anthropic        (returns an Anthropic Messages body)
-#   - Kottos:  --translate anthropic             (OpenAI in -> Anthropic upstream -> OpenAI out)
+#   - llmbridge:  --translate anthropic             (OpenAI in -> Anthropic upstream -> OpenAI out)
 #   - LiteLLM: litellm_config_anthropic.yaml     (anthropic/* model -> same mock)
 #
 # Per RPS we measure with the same loadgen: direct-to-mock (baseline), through
-# Kottos, through LiteLLM. Kottos added latency = its own self-reported added-total
+# llmbridge, through LiteLLM. llmbridge added latency = its own self-reported added-total
 # p99 (request-path + response-path, upstream wait excluded). LiteLLM added latency
 # = through-LiteLLM e2e - direct-to-mock e2e (it can't self-report). Emits a table
 # plus bench/results/phase-a-comparison.csv for make_chart.py.
@@ -30,7 +38,7 @@ RPS_LIST=("${@:-100 500 1000 5000}")
 if [ "${#RPS_LIST[@]}" -eq 1 ]; then read -r -a RPS_LIST <<< "${RPS_LIST[0]}"; fi
 
 MOCK_PORT=9001
-KOTTOS_PORT=8088
+LLMBRIDGE_PORT=8088
 LL_PORT=8089
 VENV=bench/.litellm-venv
 RESDIR=bench/results
@@ -42,7 +50,7 @@ CSV="$RESDIR/phase-a-comparison.csv"
 BIN="${BIN:-}"
 if [ -z "$BIN" ]; then
   for d in cmake-build-release/bin cmake-build-debug/bin build-linux/bin build/bin; do
-    if [ -x "$d/kottos" ] && [ -x "$d/loadgen" ]; then BIN="$d"; break; fi
+    if [ -x "$d/llmbridge" ] && [ -x "$d/loadgen" ]; then BIN="$d"; break; fi
   done
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build first or set BIN=path" >&2; exit 1; }
@@ -50,7 +58,7 @@ echo "Using binaries in $BIN"
 
 cleanup() {
   pkill -f mock_provider.py 2>/dev/null
-  pkill -f "$BIN/kottos" 2>/dev/null
+  pkill -f "$BIN/llmbridge" 2>/dev/null
   pkill -f 'litellm.*--port' 2>/dev/null
 }
 trap cleanup EXIT
@@ -76,16 +84,16 @@ achieved_of() { sed -n 's/.*achieved=\([0-9]*\) .*/\1/p'; }
 ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
 
 {
-  echo "Kottos vs LiteLLM — equal-work (OpenAI<->Anthropic) — $STAMP"
+  echo "llmbridge vs LiteLLM — equal-work (OpenAI<->Anthropic) — $STAMP"
   echo "mock(anthropic) latency=${LAT_MS}ms  dur=${DUR}s  warmup=${WARMUP}s  host=$(uname -mn)"
   echo
-  printf "%-6s | %-22s | %-30s | %s\n" "RPS" "KOTTOS added (ms)" "LITELLM added (ms)" "LiteLLM achieved"
+  printf "%-6s | %-22s | %-30s | %s\n" "RPS" "LLMBRIDGE added (ms)" "LITELLM added (ms)" "LiteLLM achieved"
   printf "%-6s | %-22s | %-30s | %s\n" "" "self p50 / p99" "Δp50 / Δp99 (client)" "req/s (target)"
   echo "-------+------------------------+--------------------------------+------------------"
 } | tee "$SUMMARY"
 
-echo "# Kottos vs LiteLLM, equal-work OpenAI<->Anthropic, $STAMP, host=$(uname -mn), mock ${LAT_MS}ms" > "$CSV"
-echo "rps,kottos_p50_ms,kottos_p99_ms,kottos_p999_ms,kottos_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat" >> "$CSV"
+echo "# llmbridge vs LiteLLM, equal-work OpenAI<->Anthropic, $STAMP, host=$(uname -mn), mock ${LAT_MS}ms" > "$CSV"
+echo "rps,llmbridge_p50_ms,llmbridge_p99_ms,llmbridge_p999_ms,llmbridge_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat" >> "$CSV"
 
 for RPS in "${RPS_LIST[@]}"; do
   echo ">>> RPS=$RPS" >&2
@@ -95,17 +103,17 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r d50 d99 d999 dmax <<< "$(echo "$D" | extract)"
   : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
-  # (2) through Kottos (fresh per RPS; translate anthropic = equal work)
-  $BIN/kottos --listen $KOTTOS_PORT --upstream 127.0.0.1:$MOCK_PORT --translate anthropic \
-      --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-kottos-$RPS-$STAMP.log" 2>&1 &
+  # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
+  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --translate anthropic \
+      --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" 2>&1 &
   KP=$!
   sleep 1
-  $BIN/loadgen --target 127.0.0.1:$KOTTOS_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" >/dev/null 2>>"$RESDIR/h2h-kottos-loadgen-$RPS-$STAMP.log"
+  $BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" >/dev/null 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log"
   kill -TERM "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
-  k_self_p50=$(sed -n 's/.*added-total.*p50=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-kottos-$RPS-$STAMP.log" | head -1)
-  k_self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-kottos-$RPS-$STAMP.log" | head -1)
-  k_self_p999=$(sed -n 's/.*added-total.*p99.9=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-kottos-$RPS-$STAMP.log" | head -1)
-  k_self_max=$(sed -n 's/.*added-total.*max=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-kottos-$RPS-$STAMP.log" | head -1)
+  k_self_p50=$(sed -n 's/.*added-total.*p50=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
+  k_self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
+  k_self_p999=$(sed -n 's/.*added-total.*p99.9=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
+  k_self_max=$(sed -n 's/.*added-total.*max=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   : "${k_self_p50:=0}" "${k_self_p99:=0}" "${k_self_p999:=0}" "${k_self_max:=0}"
 
   # (3) through LiteLLM
@@ -121,7 +129,7 @@ for RPS in "${RPS_LIST[@]}"; do
   lamax=$(awk -v a="$lmax" -v b="$dmax" 'BEGIN{printf "%.3f", (a-b)/1000.0}')
   # saturated if achieved < 90% of target
   lsat=$(awk -v a="$la" -v t="$RPS" 'BEGIN{print (a < 0.9*t) ? "yes" : "no"}')
-  # Kottos self-measured added, in ms
+  # llmbridge self-measured added, in ms
   k50=$(awk -v u="$k_self_p50" 'BEGIN{printf "%.3f", u/1000.0}')
   k99=$(awk -v u="$k_self_p99" 'BEGIN{printf "%.3f", u/1000.0}')
   k999=$(awk -v u="$k_self_p999" 'BEGIN{printf "%.3f", u/1000.0}')

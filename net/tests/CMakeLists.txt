@@ -1,5 +1,5 @@
 # GoogleTest is made available once at the root (FetchContent) under
-# KOTTOS_BUILD_TESTS; modules just consume GTest::gtest_main.
+# LLMBRIDGE_BUILD_TESTS; modules just consume GTest::gtest_main.
 
 add_executable(net_http_test http_test.cpp)
 target_link_libraries(net_http_test PRIVATE net GTest::gtest_main)

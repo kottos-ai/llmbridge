@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 // Integration tests for the Gateway. A real in-process backend (blocking
 // thread) + the Gateway event loop running on its own thread, driven by a
 // loopback client. Covers: round-trip correctness, response-body integrity,
@@ -24,7 +31,7 @@
 
 #include "net/http.hpp"
 
-using kottos::Gateway;
+using llmbridge::Gateway;
 
 namespace
 {
@@ -113,8 +120,8 @@ namespace
             const std::string resp = canned_response();
             while (!_stop)
             {
-                kottos::http::Message m;
-                while (kottos::http::parse(buf, m) != kottos::http::ParseStatus::Complete)
+                llmbridge::http::Message m;
+                while (llmbridge::http::parse(buf, m) != llmbridge::http::ParseStatus::Complete)
                 {
                     ssize_t n = ::read(c, tmp, sizeof(tmp));
                     if (n <= 0) { ::close(c); return; }
@@ -166,8 +173,8 @@ namespace
             char tmp[8192];
             for (;;)
             {
-                kottos::http::Message m;
-                if (kottos::http::parse(_buf, m) == kottos::http::ParseStatus::Complete)
+                llmbridge::http::Message m;
+                if (llmbridge::http::parse(_buf, m) == llmbridge::http::ParseStatus::Complete)
                 {
                     std::string out = _buf.substr(0, m.total_len);
                     _buf.erase(0, m.total_len);
@@ -251,8 +258,8 @@ TEST_F(ProxyIT, ResponseBodyIntegrity)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
     std::string resp = c.recv_response();
-    kottos::http::Message m;
-    ASSERT_EQ(kottos::http::parse(resp, m), kottos::http::ParseStatus::Complete);
+    llmbridge::http::Message m;
+    ASSERT_EQ(llmbridge::http::parse(resp, m), llmbridge::http::ParseStatus::Complete);
     EXPECT_EQ(resp.substr(m.header_len), kRespBody);
 }
 

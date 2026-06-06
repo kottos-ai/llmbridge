@@ -1,5 +1,5 @@
-# LiteLLM proxy config for the Kottos head-to-head. Routes model "mock-1" to
-# the same asyncio mock provider Kottos is benchmarked against, so the only
+# LiteLLM proxy config for the llmbridge head-to-head. Routes model "mock-1" to
+# the same asyncio mock provider llmbridge is benchmarked against, so the only
 # difference between the two runs is the gateway itself.
 model_list:
   - model_name: mock-1

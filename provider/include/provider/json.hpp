@@ -1,9 +1,16 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
-// Minimal, zero-dependency JSON for the Kottos provider-translation layer.
+// Minimal, zero-dependency JSON for the llmbridge provider-translation layer.
 //
 // Deliberately hand-rolled (no library) — a tiny zero-alloc parser, like the
-// rest of Kottos: a recursive-descent parser into an ordered DOM, plus a
+// rest of llmbridge: a recursive-descent parser into an ordered DOM, plus a
 // string-append builder with escaping. Scope is "enough to translate chat
 // completion request/response bodies between provider dialects" — objects,
 // arrays, strings, numbers, bools, null, and the common escape sequences. Not a
@@ -15,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace kottos::json
+namespace llmbridge::json
 {
     class Value
     {
@@ -69,39 +76,41 @@ namespace kottos::json
             }
 
             // Decode a JSON string (assumes s[i]=='"'); advances past the closing quote.
+            // Bulk-copies runs of plain chars between escapes (most content has no
+            // escapes), so the common path is a handful of appends, not a char loop.
             std::string parse_string()
             {
                 std::string out;
                 ++i; // opening quote
                 while (i < s.size())
                 {
-                    char c = s[i++];
-                    if (c == '"') return out;
-                    if (c == '\\' && i < s.size())
+                    // Copy the run up to the next '"' or '\\' in one shot.
+                    const size_t start = i;
+                    while (i < s.size() && s[i] != '"' && s[i] != '\\') ++i;
+                    out.append(s.data() + start, i - start);
+                    if (i >= s.size()) break; // unterminated
+                    const char c = s[i++];
+                    if (c == '"') return out; // closing quote
+                    // c == '\\': decode a single escape.
+                    if (i >= s.size()) { out += '\\'; break; } // lone trailing backslash
+                    const char e = s[i++];
+                    switch (e)
                     {
-                        char e = s[i++];
-                        switch (e)
-                        {
-                            case '"': out += '"'; break;
-                            case '\\': out += '\\'; break;
-                            case '/': out += '/'; break;
-                            case 'n': out += '\n'; break;
-                            case 't': out += '\t'; break;
-                            case 'r': out += '\r'; break;
-                            case 'b': out += '\b'; break;
-                            case 'f': out += '\f'; break;
-                            case 'u':
-                                // Pass the \uXXXX through verbatim — we never need to
-                                // interpret code points to shuttle text between dialects.
-                                out += "\\u";
-                                for (int k = 0; k < 4 && i < s.size(); ++k) out += s[i++];
-                                break;
-                            default: out += e; break;
-                        }
-                    }
-                    else
-                    {
-                        out += c;
+                        case '"': out += '"'; break;
+                        case '\\': out += '\\'; break;
+                        case '/': out += '/'; break;
+                        case 'n': out += '\n'; break;
+                        case 't': out += '\t'; break;
+                        case 'r': out += '\r'; break;
+                        case 'b': out += '\b'; break;
+                        case 'f': out += '\f'; break;
+                        case 'u':
+                            // Pass the \uXXXX through verbatim — we never need to
+                            // interpret code points to shuttle text between dialects.
+                            out += "\\u";
+                            for (int k = 0; k < 4 && i < s.size(); ++k) out += s[i++];
+                            break;
+                        default: out += e; break;
                     }
                 }
                 ok = false; // unterminated string
@@ -203,11 +212,18 @@ namespace kottos::json
     }
 
     // Append `raw` as a JSON string literal (with surrounding quotes + escaping).
+    // Bulk-copies runs of chars that don't need escaping (the common case), only
+    // escaping the special ones individually — so most content is a few memcpys.
     inline void append_escaped(std::string& out, std::string_view raw)
     {
         out += '"';
-        for (char c : raw)
+        const size_t n = raw.size();
+        size_t start = 0;
+        for (size_t i = 0; i < n; ++i)
         {
+            const unsigned char c = static_cast<unsigned char>(raw[i]);
+            if (c != '"' && c != '\\' && c >= 0x20) continue; // plain char; keep scanning
+            out.append(raw.data() + start, i - start);        // flush the plain run
             switch (c)
             {
                 case '"': out += "\\\""; break;
@@ -217,17 +233,17 @@ namespace kottos::json
                 case '\r': out += "\\r"; break;
                 case '\b': out += "\\b"; break;
                 case '\f': out += "\\f"; break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20)
-                    {
-                        static const char* hex = "0123456789abcdef";
-                        out += "\\u00";
-                        out += hex[(c >> 4) & 0xF];
-                        out += hex[c & 0xF];
-                    }
-                    else out += c;
+                default: // other control char < 0x20 -> \u00XX
+                {
+                    static const char* hex = "0123456789abcdef";
+                    out += "\\u00";
+                    out += hex[(c >> 4) & 0xF];
+                    out += hex[c & 0xF];
+                }
             }
+            start = i + 1;
         }
+        out.append(raw.data() + start, n - start); // trailing plain run
         out += '"';
     }
-} // namespace kottos::json
+} // namespace llmbridge::json

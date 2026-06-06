@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #include "provider/translate.hpp"
 
 #include <charconv>
@@ -5,7 +12,7 @@
 
 #include "provider/json.hpp"
 
-namespace kottos::provider
+namespace llmbridge::provider
 {
     namespace
     {
@@ -104,7 +111,7 @@ namespace kottos::provider
         }
 
         std::string out = "{\"id\":";
-        json::append_escaped(out, v.str_or("id", "chatcmpl-kottos"));
+        json::append_escaped(out, v.str_or("id", "chatcmpl-llmbridge"));
         out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
         json::append_escaped(out, v.str_or("model"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
@@ -208,7 +215,7 @@ namespace kottos::provider
         }
         if (total == 0) total = in_tok + out_tok;
 
-        std::string out = "{\"id\":\"chatcmpl-kottos\",\"object\":\"chat.completion\",\"created\":0,\"model\":";
+        std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":0,\"model\":";
         json::append_escaped(out, v.str_or("modelVersion"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
         json::append_escaped(out, content);
@@ -285,7 +292,7 @@ namespace kottos::provider
             }
 
         std::string out = "{\"id\":";
-        json::append_escaped(out, v.str_or("id", "chatcmpl-kottos"));
+        json::append_escaped(out, v.str_or("id", "chatcmpl-llmbridge"));
         out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
         json::append_escaped(out, v.str_or("model"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
@@ -297,4 +304,4 @@ namespace kottos::provider
                ",\"total_tokens\":" + std::to_string(in_tok + out_tok) + "}}";
         return out;
     }
-} // namespace kottos::provider
+} // namespace llmbridge::provider

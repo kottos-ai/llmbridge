@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #include "gateway/gateway.hpp"
 
 #include <arpa/inet.h>
@@ -16,7 +23,7 @@
 
 #include "net/socket_util.hpp"
 
-namespace kottos
+namespace llmbridge
 {
     namespace
     {
@@ -57,7 +64,7 @@ namespace kottos
         _listen_conn = new Connection();
         _listen_conn->fd = _listen_fd;
         ep_add_read(_listen_conn);
-        std::fprintf(stderr, "kottos: listening :%u -> upstream %s:%u%s\n",
+        std::fprintf(stderr, "llmbridge: listening :%u -> upstream %s:%u%s\n",
                      _listen_port, _upstream_ip.c_str(), _upstream_port,
                      _translate == TranslateMode::Anthropic ? " (translate: anthropic)" : "");
     }
@@ -461,4 +468,4 @@ namespace kottos
         }
         return 0;
     }
-} // namespace kottos
+} // namespace llmbridge

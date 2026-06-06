@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Find the single-thread saturation point of the Kottos proxy.
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Find the single-thread saturation point of the llmbridge proxy.
 #
 # Uses the C++ fastbackend (instant response) so the *backend* never saturates
 # first — confirmed by also driving the backend directly at each RPS. The
@@ -29,12 +37,12 @@ OUT="$RESDIR/saturation-$STAMP.txt"
 BIN="${BIN:-}"
 if [ -z "$BIN" ]; then
   for d in cmake-build-release/bin cmake-build-debug/bin build-linux/bin build/bin; do
-    if [ -x "$d/kottos" ]; then BIN="$d"; break; fi
+    if [ -x "$d/llmbridge" ]; then BIN="$d"; break; fi
   done
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build the CMake project first or set BIN=path" >&2; exit 1; }
 
-cleanup() { pkill -f "$BIN/fastbackend" 2>/dev/null; pkill -f "$BIN/kottos" 2>/dev/null; }
+cleanup() { pkill -f "$BIN/fastbackend" 2>/dev/null; pkill -f "$BIN/llmbridge" 2>/dev/null; }
 trap cleanup EXIT
 cleanup; sleep 0.3
 echo "Using binaries in $BIN"
@@ -46,7 +54,7 @@ extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 
 {
-  echo "Kottos single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup)"
+  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup)"
   printf "%-9s | %-22s | %-38s | %s\n" "TARGET" "DIRECT backend" "THROUGH proxy" "proxy"
   printf "%-9s | %-22s | %-38s | %s\n" "RPS" "achieved (p99 µs)" "achieved / p50 / p99 / p99.9 / max (µs)" "backlog"
   echo "----------+------------------------+----------------------------------------+--------"
@@ -59,7 +67,7 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r da d_p50 d_p99 d_p999 d_max <<< "$(echo "$D" | extract)"
 
   # fresh proxy per level
-  $BIN/kottos --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT \
+  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/sat-proxy-$RPS-$STAMP.log" 2>&1 &
   PP=$!
   sleep 0.7

@@ -1,4 +1,4 @@
-# GoogleTest comes from the root (FetchContent under KOTTOS_BUILD_TESTS).
+# GoogleTest comes from the root (FetchContent under LLMBRIDGE_BUILD_TESTS).
 # One executable per class/concern.
 
 add_executable(gateway_metrics_test metrics_test.cpp)

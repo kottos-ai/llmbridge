@@ -38,11 +38,11 @@
 <circle cx="253.0" cy="476.7" r="3.5" fill="#dc2626"/>
 <circle cx="323.3" cy="476.2" r="3.5" fill="#dc2626"/>
 <circle cx="486.3" cy="481.2" r="3.5" fill="#dc2626"/>
-<text x="789.8" y="143.3" font-size="12" fill="#16a34a" text-anchor="end" font-weight="700">Kottos ceiling ≈ 58,000 RPS</text>
+<text x="789.8" y="143.3" font-size="12" fill="#16a34a" text-anchor="end" font-weight="700">llmbridge ceiling ≈ 58,000 RPS</text>
 <text x="486.3" y="465.8" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="700">LiteLLM ceiling ≈ 250 RPS</text>
 <rect x="610" y="80" width="240" height="56" fill="white" stroke="#e5e7eb" rx="4"/>
 <line x1="622" y1="94" x2="646" y2="94" stroke="#16a34a" stroke-width="2.5"/>
-<text x="652" y="98" font-size="12" fill="#111827">Kottos (C++/epoll, 1 thread)</text>
+<text x="652" y="98" font-size="12" fill="#111827">llmbridge (C++/epoll, 1 thread)</text>
 <line x1="622" y1="116" x2="646" y2="116" stroke="#dc2626" stroke-width="2.5"/>
 <text x="652" y="120" font-size="12" fill="#111827">LiteLLM (Python, 1 worker)</text>
 </svg>

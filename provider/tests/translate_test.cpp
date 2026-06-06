@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 // Tests for the OpenAI <-> Anthropic translation (provider/translate.hpp).
 // Outputs are re-parsed with our own JSON to assert structure.
 
@@ -9,14 +16,14 @@
 
 #include "provider/json.hpp"
 
-using kottos::provider::openai_to_anthropic_request;
-using kottos::provider::anthropic_to_openai_response;
-using kottos::provider::openai_to_gemini_request;
-using kottos::provider::gemini_to_openai_response;
-using kottos::provider::openai_to_cohere_request;
-using kottos::provider::cohere_to_openai_response;
-using kottos::json::Value;
-using kottos::json::parse;
+using llmbridge::provider::openai_to_anthropic_request;
+using llmbridge::provider::anthropic_to_openai_response;
+using llmbridge::provider::openai_to_gemini_request;
+using llmbridge::provider::gemini_to_openai_response;
+using llmbridge::provider::openai_to_cohere_request;
+using llmbridge::provider::cohere_to_openai_response;
+using llmbridge::json::Value;
+using llmbridge::json::parse;
 
 namespace
 {

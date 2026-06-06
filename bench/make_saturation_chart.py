@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
 """Render the throughput-saturation chart (offered vs achieved RPS) as SVG.
 
-Log-log axes so both ceilings fit on one plot: Kottos tracks the ideal y=x line
+Log-log axes so both ceilings fit on one plot: llmbridge tracks the ideal y=x line
 up to ~58k RPS then flattens (single-thread bottleneck); LiteLLM flattens at
 ~250 RPS/worker. The gap between each curve and the diagonal is dropped load.
 
@@ -13,10 +21,10 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "results", "saturation.svg")
 
-# (offered, achieved). Kottos from the Linux phase-a + saturation sweeps
+# (offered, achieved). llmbridge from the Linux phase-a + saturation sweeps
 # (i7-9750H, all processes co-located); LiteLLM from the head-to-head run (1
 # uvicorn worker).
-KOTTOS = [(1000, 1000), (5000, 5000), (10000, 10000), (20000, 20000),
+LLMBRIDGE = [(1000, 1000), (5000, 5000), (10000, 10000), (20000, 20000),
           (30000, 30001), (40000, 40000), (50000, 50000), (60000, 57692),
           (80000, 60476), (100000, 58716)]
 LITELLM = [(100, 100), (500, 246), (1000, 248), (5000, 228)]
@@ -75,12 +83,12 @@ def poly(pts, color):
         s.append(f'<circle cx="{lx(o):.1f}" cy="{ly(a):.1f}" r="3.5" fill="{color}"/>')
 
 
-poly(KOTTOS, CG)
+poly(LLMBRIDGE, CG)
 poly(LITELLM, CR)
 
 # ceiling annotations
 s.append(
-    f'<text x="{lx(100000):.1f}" y="{ly(58000) - 10:.1f}" font-size="12" fill="{CG}" text-anchor="end" font-weight="700">Kottos ceiling ≈ 58,000 RPS</text>')
+    f'<text x="{lx(100000):.1f}" y="{ly(58000) - 10:.1f}" font-size="12" fill="{CG}" text-anchor="end" font-weight="700">llmbridge ceiling ≈ 58,000 RPS</text>')
 s.append(
     f'<text x="{lx(5000):.1f}" y="{ly(250) - 10:.1f}" font-size="12" fill="{CR}" text-anchor="middle" font-weight="700">LiteLLM ceiling ≈ 250 RPS</text>')
 
@@ -89,7 +97,7 @@ lgy = MT + 12
 s.append(f'<rect x="{ML + PW - 250}" y="{lgy - 12}" width="240" height="56" fill="white" stroke="{GRID}" rx="4"/>')
 s.append(
     f'<line x1="{ML + PW - 238}" y1="{lgy + 2}" x2="{ML + PW - 214}" y2="{lgy + 2}" stroke="{CG}" stroke-width="2.5"/>')
-s.append(f'<text x="{ML + PW - 208}" y="{lgy + 6}" font-size="12" fill="{INK}">Kottos (C++/epoll, 1 thread)</text>')
+s.append(f'<text x="{ML + PW - 208}" y="{lgy + 6}" font-size="12" fill="{INK}">llmbridge (C++/epoll, 1 thread)</text>')
 s.append(
     f'<line x1="{ML + PW - 238}" y1="{lgy + 24}" x2="{ML + PW - 214}" y2="{lgy + 24}" stroke="{CR}" stroke-width="2.5"/>')
 s.append(f'<text x="{ML + PW - 208}" y="{lgy + 28}" font-size="12" fill="{INK}">LiteLLM (Python, 1 worker)</text>')

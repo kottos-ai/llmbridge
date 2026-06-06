@@ -1,9 +1,16 @@
-// Kottos gateway daemon.
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//   kottos [--listen PORT] [--upstream IP:PORT] [--duration SECONDS]
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+// llmbridge gateway daemon.
+//
+//   llmbridge [--listen PORT] [--upstream IP:PORT] [--duration SECONDS]
 //          [--warmup SECONDS] [--translate none|anthropic]
 //
-// One self-contained event-loop class (kottos::Gateway) does everything:
+// One self-contained event-loop class (llmbridge::Gateway) does everything:
 // accept clients, frame requests, optionally translate the provider dialect,
 // forward over a keep-alive upstream pool, translate the response back, reply.
 // Defaults: listen :8088, upstream 127.0.0.1:9001. With --duration the daemon
@@ -18,13 +25,14 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "gateway/gateway.hpp"
 
 namespace
 {
-    kottos::Gateway* g_gateway = nullptr;
+    llmbridge::Gateway* g_gateway = nullptr;
     void on_signal(int) noexcept
     {
         if (g_gateway) g_gateway->request_stop();
@@ -38,11 +46,11 @@ int main(int argc, char** argv)
     uint16_t upstream_port = 9001;
     int duration = 0;
     double warmup = 0;
-    kottos::TranslateMode translate = kottos::TranslateMode::None;
+    llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
 
     for (int i = 1; i < argc; ++i)
     {
-        std::string a = argv[i];
+        const std::string_view a = argv[i];
         auto nextarg = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
         if (a == "--listen")
         {
@@ -67,10 +75,10 @@ int main(int argc, char** argv)
             if (const char* v = nextarg())
             {
                 std::string mode(v);
-                if (mode == "anthropic") translate = kottos::TranslateMode::Anthropic;
-                else if (mode == "gemini") translate = kottos::TranslateMode::Gemini;
-                else if (mode == "cohere") translate = kottos::TranslateMode::Cohere;
-                else translate = kottos::TranslateMode::None;
+                if (mode == "anthropic") translate = llmbridge::TranslateMode::Anthropic;
+                else if (mode == "gemini") translate = llmbridge::TranslateMode::Gemini;
+                else if (mode == "cohere") translate = llmbridge::TranslateMode::Cohere;
+                else translate = llmbridge::TranslateMode::None;
             }
         }
         else if (a == "--help" || a == "-h")
@@ -84,7 +92,7 @@ int main(int argc, char** argv)
 
     std::signal(SIGPIPE, SIG_IGN);
 
-    kottos::Gateway gateway(listen_port, upstream_ip, upstream_port,
+    llmbridge::Gateway gateway(listen_port, upstream_ip, upstream_port,
                             static_cast<int64_t>(warmup * 1e9), translate);
     g_gateway = &gateway;
 
@@ -104,8 +112,8 @@ int main(int argc, char** argv)
 
     if (timer.joinable()) timer.join();
 
-    const kottos::Stats& s = gateway.stats();
-    std::fprintf(stderr, "\n=== Kottos gateway — added-latency profile ===\n");
+    const llmbridge::Stats& s = gateway.stats();
+    std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile ===\n");
     std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu\n",
                  (unsigned long long)s.requests, (unsigned long long)s.errors,
                  (unsigned long long)s.upstream_conns_opened);

@@ -1,6 +1,13 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
-// Gateway — the whole Kottos proxy in one self-contained class. A single-
+// Gateway — the whole llmbridge proxy in one self-contained class. A single-
 // threaded, non-blocking epoll event loop: accept clients, frame requests,
 // (optionally) translate the provider dialect, forward over a keep-alive
 // upstream pool, read the response, translate back, write to the client. No
@@ -21,7 +28,7 @@
 #include "net/http.hpp"
 #include "provider/translate.hpp"
 
-namespace kottos
+namespace llmbridge
 {
     // Dialect translation: None = byte-forward (OpenAI-compatible upstreams);
     // the rest translate OpenAI<->provider on the way out and back.
@@ -136,4 +143,4 @@ namespace kottos
         Stats _stats;
         volatile bool _stop = false;
     };
-} // namespace kottos
+} // namespace llmbridge

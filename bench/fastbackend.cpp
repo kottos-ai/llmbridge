@@ -1,8 +1,15 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 // Minimal C++ HTTP/1.1 backend for the saturation test.
 //
 // The Python asyncio mock tops out in the low tens of thousands of RPS — fine
-// for measuring Kottos's *added latency* (where the 200 ms backend dominates),
-// but useless for finding where Kottos itself saturates, because the mock would
+// for measuring llmbridge's *added latency* (where the 200 ms backend dominates),
+// but useless for finding where llmbridge itself saturates, because the mock would
 // fall over first. This backend is a stripped epoll echo-responder built on the
 // same net/ primitives: read a request, immediately write a canned
 // chat-completion response, keep-alive. Single thread, zero per-request alloc
@@ -23,6 +30,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <string_view>
 
 #include "net/http.hpp"
 #include "net/socket_util.hpp"
@@ -97,7 +105,7 @@ int main(int argc, char** argv)
     bool anthropic = false;
     for (int i = 1; i < argc; ++i)
     {
-        std::string a = argv[i];
+        const std::string_view a = argv[i];
         if (a == "--port" && i + 1 < argc) port = (uint16_t)std::atoi(argv[++i]);
         else if (a == "--latency-us" && i + 1 < argc) latency_us = std::atol(argv[++i]);
         else if (a == "--anthropic") anthropic = true; // serve Anthropic-shape body
@@ -110,7 +118,7 @@ int main(int argc, char** argv)
              std::to_string(kBody.size()) + "\r\nConnection: keep-alive\r\n\r\n" + kBody;
 
     g_epfd = ::epoll_create1(0);
-    int lfd = kottos::net::make_listener(port);
+    int lfd = llmbridge::net::make_listener(port);
     if (lfd < 0) { std::fprintf(stderr, "bind :%u failed\n", port); return 1; }
     Connection* lc = new Connection(); lc->fd = lfd;
     add_read(lc);
@@ -130,9 +138,9 @@ int main(int argc, char** argv)
                 {
                     int fd = ::accept(lfd, nullptr, nullptr);
                     if (fd < 0) break;
-                    kottos::net::set_nonblocking(fd);
-                    kottos::net::set_nodelay(fd);
-                    kottos::net::set_nosigpipe(fd);
+                    llmbridge::net::set_nonblocking(fd);
+                    llmbridge::net::set_nodelay(fd);
+                    llmbridge::net::set_nosigpipe(fd);
                     Connection* nc = new Connection(); nc->fd = fd; nc->rbuf.reserve(2048);
                     add_read(nc);
                 }
@@ -162,9 +170,9 @@ int main(int argc, char** argv)
             // Drain all complete requests in the buffer, respond to each.
             for (;;)
             {
-                kottos::http::Message m;
-                auto st = kottos::http::parse(c->rbuf, m);
-                if (st != kottos::http::ParseStatus::Complete) break;
+                llmbridge::http::Message m;
+                auto st = llmbridge::http::parse(c->rbuf, m);
+                if (st != llmbridge::http::ParseStatus::Complete) break;
                 c->rbuf.erase(0, m.total_len);
                 if (latency_us > 0) { struct timespec t{latency_us / 1000000, (latency_us % 1000000) * 1000}; nanosleep(&t, nullptr); }
                 c->wbuf.append(g_resp);

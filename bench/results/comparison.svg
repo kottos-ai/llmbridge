@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="920" height="560" fill="white"/>
-<text x="80" y="34" font-size="22" font-weight="700" fill="#111827">Kottos vs LiteLLM — gateway added latency (p99)</text>
+<text x="80" y="34" font-size="22" font-weight="700" fill="#111827">llmbridge vs LiteLLM — gateway added latency (p99)</text>
 <text x="80" y="56" font-size="13" fill="#6b7280">Both gateways translate OpenAI&#8596;Anthropic (equal work). 200 ms mock backend, open-loop load. Single Linux host, co-located. Lower is better; log scale.</text>
 <line x1="80" y1="470.0" x2="890" y2="470.0" stroke="#e5e7eb" stroke-width="1"/>
 <text x="72" y="474.0" font-size="11" fill="#6b7280" text-anchor="end">0.01 ms</text>
@@ -45,7 +45,7 @@
 <text x="788.8" y="506.0" font-size="10" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <line x1="80" y1="470.0" x2="890" y2="470.0" stroke="#111827" stroke-width="1.5"/>
 <rect x="80" y="520" width="14" height="14" fill="#16a34a" rx="2"/>
-<text x="100" y="532" font-size="12" fill="#111827">Kottos (C++/epoll, 1 thread) — proxy self-measured added p99</text>
+<text x="100" y="532" font-size="12" fill="#111827">llmbridge (C++/epoll, 1 thread) — proxy self-measured added p99</text>
 <rect x="510" y="520" width="14" height="14" fill="#dc2626" rx="2"/>
 <text x="530" y="532" font-size="12" fill="#111827">LiteLLM (Python, 1 worker) — client-measured added p99</text>
 </svg>

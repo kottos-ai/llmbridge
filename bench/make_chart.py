@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Render the Kottos-vs-LiteLLM added-latency chart as a standalone SVG.
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Render the llmbridge-vs-LiteLLM added-latency chart as a standalone SVG.
 
 Pure stdlib — emits SVG text directly (no matplotlib), so it runs anywhere and
 produces a crisp vector artifact for the pitch deck / README. Log y-axis,
 because the two systems differ by ~6 orders of magnitude and a linear axis
-would render Kottos as a flat zero.
+would render llmbridge as a flat zero.
 
   python3 bench/make_chart.py            # -> bench/results/comparison.svg
 """
@@ -26,7 +34,7 @@ with open(CSV) as f:
         c = line.strip().split(",")
         rows.append({
             "rps": int(c[0]),
-            "kottos_p99": float(c[2]),
+            "llmbridge_p99": float(c[2]),
             "litellm_p99": float(c[7]),
             "litellm_sat": c[9].strip() == "yes",
         })
@@ -45,7 +53,7 @@ def ly(v):
     return MT + t * PH
 
 
-KOTTOS = "#16a34a"  # green
+LLMBRIDGE = "#16a34a"  # green
 LITELLM = "#dc2626"  # red
 GRID = "#e5e7eb"
 INK = "#111827"
@@ -56,7 +64,7 @@ svg.append(
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">')
 svg.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 svg.append(
-    f'<text x="{ML}" y="34" font-size="22" font-weight="700" fill="{INK}">Kottos vs LiteLLM — gateway added latency (p99)</text>')
+    f'<text x="{ML}" y="34" font-size="22" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — gateway added latency (p99)</text>')
 svg.append(
     f'<text x="{ML}" y="56" font-size="13" fill="{SUB}">Both gateways translate OpenAI&#8596;Anthropic (equal work). 200 ms mock backend, open-loop load. Single Linux host, co-located. Lower is better; log scale.</text>')
 
@@ -84,12 +92,12 @@ bw = group_w * 0.30
 axis_y = ly(YMIN)
 for i, r in enumerate(rows):
     gx = ML + i * group_w + group_w / 2
-    # Kottos bar
+    # llmbridge bar
     cx = gx - bw - 4
-    cy = ly(r["kottos_p99"])
-    svg.append(f'<rect x="{cx:.1f}" y="{cy:.1f}" width="{bw:.1f}" height="{axis_y - cy:.1f}" fill="{KOTTOS}" rx="2"/>')
+    cy = ly(r["llmbridge_p99"])
+    svg.append(f'<rect x="{cx:.1f}" y="{cy:.1f}" width="{bw:.1f}" height="{axis_y - cy:.1f}" fill="{LLMBRIDGE}" rx="2"/>')
     svg.append(
-        f'<text x="{cx + bw / 2:.1f}" y="{cy - 6:.1f}" font-size="11" fill="{KOTTOS}" text-anchor="middle" font-weight="700">{r["kottos_p99"]:.3f}</text>')
+        f'<text x="{cx + bw / 2:.1f}" y="{cy - 6:.1f}" font-size="11" fill="{LLMBRIDGE}" text-anchor="middle" font-weight="700">{r["llmbridge_p99"]:.3f}</text>')
     # LiteLLM bar
     lx = gx + 4
     lyv = ly(r["litellm_p99"])
@@ -111,9 +119,9 @@ svg.append(f'<line x1="{ML}" y1="{axis_y:.1f}" x2="{ML + PW}" y2="{axis_y:.1f}" 
 
 # legend
 lgx, lgy = ML, H - 28
-svg.append(f'<rect x="{lgx}" y="{lgy - 12}" width="14" height="14" fill="{KOTTOS}" rx="2"/>')
+svg.append(f'<rect x="{lgx}" y="{lgy - 12}" width="14" height="14" fill="{LLMBRIDGE}" rx="2"/>')
 svg.append(
-    f'<text x="{lgx + 20}" y="{lgy}" font-size="12" fill="{INK}">Kottos (C++/epoll, 1 thread) — proxy self-measured added p99</text>')
+    f'<text x="{lgx + 20}" y="{lgy}" font-size="12" fill="{INK}">llmbridge (C++/epoll, 1 thread) — proxy self-measured added p99</text>')
 svg.append(f'<rect x="{lgx + 430}" y="{lgy - 12}" width="14" height="14" fill="{LITELLM}" rx="2"/>')
 svg.append(
     f'<text x="{lgx + 450}" y="{lgy}" font-size="12" fill="{INK}">LiteLLM (Python, 1 worker) — client-measured added p99</text>')

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
 # Head-to-head: same open-loop loadgen, same 200 ms mock backend, same RPS
 # levels — once through LiteLLM, once direct to the mock. Added gateway latency
-# = (through-LiteLLM e2e) - (direct e2e). Pairs with run_bench.sh's Kottos
+# = (through-LiteLLM e2e) - (direct e2e). Pairs with run_bench.sh's llmbridge
 # numbers to build the side-by-side artifact.
 set -uo pipefail
 cd "$(dirname "$0")/.."

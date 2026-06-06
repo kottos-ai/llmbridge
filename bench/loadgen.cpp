@@ -1,4 +1,11 @@
-// Kottos benchmark load generator.
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+// llmbridge benchmark load generator.
 //
 // Open-loop, constant-arrival-rate HTTP/1.1 driver — the wrk2 methodology,
 // purpose-built because wrk2 isn't on the box and because owning the loop lets
@@ -11,7 +18,7 @@
 // Single epoll thread drives a fixed pool of persistent keep-alive connections
 // (sized to cover peak concurrency = RPS x latency). The same non-blocking
 // primitives the proxy uses (net/socket_util.hpp, net/http.hpp) and the same
-// Kottos Histogram/Clock back the measurement, so loadgen and proxy report
+// llmbridge Histogram/Clock back the measurement, so loadgen and proxy report
 // latency on identical machinery.
 //
 // epoll_pwait2 gives the loop a nanosecond-resolution timeout, which the
@@ -37,14 +44,15 @@
 #include <deque>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include "gateway/metrics.hpp" // kottos::Histogram + now_ns()
+#include "gateway/metrics.hpp" // llmbridge::Histogram + now_ns()
 #include "net/http.hpp"
 #include "net/socket_util.hpp"
 
-using kottos::http::Message;
-using kottos::http::ParseStatus;
+using llmbridge::http::Message;
+using llmbridge::http::ParseStatus;
 
 namespace
 {
@@ -81,7 +89,7 @@ namespace
         Args a;
         for (int i = 1; i < argc; ++i)
         {
-            std::string s = argv[i];
+            const std::string_view s = argv[i];
             auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
             if (s == "--target")
             {
@@ -147,7 +155,7 @@ int main(int argc, char** argv)
     if (epfd < 0) { std::perror("epoll_create1"); return 1; }
 
     // 10 µs buckets x 65536 => 0..655 ms range, covering a 200 ms backend + tail.
-    kottos::Histogram hist(10'000, 65536);
+    llmbridge::Histogram hist(10'000, 65536);
 
     std::vector<Connection*> pool;
     pool.reserve(conns);
@@ -173,7 +181,7 @@ int main(int argc, char** argv)
     // Open all connections up front (non-blocking connect).
     for (int i = 0; i < conns; ++i)
     {
-        int fd = kottos::net::start_connect(args.ip.c_str(), args.port);
+        int fd = llmbridge::net::start_connect(args.ip.c_str(), args.port);
         if (fd < 0) { std::perror("connect"); continue; }
         Connection* c = new Connection();
         c->fd = fd;
@@ -202,7 +210,7 @@ int main(int argc, char** argv)
         c->state = State::Awaiting;
     };
 
-    const int64_t t_start = kottos::now_ns();
+    const int64_t t_start = llmbridge::now_ns();
     const int64_t t_warmup_end = t_start + (int64_t)(args.warmup * 1e9);
     const int64_t t_end = t_start + (int64_t)((args.warmup + args.duration) * 1e9);
     int64_t next_arrival = t_start;
@@ -214,7 +222,7 @@ int main(int argc, char** argv)
     epoll_event events[2048];
     while (true)
     {
-        int64_t now = kottos::now_ns();
+        int64_t now = llmbridge::now_ns();
         if (now >= t_end) break;
 
         // 1) Generate arrivals up to `now` on the fixed schedule.
@@ -258,7 +266,7 @@ int main(int argc, char** argv)
             {
                 if (c->state == State::Connecting)
                 {
-                    int err = kottos::net::connect_result(c->fd);
+                    int err = llmbridge::net::connect_result(c->fd);
                     disarm_write(c);
                     if (err != 0) { ++errors; c->state = State::Idle; idle.push_back(c); continue; }
                     c->state = State::Idle;
@@ -292,13 +300,13 @@ int main(int argc, char** argv)
             if (dead) { ++errors; ::close(c->fd); c->fd = -1; continue; }
 
             Message m;
-            ParseStatus st = kottos::http::parse(c->rbuf, m);
+            ParseStatus st = llmbridge::http::parse(c->rbuf, m);
             if (st == ParseStatus::NeedMore) continue;
             if (st == ParseStatus::Error) { ++errors; ::close(c->fd); c->fd = -1; continue; }
 
             // Full response. Record CO-corrected latency, recycle the conn.
-            int64_t lat = kottos::now_ns() - c->scheduled_ns;
-            if (kottos::now_ns() >= t_warmup_end)
+            int64_t lat = llmbridge::now_ns() - c->scheduled_ns;
+            if (llmbridge::now_ns() >= t_warmup_end)
             {
                 if (lat >= 0) hist.record((uint64_t)lat);
                 ++completed;

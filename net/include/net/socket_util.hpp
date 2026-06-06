@@ -1,6 +1,13 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
-// Thin BSD-socket helpers for the Kottos proxy. Linux/epoll target; the calls
+// Thin BSD-socket helpers for the llmbridge proxy. Linux/epoll target; the calls
 // used here (fcntl O_NONBLOCK, SO_REUSEPORT, TCP_NODELAY) are all standard on
 // Linux. SIGPIPE is suppressed process-wide (the event loop ignores it) rather
 // than per-socket, since Linux has no SO_NOSIGPIPE — kept deliberately small so
@@ -12,7 +19,7 @@
 
 #include <cstdint>
 
-namespace kottos::net
+namespace llmbridge::net
 {
     // Set O_NONBLOCK. Returns false on fcntl failure.
     bool set_nonblocking(int fd) noexcept;
@@ -38,4 +45,4 @@ namespace kottos::net
     // After a connect socket reports writable, returns 0 on success or the
     // SO_ERROR errno otherwise.
     int connect_result(int fd) noexcept;
-} // namespace kottos::net
+} // namespace llmbridge::net

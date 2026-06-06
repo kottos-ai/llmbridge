@@ -1,13 +1,16 @@
-Kottos — a sub-millisecond C++ LLM gateway
-Copyright 2026 Kottos AI, Inc. (https://kottosai.com)
+llmbridge — a sub-millisecond C++ LLM gateway
+Copyright 2026 Kottos AI, Inc.
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this product except in compliance with the License. A copy of the License is
-provided in the LICENSE file, or at:
+This product is developed and maintained by Kottos AI, Inc.
+(https://kottosai.com).
 
-    http://www.apache.org/licenses/LICENSE-2.0
+This product has zero third-party runtime dependencies and is
+distributed as a self-contained C++20 artifact under the Apache
+License, Version 2.0.
 
-Kottos has zero third-party runtime dependencies — it is a self-contained C++20
-artifact. The only fetched dependency is GoogleTest (BSD-3-Clause), pulled in at
-build time for the test suite only; it is never linked into the gateway and
-imposes no obligations on downstream users of the runtime.
+Build-time and test-time tooling (not distributed with the runtime
+library) may include third-party components such as Catch2 (BSL-1.0)
+and Google Benchmark (Apache-2.0). See the build documentation for
+details. These components are not linked into the distributed
+artifact and impose no obligations on downstream consumers.
+

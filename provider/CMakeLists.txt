@@ -9,6 +9,6 @@ add_library(provider STATIC
 target_include_directories(provider PUBLIC include)
 target_compile_features(provider PUBLIC cxx_std_20)
 
-if (KOTTOS_BUILD_TESTS)
+if (LLMBRIDGE_BUILD_TESTS)
     add_subdirectory(tests)
 endif ()

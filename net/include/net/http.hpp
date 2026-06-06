@@ -1,6 +1,13 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
-// Minimal HTTP/1.1 message framing for the Kottos proxy hot path.
+// Minimal HTTP/1.1 message framing for the llmbridge proxy hot path.
 //
 // Scope (Phase A): just enough to (a) know when a full request/response has
 // arrived in a buffer, and (b) decide keep-alive. Content-Length framing
@@ -14,7 +21,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace kottos::http
+namespace llmbridge::http
 {
     struct Message
     {
@@ -113,4 +120,4 @@ namespace kottos::http
         if (buf.size() < out.total_len) return ParseStatus::NeedMore;
         return ParseStatus::Complete;
     }
-} // namespace kottos::http
+} // namespace llmbridge::http

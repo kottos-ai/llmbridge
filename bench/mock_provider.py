@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Mock OpenAI-compatible provider for the Kottos Phase A benchmark.
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Mock OpenAI-compatible provider for the llmbridge Phase A benchmark.
 
 Pure stdlib asyncio (no aiohttp) — a raw HTTP/1.1 server that answers
 POST /v1/chat/completions with a canned chat-completion JSON after a fixed,
 configurable delay. The delay simulates a real provider's generation time; the
-whole benchmark measures Kottos's *added* latency on top of it, so this backend
+whole benchmark measures llmbridge's *added* latency on top of it, so this backend
 just needs to be (a) stable in its latency and (b) able to hold thousands of
 concurrent keep-alive connections without itself becoming the bottleneck.
 
 asyncio gives us cheap concurrency: each connection is a coroutine parked on
 asyncio.sleep() during the simulated delay, so 1000+ in-flight requests cost
-~nothing in threads. Connection: keep-alive is honored so Kottos can pool
+~nothing in threads. Connection: keep-alive is honored so llmbridge can pool
 upstream sockets and we avoid TIME_WAIT churn at high RPS.
 
   python3 mock_provider.py [--port 9001] [--latency-ms 200]
@@ -22,7 +30,7 @@ import json
 
 # OpenAI chat-completion shape (default — what a passthrough gateway forwards).
 CANNED_OPENAI = {
-    "id": "chatcmpl-kottos-mock",
+    "id": "chatcmpl-llmbridge-mock",
     "object": "chat.completion",
     "created": 0,
     "model": "mock-1",
@@ -39,7 +47,7 @@ CANNED_OPENAI = {
 # Anthropic Messages shape — used when the gateway under test translates
 # (OpenAI -> Anthropic outbound, Anthropic -> OpenAI on the way back).
 CANNED_ANTHROPIC = {
-    "id": "msg_kottos_mock",
+    "id": "msg_llmbridge_mock",
     "type": "message",
     "role": "assistant",
     "model": "claude-mock-1",

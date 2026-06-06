@@ -1,9 +1,16 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #include "gateway/metrics.hpp"
 
 #include <chrono>
 #include <cstdio>
 
-namespace kottos
+namespace llmbridge
 {
     int64_t now_ns() noexcept
     {
@@ -41,4 +48,4 @@ namespace kottos
                       p50, p99, p999, pmax, _overflow ? "  [overflow!]" : "");
         os << buf;
     }
-} // namespace kottos
+} // namespace llmbridge

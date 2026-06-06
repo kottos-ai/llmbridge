@@ -1,7 +1,14 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
-// Self-contained metrics for Kottos — a tiny linear-bucket latency histogram and
-// a monotonic clock. Zero dependencies — Kottos stands alone as a
+// Self-contained metrics for llmbridge — a tiny linear-bucket latency histogram and
+// a monotonic clock. Zero dependencies — llmbridge stands alone as a
 // self-contained, open-source project.
 //
 // The histogram is single-threaded by design: give each thread its own and
@@ -13,7 +20,7 @@
 #include <ostream>
 #include <vector>
 
-namespace kottos
+namespace llmbridge
 {
     // Monotonic wall-clock in nanoseconds. steady_clock is the right source for
     // measuring intervals (never steps backward, unaffected by NTP).
@@ -82,4 +89,4 @@ namespace kottos
         uint64_t _overflow = 0;
         uint64_t _max = 0;
     };
-} // namespace kottos
+} // namespace llmbridge

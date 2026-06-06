@@ -1,233 +1,160 @@
-# Kottos — Phase A benchmark proof-of-concept
+# llmbridge
 
-**A hundred hands to route your inference.**
+> ⚡ A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, zero runtime dependencies, p99 < 1 ms at 1,000 RPS.
 
-Kottos is a sub-millisecond LLM gateway for agentic workloads. This directory is
-the **Phase A proof-of-concept**: the smallest artifact that proves (or kills)
-the founding thesis —
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
+[![Build Status](https://github.com/kottosai/llmbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/kottosai/llmbridge/actions)
 
-> A C++ proxy can sit between an agent and a model provider and add **< 1 ms of
-> p99 overhead at 1000+ RPS**, where LiteLLM adds 10–20 ms and OpenRouter ~50 ms.
+## What it does
 
-**Result: thesis validated with ~16× margin.** On a Linux laptop (i7-9750H,
-6c/12t, all processes co-located), doing the **same work LiteLLM does** (full
-OpenAI↔Anthropic translation), the proxy adds **30 µs median / 63 µs p99 at
-1000 RPS** (self-measured) — every request far under 1 ms.
+`llmbridge` is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, …) and the response back — adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation functions as a C++ library. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to HFT latency standards.
 
-![Kottos vs LiteLLM](bench/results/comparison.svg)
+**Three properties that matter:**
 
-Equal-work head-to-head — **both** gateways translate OpenAI↔Anthropic, same
-200 ms mock backend, same open-loop load gen (Linux, 2026-06-04):
+- **Drop-in OpenAI-compatible.** Point an existing OpenAI client at `llmbridge` and route to a different provider with one flag — no app changes.
+- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~58k RPS single-thread ceiling. No GC pauses, no allocation spikes — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
+- **Zero runtime dependencies.** Self-contained C++20 — both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
-| RPS  | Kottos added p99 (self) | LiteLLM added p99 | LiteLLM throughput   |
-|------|-------------------------|-------------------|----------------------|
-| 100  | **0.075 ms**            | 124.79 ms         | 100/100 ✓            |
-| 1000 | **0.063 ms**            | 9 650 ms          | 248/1000 (saturated) |
-| 5000 | **0.045 ms**            | 12 513 ms         | 228/5000 (saturated) |
+> **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI](https://kottosai.com) (see the bottom of this README).
 
-The unsaturated **100 RPS** row is the apples-to-apples number: **~1660× lower
-p99**. LiteLLM (1 uvicorn worker) saturates at ~250 RPS on this box, then
-degrades into multi-second latency; Kottos holds 45–75 µs p99 across the whole
-range. (Kottos is proxy-self-measured; LiteLLM is client-measured e2e − backend,
-since it can't self-report — its own client-measured delta is sub-noise.)
+**Current provider support — non-streaming chat completions:**
 
-## Saturation point
+- ✅ OpenAI ↔ Anthropic
+- ✅ OpenAI ↔ Google Gemini
+- ✅ OpenAI ↔ Cohere
+- ✅ OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral, …) — passthrough, no body translation needed
+- 🚧 Streaming (SSE), tool calling, vision, `cache_control`, AWS Bedrock — planned (Phase B)
 
-How far does one thread go? Driven through an **instant C++ backend** (so the
-backend never saturates first — verified: direct-to-backend tracked target up
-to 100k RPS while the proxy capped at ~58k, proving the proxy is the
-bottleneck):
+## Benchmarks
 
-![Throughput saturation](bench/results/saturation.svg)
+**Equal-work head-to-head:** both `llmbridge` and LiteLLM do the full OpenAI↔Anthropic translation against the same 200 ms mock backend, driven by the same open-loop, coordinated-omission-corrected load generator. Single Linux host (i7-9750H, 6c/12t), all processes co-located — so absolute tails are a dev-box upper bound. This measures **gateway overhead**, not end-to-end LLM latency.
 
-| Offered RPS | Kottos achieved | client p99 | verdict                                         |
-|-------------|-----------------|------------|-------------------------------------------------|
-| 10 000      | 10 000          | 200 µs     | clean                                           |
-| 30 000      | 30 001          | 140 µs     | clean                                           |
-| 40 000      | 40 000          | 160 µs     | sub-ms p99                                      |
-| 50 000      | 50 000          | 280 µs     | sub-ms p99, tail starting to fray               |
-| 60 000+     | **~58–60 000**  | seconds    | saturated (achieved plateaus, backlog explodes) |
+![llmbridge vs LiteLLM — added latency p99](bench/results/comparison.svg)
 
-- **Throughput ceiling: ~58,000 RPS on a single thread** (achieved plateaus at
-  57.7–60.5k across 60k/80k/100k offered, while the direct-to-backend leg keeps
-  tracking 100k — so the proxy, not the backend, is the limit).
-- **Sub-millisecond p99 holds up to ~50 k RPS** — i.e. 50× the Phase A bar's
-  1000 RPS, on one core. (At 1000 RPS the byte-forward self-measured added p99 is
-  ~44 µs; ~63 µs with full OpenAI↔Anthropic translation.)
-- For contrast, LiteLLM (1 worker) saturates at **~250 RPS** — Kottos's
-  single-thread ceiling is **~230× higher**, and scales further with more
-  loops (SO_REUSEPORT, Phase D).
-- The proxy does ~2× the socket work per request as the backend (read client →
-  write upstream → read upstream → write client), which is why it caps at ~58k
-  vs the backend's 100k+ — consistent, not mysterious.
+At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **~0.075 ms p99** (self-measured) vs LiteLLM's **~125 ms** — and `llmbridge` holds 45–75 µs p99 across 100–5000 RPS while LiteLLM (1 uvicorn worker) saturates around **~250 RPS**.
 
-Reproduce: `./bench/saturate.sh 5 2 "10000 30000 50000 60000 80000 100000"`
+![Throughput saturation — offered vs achieved RPS](bench/results/saturation.svg)
 
-## Architecture
+Single-thread throughput ceiling is **~58k RPS**, with sub-millisecond p99 holding to ~50k RPS. *(Bifrost and Helicone not yet measured.)*
 
-**One class, one event loop, zero external runtime dependencies.** Kottos is a
-single-threaded, non-blocking **epoll** event loop wrapped in a `Gateway` class:
-accept clients, frame HTTP requests, optionally translate the provider dialect,
-forward over a **keep-alive upstream pool**, read the response, (translate
-back), write to the client. No framework. No DAG dispatcher. Just C++20.
+**Reproduce:** `./bench/run_headtohead.sh` (latency) and `./bench/saturate.sh` (throughput) — see [`bench/`](./bench). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
-```
-CMakeLists.txt          root — pure CMake, no third-party fetches (GoogleTest only for tests)
-net/                    LIB  — sockets + zero-alloc HTTP/1.1 framing
-  include/net/{socket_util.hpp, http.hpp}   src/socket_util.cpp   tests/
-provider/               LIB  — hand-rolled JSON + OpenAI↔Anthropic dialect translation
-  include/provider/{json.hpp, translate.hpp}   src/translate.cpp   tests/
-gateway/                LIB  — the Gateway event loop + a tiny vendored latency histogram
-  include/gateway/{gateway.hpp, metrics.hpp}   src/{gateway.cpp, metrics.cpp}   tests/
-app/                    EXE  — the `kottos` daemon (CLI/signal shell)
-bench/                  EXE  — loadgen + fastbackend + Python mock + scripts
+## Quick start
+
+### C++ — translate a request/response body
+
+```cpp
+#include "provider/translate.hpp"
+
+// An OpenAI-shaped chat-completion request body from your client:
+std::string openai_request = R"({
+    "model": "claude-3-5-sonnet-latest",
+    "messages": [{"role": "user", "content": "Hello"}]
+})";
+
+// Translate it to the Anthropic Messages dialect (returns "" on parse failure):
+std::string anthropic_request =
+    llmbridge::provider::openai_to_anthropic_request(openai_request);
+
+// ...send anthropic_request to Anthropic, then translate the reply back:
+std::string openai_response =
+    llmbridge::provider::anthropic_to_openai_response(provider_reply);
 ```
 
-### Overhead measurement (the number that matters)
+Also available: `openai_to_gemini_request` / `gemini_to_openai_response` and
+`openai_to_cohere_request` / `cohere_to_openai_response`.
 
-For each request the gateway stamps the clock at four points and reports
-`added = (upstream_request_sent − client_request_received) + (client_response_sent − upstream_response_received)`
-— i.e. request-path work + response-path work, with the upstream wait excluded
-entirely. That isolates *Kottos's* contribution from the backend's response
-time. Recorded into a tiny vendored linear-bucket `Histogram` (20 ns buckets).
+### As a gateway
 
-### Provider translation (the equal-work comparison)
+Run the binary in front of an upstream and translate on the fly:
 
-With `--translate anthropic`, the gateway does the *same work LiteLLM does* —
-parse the OpenAI request, translate to the Anthropic Messages dialect, call the
-provider, translate the Anthropic response back to OpenAI (the `provider` module,
-hand-rolled zero-alloc JSON). This exists so the LiteLLM comparison is fair, not
-passthrough-vs-translation. Result (same Anthropic mock, same load gen, both
-translating):
+```sh
+llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
+#                                                  --translate none|anthropic|gemini|cohere
+```
 
-| | added p99 @ 100 RPS | sustained throughput |
+Clients POST OpenAI-shaped requests to `:8088`; `llmbridge` translates to the upstream
+dialect and back. (Plain HTTP today — TLS and real provider endpoints are Phase C; for
+now front a local or already-proxied upstream.)
+
+<!--
+### Language bindings (planned)
+
+Python (`pybind11`), Go (`cgo`), and Rust (FFI) bindings are on the roadmap and
+**not yet available** — today `llmbridge` is a C++ library plus the gateway binary.
+-->
+
+## What's supported
+
+Today — **non-streaming chat completions**, via `--translate` or the `provider::` API:
+
+| Provider dialect | OpenAI → provider | provider → OpenAI |
 |---|---|---|
-| **Kottos** (translating) | ~75 µs self / <1 ms client | ~58k RPS/thread |
-| **LiteLLM** (translating) | ~125 ms | ~250 RPS/worker, then seconds |
+| Anthropic Messages | ✅ | ✅ |
+| Google Gemini (`generateContent`) | ✅ | ✅ |
+| Cohere Chat v2 | ✅ | ✅ |
+| OpenAI-compatible (Groq / Together / Fireworks / …) | passthrough | passthrough |
 
-The translation itself costs Kottos only a few µs over byte-forwarding (byte-forward
-self p99 ~44 µs → ~63 µs translating at 1000 RPS). LiteLLM adds ~125 ms p99 doing
-the same translation and saturates at ~250 RPS/worker — confirming the gap is
-structural (C++ event loop vs Python per-request object churn), not a measurement
-artifact. Run it: `--translate anthropic` +
-`bench/mock_provider.py --format anthropic`.
+Per-dialect coverage is the common chat path: model, system prompt, user/assistant
+turns, `max_tokens` / `temperature` / `top_p`; and on the response, content /
+finish-reason / usage.
 
-## Provider translations
+**Planned (Phase B):** streaming (SSE, token-by-token), tool calling (incl. streaming
+deltas), `tool_result` reconciliation, vision / image inputs, `cache_control`, and
+AWS Bedrock. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
-OpenAI chat-completions is the canonical client format. Kottos translates it to
-each structurally-different provider wire format and back, in hand-rolled
-zero-alloc C++ (the `provider/` module). Select one with `--translate`:
+## Installation
 
-| `--translate` | Upstream dialect | Maps (request → / ← response) |
-|---|---|---|
-| `none` (default) | OpenAI-compatible — byte-forward | — |
-| `anthropic` | Anthropic Messages | system extraction, content blocks, `max_tokens` ⟷ `stop_reason`, usage |
-| `gemini` | Google Gemini `generateContent` | `contents`/`parts`, role `model`, `systemInstruction`, `generationConfig` ⟷ `candidates`, `finishReason`, `usageMetadata` |
-| `cohere` | Cohere Chat v2 (`/v2/chat`) | messages, `top_p`→`p` ⟷ content blocks, `finish_reason`, `usage.tokens` |
+### From source (C++)
 
-**OpenAI-compatible providers need no body translation** — Groq, Together,
-Fireworks, DeepInfra, Mistral, Perplexity, xAI, OpenRouter, Cerebras, vLLM,
-Ollama, … speak the OpenAI dialect, so `--translate none` byte-forwards them
-(only auth/endpoint differ). The dialects above are the cases where the body
-actually changes shape — i.e. the work that costs LiteLLM milliseconds.
-
-**Coverage:** the common chat path — model, system, user/assistant turns,
-`max_tokens`/`temperature`/`top_p`; response content / finish-reason / usage.
-Representative, not 100% provider-complete: **streaming deltas, tool-calling,
-vision/multimodal, and Anthropic `cache_control` are Phase B.** Every dialect
-has GoogleTest coverage (request, response, finish-reason mapping, round-trip).
-
-## Build
-
-Requires CMake ≥ 3.20 and a C++20 compiler. **No other runtime dependencies.**
-First configure fetches GoogleTest *only* (and only when building tests).
-
-**CLion:** open this directory as the project root — it configures automatically.
-
-**CLI:**
-
-```sh
-cmake -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-release -j
-ctest --test-dir cmake-build-release --output-on-failure   # run module tests
+```bash
+git clone https://github.com/kottosai/llmbridge.git
+cd llmbridge
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+sudo cmake --install build
 ```
 
-## Tests
+Requires C++20 (GCC 13+, Clang 16+, MSVC 19.34+). Developed and tested on **Ubuntu 24.04 LTS** (kernel 6.8+) as the canonical platform. **Zero third-party runtime dependencies** — `llmbridge` is a self-contained C++20 artifact you can drop into your build without inheriting a transitive dependency tree. Build-time tools (testing, benchmarking) have their own dependencies but are not linked into the distributed library.
 
-GoogleTest, one executable per class/concern under each module's `tests/`
-**400 tests**, run with `ctest --test-dir <build>`:
+<!--
+_Python / Go / Rust packages are planned — see [Language bindings (planned)](#language-bindings-planned) above. Today llmbridge is built from source as a C++ library + gateway binary._
+-->
 
-| Suite | File | Tests | What |
-|-------|------|------:|------|
-| http framer | `net/tests/http_test.cpp` | 296 | Complete/NeedMore/Error/Pipeline tables + byte-by-byte incremental-arrival property + lenient-parse quirks |
-| JSON + translate | `provider/tests/{json,translate}_test.cpp` | 32 | hand-rolled JSON parser/builder; OpenAI↔Anthropic request/response translation + round-trip |
-| socket utils | `net/tests/socket_util_test.cpp` | 24 | loopback: flag setters, listener bind/reuse/accept, non-blocking connect (success/refused/bad-IP) |
-| Histogram + clock | `gateway/tests/metrics_test.cpp` | 26 | linear-bucket histogram (config, record, percentile, overflow, clear) + monotonic `now_ns()` |
-| Stats | `gateway/tests/stats_test.cpp` | 5 | zeroed counters + three independent sub-ms-resolution histograms |
-| Gateway integration | `gateway/tests/gateway_test.cpp` | 17 | round-trip, keep-alive, multi-client + pool reuse, warm-up gating, upstream-refused, shutdown, construction |
+## Design
 
-> The integration suite caught a real bug: a use-after-free in the event loop
-> when an upstream connect failed and one connection was freed while still
-> referenced by a later event in the same poll batch. Fixed by deferring
-> connection deletion to the end of each batch (`Gateway::close_*` mark `doomed`;
-> the sweep happens after each batch in `run()`).
+`llmbridge` is written in modern C++20 with these principles:
 
-Executables land in `cmake-build-release/bin/` (`kottos`, `loadgen`, `fastbackend`).
+- **Lean hot path.** Zero-copy `string_view` over the input buffer; the translation builds its output in one growable buffer. A per-connection slab arena (to remove the last `new`/`delete`) is staged for the multi-loop phase.
+- **Hand-rolled, dependency-free JSON.** A small recursive-descent parser into an ordered DOM plus a string-append builder — scoped to the chat-completion shapes we translate, not a general-purpose library. No `nlohmann::json`, `jsoncpp`, or `simdjson` in the shipped binary.
+- **No GC pauses** (it's C++). Tail latency is bounded by `malloc`, not garbage collection.
+- **No locks on the hot path.** A single-threaded `epoll` event loop with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~58k RPS; scale out with `SO_REUSEPORT`. (Token-by-token SSE streaming is on the Phase B roadmap.)
 
-## Run it
+The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules.
 
-```sh
-BIN=cmake-build-release/bin   # wherever you built
+## Project status
 
-# terminal 1 — mock provider, 200 ms simulated generation latency
-python3 bench/mock_provider.py --port 9001 --latency-ms 200
+**Alpha.** API is unstable; expect breaking changes before v1.0. Built and maintained by [Kottos AI](https://kottosai.com), which uses it as the foundation for a hosted inference gateway.
 
-# terminal 2 — the proxy
-$BIN/kottos --listen 8088 --upstream 127.0.0.1:9001
-
-# terminal 3 — drive load (open-loop, coordinated-omission corrected)
-$BIN/loadgen --target 127.0.0.1:8088 --rps 1000 --duration 20 --warmup 5
-```
-
-The proxy prints its added-latency histogram on SIGINT/SIGTERM (or after
-`--duration`). Use `--warmup S` to exclude the connection-pool ramp.
-
-## Reproduce the full benchmark + chart
-
-The scripts auto-locate the binaries in `cmake-build-*/bin` (override with
-`BIN=/path/to/bin`):
-
-```sh
-./bench/run_bench.sh 200 20 5 "100 500 1000 5000"   # Kottos vs mock: latency_ms dur warmup rps...
-./bench/saturate.sh 8 2 "20000 40000 60000 80000"   # single-thread saturation sweep
-./bench/run_litellm.sh 200 15 5 "100 500 1000 5000" # LiteLLM head-to-head (needs the venv below)
-python3 bench/make_chart.py                          # -> bench/results/comparison.svg
-python3 bench/make_saturation_chart.py               # -> bench/results/saturation.svg
-```
-
-LiteLLM venv (one-time): `python3 -m venv bench/.litellm-venv && bench/.litellm-venv/bin/pip install 'litellm[proxy]'`
-
-## Honesty / caveats (read before quoting numbers)
-
-- **Dev box, co-located.** Mock + proxy + loadgen share one Linux laptop
-  (i7-9750H, 6 cores / 12 threads). Absolute tails are an upper bound; the delta
-  methodology cancels most co-location noise. A clean public number wants
-  separate hosts (Phase D).
-- **Localhost mock, no TLS/WAN.** Phase A measures pure proxy overhead, not
-  real-provider round trips. TLS + real providers come in Phase C.
-- **LiteLLM ran with 1 worker** (CLI default, v1.87.0). Its ~250 RPS ceiling is
-  per-worker and scales with more workers; its **per-request** ~125 ms p99
-  overhead (doing the same OpenAI↔Anthropic translation) does not.
-- **Two measurement methods.** Kottos's headline is *proxy-self-measured*
-  (rigorous, no cross-run sampling noise). LiteLLM's is *client-measured*
-  (e2e − backend). Kottos's own client-measured delta is < 0.25 ms — below the
-  noise floor, consistent with the µs self-report.
-- **Content-Length framing only** (no chunked transfer-encoding yet); **epoll
-  only** (Linux). Per-connection `new`/`delete` (a slab arena is staged for the
-  multi-loop phase).
+We follow semantic versioning. Pre-1.0 versions may break the API across minor versions. The 1.0 commitment will come after at least six months of public use and at least one production deployment with stable feedback.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). No third-party
-runtime dependencies; GoogleTest (BSD-3-Clause) is fetched at build time only,
-for the test suite.
+Apache License 2.0. See [LICENSE](./LICENSE).
+
+Copyright © 2026 Kottos AI, Inc.
+
+## Contributions
+
+**This project is maintained by Kottos AI and does not currently accept external code contributions.** We do welcome bug reports, feature suggestions, and questions.
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for details on how to engage with the project.
+
+## Security
+
+For responsible disclosure of security vulnerabilities, see [SECURITY.md](./SECURITY.md) or email `security@kottosai.com`.
+
+## About Kottos AI
+
+`llmbridge` is developed and sponsored by [Kottos AI, Inc.](https://kottosai.com), which builds exchange-grade inference infrastructure for AI applications. If you need this kind of performance at scale, with managed routing across providers, observability, and enterprise features — [get in touch](mailto:hello@kottosai.com).

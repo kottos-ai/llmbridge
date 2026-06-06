@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 // Tests for the vendored metrics (gateway/metrics.hpp): the linear-bucket
 // Histogram and the monotonic now_ns() clock.
 
@@ -8,8 +15,8 @@
 #include <cstdint>
 #include <string>
 
-using kottos::Histogram;
-using kottos::now_ns;
+using llmbridge::Histogram;
+using llmbridge::now_ns;
 
 namespace
 {

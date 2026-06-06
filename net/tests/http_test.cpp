@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 // Exhaustive tests for the zero-alloc HTTP/1.1 framer (net/http.hpp).
 //
 // Coverage is generated programmatically (expected fields computed from the raw
@@ -21,10 +28,10 @@
 #include <utility>
 #include <vector>
 
-using kottos::http::Message;
-using kottos::http::ParseStatus;
-using kottos::http::parse;
-using kottos::http::kMaxHeaderLen;
+using llmbridge::http::Message;
+using llmbridge::http::ParseStatus;
+using llmbridge::http::parse;
+using llmbridge::http::kMaxHeaderLen;
 
 namespace
 {

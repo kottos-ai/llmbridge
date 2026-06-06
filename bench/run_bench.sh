@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
+
+# Copyright 2026 Kottos AI, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
 # Phase A benchmark orchestrator.
 #
 # For each target RPS we measure latency twice with the same open-loop loadgen:
-#   (1) through the Kottos proxy        -> backend latency + proxy overhead
+#   (1) through the llmbridge proxy        -> backend latency + proxy overhead
 #   (2) direct to the mock provider     -> backend latency baseline
 # The proxy's added latency is the delta of those two client-observed numbers,
 # cross-checked against the proxy's own self-reported overhead (request-path +
@@ -37,12 +45,12 @@ SUMMARY="$RESDIR/summary-$STAMP.txt"
 BIN="${BIN:-}"
 if [ -z "$BIN" ]; then
   for d in cmake-build-release/bin cmake-build-debug/bin build-linux/bin build/bin; do
-    if [ -x "$d/kottos" ]; then BIN="$d"; break; fi
+    if [ -x "$d/llmbridge" ]; then BIN="$d"; break; fi
   done
 fi
 [ -z "$BIN" ] && { echo "No built binaries; build the CMake project first or set BIN=path" >&2; exit 1; }
 
-cleanup() { pkill -f mock_provider.py 2>/dev/null || true; pkill -f "$BIN/kottos" 2>/dev/null || true; }
+cleanup() { pkill -f mock_provider.py 2>/dev/null || true; pkill -f "$BIN/llmbridge" 2>/dev/null || true; }
 trap cleanup EXIT
 cleanup; sleep 0.3
 
@@ -53,7 +61,7 @@ python3 bench/mock_provider.py --port "$MOCK_PORT" --latency-ms "$LAT_MS" >"$RES
 sleep 1
 
 {
-  echo "Kottos Phase A benchmark — $STAMP"
+  echo "llmbridge Phase A benchmark — $STAMP"
   echo "mock latency=${LAT_MS}ms  duration=${DUR}s  warmup=${WARMUP}s  host=$(uname -mn)"
   echo
   printf "%-7s | %-32s | %-32s | %s\n" "RPS" "DIRECT-to-mock (client e2e, ms)" "THROUGH-proxy (client e2e, ms)" "PROXY ADDED (ms)"
@@ -73,7 +81,7 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r d50 d99 d999 dmax <<< "$(echo "$DIRECT" | extract_us)"
 
   # (1) through-proxy: fresh proxy per level so its self-stats are per-RPS
-  $BIN/kottos --listen $PROXY_PORT --upstream 127.0.0.1:$MOCK_PORT \
+  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$MOCK_PORT \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/proxy-$RPS-$STAMP.log" 2>&1 &
   PROXY_PID=$!
   sleep 1

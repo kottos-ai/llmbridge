@@ -1,3 +1,10 @@
+// Copyright 2026 Kottos AI, Inc.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
 #pragma once
 
 // Provider dialect translation — the C++ analog of LiteLLM's
@@ -24,7 +31,7 @@
 #include <string>
 #include <string_view>
 
-namespace kottos::provider
+namespace llmbridge::provider
 {
     // ── Anthropic Messages ──────────────────────────────────────────────────
     // OpenAI chat-completion request body  ->  Anthropic Messages request body.
@@ -43,4 +50,4 @@ namespace kottos::provider
     std::string openai_to_cohere_request(std::string_view openai_body);
     // Cohere /v2/chat response body  ->  OpenAI chat-completion response body.
     std::string cohere_to_openai_response(std::string_view cohere_body);
-} // namespace kottos::provider
+} // namespace llmbridge::provider
