@@ -1,0 +1,8 @@
+model_list:
+  - model_name: mock-1
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      api_base: http://127.0.0.1:9001
+      api_key: dummy-key
+litellm_settings:
+  drop_params: true

@@ -1,0 +1,6 @@
+# Kottos vs LiteLLM, equal-work OpenAI<->Anthropic, 20260603-190552, host=lenovo-c940 x86_64, mock 200ms
+rps,kottos_p50_ms,kottos_p99_ms,kottos_p999_ms,kottos_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat
+100,0.036,0.075,0.097,0.122,4.560,100,124.790,176.584,no
+500,0.031,0.068,0.085,0.122,6589.722,246,6588.492,6588.268,yes
+1000,0.030,0.063,0.079,0.091,9650.731,248,9649.681,9649.622,yes
+5000,0.019,0.045,0.064,0.122,12513.179,228,12512.769,12512.246,yes

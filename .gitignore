@@ -1,0 +1,24 @@
+# Build trees
+/build/
+/build-*/
+/cmake-build-*/
+compile_commands.json
+
+# IDE
+/.idea/
+*.DS_Store
+
+# Private business/strategy material — NOT part of the public OSS repo.
+# (Handoff doc, exchange thesis, GTM/discovery scripts, briefing, AI-assistant
+# instructions.) Keep these out of the public history entirely.
+/private/
+/CLAUDE.md
+**/.claude/
+
+# LiteLLM head-to-head venv (large; recreate via the note in bench/run_headtohead.sh)
+bench/.litellm-venv/
+
+# Stamped raw benchmark logs / run output.
+# Keep the committed artifacts: bench/results/*.svg and phase-a-comparison.csv
+bench/results/*.log
+bench/results/*.txt

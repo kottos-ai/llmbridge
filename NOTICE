@@ -1,0 +1,13 @@
+Kottos — a sub-millisecond C++ LLM gateway
+Copyright 2026 Kottos AI, Inc. (https://kottosai.com)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this product except in compliance with the License. A copy of the License is
+provided in the LICENSE file, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Kottos has zero third-party runtime dependencies — it is a self-contained C++20
+artifact. The only fetched dependency is GoogleTest (BSD-3-Clause), pulled in at
+build time for the test suite only; it is never linked into the gateway and
+imposes no obligations on downstream users of the runtime.

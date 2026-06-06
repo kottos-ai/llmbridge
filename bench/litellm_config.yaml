@@ -1,0 +1,16 @@
+# LiteLLM proxy config for the Kottos head-to-head. Routes model "mock-1" to
+# the same asyncio mock provider Kottos is benchmarked against, so the only
+# difference between the two runs is the gateway itself.
+model_list:
+  - model_name: mock-1
+    litellm_params:
+      model: openai/mock-1
+      api_base: http://127.0.0.1:9001
+      api_key: dummy-key
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  # No master key -> no auth, so the loadgen's keyless POSTs are accepted.
+  disable_spend_logs: true
