@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <deque>
 #include <string>
 
 using llmbridge::json::Value;
@@ -19,11 +20,17 @@ using llmbridge::json::append_escaped;
 
 namespace
 {
-    Value P(const std::string& s)
+    // The DOM is view-based: a parsed Value holds string_views into its input, so
+    // the backing bytes must outlive it. Stash each input in a pointer-stable store
+    // (std::deque never relocates elements) that lives for the whole test binary.
+    std::deque<std::string> g_backing;
+
+    Value P(std::string s)
     {
+        g_backing.push_back(std::move(s));
         bool ok = false;
-        Value v = parse(s, ok);
-        EXPECT_TRUE(ok) << "failed to parse: " << s;
+        Value v = parse(g_backing.back(), ok);
+        EXPECT_TRUE(ok) << "failed to parse: " << g_backing.back();
         return v;
     }
 } // namespace
@@ -72,10 +79,12 @@ TEST(Json, EmptyArrayAndObject)
     EXPECT_TRUE(P(R"({"a":{}})").find("a")->is_object());
 }
 
-TEST(Json, StringEscapes)
+TEST(Json, StringEscapesPassedThroughRaw)
 {
+    // The parser is zero-copy: a string value is the RAW span between the quotes,
+    // still JSON-escaped — never decoded. The backslash escapes survive verbatim.
     Value v = P(R"({"s":"a\"b\\c\nd\te"})");
-    EXPECT_EQ(v.str_or("s"), "a\"b\\c\nd\te");
+    EXPECT_EQ(v.str_or("s"), "a\\\"b\\\\c\\nd\\te");
 }
 
 TEST(Json, UnicodeEscapePassedThrough)
@@ -124,7 +133,7 @@ TEST(Json, DeeplyNested)
     Value v = P(R"({"a":{"b":{"c":[{"d":"e"}]}}})");
     const Value* d = v.find("a")->find("b")->find("c")->arr[0].find("d");
     ASSERT_NE(d, nullptr);
-    EXPECT_EQ(d->str, "e");
+    EXPECT_EQ(d->sv, "e");
 }
 
 TEST(Json, MalformedSetsNotOk)
@@ -140,16 +149,24 @@ TEST(Json, MalformedSetsNotOk)
     EXPECT_FALSE(ok);
 }
 
-TEST(JsonBuilder, EscapesRoundTrip)
+TEST(JsonBuilder, EscapedFormIsSelfConsistent)
 {
     std::string out;
     const std::string raw = "line1\nline2\t\"quoted\" \\back\\";
     append_escaped(out, raw);
-    // The escaped form must parse back to the original string.
+    // The special chars are escaped on the way out.
+    EXPECT_NE(out.find("\\n"), std::string::npos);
+    EXPECT_NE(out.find("\\t"), std::string::npos);
+    EXPECT_NE(out.find("\\\""), std::string::npos);
+    EXPECT_NE(out.find("\\\\"), std::string::npos);
+    // The parser no longer decodes: re-parsing the escaped literal yields the raw
+    // (still-escaped) span verbatim — exactly what append_escaped emitted, minus
+    // the surrounding quotes. So append_escaped + parse round-trips byte-for-byte.
+    const std::string doc = "{\"s\":" + out + "}"; // must outlive the view-based DOM
     bool ok = false;
-    Value v = parse("{\"s\":" + out + "}", ok);
+    Value v = parse(doc, ok);
     ASSERT_TRUE(ok);
-    EXPECT_EQ(v.str_or("s"), raw);
+    EXPECT_EQ(v.str_or("s"), out.substr(1, out.size() - 2));
 }
 
 TEST(JsonBuilder, EscapesControlChars)

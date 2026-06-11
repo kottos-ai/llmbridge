@@ -9,6 +9,7 @@
 
 #include <charconv>
 #include <string>
+#include <string_view>
 
 #include "provider/json.hpp"
 
@@ -16,29 +17,29 @@ namespace llmbridge::provider
 {
     namespace
     {
-        long long to_ll(const std::string& s)
+        long long to_ll(std::string_view s)
         {
             long long v = 0;
             std::from_chars(s.data(), s.data() + s.size(), v);
             return v;
         }
 
-        // Extract message text from an OpenAI "content" field, which is either a
-        // plain string or an array of parts ({type:"text", text:"..."}).
-        std::string content_text(const json::Value* c)
+        // Append the raw (already JSON-escaped) text of a content field — a plain
+        // string, or an array of {type:"text",text:...} parts — to `out`, WITHOUT
+        // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
+        // the output's, so nothing is decoded or re-escaped; the bytes are viewed
+        // straight out of the request/response buffer.
+        void append_text(std::string& out, const json::Value* c)
         {
-            if (!c) return {};
-            if (c->is_string()) return c->str;
+            if (!c) return;
+            if (c->is_string()) { out += c->sv; return; }
             if (c->is_array())
-            {
-                std::string out;
                 for (const auto& part : c->arr)
                     if (part.str_or("type") == "text") out += part.str_or("text");
-                return out;
-            }
-            return {};
         }
     } // namespace
+
+    // ── Anthropic Messages ──────────────────────────────────────────────────
 
     std::string openai_to_anthropic_request(std::string_view openai_body)
     {
@@ -46,44 +47,50 @@ namespace llmbridge::provider
         json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        std::string system;       // collected from role:"system" messages
+        std::string system;        // collected system content (raw), joined by \n
+        bool has_system = false;
         std::string messages = "["; // anthropic user/assistant turns
         bool first = true;
         if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
         {
             for (const auto& m : msgs->arr)
             {
-                const std::string role = m.str_or("role");
-                const std::string content = content_text(m.find("content"));
+                const std::string_view role = m.str_or("role");
+                const json::Value* content = m.find("content");
                 if (role == "system")
                 {
-                    if (!system.empty()) system += "\n";
-                    system += content;
+                    if (has_system) system += "\\n"; // escaped newline in the output
+                    append_text(system, content);
+                    has_system = true;
                     continue;
                 }
                 if (!first) messages += ',';
                 first = false;
                 messages += "{\"role\":";
-                json::append_escaped(messages, role);
-                messages += ",\"content\":";
-                json::append_escaped(messages, content);
-                messages += '}';
+                json::append_raw_string(messages, role);
+                messages += ",\"content\":\"";
+                append_text(messages, content);
+                messages += "\"}";
             }
         }
         messages += ']';
 
         std::string out = "{\"model\":";
-        json::append_escaped(out, v.str_or("model", "claude-3-5-sonnet-latest"));
+        json::append_raw_string(out, v.str_or("model", "claude-3-5-sonnet-latest"));
         // Anthropic requires max_tokens; default if the OpenAI request omitted it.
-        out += ",\"max_tokens\":" + v.num_or("max_tokens", "1024");
-        if (!system.empty())
+        out += ",\"max_tokens\":";
+        out += v.num_or("max_tokens", "1024");
+        if (has_system)
         {
-            out += ",\"system\":";
-            json::append_escaped(out, system);
+            out += ",\"system\":\"";
+            out += system;
+            out += '"';
         }
-        if (std::string t = v.num_or("temperature"); !t.empty()) out += ",\"temperature\":" + t;
-        if (std::string p = v.num_or("top_p"); !p.empty()) out += ",\"top_p\":" + p;
-        out += ",\"messages\":" + messages + "}";
+        if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
+        if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"top_p\":"; out += p; }
+        out += ",\"messages\":";
+        out += messages;
+        out += "}";
         return out;
     }
 
@@ -93,14 +100,8 @@ namespace llmbridge::provider
         json::Value v = json::parse(anthropic_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        // content: array of blocks; join the text of text-blocks.
-        std::string content;
-        if (const json::Value* c = v.find("content"); c && c->is_array())
-            for (const auto& blk : c->arr)
-                if (blk.str_or("type") == "text") content += blk.str_or("text");
-
         // stop_reason -> OpenAI finish_reason.
-        const std::string sr = v.str_or("stop_reason", "end_turn");
+        const std::string_view sr = v.str_or("stop_reason", "end_turn");
         const char* finish = sr == "max_tokens" ? "length" : sr == "tool_use" ? "tool_calls" : "stop";
 
         long long in_tok = 0, out_tok = 0;
@@ -111,14 +112,17 @@ namespace llmbridge::provider
         }
 
         std::string out = "{\"id\":";
-        json::append_escaped(out, v.str_or("id", "chatcmpl-llmbridge"));
+        json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
         out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
-        json::append_escaped(out, v.str_or("model"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
-        json::append_escaped(out, content);
-        out += "},\"finish_reason\":";
-        json::append_escaped(out, finish);
-        out += "}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
+        json::append_raw_string(out, v.str_or("model"));
+        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        // content: array of blocks; emit the text of text-blocks verbatim.
+        if (const json::Value* c = v.find("content"); c && c->is_array())
+            for (const auto& blk : c->arr)
+                if (blk.str_or("type") == "text") out += blk.str_or("text");
+        out += "\"},\"finish_reason\":\"";
+        out += finish;
+        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
                ",\"total_tokens\":" + std::to_string(in_tok + out_tok) + "}}";
         return out;
@@ -132,52 +136,56 @@ namespace llmbridge::provider
         json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        std::string system;          // collected from role:"system" messages
+        std::string system;          // collected system content (raw), joined by \n
+        bool has_system = false;
         std::string contents = "[";  // gemini "contents" turns
         bool first = true;
         if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
         {
             for (const auto& m : msgs->arr)
             {
-                const std::string role = m.str_or("role");
-                const std::string content = content_text(m.find("content"));
+                const std::string_view role = m.str_or("role");
+                const json::Value* content = m.find("content");
                 if (role == "system")
                 {
-                    if (!system.empty()) system += "\n";
-                    system += content;
+                    if (has_system) system += "\\n";
+                    append_text(system, content);
+                    has_system = true;
                     continue;
                 }
                 if (!first) contents += ',';
                 first = false;
                 // OpenAI "assistant" -> Gemini "model"; everything else -> "user".
                 contents += "{\"role\":";
-                json::append_escaped(contents, role == "assistant" ? "model" : "user");
-                contents += ",\"parts\":[{\"text\":";
-                json::append_escaped(contents, content);
-                contents += "}]}";
+                contents += role == "assistant" ? "\"model\"" : "\"user\"";
+                contents += ",\"parts\":[{\"text\":\"";
+                append_text(contents, content);
+                contents += "\"}]}";
             }
         }
         contents += ']';
 
         std::string out = "{\"contents\":" + contents;
-        if (!system.empty())
+        if (has_system)
         {
-            out += ",\"systemInstruction\":{\"parts\":[{\"text\":";
-            json::append_escaped(out, system);
-            out += "}]}";
+            out += ",\"systemInstruction\":{\"parts\":[{\"text\":\"";
+            out += system;
+            out += "\"}]}";
         }
         // generationConfig — only the keys the OpenAI request actually set.
         std::string gc;
-        if (std::string mt = v.num_or("max_tokens"); !mt.empty()) gc += "\"maxOutputTokens\":" + mt;
-        if (std::string t = v.num_or("temperature"); !t.empty())
+        if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { gc += "\"maxOutputTokens\":"; gc += mt; }
+        if (std::string_view t = v.num_or("temperature"); !t.empty())
         {
             if (!gc.empty()) gc += ',';
-            gc += "\"temperature\":" + t;
+            gc += "\"temperature\":";
+            gc += t;
         }
-        if (std::string p = v.num_or("top_p"); !p.empty())
+        if (std::string_view p = v.num_or("top_p"); !p.empty())
         {
             if (!gc.empty()) gc += ',';
-            gc += "\"topP\":" + p;
+            gc += "\"topP\":";
+            gc += p;
         }
         if (!gc.empty()) out += ",\"generationConfig\":{" + gc + "}";
         out += "}";
@@ -190,16 +198,15 @@ namespace llmbridge::provider
         json::Value v = json::parse(gemini_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        std::string content;
-        std::string finish = "stop";
+        const json::Value* parts = nullptr; // candidates[0].content.parts
+        const char* finish = "stop";
         if (const json::Value* cands = v.find("candidates"); cands && cands->is_array() && !cands->arr.empty())
         {
             const json::Value& c0 = cands->arr.front();
             if (const json::Value* cont = c0.find("content"))
-                if (const json::Value* parts = cont->find("parts"); parts && parts->is_array())
-                    for (const auto& part : parts->arr) content += part.str_or("text");
+                if (const json::Value* p = cont->find("parts"); p && p->is_array()) parts = p;
             // Gemini finishReason -> OpenAI finish_reason.
-            const std::string fr = c0.str_or("finishReason", "STOP");
+            const std::string_view fr = c0.str_or("finishReason", "STOP");
             finish = fr == "MAX_TOKENS" ? "length"
                    : (fr == "SAFETY" || fr == "RECITATION" || fr == "BLOCKLIST" ||
                       fr == "PROHIBITED_CONTENT") ? "content_filter"
@@ -216,12 +223,13 @@ namespace llmbridge::provider
         if (total == 0) total = in_tok + out_tok;
 
         std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":0,\"model\":";
-        json::append_escaped(out, v.str_or("modelVersion"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
-        json::append_escaped(out, content);
-        out += "},\"finish_reason\":";
-        json::append_escaped(out, finish);
-        out += "}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
+        json::append_raw_string(out, v.str_or("modelVersion"));
+        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        if (parts)
+            for (const auto& part : parts->arr) out += part.str_or("text");
+        out += "\"},\"finish_reason\":\"";
+        out += finish;
+        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
                ",\"total_tokens\":" + std::to_string(total) + "}}";
         return out;
@@ -235,33 +243,34 @@ namespace llmbridge::provider
         json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        // Cohere v2 keeps OpenAI-style system/user/assistant message turns; the
-        // body differences are top_p -> "p" and the response shape.
+        // Cohere v2 keeps OpenAI-style system/user/assistant turns; the body
+        // differences are top_p -> "p" and the response shape.
         std::string messages = "[";
         bool first = true;
         if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
         {
             for (const auto& m : msgs->arr)
             {
-                const std::string role = m.str_or("role");
-                const std::string content = content_text(m.find("content"));
+                const std::string_view role = m.str_or("role");
+                const json::Value* content = m.find("content");
                 if (!first) messages += ',';
                 first = false;
                 messages += "{\"role\":";
-                json::append_escaped(messages, role);
-                messages += ",\"content\":";
-                json::append_escaped(messages, content);
-                messages += '}';
+                json::append_raw_string(messages, role);
+                messages += ",\"content\":\"";
+                append_text(messages, content);
+                messages += "\"}";
             }
         }
         messages += ']';
 
         std::string out = "{\"model\":";
-        json::append_escaped(out, v.str_or("model", "command-r-plus"));
-        out += ",\"messages\":" + messages;
-        if (std::string mt = v.num_or("max_tokens"); !mt.empty()) out += ",\"max_tokens\":" + mt;
-        if (std::string t = v.num_or("temperature"); !t.empty()) out += ",\"temperature\":" + t;
-        if (std::string p = v.num_or("top_p"); !p.empty()) out += ",\"p\":" + p; // Cohere: top_p is "p"
+        json::append_raw_string(out, v.str_or("model", "command-r-plus"));
+        out += ",\"messages\":";
+        out += messages;
+        if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
+        if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
+        if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"p\":"; out += p; } // Cohere: top_p is "p"
         out += "}";
         return out;
     }
@@ -272,15 +281,8 @@ namespace llmbridge::provider
         json::Value v = json::parse(cohere_body, ok);
         if (!ok || !v.is_object()) return {};
 
-        // message.content: array of blocks; join the text of text-blocks.
-        std::string content;
-        if (const json::Value* msg = v.find("message"))
-            if (const json::Value* c = msg->find("content"); c && c->is_array())
-                for (const auto& blk : c->arr)
-                    if (blk.str_or("type") == "text") content += blk.str_or("text");
-
         // Cohere finish_reason -> OpenAI finish_reason.
-        const std::string fr = v.str_or("finish_reason", "COMPLETE");
+        const std::string_view fr = v.str_or("finish_reason", "COMPLETE");
         const char* finish = fr == "MAX_TOKENS" ? "length" : fr == "TOOL_CALL" ? "tool_calls" : "stop";
 
         long long in_tok = 0, out_tok = 0;
@@ -292,14 +294,17 @@ namespace llmbridge::provider
             }
 
         std::string out = "{\"id\":";
-        json::append_escaped(out, v.str_or("id", "chatcmpl-llmbridge"));
+        json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
         out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
-        json::append_escaped(out, v.str_or("model"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
-        json::append_escaped(out, content);
-        out += "},\"finish_reason\":";
-        json::append_escaped(out, finish);
-        out += "}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
+        json::append_raw_string(out, v.str_or("model"));
+        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        if (const json::Value* msg = v.find("message"))
+            if (const json::Value* c = msg->find("content"); c && c->is_array())
+                for (const auto& blk : c->arr)
+                    if (blk.str_or("type") == "text") out += blk.str_or("text");
+        out += "\"},\"finish_reason\":\"";
+        out += finish;
+        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
                ",\"total_tokens\":" + std::to_string(in_tok + out_tok) + "}}";
         return out;

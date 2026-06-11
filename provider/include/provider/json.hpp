@@ -31,9 +31,13 @@ namespace llmbridge::json
 
         Type type = Type::Null;
         bool boolean = false;
-        std::string str;                                   // String (decoded) or Number (raw text)
-        std::vector<Value> arr;                            // Array elements
-        std::vector<std::pair<std::string, Value>> obj;    // Object members, insertion order
+        // For String, `sv` is the RAW span between the quotes (still JSON-escaped) —
+        // a view into the parsed input, never decoded, never owned. For Number, it's
+        // the raw number text. This makes the DOM zero-copy: a passthrough value is
+        // emitted verbatim, since the input's escaping is exactly the output's.
+        std::string_view sv;
+        std::vector<Value> arr;                                  // Array elements
+        std::vector<std::pair<std::string_view, Value>> obj;     // Object members, insertion order
 
         [[nodiscard]] bool is_object() const { return type == Type::Object; }
         [[nodiscard]] bool is_array() const { return type == Type::Array; }
@@ -48,17 +52,18 @@ namespace llmbridge::json
             return nullptr;
         }
 
-        // Convenience: a string member's decoded value, or a default.
-        [[nodiscard]] std::string str_or(std::string_view key, std::string_view def = "") const
+        // A string member's raw (still-escaped) span, or `def`. Returns a view —
+        // `def` and the parsed input must outlive the result.
+        [[nodiscard]] std::string_view str_or(std::string_view key, std::string_view def = "") const
         {
             const Value* v = find(key);
-            return (v && v->type == Type::String) ? v->str : std::string(def);
+            return (v && v->type == Type::String) ? v->sv : def;
         }
-        // Convenience: a number member's raw text (e.g. "256", "0.7"), or a default.
-        [[nodiscard]] std::string num_or(std::string_view key, std::string_view def = "") const
+        // A number member's raw text (e.g. "256", "0.7"), or `def`.
+        [[nodiscard]] std::string_view num_or(std::string_view key, std::string_view def = "") const
         {
             const Value* v = find(key);
-            return (v && v->type == Type::Number) ? v->str : std::string(def);
+            return (v && v->type == Type::Number) ? v->sv : def;
         }
     };
 
@@ -75,46 +80,22 @@ namespace llmbridge::json
                 while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
             }
 
-            // Decode a JSON string (assumes s[i]=='"'); advances past the closing quote.
-            // Bulk-copies runs of plain chars between escapes (most content has no
-            // escapes), so the common path is a handful of appends, not a char loop.
-            std::string parse_string()
+            // Return the RAW span between the quotes (assumes s[i]=='"'), still
+            // JSON-escaped, as a view into the input — never decoded, never copied.
+            // We scan only for the real closing quote, skipping escape pairs (\X).
+            std::string_view parse_string()
             {
-                std::string out;
                 ++i; // opening quote
+                const size_t start = i;
                 while (i < s.size())
                 {
-                    // Copy the run up to the next '"' or '\\' in one shot.
-                    const size_t start = i;
-                    while (i < s.size() && s[i] != '"' && s[i] != '\\') ++i;
-                    out.append(s.data() + start, i - start);
-                    if (i >= s.size()) break; // unterminated
-                    const char c = s[i++];
-                    if (c == '"') return out; // closing quote
-                    // c == '\\': decode a single escape.
-                    if (i >= s.size()) { out += '\\'; break; } // lone trailing backslash
-                    const char e = s[i++];
-                    switch (e)
-                    {
-                        case '"': out += '"'; break;
-                        case '\\': out += '\\'; break;
-                        case '/': out += '/'; break;
-                        case 'n': out += '\n'; break;
-                        case 't': out += '\t'; break;
-                        case 'r': out += '\r'; break;
-                        case 'b': out += '\b'; break;
-                        case 'f': out += '\f'; break;
-                        case 'u':
-                            // Pass the \uXXXX through verbatim — we never need to
-                            // interpret code points to shuttle text between dialects.
-                            out += "\\u";
-                            for (int k = 0; k < 4 && i < s.size(); ++k) out += s[i++];
-                            break;
-                        default: out += e; break;
-                    }
+                    const char c = s[i];
+                    if (c == '"') { std::string_view sv = s.substr(start, i - start); ++i; return sv; }
+                    if (c == '\\') { i += 2; continue; } // skip the escaped char
+                    ++i;
                 }
                 ok = false; // unterminated string
-                return out;
+                return s.substr(start);
             }
 
             Value parse_value()
@@ -122,7 +103,7 @@ namespace llmbridge::json
                 ws();
                 if (i >= s.size()) { ok = false; return {}; }
                 char c = s[i];
-                if (c == '"') { Value v; v.type = Value::Type::String; v.str = parse_string(); return v; }
+                if (c == '"') { Value v; v.type = Value::Type::String; v.sv = parse_string(); return v; }
                 if (c == '{') return parse_object();
                 if (c == '[') return parse_array();
                 if (c == 't' || c == 'f') return parse_bool();
@@ -154,8 +135,8 @@ namespace llmbridge::json
                     else break;
                 }
                 Value v; v.type = Value::Type::Number;
-                v.str = std::string(s.substr(start, i - start));
-                if (v.str.empty()) ok = false;
+                v.sv = s.substr(start, i - start);
+                if (v.sv.empty()) ok = false;
                 return v;
             }
 
@@ -186,11 +167,11 @@ namespace llmbridge::json
                 {
                     ws();
                     if (i >= s.size() || s[i] != '"') { ok = false; return v; }
-                    std::string key = parse_string();
+                    std::string_view key = parse_string();
                     ws();
                     if (i >= s.size() || s[i] != ':') { ok = false; return v; }
                     ++i; // :
-                    v.obj.emplace_back(std::move(key), parse_value());
+                    v.obj.emplace_back(key, parse_value());
                     ws();
                     if (i < s.size() && s[i] == ',') { ++i; continue; }
                     if (i < s.size() && s[i] == '}') { ++i; return v; }
@@ -211,7 +192,17 @@ namespace llmbridge::json
         return v;
     }
 
-    // Append `raw` as a JSON string literal (with surrounding quotes + escaping).
+    // Append a RAW (already JSON-escaped) span as a quoted string literal — the
+    // zero-copy passthrough path. The bytes came from valid JSON input, so the
+    // escaping is already correct; emit verbatim, no decode/re-encode.
+    inline void append_raw_string(std::string& out, std::string_view raw)
+    {
+        out += '"';
+        out += raw;
+        out += '"';
+    }
+
+    // Append `raw` (a DECODED string) as a JSON string literal, escaping as needed.
     // Bulk-copies runs of chars that don't need escaping (the common case), only
     // escaping the special ones individually — so most content is a few memcpys.
     inline void append_escaped(std::string& out, std::string_view raw)

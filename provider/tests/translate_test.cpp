@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <deque>
 #include <string>
 
 #include "provider/json.hpp"
@@ -27,11 +28,17 @@ using llmbridge::json::parse;
 
 namespace
 {
-    Value P(const std::string& s)
+    // The DOM is view-based: a parsed Value holds string_views into its input, so
+    // the backing bytes must outlive it. Stash each input in a pointer-stable store
+    // (std::deque never relocates elements) that lives for the whole test binary.
+    std::deque<std::string> g_backing;
+
+    Value P(std::string s)
     {
+        g_backing.push_back(std::move(s));
         bool ok = false;
-        Value v = parse(s, ok);
-        EXPECT_TRUE(ok) << "unparseable translation output: " << s;
+        Value v = parse(g_backing.back(), ok);
+        EXPECT_TRUE(ok) << "unparseable translation output: " << g_backing.back();
         return v;
     }
 } // namespace
@@ -84,7 +91,9 @@ TEST(ReqXlate, ConcatenatesMultipleSystemMessages)
         {"role":"system","content":"b"},
         {"role":"user","content":"hi"}]})";
     Value out = P(openai_to_anthropic_request(in));
-    EXPECT_EQ(out.str_or("system"), "a\nb");
+    // Joined with an escaped newline in the JSON; the raw span is the 4 bytes a \ n b,
+    // i.e. the wire string "a\nb" (a real newline once a client decodes it).
+    EXPECT_EQ(out.str_or("system"), "a\\nb");
 }
 
 TEST(ReqXlate, ContentAsArrayOfTextParts)
