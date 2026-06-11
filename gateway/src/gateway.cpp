@@ -263,13 +263,18 @@ namespace llmbridge
         if (c->peer != nullptr || !c->wbuf.empty()) return;
         if (c->rbuf.empty()) return;
 
+        // Stamp just before framing so the (completing) HTTP parse is counted in
+        // the request-path overhead. On a partial read parse returns NeedMore and
+        // we discard t0 and return, so inter-packet network wait is never charged
+        // to the gateway.
+        const int64_t t0 = now_ns();
         http::Message m;
         auto st = http::parse(c->rbuf, m);
         if (st == http::ParseStatus::NeedMore) return;
         if (st == http::ParseStatus::Error) { close_client(c); ++_stats.errors; return; }
 
         c->msg = m;
-        c->ts_req_recvd = now_ns();
+        c->ts_req_recvd = t0;
         forward(c);
     }
 
@@ -353,13 +358,16 @@ namespace llmbridge
         }
         if (u->peer == nullptr) return; // stray bytes on an idle pooled conn
 
+        // Stamp just before framing so the response HTTP parse is counted in the
+        // response-path overhead, without charging inter-packet network wait.
+        const int64_t t0 = now_ns();
         http::Message m;
         auto st = http::parse(u->rbuf, m);
         if (st == http::ParseStatus::NeedMore) return;
         if (st == http::ParseStatus::Error) { abort_pair(u->peer); return; }
 
         Connection* client = u->peer;
-        client->ts_up_recvd = now_ns(); // end of upstream wait
+        client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
 
         if (_translate != TranslateMode::None)
         {
