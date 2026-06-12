@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 
+using llmbridge::net::uring::BufRing;
 using llmbridge::net::uring::Ring;
 using llmbridge::net::uring::available;
 
@@ -145,6 +146,60 @@ TEST(Uring, SqFillsAndDrains)
     // After draining, the ring is reusable.
     io_uring_sqe* again = r.get_sqe();
     EXPECT_NE(again, nullptr);
+}
+
+TEST(Uring, MultishotRecvWithProvidedBuffers)
+{
+    if (!available()) GTEST_SKIP();
+    Ring r;
+    ASSERT_TRUE(init_best(r, 16));
+    BufRing br;
+    if (!br.init(r, /*bgid=*/1, /*count=*/8, /*buf_size=*/64))
+        GTEST_SKIP() << "provided-buffer rings unsupported on this kernel";
+
+    int sv[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    // One multishot recv on sv[0], drawing buffers from group 1.
+    io_uring_sqe* s = r.get_sqe();
+    ASSERT_NE(s, nullptr);
+    s->opcode = IORING_OP_RECV;
+    s->fd = sv[0];
+    s->addr = 0;
+    s->len = 0;
+    s->flags |= IOSQE_BUFFER_SELECT;
+    s->buf_group = 1;
+    s->ioprio |= IORING_RECV_MULTISHOT;
+    s->user_data = 42;
+    ASSERT_GE(r.submit(), 1);
+
+    const char m1[] = "alpha";
+    const char m2[] = "bravo";
+    ASSERT_EQ(::write(sv[1], m1, 5), 5);
+    ASSERT_EQ(::write(sv[1], m2, 5), 5);
+
+    std::string seen;
+    bool more_seen = false;
+    for (int tries = 0; tries < 16 && (seen.find("alpha") == std::string::npos ||
+                                       seen.find("bravo") == std::string::npos);
+         ++tries)
+    {
+        r.submit_and_wait(1);
+        r.for_each_cqe([&](const io_uring_cqe* cqe) {
+            if (cqe->user_data != 42 || cqe->res <= 0) return;
+            EXPECT_TRUE(cqe->flags & IORING_CQE_F_BUFFER) << "recv must select a provided buffer";
+            const unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+            seen.append(br.data(bid), static_cast<size_t>(cqe->res));
+            br.recycle(bid); // return the buffer to the pool
+            if (cqe->flags & IORING_CQE_F_MORE) more_seen = true; // multishot stayed armed
+        });
+    }
+    EXPECT_NE(seen.find("alpha"), std::string::npos);
+    EXPECT_NE(seen.find("bravo"), std::string::npos);
+    EXPECT_TRUE(more_seen) << "multishot recv should remain armed (F_MORE)";
+
+    ::close(sv[0]);
+    ::close(sv[1]);
 }
 
 #else // !LLMBRIDGE_HAVE_URING

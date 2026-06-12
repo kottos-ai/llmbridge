@@ -107,6 +107,48 @@ namespace llmbridge::net::uring
         io_uring_cqe* _cqes = nullptr;
         unsigned _cq_mask = 0;
     };
+
+    // A provided-buffer ring (IORING_REGISTER_PBUF_RING): a pool of `count`
+    // fixed-size buffers the kernel draws from for multishot recv. One submitted
+    // multishot recv per connection then delivers a completion per data arrival —
+    // each naming the buffer it used — so we stop re-submitting a recv (and a
+    // per-connection staging buffer) per read. After consuming a buffer's bytes,
+    // recycle() returns it to the pool. Single-issuer, like the ring itself.
+    class BufRing
+    {
+    public:
+        BufRing() = default;
+        ~BufRing();
+        BufRing(const BufRing&) = delete;
+        BufRing& operator=(const BufRing&) = delete;
+
+        // `count` must be a power of two. Returns false on failure.
+        bool init(Ring& ring, unsigned bgid, unsigned count, unsigned buf_size) noexcept;
+
+        [[nodiscard]] bool valid() const noexcept { return _ring != nullptr; }
+        [[nodiscard]] unsigned bgid() const noexcept { return _bgid; }
+        [[nodiscard]] unsigned buf_size() const noexcept { return _buf_size; }
+
+        // Pointer to buffer `bid`'s bytes (the kernel just filled it on a recv CQE).
+        [[nodiscard]] char* data(unsigned bid) noexcept { return _bufs + static_cast<size_t>(bid) * _buf_size; }
+
+        // Return buffer `bid` to the kernel pool (after its bytes are consumed).
+        void recycle(unsigned bid) noexcept;
+
+    private:
+        void teardown() noexcept;
+
+        int _ring_fd = -1;
+        void* _ring = nullptr; // mmap'd io_uring_buf_ring
+        std::size_t _ring_sz = 0;
+        char* _bufs = nullptr; // the buffer memory
+        std::size_t _bufs_sz = 0;
+        unsigned _bgid = 0;
+        unsigned _count = 0;
+        unsigned _mask = 0;
+        unsigned _buf_size = 0;
+        unsigned _tail = 0; // our producer cursor into the buf ring
+    };
 } // namespace llmbridge::net::uring
 
 #endif // LLMBRIDGE_HAVE_URING

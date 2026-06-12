@@ -588,14 +588,18 @@ namespace llmbridge
     // ════════════════════════════════════════════════════════════════════════
     namespace
     {
-        enum UOp : uint64_t { UAccept = 0, URecv = 1, USend = 2, UConnect = 3, UTimer = 4 };
+        enum UOp : uint64_t { UAccept = 0, URecv = 1, USend = 2, UConnect = 3, UTimer = 4, UCancel = 5 };
         constexpr uint64_t kTagMask = 7;
         inline uint64_t make_ud(Connection* c, UOp op) { return reinterpret_cast<uintptr_t>(c) | op; }
         inline Connection* ud_conn(uint64_t d) { return reinterpret_cast<Connection*>(d & ~kTagMask); }
         inline UOp ud_op(uint64_t d) { return static_cast<UOp>(d & kTagMask); }
 
-        constexpr size_t kRecvChunk = 16384;
         constexpr unsigned kRingDepth = 4096;
+        // Provided-buffer pool for multishot recv: plenty so a connection always has
+        // a buffer to land in (we recycle each immediately after copying it out).
+        constexpr unsigned kBufGroup = 1;
+        constexpr unsigned kBufCount = 4096; // power of two
+        constexpr unsigned kBufSize = 4096;
     } // namespace
 
     bool Gateway::u_next_sqe(io_uring_sqe** out) noexcept
@@ -627,15 +631,21 @@ namespace llmbridge
         s->user_data = UTimer; // conn = nullptr
     }
 
-    bool Gateway::u_submit_recv(Connection* c) noexcept
+    bool Gateway::u_arm_recv(Connection* c) noexcept
     {
+        // Multishot recv drawing from the provided-buffer pool: one submission keeps
+        // delivering a completion per data arrival (each naming the buffer it used),
+        // so we never re-submit a recv per read. Armed once per connection; only
+        // re-armed if the kernel ends the multishot (e.g. pool exhaustion).
         io_uring_sqe* s = nullptr;
         if (!u_next_sqe(&s)) { u_close(c); return false; }
-        if (c->rstage.size() < kRecvChunk) c->rstage.resize(kRecvChunk); // once per conn
         s->opcode = IORING_OP_RECV;
         s->fd = c->fd;
-        s->addr = reinterpret_cast<uint64_t>(c->rstage.data());
-        s->len = kRecvChunk;
+        s->addr = 0;
+        s->len = 0;
+        s->flags |= IOSQE_BUFFER_SELECT;
+        s->buf_group = kBufGroup;
+        s->ioprio |= IORING_RECV_MULTISHOT;
         s->user_data = make_ud(c, URecv);
         ++c->inflight;
         ++_uring_inflight;
@@ -668,6 +678,19 @@ namespace llmbridge
         ++u->inflight;
         ++_uring_inflight;
         return true;
+    }
+
+    void Gateway::u_submit_cancel(int fd) noexcept
+    {
+        // Cancel every in-flight op on `fd` (notably the armed multishot recv, which
+        // shutdown() does NOT terminate). The cancelled ops complete with -ECANCELED,
+        // releasing their inflight slots so the conn can be freed / the drain finishes.
+        io_uring_sqe* s = nullptr;
+        if (!u_next_sqe(&s)) return;
+        s->opcode = IORING_OP_ASYNC_CANCEL;
+        s->fd = fd;
+        s->cancel_flags = IORING_ASYNC_CANCEL_FD;
+        s->user_data = UCancel; // sentinel: not inflight-counted, completion ignored
     }
 
     Connection* Gateway::u_acquire_upstream() noexcept
@@ -741,9 +764,10 @@ namespace llmbridge
         if (c->is_client && c->id) _clients.erase(c->id);
         for (auto it = _idle_upstreams.begin(); it != _idle_upstreams.end(); ++it)
             if (*it == c) { _idle_upstreams.erase(it); break; }
-        // Force any in-flight recv/send on this fd to complete (EOF/EPIPE) so its
-        // inflight count drains; the fd is actually closed at free time.
-        if (c->fd >= 0) ::shutdown(c->fd, SHUT_RDWR);
+        // Force any in-flight op on this fd to complete so its inflight count drains
+        // (the fd is closed at free time). shutdown alone does NOT end an armed
+        // multishot recv, so also cancel everything on the fd.
+        if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); u_submit_cancel(c->fd); }
         c->doomed = true;
         _doomed.push_back(c);
         u_maybe_free(c);
@@ -770,15 +794,27 @@ namespace llmbridge
     {
         const UOp op = ud_op(user_data);
         if (op == UTimer) { if (!_draining && !_stop) u_submit_timer(); return; }
+        if (op == UCancel) return; // control op (cancel-by-fd); not inflight-counted
         if (op == UAccept) { u_on_accept(res, flags); return; } // not inflight-counted
 
         Connection* c = ud_conn(user_data);
-        --c->inflight;
-        --_uring_inflight;
-        if (_draining || c->doomed) { u_maybe_free(c); return; }
+        // A multishot recv stays armed only while it keeps delivering data (F_MORE
+        // set AND res > 0). Its terminal completion (EOF/error, res <= 0) can still
+        // carry F_MORE, so it must release the inflight slot — otherwise the drain
+        // never reaches zero. Only the consuming (terminal) completion decrements.
+        const bool armed = (op == URecv) && (flags & IORING_CQE_F_MORE) && res > 0;
+        if (!armed) { --c->inflight; --_uring_inflight; }
+
+        if (_draining || c->doomed)
+        {
+            if (op == URecv && (flags & IORING_CQE_F_BUFFER))
+                _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT); // return the provided buffer
+            if (!armed) u_maybe_free(c);
+            return;
+        }
         switch (op)
         {
-            case URecv: u_on_recv(c, res); break;
+            case URecv: u_on_recv(c, res, flags); break;
             case USend: u_on_send(c, res); break;
             case UConnect: u_on_connect(c, res); break;
             default: break;
@@ -802,40 +838,60 @@ namespace llmbridge
         c->id = _next_client_id++;
         c->rbuf.reserve(kInitialBuf);
         _clients[c->id] = c;
-        u_submit_recv(c);
+        u_arm_recv(c); // multishot recv stays armed for the connection's life
     }
 
-    void Gateway::u_on_recv(Connection* c, int res) noexcept
+    void Gateway::u_on_recv(Connection* c, int res, uint32_t flags) noexcept
     {
-        if (res <= 0) // 0 = peer EOF, <0 = error
+        const bool armed = flags & IORING_CQE_F_MORE;
+
+        if (res <= 0) // multishot ended: EOF (0) or error (<0)
         {
+            if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
             if (c->is_client) { if (c->peer) u_abort_pair(c); else u_close(c); }
             else if (!u_retry_upstream(c)) { if (c->peer) u_abort_pair(c->peer); else u_close(c); }
             return;
         }
-        c->rbuf.append(c->rstage.data(), static_cast<size_t>(res)); // accumulate received bytes
 
-        const int64_t t0 = now_ns();
-        http::Message m;
-        const auto st = http::parse(c->rbuf, m);
-        if (st == http::ParseStatus::NeedMore) { u_submit_recv(c); return; }
-        if (st == http::ParseStatus::Error)
+        // Copy the bytes out of the kernel-selected buffer, then return it to the pool.
+        if (flags & IORING_CQE_F_BUFFER)
         {
-            if (c->is_client) { u_close(c); ++_stats.errors; }
-            else u_abort_pair(c->peer);
-            return;
+            const unsigned bid = flags >> IORING_CQE_BUFFER_SHIFT;
+            c->rbuf.append(_bufring.data(bid), static_cast<size_t>(res));
+            _bufring.recycle(bid);
         }
+        if (!armed) u_arm_recv(c); // kernel ended the multishot (pool pressure) -> re-arm
+
         if (c->is_client)
         {
-            c->msg = m;
-            c->ts_req_recvd = t0;
-            u_forward(c);
+            u_try_forward_buffered(c); // forward a framed request iff the client is idle
         }
         else
         {
-            c->peer->ts_up_recvd = t0;
+            // Upstream bytes are the response to the in-flight request. Stray data on
+            // an idle pooled upstream (no peer) means it's unusable — drop it.
+            if (!c->peer) { u_close(c); return; }
+            http::Message m;
+            const auto st = http::parse(c->rbuf, m);
+            if (st == http::ParseStatus::NeedMore) return; // armed recv delivers the rest
+            if (st == http::ParseStatus::Error) { u_abort_pair(c->peer); return; }
+            c->peer->ts_up_recvd = now_ns();
             u_on_response(c, m);
         }
+    }
+
+    void Gateway::u_try_forward_buffered(Connection* c) noexcept
+    {
+        // Forward the next framed request only when the client is idle — no request
+        // in flight (peer) and no response still draining to it (wbuf).
+        if (c->peer != nullptr || !c->wbuf.empty() || c->rbuf.empty()) return;
+        http::Message m;
+        const auto st = http::parse(c->rbuf, m);
+        if (st == http::ParseStatus::NeedMore) return; // the armed recv will deliver more
+        if (st == http::ParseStatus::Error) { u_close(c); ++_stats.errors; return; }
+        c->msg = m;
+        c->ts_req_recvd = now_ns();
+        u_forward(c);
     }
 
     void Gateway::u_forward(Connection* c) noexcept
@@ -877,7 +933,8 @@ namespace llmbridge
             return;
         }
         u->connected = true;
-        u_submit_send(u);
+        u_arm_recv(u);    // arm the multishot recv for this upstream's life
+        u_submit_send(u); // then send the request
     }
 
     void Gateway::u_on_response(Connection* u, const http::Message& m) noexcept
@@ -927,10 +984,9 @@ namespace llmbridge
 
         if (!c->is_client)
         {
-            // Request fully sent — KEEP wbuf so we can resend on a stale-connection
-            // failure that arrives before any response.
+            // Request fully sent. The response arrives via the already-armed multishot
+            // recv. KEEP wbuf so we can resend on a stale-connection failure.
             if (c->peer) c->peer->ts_up_sent = now_ns();
-            u_submit_recv(c); // now read the response
         }
         else
         {
@@ -956,13 +1012,9 @@ namespace llmbridge
         const bool keep_alive = c->msg.keep_alive;
         c->msg = http::Message{};
         if (!keep_alive) { u_close(c); return; }
-
-        // A pipelined next request may already sit in rbuf; otherwise read more.
-        http::Message m;
-        const auto st = http::parse(c->rbuf, m);
-        if (st == http::ParseStatus::Complete) { c->msg = m; c->ts_req_recvd = now_ns(); u_forward(c); }
-        else if (st == http::ParseStatus::Error) { u_close(c); ++_stats.errors; }
-        else u_submit_recv(c);
+        // The client's multishot recv is still armed; a pipelined next request may
+        // already sit in rbuf — forward it, else the armed recv delivers more.
+        u_try_forward_buffered(c);
     }
 
     int Gateway::run_uring()
@@ -976,6 +1028,11 @@ namespace llmbridge
         if (!_ring.init(kRingDepth, flags) && !_ring.init(kRingDepth, 0))
         {
             std::fprintf(stderr, "llmbridge: io_uring init failed; using epoll\n");
+            return run_epoll();
+        }
+        if (!_bufring.init(_ring, kBufGroup, kBufCount, kBufSize))
+        {
+            std::fprintf(stderr, "llmbridge: io_uring provided-buffer ring unavailable; using epoll\n");
             return run_epoll();
         }
         if (!net::resolve_ipv4(_upstream_ip.c_str(), _upstream_port, _upstream_addr))
@@ -1005,13 +1062,16 @@ namespace llmbridge
         // writes into a buffer we're about to free. Acquired upstreams are reachable
         // only via client->peer, so shut those down too.
         _draining = true;
+        auto stop_conn = [this](Connection* c) {
+            if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); u_submit_cancel(c->fd); }
+        };
         for (auto& [id, c] : _clients)
         {
-            if (c->fd >= 0) ::shutdown(c->fd, SHUT_RDWR);
-            if (c->peer && c->peer->fd >= 0) ::shutdown(c->peer->fd, SHUT_RDWR);
+            stop_conn(c);
+            if (c->peer) stop_conn(c->peer); // acquired upstreams reachable only via peer
         }
-        for (Connection* u : _idle_upstreams) if (u->fd >= 0) ::shutdown(u->fd, SHUT_RDWR);
-        for (Connection* d : _doomed) if (d->fd >= 0) ::shutdown(d->fd, SHUT_RDWR);
+        for (Connection* u : _idle_upstreams) stop_conn(u);
+        // doomed conns were already shut down + cancelled by u_close().
 
         while (_uring_inflight > 0)
         {

@@ -33,6 +33,10 @@ namespace llmbridge::net::uring
                 ::syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags,
                           static_cast<sigset_t*>(nullptr), _NSIG / 8));
         }
+        int sys_io_uring_register(int fd, unsigned opcode, void* arg, unsigned nr) noexcept
+        {
+            return static_cast<int>(::syscall(__NR_io_uring_register, fd, opcode, arg, nr));
+        }
     } // namespace
 
     bool available() noexcept
@@ -141,6 +145,72 @@ namespace llmbridge::net::uring
     }
 
     Ring::~Ring() { teardown(); }
+
+    // ── BufRing (provided-buffer ring) ──────────────────────────────────────
+
+    bool BufRing::init(Ring& ring, unsigned bgid, unsigned count, unsigned buf_size) noexcept
+    {
+        if (count == 0 || (count & (count - 1)) != 0) return false; // must be power of two
+        _ring_fd = ring.ring_fd();
+        _bgid = bgid;
+        _count = count;
+        _mask = count - 1;
+        _buf_size = buf_size;
+
+        _ring_sz = static_cast<size_t>(count) * sizeof(io_uring_buf);
+        _ring = ::mmap(nullptr, _ring_sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (_ring == MAP_FAILED) { _ring = nullptr; return false; }
+
+        _bufs_sz = static_cast<size_t>(count) * buf_size;
+        _bufs = static_cast<char*>(
+            ::mmap(nullptr, _bufs_sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
+        if (_bufs == MAP_FAILED) { _bufs = nullptr; teardown(); return false; }
+
+        io_uring_buf_reg reg;
+        std::memset(&reg, 0, sizeof(reg));
+        reg.ring_addr = reinterpret_cast<uint64_t>(_ring);
+        reg.ring_entries = count;
+        reg.bgid = static_cast<uint16_t>(bgid);
+        if (sys_io_uring_register(_ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1) < 0)
+        {
+            teardown();
+            return false;
+        }
+
+        // Publish all buffers. (bufs[0].resv aliases the ring tail; writing
+        // addr/len/bid doesn't touch it, then we store the tail with release.)
+        auto* br = static_cast<io_uring_buf_ring*>(_ring);
+        for (unsigned i = 0; i < count; ++i)
+        {
+            br->bufs[i].addr = reinterpret_cast<uint64_t>(_bufs + static_cast<size_t>(i) * buf_size);
+            br->bufs[i].len = buf_size;
+            br->bufs[i].bid = static_cast<uint16_t>(i);
+        }
+        _tail = count;
+        __atomic_store_n(&br->tail, static_cast<uint16_t>(_tail), __ATOMIC_RELEASE);
+        return true;
+    }
+
+    void BufRing::recycle(unsigned bid) noexcept
+    {
+        auto* br = static_cast<io_uring_buf_ring*>(_ring);
+        const unsigned idx = _tail & _mask;
+        br->bufs[idx].addr = reinterpret_cast<uint64_t>(_bufs + static_cast<size_t>(bid) * _buf_size);
+        br->bufs[idx].len = _buf_size;
+        br->bufs[idx].bid = static_cast<uint16_t>(bid);
+        ++_tail;
+        __atomic_store_n(&br->tail, static_cast<uint16_t>(_tail), __ATOMIC_RELEASE);
+    }
+
+    void BufRing::teardown() noexcept
+    {
+        if (_bufs && _bufs != MAP_FAILED) ::munmap(_bufs, _bufs_sz);
+        if (_ring && _ring != MAP_FAILED) ::munmap(_ring, _ring_sz);
+        _bufs = nullptr;
+        _ring = nullptr;
+    }
+
+    BufRing::~BufRing() { teardown(); }
 } // namespace llmbridge::net::uring
 
 #endif // LLMBRIDGE_HAVE_URING

@@ -1187,11 +1187,10 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
     }
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u); // stale connections recovered, never surfaced
-    // io_uring can't evict idle pooled conns, so it MUST hit the retry path. epoll
-    // recovers via EOF-eviction between sequential clients (occasionally via retry
-    // if the timing races), so we only require it served every request.
-    if (GetParam() == llmbridge::IoBackend::Uring)
-        EXPECT_GT(_gw->stats().upstream_retries, 0u) << "io_uring should have retried stale connections";
+    // Both backends keep a recv armed on idle pooled upstreams, so between sequential
+    // clients they EVICT the dead connection on EOF before reuse (occasionally retry
+    // if the timing races). Either recovery is correct — we only require every
+    // request was served. The pipelined variant below forces the retry path itself.
 }
 
 // Pipelined variant: two requests on ONE keep-alive connection. The 2nd is
@@ -1210,9 +1209,13 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
     EXPECT_NE(body_of(c.recv_response()).find("\"content\":\"pong\""), std::string::npos) << "response 2";
     c.close();
     shutdown();
-    EXPECT_EQ(_gw->stats().errors, 0u);
-    EXPECT_GT(_gw->stats().upstream_retries, 0u)
-        << "inline pipelined reuse of a dead pooled conn must retry on " << be_name(GetParam());
+    EXPECT_EQ(_gw->stats().errors, 0u); // both requests served despite the dropped conn
+    // Recovery mechanism: epoll only processes the dead conn's EOF at epoll_wait —
+    // after the inline reuse — so it deterministically RETRIES. io_uring's always-
+    // armed recv may instead evict the dead conn first (a completion-order race), so
+    // we assert the retry path only where it's deterministic.
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+        EXPECT_GT(_gw->stats().upstream_retries, 0u) << "epoll inline pipelined reuse must retry";
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,

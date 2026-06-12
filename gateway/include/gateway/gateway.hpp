@@ -89,11 +89,9 @@ namespace llmbridge
         int64_t ts_up_recvd = 0;
 
         // io_uring backend only: submitted-but-uncompleted SQEs referencing this
-        // conn (it is freed only when this hits 0), and a fixed staging buffer the
-        // in-flight RECV lands into (allocated once, then reused — no per-recv
-        // zero-fill; the received bytes are appended to rbuf on completion).
+        // conn — it is freed only when this hits 0. (Multishot recv lands data in a
+        // shared provided-buffer pool, so there is no per-connection recv buffer.)
         int inflight = 0;
-        std::string rstage;
         // io_uring stale-connection handling: was this upstream reused from the
         // keep-alive pool (so a failure before any response is retry-eligible), and
         // has this request already been retried once on a fresh connection.
@@ -179,15 +177,17 @@ namespace llmbridge
         bool u_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
         void u_submit_accept() noexcept;
         void u_submit_timer() noexcept;
-        bool u_submit_recv(Connection* c) noexcept;
+        bool u_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
         bool u_submit_send(Connection* c) noexcept;
         bool u_submit_connect(Connection* u) noexcept;
+        void u_submit_cancel(int fd) noexcept; // cancel all in-flight ops on a fd
         void u_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
         void u_on_accept(int res, uint32_t flags) noexcept;
-        void u_on_recv(Connection* c, int res) noexcept;
+        void u_on_recv(Connection* c, int res, uint32_t flags) noexcept;
         void u_on_send(Connection* c, int res) noexcept;
         void u_on_connect(Connection* u, int res) noexcept;
         void u_forward(Connection* c) noexcept;
+        void u_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
         void u_on_response(Connection* u, const http::Message& m) noexcept;
         void u_finish_client(Connection* c) noexcept;
         Connection* u_acquire_upstream() noexcept;
@@ -201,6 +201,7 @@ namespace llmbridge
         void u_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;
+        net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
         sockaddr_in _upstream_addr{};
         struct __kernel_timespec _uring_ts{};
         long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
