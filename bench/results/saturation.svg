@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="600" viewBox="0 0 900 600" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="900" height="600" fill="white"/>
-<text x="90" y="34" font-size="22" font-weight="700" fill="#111827">Throughput saturation — offered vs achieved RPS</text>
-<text x="90" y="56" font-size="13" fill="#6b7280">One thread / one worker, instant backend, log-log. llmbridge swept at 64B / 1KB / 8KB request bodies. On the dashed line = keeping up; below it = dropping load.</text>
+<text x="90" y="34" font-size="22" font-weight="700" fill="#111827">Throughput saturation — offered vs achieved RPS (1 KB requests)</text>
+<text x="90" y="56" font-size="13" fill="#6b7280">Both single worker (1 thread), 1 KB requests, instant backend, log-log. On the dashed line = keeping up; below it = dropping load.</text>
 <line x1="90.0" y1="80" x2="90.0" y2="530" stroke="#e5e7eb"/>
 <line x1="90" y1="530.0" x2="860" y2="530.0" stroke="#e5e7eb"/>
 <text x="90.0" y="550.0" font-size="11" fill="#6b7280" text-anchor="middle">100</text>
@@ -22,46 +22,23 @@
 <text x="22" y="305.0" font-size="13" fill="#111827" text-anchor="middle" transform="rotate(-90 22 305.0)" font-weight="600">achieved RPS</text>
 <line x1="90.0" y1="530.0" x2="860.0" y2="80.0" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 4"/>
 <text x="854.0" y="96.0" font-size="11" fill="#9ca3af" text-anchor="end">ideal (achieved = offered)</text>
-<polyline points="556.5,257.4 626.7,216.3 667.8,192.3 719.6,162.1 753.6,156.9 779.1,155.2 808.3,155.6" fill="none" stroke="#9333ea" stroke-width="2.5"/>
-<circle cx="556.5" cy="257.4" r="3.5" fill="#9333ea"/>
-<circle cx="626.7" cy="216.3" r="3.5" fill="#9333ea"/>
-<circle cx="667.8" cy="192.3" r="3.5" fill="#9333ea"/>
-<circle cx="719.6" cy="162.1" r="3.5" fill="#9333ea"/>
-<circle cx="753.6" cy="156.9" r="3.5" fill="#9333ea"/>
-<circle cx="779.1" cy="155.2" r="3.5" fill="#9333ea"/>
-<circle cx="808.3" cy="155.6" r="3.5" fill="#9333ea"/>
-<polyline points="556.5,257.4 626.7,216.3 667.8,192.3 719.6,162.1 753.6,143.0 779.1,143.6 808.3,143.7" fill="none" stroke="#2563eb" stroke-width="2.5"/>
-<circle cx="556.5" cy="257.4" r="3.5" fill="#2563eb"/>
-<circle cx="626.7" cy="216.3" r="3.5" fill="#2563eb"/>
-<circle cx="667.8" cy="192.3" r="3.5" fill="#2563eb"/>
-<circle cx="719.6" cy="162.1" r="3.5" fill="#2563eb"/>
-<circle cx="753.6" cy="143.0" r="3.5" fill="#2563eb"/>
-<circle cx="779.1" cy="143.6" r="3.5" fill="#2563eb"/>
-<circle cx="808.3" cy="143.7" r="3.5" fill="#2563eb"/>
-<polyline points="556.5,257.4 626.7,216.3 667.8,192.3 719.6,162.1 753.6,142.2 779.1,142.1 808.3,142.3" fill="none" stroke="#16a34a" stroke-width="2.5"/>
-<circle cx="556.5" cy="257.4" r="3.5" fill="#16a34a"/>
+<polyline points="626.7,216.3 697.0,175.3 738.0,151.3 767.2,134.2 789.8,128.9 808.3,126.4" fill="none" stroke="#16a34a" stroke-width="2.5"/>
 <circle cx="626.7" cy="216.3" r="3.5" fill="#16a34a"/>
-<circle cx="667.8" cy="192.3" r="3.5" fill="#16a34a"/>
-<circle cx="719.6" cy="162.1" r="3.5" fill="#16a34a"/>
-<circle cx="753.6" cy="142.2" r="3.5" fill="#16a34a"/>
-<circle cx="779.1" cy="142.1" r="3.5" fill="#16a34a"/>
-<circle cx="808.3" cy="142.3" r="3.5" fill="#16a34a"/>
+<circle cx="697.0" cy="175.3" r="3.5" fill="#16a34a"/>
+<circle cx="738.0" cy="151.3" r="3.5" fill="#16a34a"/>
+<circle cx="767.2" cy="134.2" r="3.5" fill="#16a34a"/>
+<circle cx="789.8" cy="128.9" r="3.5" fill="#16a34a"/>
+<circle cx="808.3" cy="126.4" r="3.5" fill="#16a34a"/>
 <polyline points="90.0,530.0 253.0,476.7 323.3,476.2 486.3,481.2" fill="none" stroke="#dc2626" stroke-width="2.5"/>
 <circle cx="90.0" cy="530.0" r="3.5" fill="#dc2626"/>
 <circle cx="253.0" cy="476.7" r="3.5" fill="#dc2626"/>
 <circle cx="323.3" cy="476.2" r="3.5" fill="#dc2626"/>
 <circle cx="486.3" cy="481.2" r="3.5" fill="#dc2626"/>
-<text x="808.3" y="133.2" font-size="11" fill="#16a34a" text-anchor="end" font-weight="700">64B ≈ 70,000 RPS</text>
-<text x="808.3" y="161.9" font-size="11" fill="#2563eb" text-anchor="end" font-weight="700">1KB ≈ 68,000</text>
-<text x="808.3" y="172.4" font-size="11" fill="#9333ea" text-anchor="end" font-weight="700">8KB ≈ 55,000</text>
+<text x="808.3" y="116.6" font-size="12" fill="#16a34a" text-anchor="end" font-weight="700">llmbridge ceiling ≈ 90,000 RPS</text>
 <text x="486.3" y="465.8" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="700">LiteLLM ceiling ≈ 250 RPS</text>
-<rect x="600" y="80" width="250" height="92" fill="white" stroke="#e5e7eb" rx="4"/>
-<line x1="612" y1="94" x2="636" y2="94" stroke="#16a34a" stroke-width="2.5"/>
-<text x="642" y="98" font-size="12" fill="#111827">llmbridge — 64B body</text>
-<line x1="612" y1="116" x2="636" y2="116" stroke="#2563eb" stroke-width="2.5"/>
-<text x="642" y="120" font-size="12" fill="#111827">llmbridge — 1KB body</text>
-<line x1="612" y1="138" x2="636" y2="138" stroke="#9333ea" stroke-width="2.5"/>
-<text x="642" y="142" font-size="12" fill="#111827">llmbridge — 8KB body</text>
-<line x1="612" y1="160" x2="636" y2="160" stroke="#dc2626" stroke-width="2.5"/>
-<text x="642" y="164" font-size="12" fill="#111827">LiteLLM (Python, 1 worker)</text>
+<rect x="590" y="80" width="260" height="52" fill="white" stroke="#e5e7eb" rx="4"/>
+<line x1="602" y1="94" x2="626" y2="94" stroke="#16a34a" stroke-width="2.5"/>
+<text x="632" y="98" font-size="12" fill="#111827">llmbridge (C++/io_uring, 1 worker)</text>
+<line x1="602" y1="116" x2="626" y2="116" stroke="#dc2626" stroke-width="2.5"/>
+<text x="632" y="120" font-size="12" fill="#111827">LiteLLM (Python, 1 worker)</text>
 </svg>

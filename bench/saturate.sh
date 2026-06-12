@@ -24,7 +24,10 @@ DUR="${1:-6}"
 WARMUP="${2:-2}"
 shift $(( $# < 2 ? $# : 2 )) || true
 RPS_LIST=(${@:-20000 40000 60000 80000 100000 120000})
-BODY="${BODY:-64}" # request body size in bytes (loadgen --body-bytes); set to sweep message size
+BODY="${BODY:-64}" # request body size in bytes (loadgen --body-bytes)
+WORKERS="${WORKERS:-1}" # number of SO_REUSEPORT worker threads
+IO="${IO:-uring}"        # event-loop backend (auto|epoll|uring)
+BACKENDS="${BACKENDS:-1}" # mock backend instances (SO_REUSEPORT) so the backend is not the cap
 
 BACK_PORT=9002
 PROXY_PORT=8090
@@ -48,14 +51,16 @@ trap cleanup EXIT
 cleanup; sleep 0.3
 echo "Using binaries in $BIN"
 
-$BIN/fastbackend --port "$BACK_PORT" --latency-us 0 >"$RESDIR/fb-$STAMP.log" 2>&1 &
+for b in $(seq 1 "$BACKENDS"); do
+  $BIN/fastbackend --port "$BACK_PORT" --latency-us 0 >>"$RESDIR/fb-$STAMP.log" 2>&1 &
+done
 sleep 0.5
 
 extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) max_us=\([0-9]*\).*/\1 \2 \3 \4 \5/p'; }
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 
 {
-  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B)"
+  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B, io=${IO}, workers=${WORKERS}, backends=${BACKENDS})"
   printf "%-9s | %-22s | %-38s | %s\n" "TARGET" "DIRECT backend" "THROUGH proxy" "proxy"
   printf "%-9s | %-22s | %-38s | %s\n" "RPS" "achieved (p99 µs)" "achieved / p50 / p99 / p99.9 / max (µs)" "backlog"
   echo "----------+------------------------+----------------------------------------+--------"
@@ -68,7 +73,7 @@ for RPS in "${RPS_LIST[@]}"; do
   read -r da d_p50 d_p99 d_p999 d_max <<< "$(echo "$D" | extract)"
 
   # fresh proxy per level
-  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT \
+  $BIN/llmbridge --listen $PROXY_PORT --upstream 127.0.0.1:$BACK_PORT --io "$IO" --workers "$WORKERS" \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/sat-proxy-$RPS-$STAMP.log" 2>&1 &
   PP=$!
   sleep 0.7

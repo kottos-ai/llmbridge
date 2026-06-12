@@ -52,6 +52,18 @@ namespace llmbridge
             _total = _overflow = _total_ns = _max = 0;
         }
 
+        // Fold another histogram (same bucket size) into this one — for aggregating
+        // per-worker stats across a multi-worker (SO_REUSEPORT) run.
+        void merge(const Histogram& o) noexcept
+        {
+            if (o._counts.size() > _counts.size()) _counts.resize(o._counts.size(), 0);
+            for (size_t i = 0; i < o._counts.size(); ++i) _counts[i] += o._counts[i];
+            _total += o._total;
+            _total_ns += o._total_ns;
+            _overflow += o._overflow;
+            if (o._max > _max) _max = o._max;
+        }
+
         [[nodiscard]] uint64_t total() const noexcept { return _total; }
         [[nodiscard]] uint64_t max() const noexcept { return _max; }
         [[nodiscard]] uint64_t mean_ns() const noexcept { return _total ? _total_ns / _total : 0; }

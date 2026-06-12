@@ -35,6 +35,7 @@ DUR="${2:-10}"
 WARMUP="${3:-3}"
 shift $(( $# < 3 ? $# : 3 )) || true
 RPS_LIST=("${@:-100 500 1000 5000}")
+BODY="${BODY:-64}" # loadgen request body size (bytes)
 if [ "${#RPS_LIST[@]}" -eq 1 ]; then read -r -a RPS_LIST <<< "${RPS_LIST[0]}"; fi
 
 MOCK_PORT=9001
@@ -99,16 +100,16 @@ for RPS in "${RPS_LIST[@]}"; do
   echo ">>> RPS=$RPS" >&2
 
   # (1) direct-to-mock baseline (shared by both deltas)
-  D=$($BIN/loadgen --target 127.0.0.1:$MOCK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/h2h-direct-$RPS-$STAMP.log")
+  D=$($BIN/loadgen --target 127.0.0.1:$MOCK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-direct-$RPS-$STAMP.log")
   read -r d50 d99 d999 dmax <<< "$(echo "$D" | extract)"
   : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
   # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
-  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --translate anthropic \
+  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --translate anthropic --io uring --workers 1 \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" 2>&1 &
   KP=$!
   sleep 1
-  $BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" >/dev/null 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log"
+  $BIN/loadgen --target 127.0.0.1:$LLMBRIDGE_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" >/dev/null 2>>"$RESDIR/h2h-llmbridge-loadgen-$RPS-$STAMP.log"
   kill -TERM "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
   k_self_p50=$(sed -n 's/.*added-total.*p50=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
   k_self_p99=$(sed -n 's/.*added-total.*p99=\([0-9.]*\) [µu]s.*/\1/p' "$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" | head -1)
@@ -117,7 +118,7 @@ for RPS in "${RPS_LIST[@]}"; do
   : "${k_self_p50:=0}" "${k_self_p99:=0}" "${k_self_p999:=0}" "${k_self_max:=0}"
 
   # (3) through LiteLLM
-  L=$($BIN/loadgen --target 127.0.0.1:$LL_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" 2>>"$RESDIR/h2h-litellm-$RPS-$STAMP.log")
+  L=$($BIN/loadgen --target 127.0.0.1:$LL_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --body-bytes "$BODY" 2>>"$RESDIR/h2h-litellm-$RPS-$STAMP.log")
   read -r l50 l99 l999 lmax <<< "$(echo "$L" | extract)"
   la=$(echo "$L" | achieved_of)
   : "${l50:=0}" "${l99:=0}" "${l999:=0}" "${lmax:=0}" "${la:=0}"

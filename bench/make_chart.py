@@ -64,9 +64,9 @@ svg.append(
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">')
 svg.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 svg.append(
-    f'<text x="{ML}" y="34" font-size="22" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — gateway added latency (p99)</text>')
+    f'<text x="{ML}" y="34" font-size="22" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — gateway added latency (p99), 1 KB requests</text>')
 svg.append(
-    f'<text x="{ML}" y="56" font-size="13" fill="{SUB}">Both gateways translate OpenAI&#8596;Anthropic (equal work). 200 ms mock backend, open-loop load. Single Linux host, co-located. Lower is better; log scale.</text>')
+    f'<text x="{ML}" y="56" font-size="13" fill="{SUB}">Both gateways translate OpenAI&#8596;Anthropic (equal work), one worker each, 1 KB requests. 200 ms mock backend, open-loop load. Single co-located host. Lower is better; log scale.</text>')
 
 # y grid + labels (decades)
 dec = -2
@@ -121,7 +121,7 @@ svg.append(f'<line x1="{ML}" y1="{axis_y:.1f}" x2="{ML + PW}" y2="{axis_y:.1f}" 
 lgx, lgy = ML, H - 28
 svg.append(f'<rect x="{lgx}" y="{lgy - 12}" width="14" height="14" fill="{LLMBRIDGE}" rx="2"/>')
 svg.append(
-    f'<text x="{lgx + 20}" y="{lgy}" font-size="12" fill="{INK}">llmbridge (C++/epoll, 1 thread) — proxy self-measured added p99</text>')
+    f'<text x="{lgx + 20}" y="{lgy}" font-size="12" fill="{INK}">llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99</text>')
 svg.append(f'<rect x="{lgx + 430}" y="{lgy - 12}" width="14" height="14" fill="{LITELLM}" rx="2"/>')
 svg.append(
     f'<text x="{lgx + 450}" y="{lgy}" font-size="12" fill="{INK}">LiteLLM (Python, 1 worker) — client-measured added p99</text>')

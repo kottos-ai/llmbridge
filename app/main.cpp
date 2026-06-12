@@ -25,18 +25,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "gateway/gateway.hpp"
 
 namespace
 {
-    llmbridge::Gateway* g_gateway = nullptr;
+    std::vector<std::unique_ptr<llmbridge::Gateway>>* g_gateways = nullptr;
     void on_signal(int) noexcept
     {
-        if (g_gateway) g_gateway->request_stop();
+        if (g_gateways)
+            for (auto& g : *g_gateways) g->request_stop();
     }
 } // namespace
 
@@ -47,6 +50,7 @@ int main(int argc, char** argv)
     uint16_t upstream_port = 9001;
     int duration = 0;
     double warmup = 0;
+    int workers = 1;
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
@@ -72,6 +76,7 @@ int main(int argc, char** argv)
         }
         else if (a == "--duration") { if (const char* v = nextarg()) duration = std::atoi(v); }
         else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
+        else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--translate")
         {
             if (const char* v = nextarg())
@@ -98,16 +103,23 @@ int main(int argc, char** argv)
             std::printf("usage: %s [--listen PORT] [--upstream IP:PORT] "
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
-                        "[--io auto|epoll|uring]\n", argv[0]);
+                        "[--io auto|epoll|uring] [--workers N]\n", argv[0]);
             return 0;
         }
     }
+    if (workers < 1) workers = 1;
 
     std::signal(SIGPIPE, SIG_IGN);
 
-    llmbridge::Gateway gateway(listen_port, upstream_ip, upstream_port,
-                            static_cast<int64_t>(warmup * 1e9), translate, io);
-    g_gateway = &gateway;
+    // N shared-nothing workers, each its own event loop binding the same port with
+    // SO_REUSEPORT — the kernel load-balances connections across them. No locks on
+    // the hot path; per-worker upstream pools and stats, merged at the end.
+    const int64_t warmup_ns = static_cast<int64_t>(warmup * 1e9);
+    std::vector<std::unique_ptr<llmbridge::Gateway>> gateways;
+    for (int i = 0; i < workers; ++i)
+        gateways.push_back(std::make_unique<llmbridge::Gateway>(
+            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io));
+    g_gateways = &gateways;
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -115,23 +127,37 @@ int main(int argc, char** argv)
     std::thread timer;
     if (duration > 0)
     {
-        timer = std::thread([&gateway, duration] {
+        timer = std::thread([&gateways, duration] {
             std::this_thread::sleep_for(std::chrono::seconds(duration));
-            gateway.request_stop();
+            for (auto& g : gateways) g->request_stop();
         });
     }
 
-    gateway.run();
-
+    std::vector<std::thread> threads;
+    for (auto& g : gateways) threads.emplace_back([gp = g.get()] { gp->run(); });
+    for (auto& t : threads) t.join();
     if (timer.joinable()) timer.join();
 
-    const llmbridge::Stats& s = gateway.stats();
-    std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile ===\n");
-    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu\n",
-                 (unsigned long long)s.requests, (unsigned long long)s.errors,
-                 (unsigned long long)s.upstream_conns_opened);
-    s.overhead.print(std::cerr, "added-total  ");
-    s.req_path.print(std::cerr, "  request-path ");
-    s.resp_path.print(std::cerr, "  response-path");
+    // Aggregate per-worker stats into one profile.
+    llmbridge::Stats agg;
+    for (const auto& g : gateways)
+    {
+        const llmbridge::Stats& s = g->stats();
+        agg.requests += s.requests;
+        agg.errors += s.errors;
+        agg.upstream_conns_opened += s.upstream_conns_opened;
+        agg.upstream_retries += s.upstream_retries;
+        agg.overhead.merge(s.overhead);
+        agg.req_path.merge(s.req_path);
+        agg.resp_path.merge(s.resp_path);
+    }
+    std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile (%d worker%s) ===\n",
+                 workers, workers == 1 ? "" : "s");
+    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  retries=%llu\n",
+                 (unsigned long long)agg.requests, (unsigned long long)agg.errors,
+                 (unsigned long long)agg.upstream_conns_opened, (unsigned long long)agg.upstream_retries);
+    agg.overhead.print(std::cerr, "added-total  ");
+    agg.req_path.print(std::cerr, "  request-path ");
+    agg.resp_path.print(std::cerr, "  response-path");
     return 0;
 }
