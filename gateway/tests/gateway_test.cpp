@@ -135,8 +135,9 @@ namespace
         void stop()
         {
             _stop = true;
-            if (_fd >= 0) { ::shutdown(_fd, SHUT_RDWR); ::close(_fd); _fd = -1; }
-            if (_acc.joinable()) _acc.join();
+            if (_fd >= 0) ::shutdown(_fd, SHUT_RDWR); // unblock the accept loop
+            if (_acc.joinable()) _acc.join();          // accept_loop has stopped touching _fd
+            if (_fd >= 0) { ::close(_fd); _fd = -1; }  // now safe to close/null it
             // The proxy keeps upstream connections open (keep-alive pool), so the
             // handler threads are parked in a blocking read() that _stop alone
             // won't interrupt — shut the accepted fds down to unblock them.
@@ -1253,6 +1254,50 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
         } // ~Gateway runs here
         EXPECT_EQ(llmbridge::Connection::s_live.load(), base) << be_name(backend);
     }
+}
+
+// Multi-worker (SO_REUSEPORT) shared-nothing model: two independent Gateway loops
+// on two threads bind the same port; the kernel shards connections across them.
+// Each worker owns its connections/pools exclusively (no shared per-request state),
+// so the only cross-thread state is the atomic stop flag + the s_live counter. Run
+// under ThreadSanitizer (epoll backend) this proves there are no data races; here
+// it also checks both workers together serve every request and free every conn.
+TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
+{
+    const long base = llmbridge::Connection::s_live.load();
+    {
+        TestBackend be;
+        be.start();
+        const uint16_t port = free_port();
+        std::vector<std::unique_ptr<Gateway>> gws;
+        for (int i = 0; i < 2; ++i)
+            gws.push_back(std::make_unique<Gateway>(port, "127.0.0.1", be.port(), 0,
+                                                    TranslateMode::None, llmbridge::IoBackend::Epoll));
+        std::vector<std::thread> ths;
+        for (auto& g : gws) ths.emplace_back([gp = g.get()] { gp->run(); });
+
+        const int M = 48;
+        std::vector<std::unique_ptr<Client>> cs;
+        for (int i = 0; i < M; ++i)
+        {
+            auto c = std::make_unique<Client>();
+            ASSERT_TRUE(c->connect(port)) << i;
+            ASSERT_TRUE(c->send(make_request("req" + std::to_string(i))));
+            cs.push_back(std::move(c));
+        }
+        for (int i = 0; i < M; ++i)
+            EXPECT_NE(cs[i]->recv_response().find("200 OK"), std::string::npos) << "client " << i;
+        for (auto& c : cs) c->close();
+
+        for (auto& g : gws) g->request_stop();
+        for (auto& t : ths) t.join();
+        be.stop();
+
+        uint64_t total = 0;
+        for (auto& g : gws) total += g->stats().requests; // safe: read after join
+        EXPECT_EQ(total, static_cast<uint64_t>(M)); // the two workers together served all
+    }
+    EXPECT_EQ(llmbridge::Connection::s_live.load(), base); // no leak across workers
 }
 
 // Translation parity across BOTH backends AND all three dialects (2 x 3 = 6).

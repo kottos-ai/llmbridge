@@ -125,7 +125,7 @@ namespace llmbridge
         int run();
 
         // Async-signal-safe-ish: flips a flag the loop observes within one poll tick.
-        void request_stop() noexcept { _stop = true; }
+        void request_stop() noexcept { _stop.store(true, std::memory_order_relaxed); }
 
         const Stats& stats() const noexcept { return _stats; }
 
@@ -227,6 +227,9 @@ namespace llmbridge
 
         int64_t _t_start = 0;
         Stats _stats;
-        volatile bool _stop = false;
+        // Set cross-thread by the signal/timer thread, observed by the worker loop:
+        // a std::atomic (not volatile) for a correct memory-model tripwire. Relaxed
+        // is enough — it gates loop continuation, no other state depends on it.
+        std::atomic<bool> _stop{false};
     };
 } // namespace llmbridge
