@@ -19,6 +19,8 @@
 
 #include <cstdint>
 
+struct sockaddr_in; // fwd-declared; callers that use resolve_ipv4 include <netinet/in.h>
+
 namespace llmbridge::net
 {
     // Set O_NONBLOCK. Returns false on fcntl failure.
@@ -45,4 +47,12 @@ namespace llmbridge::net
     // After a connect socket reports writable, returns 0 on success or the
     // SO_ERROR errno otherwise.
     int connect_result(int fd) noexcept;
+
+    // Create a non-blocking TCP socket with TCP_NODELAY but DON'T connect it — for
+    // the io_uring path, which issues the connect as a ring op (IORING_OP_CONNECT).
+    // Returns the fd, or -1 on error.
+    int make_client_socket() noexcept;
+
+    // Fill `out` (a sockaddr_in) for ip:port. Returns false on a bad dotted-quad.
+    bool resolve_ipv4(const char* ip, uint16_t port, sockaddr_in& out) noexcept;
 } // namespace llmbridge::net

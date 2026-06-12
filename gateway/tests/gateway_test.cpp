@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "net/http.hpp"
@@ -57,6 +58,12 @@ namespace
     std::string http_ok(const std::string& body)
     {
         return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+    // Same, but the upstream declares Connection: close — the gateway must not pool it.
+    std::string http_close(const std::string& body)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
                std::to_string(body.size()) + "\r\n\r\n" + body;
     }
 
@@ -146,6 +153,9 @@ namespace
         void set_response(std::string r) { _resp_override = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
+        // Respond once (keep-alive), then close the connection — simulates a
+        // provider dropping an idle pooled keep-alive connection.
+        void set_close_after_first(bool b) { _close_after_first = b; }
         int requests_seen() const { return _requests_seen.load(); }
         std::string last_request()
         {
@@ -207,6 +217,7 @@ namespace
                     ok = ::write(c, resp.data(), resp.size()) >= 0;
                 }
                 if (!ok) { ::close(c); return; }
+                if (_close_after_first) { ::close(c); return; } // drop the "idle" keep-alive
                 if (!m.keep_alive) { ::close(c); return; }
             }
             ::close(c);
@@ -217,6 +228,7 @@ namespace
         std::string _resp_override;
         int _trickle_chunk = 0;
         bool _close_mid = false;
+        bool _close_after_first = false;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
         std::atomic<bool> _stop{false};
@@ -304,13 +316,14 @@ namespace
     {
     protected:
         void start(int64_t warmup_ns = 0, bool with_backend = true,
-                   TranslateMode translate = TranslateMode::None)
+                   TranslateMode translate = TranslateMode::None,
+                   llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll)
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
             else up_port = free_port(); // nothing listening -> connection refused
 
-            _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate);
+            _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend);
             _proxy_port = _gw->bound_port();
             _gt = std::thread([this] { _gw->run(); });
         }
@@ -782,6 +795,496 @@ TEST_F(ProxyIT, EmptyContentTranslateRoundTrip)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Backend parity: the core scenarios must behave identically on epoll AND
+// io_uring (Phase 1). Each test runs under both — if io_uring is unavailable the
+// Gateway falls back to epoll, so this is always safe to instantiate.
+// ════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    const char* be_name(llmbridge::IoBackend b)
+    {
+        return b == llmbridge::IoBackend::Uring ? "uring" : "epoll";
+    }
+} // namespace
+
+class ProxyBackend : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyBackend, RoundTripAndKeepAlive)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 5; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request("req" + std::to_string(i))));
+        EXPECT_EQ(body_of(c.recv_response()), kRespBody) << "iter " << i;
+    }
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 5u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_P(ProxyBackend, MultipleClients)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    std::vector<std::unique_ptr<Client>> cs;
+    for (int i = 0; i < 12; ++i)
+    {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(_proxy_port));
+        ASSERT_TRUE(c->send(make_request("hi")));
+        cs.push_back(std::move(c));
+    }
+    for (int i = 0; i < 12; ++i)
+        EXPECT_NE(cs[i]->recv_response().find("200 OK"), std::string::npos) << "client " << i;
+    for (auto& c : cs) c->close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 12u);
+}
+
+TEST_P(ProxyBackend, LargeResponseAndRequest)
+{
+    const std::string big(64 * 1024, 'Z');
+    _backend.set_response(http_ok(big));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string req = make_request(std::string(64 * 1024, 'Q'));
+    ASSERT_TRUE(c.send(req));
+    EXPECT_EQ(body_of(c.recv_response()), big);   // large response intact
+    EXPECT_EQ(_backend.last_request(), req);       // large request forwarded intact
+    c.close();
+    shutdown();
+}
+
+TEST_P(ProxyBackend, Pipelining)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    std::string burst;
+    for (int i = 0; i < 16; ++i) burst += make_request("r" + std::to_string(i));
+    ASSERT_TRUE(c.send(burst));
+    for (int i = 0; i < 16; ++i)
+        ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos) << "resp " << i;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 16u);
+}
+
+TEST_P(ProxyBackend, TranslateRoundTripAndForward)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("pong")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("unique-xyz")));
+    const std::string body = body_of(c.recv_response());
+    EXPECT_NE(body.find("\"content\":\"pong\""), std::string::npos) << body;
+    EXPECT_NE(body.find("\"finish_reason\":\"stop\""), std::string::npos);
+    EXPECT_NE(_backend.last_request().find("unique-xyz"), std::string::npos);
+    EXPECT_NE(_backend.last_request().find("/v1/messages"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_P(ProxyBackend, TrickledClientAndUpstream)
+{
+    _backend.set_trickle(3); // backend dribbles its reply
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send_trickle(make_request("dribble"), 1)); // client dribbles its request
+    EXPECT_EQ(body_of(c.recv_response()), kRespBody);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 1u);
+}
+
+TEST_P(ProxyBackend, MalformedRequestSurvives)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    {
+        Client bad;
+        ASSERT_TRUE(bad.connect(_proxy_port));
+        ASSERT_TRUE(bad.send("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"));
+        EXPECT_TRUE(bad.wait_closed());
+        bad.close();
+    }
+    Client good;
+    ASSERT_TRUE(good.connect(_proxy_port));
+    ASSERT_TRUE(good.send(make_request("ok")));
+    EXPECT_NE(good.recv_response().find("200 OK"), std::string::npos);
+    good.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+    EXPECT_EQ(_gw->stats().requests, 1u);
+}
+
+TEST_P(ProxyBackend, MalformedTranslateBodySurvives)
+{
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    {
+        Client bad;
+        ASSERT_TRUE(bad.connect(_proxy_port));
+        ASSERT_TRUE(bad.send(make_request("not json {{{")));
+        EXPECT_TRUE(bad.wait_closed());
+        bad.close();
+    }
+    _backend.set_response(http_ok(anthropic_resp_body("recovered")));
+    Client good;
+    ASSERT_TRUE(good.connect(_proxy_port));
+    ASSERT_TRUE(good.send(openai_request("ping")));
+    EXPECT_NE(body_of(good.recv_response()).find("recovered"), std::string::npos);
+    good.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+}
+
+TEST_P(ProxyBackend, UpstreamClosesMidResponseAborts)
+{
+    _backend.set_close_mid_response(true);
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("hi")));
+    EXPECT_TRUE(c.recv_response().empty());
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+}
+
+TEST_P(ProxyBackend, ConnectionCloseHonored)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("bye", /*keep_alive=*/false)));
+    EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos);
+    EXPECT_TRUE(c.wait_closed());
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 1u);
+}
+
+TEST_P(ProxyBackend, ShutdownMidRequestIsClean)
+{
+    // Hold the upstream so the request is in flight when we tear down — exercises
+    // the drain path (and, under ASan, the no-UAF-on-pending-completion property).
+    _backend.set_trickle(2);
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("hi")));
+    // Don't wait for the response; shut down with work outstanding.
+    shutdown();
+    SUCCEED();
+}
+
+TEST_P(ProxyBackend, ConnectRefusedAbortsClient)
+{
+    start(0, /*with_backend=*/false, TranslateMode::None, GetParam()); // no upstream listener
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("hi")));
+    EXPECT_TRUE(c.wait_closed()); // upstream connect fails -> client aborted
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+    EXPECT_EQ(_gw->stats().requests, 0u);
+}
+
+TEST_P(ProxyBackend, ClientDisconnectsBeforeReadingSurvives)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    for (int i = 0; i < 12; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request("hi")));
+        c.close(); // close immediately, never read the response (response-send fails)
+    }
+    // The loop must survive every aborted response: a normal client still works.
+    Client good;
+    ASSERT_TRUE(good.connect(_proxy_port));
+    ASSERT_TRUE(good.send(make_request("ok")));
+    EXPECT_NE(good.recv_response().find("200 OK"), std::string::npos);
+    good.close();
+    shutdown();
+    SUCCEED();
+}
+
+TEST_P(ProxyBackend, SequentialPoolReuse)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    for (int i = 0; i < 12; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request("x")));
+        ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos) << "iter " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 12u);
+    EXPECT_LE(_gw->stats().upstream_conns_opened, 4u); // pooled & reused (connected -> send, no reconnect)
+}
+
+TEST_P(ProxyBackend, ConnectionChurn)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    for (int i = 0; i < 80; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << "iter " << i;
+        ASSERT_TRUE(c.send(make_request("x", /*keep_alive=*/false)));
+        ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos) << "iter " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 80u);
+}
+
+TEST_P(ProxyBackend, HighConcurrency)
+{
+    const int n = 100;
+    const std::string body(4096, 'B');
+    start(0, true, TranslateMode::None, GetParam());
+    std::vector<std::unique_ptr<Client>> cs;
+    for (int i = 0; i < n; ++i)
+    {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(_proxy_port)) << i;
+        ASSERT_TRUE(c->send(make_request(body)));
+        cs.push_back(std::move(c));
+    }
+    for (int i = 0; i < n; ++i)
+        EXPECT_NE(cs[i]->recv_response().find("200 OK"), std::string::npos) << "client " << i;
+    for (auto& c : cs) c->close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(n));
+}
+
+TEST_P(ProxyBackend, VeryLargeBodyMultiOp)
+{
+    const std::string big(512 * 1024, 'Z'); // 32 recv chunks + many partial sends
+    _backend.set_response(http_ok(big));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string req = make_request(std::string(512 * 1024, 'Q'));
+    ASSERT_TRUE(c.send(req));
+    EXPECT_EQ(body_of(c.recv_response()), big);
+    EXPECT_EQ(_backend.last_request(), req);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_P(ProxyBackend, DeepKeepAlive)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 64; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request("r" + std::to_string(i))));
+        ASSERT_EQ(body_of(c.recv_response()), kRespBody) << "iter " << i;
+    }
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 64u);
+}
+
+TEST_P(ProxyBackend, WarmupGating)
+{
+    start(5'000'000'000LL, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 3; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request("x")));
+        ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
+    }
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 0u); // all within warm-up -> not counted
+}
+
+TEST_P(ProxyBackend, ShutdownWithManyInFlightIsClean)
+{
+    _backend.set_trickle(4); // slow replies so requests are still in flight at teardown
+    start(0, true, TranslateMode::None, GetParam());
+    std::vector<std::unique_ptr<Client>> cs;
+    for (int i = 0; i < 30; ++i)
+    {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(_proxy_port));
+        ASSERT_TRUE(c->send(make_request("x")));
+        cs.push_back(std::move(c)); // never read -> ~30 requests mid-flight
+    }
+    shutdown(); // exercises the drain path with many outstanding ops (ASan: no UAF)
+    SUCCEED();
+}
+
+// ── Bug-1 regression (heavy): an upstream that WILL close must never be pooled or
+// reused. Before the fix, io_uring pooled the corpse and the next request failed.
+// 300/200 iterations so a single reuse-of-corpse trips an assertion.
+TEST_P(ProxyBackend, StaleUpstreamNeverReused_ClientClose)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    for (int i = 0; i < 300; ++i) // each request forwards Connection: close -> backend closes
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << i;
+        ASSERT_TRUE(c.send(make_request("x", /*keep_alive=*/false)));
+        ASSERT_EQ(body_of(c.recv_response()), kRespBody) << "iter " << i; // never a corpse reuse
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 300u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_P(ProxyBackend, StaleUpstreamNeverReused_BackendClose)
+{
+    _backend.set_response(http_close(kRespBody)); // upstream declares Connection: close
+    start(0, true, TranslateMode::None, GetParam());
+    for (int i = 0; i < 200; ++i) // keep-alive clients, but the upstream closes each time
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << i;
+        ASSERT_TRUE(c.send(make_request("x")));
+        ASSERT_EQ(body_of(c.recv_response()), kRespBody) << "iter " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 200u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// ── Stale-connection retry (heavy): the provider pools a keep-alive connection
+// then drops it idle. The gateway must transparently resend on a fresh
+// connection. epoll recovers via pool eviction; io_uring via the retry path —
+// both must serve every request. 60 iterations => ~59 stale reuses on io_uring.
+TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("pong")));
+    _backend.set_close_after_first(true); // respond keep-alive, then drop the connection
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    for (int i = 0; i < 60; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << i;
+        ASSERT_TRUE(c.send(openai_request("req" + std::to_string(i))));
+        EXPECT_NE(body_of(c.recv_response()).find("\"content\":\"pong\""), std::string::npos)
+            << "iter " << i << " (stale connection should have been retried)";
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u); // stale connections recovered, never surfaced
+    // io_uring can't evict idle pooled conns, so it MUST hit the retry path. epoll
+    // recovers via EOF-eviction between sequential clients (occasionally via retry
+    // if the timing races), so we only require it served every request.
+    if (GetParam() == llmbridge::IoBackend::Uring)
+        EXPECT_GT(_gw->stats().upstream_retries, 0u) << "io_uring should have retried stale connections";
+}
+
+// Pipelined variant: two requests on ONE keep-alive connection. The 2nd is
+// forwarded by reusing the pooled (already-dropped) upstream INLINE — before the
+// event loop can evict it — so BOTH backends are forced through the retry path.
+TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("pong")));
+    _backend.set_close_after_first(true);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string burst = openai_request("one") + openai_request("two");
+    ASSERT_TRUE(c.send(burst));
+    EXPECT_NE(body_of(c.recv_response()).find("\"content\":\"pong\""), std::string::npos) << "response 1";
+    EXPECT_NE(body_of(c.recv_response()).find("\"content\":\"pong\""), std::string::npos) << "response 2";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    EXPECT_GT(_gw->stats().upstream_retries, 0u)
+        << "inline pipelined reuse of a dead pooled conn must retry on " << be_name(GetParam());
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
+
+// ── Bug-2 regression (deterministic, no sanitizer needed): every Connection the
+// gateway allocates must be freed. Tear down with 50 requests in flight (acquired
+// upstreams reachable only via peer — exactly what leaked) and assert the live
+// Connection count returns to baseline after ~Gateway.
+TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
+{
+    for (const llmbridge::IoBackend backend : {llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring})
+    {
+        const long base = llmbridge::Connection::s_live.load();
+        {
+            TestBackend be;
+            be.set_trickle(4); // slow replies so requests are still in flight at teardown
+            be.start();
+            Gateway gw(0, "127.0.0.1", be.port(), 0, TranslateMode::None, backend);
+            const uint16_t port = gw.bound_port();
+            std::thread t([&] { gw.run(); });
+
+            std::vector<std::unique_ptr<Client>> cs;
+            for (int i = 0; i < 50; ++i)
+            {
+                auto c = std::make_unique<Client>();
+                ASSERT_TRUE(c->connect(port)) << i;
+                ASSERT_TRUE(c->send(make_request("x")));
+                cs.push_back(std::move(c)); // never read -> in flight at teardown
+            }
+            gw.request_stop();
+            t.join();
+            be.stop();
+        } // ~Gateway runs here
+        EXPECT_EQ(llmbridge::Connection::s_live.load(), base) << be_name(backend);
+    }
+}
+
+// Translation parity across BOTH backends AND all three dialects (2 x 3 = 6).
+class ProxyXlate
+    : public ProxyIT,
+      public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, TranslateMode>>
+{
+};
+TEST_P(ProxyXlate, RoundTripAndForward)
+{
+    const auto [backend, mode] = GetParam();
+    _backend.set_response(http_ok(provider_resp_body(mode, "pong")));
+    start(0, true, mode, backend);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("marker-content-123")));
+    const std::string body = body_of(c.recv_response());
+    EXPECT_NE(body.find("\"content\":\"pong\""), std::string::npos) << body;
+    EXPECT_NE(body.find("\"object\":\"chat.completion\""), std::string::npos);
+    EXPECT_NE(_backend.last_request().find("marker-content-123"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+INSTANTIATE_TEST_SUITE_P(
+    Matrix, ProxyXlate,
+    ::testing::Combine(::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                       ::testing::Values(TranslateMode::Anthropic, TranslateMode::Gemini,
+                                         TranslateMode::Cohere)),
+    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, TranslateMode>>& i) {
+        std::string n = be_name(std::get<0>(i.param));
+        const TranslateMode m = std::get<1>(i.param);
+        n += m == TranslateMode::Anthropic ? "_anthropic" : m == TranslateMode::Gemini ? "_gemini" : "_cohere";
+        return n;
+    });
 
 // ── Gateway unit checks (just construction, no run loop) ───────────
 TEST(GatewayUnit, BoundPortIsNonZeroAfterEphemeralBind)

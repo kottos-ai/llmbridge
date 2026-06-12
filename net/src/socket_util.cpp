@@ -101,4 +101,22 @@ namespace llmbridge::net
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return errno;
         return err;
     }
+
+    int make_client_socket() noexcept
+    {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        set_nonblocking(fd);
+        set_nodelay(fd);
+        set_nosigpipe(fd);
+        return fd;
+    }
+
+    bool resolve_ipv4(const char* ip, uint16_t port, sockaddr_in& out) noexcept
+    {
+        out = sockaddr_in{};
+        out.sin_family = AF_INET;
+        out.sin_port = htons(port);
+        return ::inet_pton(AF_INET, ip, &out.sin_addr) == 1;
+    }
 } // namespace llmbridge::net
