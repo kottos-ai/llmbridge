@@ -322,8 +322,21 @@ namespace llmbridge
         c->peer = u;
         u->peer = c;
 
-        if (u->connected) ep_arm_write(u);
-        // else: on_upstream_writable sends once the connect completes.
+        // Optimistic send: if the pooled upstream is already connected (the common
+        // case), write immediately and only arm EPOLLOUT if the socket buffer is
+        // full. Arming unconditionally costs two epoll_ctl calls + an extra wakeup
+        // per request; the client-response leg already writes this way.
+        if (u->connected)
+        {
+            bool done = false;
+            if (!pump_write(u, &done)) { abort_pair(c); return; }
+            if (done) c->ts_up_sent = now_ns(); // request fully sent (end of request path)
+            else ep_arm_write(u);               // socket full; finish on writability
+        }
+        else
+        {
+            ep_arm_write(u); // connect pending; on_upstream_writable sends once it completes
+        }
     }
 
     void Gateway::on_upstream_writable(Connection* u) noexcept

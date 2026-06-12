@@ -1,6 +1,6 @@
-# llmbridge vs LiteLLM, equal-work OpenAI<->Anthropic, 20260603-190552 (performance mode), host=lenovo-c940 x86_64, mock 200ms
+# llmbridge vs LiteLLM, equal-work OpenAI<->Anthropic, 20260611-185721, host=lenovo-c940 x86_64, mock 200ms
 rps,llmbridge_p50_ms,llmbridge_p99_ms,llmbridge_p999_ms,llmbridge_max_ms,litellm_p50_ms,litellm_achieved,litellm_p99_ms,litellm_max_ms,litellm_sat
-100,0.036,0.075,0.097,0.122,4.560,100,124.790,176.584,no
-500,0.031,0.068,0.085,0.122,6589.722,246,6588.492,6588.268,yes
-1000,0.030,0.063,0.079,0.091,9650.731,248,9649.681,9649.622,yes
-5000,0.019,0.045,0.064,0.122,12513.179,228,12512.769,12512.246,yes
+100,0.037,0.090,0.102,0.118,4.460,100,84.050,148.586,no
+500,0.030,0.066,0.079,0.099,6652.622,251,6651.442,6651.251,yes
+1000,0.031,0.076,0.097,0.147,9781.214,246,9780.174,9780.004,yes
+5000,0.019,0.046,0.066,0.113,12341.678,221,12341.238,8935.171,yes

@@ -20,27 +20,27 @@
 <text x="72" y="94.0" font-size="11" fill="#6b7280" text-anchor="end">100000 ms</text>
 <line x1="80" y1="361.4" x2="890" y2="361.4" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>
 <text x="890" y="355.4" font-size="11" fill="#2563eb" text-anchor="end" font-weight="600">Phase A pass bar: p99 &lt; 1 ms</text>
-<rect x="116.5" y="422.5" width="60.8" height="47.5" fill="#16a34a" rx="2"/>
-<text x="146.9" y="416.5" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.075</text>
-<rect x="185.2" y="247.6" width="60.8" height="222.4" fill="#dc2626" rx="2"/>
-<text x="215.6" y="241.6" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">124.8</text>
+<rect x="116.5" y="418.2" width="60.8" height="51.8" fill="#16a34a" rx="2"/>
+<text x="146.9" y="412.2" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.090</text>
+<rect x="185.2" y="257.0" width="60.8" height="213.0" fill="#dc2626" rx="2"/>
+<text x="215.6" y="251.0" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">84.0</text>
 <text x="181.2" y="490.0" font-size="13" fill="#111827" text-anchor="middle" font-weight="600">100 RPS</text>
-<rect x="319.0" y="424.8" width="60.8" height="45.2" fill="#16a34a" rx="2"/>
-<text x="349.4" y="418.8" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.068</text>
-<rect x="387.8" y="154.1" width="60.8" height="315.9" fill="#dc2626" rx="2"/>
-<text x="418.1" y="148.1" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">6588.5 ⚠</text>
+<rect x="319.0" y="425.5" width="60.8" height="44.5" fill="#16a34a" rx="2"/>
+<text x="349.4" y="419.5" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.066</text>
+<rect x="387.8" y="153.9" width="60.8" height="316.1" fill="#dc2626" rx="2"/>
+<text x="418.1" y="147.9" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">6651.4 ⚠</text>
 <text x="383.8" y="490.0" font-size="13" fill="#111827" text-anchor="middle" font-weight="600">500 RPS</text>
 <text x="383.8" y="506.0" font-size="10" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
-<rect x="521.5" y="426.6" width="60.8" height="43.4" fill="#16a34a" rx="2"/>
-<text x="551.9" y="420.6" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.063</text>
-<rect x="590.2" y="145.1" width="60.8" height="324.9" fill="#dc2626" rx="2"/>
-<text x="620.6" y="139.1" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">9649.7 ⚠</text>
+<rect x="521.5" y="422.2" width="60.8" height="47.8" fill="#16a34a" rx="2"/>
+<text x="551.9" y="416.2" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.076</text>
+<rect x="590.2" y="144.8" width="60.8" height="325.2" fill="#dc2626" rx="2"/>
+<text x="620.6" y="138.8" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">9780.2 ⚠</text>
 <text x="586.2" y="490.0" font-size="13" fill="#111827" text-anchor="middle" font-weight="600">1000 RPS</text>
 <text x="586.2" y="506.0" font-size="10" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
-<rect x="724.0" y="434.5" width="60.8" height="35.5" fill="#16a34a" rx="2"/>
-<text x="754.4" y="428.5" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.045</text>
-<rect x="792.8" y="139.0" width="60.8" height="331.0" fill="#dc2626" rx="2"/>
-<text x="823.1" y="133.0" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">12512.8 ⚠</text>
+<rect x="724.0" y="434.0" width="60.8" height="36.0" fill="#16a34a" rx="2"/>
+<text x="754.4" y="428.0" font-size="11" fill="#16a34a" text-anchor="middle" font-weight="700">0.046</text>
+<rect x="792.8" y="139.3" width="60.8" height="330.7" fill="#dc2626" rx="2"/>
+<text x="823.1" y="133.3" font-size="11" fill="#dc2626" text-anchor="middle" font-weight="700">12341.2 ⚠</text>
 <text x="788.8" y="490.0" font-size="13" fill="#111827" text-anchor="middle" font-weight="600">5000 RPS</text>
 <text x="788.8" y="506.0" font-size="10" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <line x1="80" y1="470.0" x2="890" y2="470.0" stroke="#111827" stroke-width="1.5"/>

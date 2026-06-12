@@ -24,6 +24,7 @@ DUR="${1:-6}"
 WARMUP="${2:-2}"
 shift $(( $# < 2 ? $# : 2 )) || true
 RPS_LIST=(${@:-20000 40000 60000 80000 100000 120000})
+BODY="${BODY:-64}" # request body size in bytes (loadgen --body-bytes); set to sweep message size
 
 BACK_PORT=9002
 PROXY_PORT=8090
@@ -54,7 +55,7 @@ extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 
 {
-  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup)"
+  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B)"
   printf "%-9s | %-22s | %-38s | %s\n" "TARGET" "DIRECT backend" "THROUGH proxy" "proxy"
   printf "%-9s | %-22s | %-38s | %s\n" "RPS" "achieved (p99 µs)" "achieved / p50 / p99 / p99.9 / max (µs)" "backlog"
   echo "----------+------------------------+----------------------------------------+--------"
@@ -63,7 +64,7 @@ backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 for RPS in "${RPS_LIST[@]}"; do
   echo ">>> RPS=$RPS" >&2
   # direct-to-backend control
-  D=$($BIN/loadgen --target 127.0.0.1:$BACK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" 2>/dev/null)
+  D=$($BIN/loadgen --target 127.0.0.1:$BACK_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" --body-bytes "$BODY" 2>/dev/null)
   read -r da d_p50 d_p99 d_p999 d_max <<< "$(echo "$D" | extract)"
 
   # fresh proxy per level
@@ -72,7 +73,7 @@ for RPS in "${RPS_LIST[@]}"; do
   PP=$!
   sleep 0.7
   PLOG="$RESDIR/sat-loadgen-$RPS-$STAMP.log"
-  P=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" 2>"$PLOG")
+  P=$($BIN/loadgen --target 127.0.0.1:$PROXY_PORT --rps "$RPS" --duration "$DUR" --warmup "$WARMUP" --conns "$CONNS" --body-bytes "$BODY" 2>"$PLOG")
   read -r pa p_p50 p_p99 p_p999 p_max <<< "$(echo "$P" | extract)"
   bl=$(backlog_of "$PLOG")
   kill -TERM "$PP" 2>/dev/null; wait "$PP" 2>/dev/null
