@@ -22,6 +22,7 @@
 #include <string_view>
 
 #include "net/socket_util.hpp"
+#include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 
 namespace llmbridge
 {
@@ -49,9 +50,9 @@ namespace llmbridge
     } // namespace
 
     Gateway::Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
-                     int64_t warmup_ns, TranslateMode translate)
+                     int64_t warmup_ns, TranslateMode translate, IoBackend io)
         : _listen_port(listen_port), _upstream_ip(std::move(upstream_ip)),
-          _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate)
+          _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate), _io(io)
     {
         // Linux has no SO_NOSIGPIPE; ignore SIGPIPE process-wide so a write to a
         // peer-closed socket returns EPIPE instead of killing us. Idempotent, so
@@ -67,6 +68,17 @@ namespace llmbridge
         std::fprintf(stderr, "llmbridge: listening :%u -> upstream %s:%u%s\n",
                      _listen_port, _upstream_ip.c_str(), _upstream_port,
                      _translate == TranslateMode::Anthropic ? " (translate: anthropic)" : "");
+
+        // Resolve and announce the event-loop backend. Phase 0: the io_uring loop
+        // isn't wired yet, so whatever is selected, run() drives epoll — but the
+        // probe + selection are real, so the fallback path is exercised today.
+        bool uring_ok = false;
+#ifdef LLMBRIDGE_HAVE_URING
+        uring_ok = net::uring::available();
+#endif
+        const char* want = _io == IoBackend::Uring ? "uring" : _io == IoBackend::Epoll ? "epoll" : "auto";
+        std::fprintf(stderr, "llmbridge: io=%s (io_uring %s) — running epoll loop (io_uring backend: Phase 1)\n",
+                     want, uring_ok ? "available" : "unavailable");
     }
 
     Gateway::~Gateway()

@@ -8,7 +8,8 @@
 // llmbridge gateway daemon.
 //
 //   llmbridge [--listen PORT] [--upstream IP:PORT] [--duration SECONDS]
-//          [--warmup SECONDS] [--translate none|anthropic]
+//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere]
+//          [--io auto|epoll|uring]
 //
 // One self-contained event-loop class (llmbridge::Gateway) does everything:
 // accept clients, frame requests, optionally translate the provider dialect,
@@ -47,6 +48,7 @@ int main(int argc, char** argv)
     int duration = 0;
     double warmup = 0;
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
+    llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -81,11 +83,22 @@ int main(int argc, char** argv)
                 else translate = llmbridge::TranslateMode::None;
             }
         }
+        else if (a == "--io")
+        {
+            if (const char* v = nextarg())
+            {
+                std::string mode(v);
+                if (mode == "epoll") io = llmbridge::IoBackend::Epoll;
+                else if (mode == "uring") io = llmbridge::IoBackend::Uring;
+                else io = llmbridge::IoBackend::Auto;
+            }
+        }
         else if (a == "--help" || a == "-h")
         {
             std::printf("usage: %s [--listen PORT] [--upstream IP:PORT] "
                         "[--duration SECONDS] [--warmup SECONDS] "
-                        "[--translate none|anthropic|gemini|cohere]\n", argv[0]);
+                        "[--translate none|anthropic|gemini|cohere] "
+                        "[--io auto|epoll|uring]\n", argv[0]);
             return 0;
         }
     }
@@ -93,7 +106,7 @@ int main(int argc, char** argv)
     std::signal(SIGPIPE, SIG_IGN);
 
     llmbridge::Gateway gateway(listen_port, upstream_ip, upstream_port,
-                            static_cast<int64_t>(warmup * 1e9), translate);
+                            static_cast<int64_t>(warmup * 1e9), translate, io);
     g_gateway = &gateway;
 
     std::signal(SIGINT, on_signal);

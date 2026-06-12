@@ -40,6 +40,16 @@ namespace llmbridge
         Cohere,
     };
 
+    // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.
+    // (Phase 0: the selection is plumbed and probed; the io_uring loop itself
+    // arrives in Phase 1, so today every choice runs the epoll loop.)
+    enum class IoBackend
+    {
+        Auto,
+        Epoll,
+        Uring,
+    };
+
     // Per-fd connection state (client or upstream).
     struct Connection
     {
@@ -79,7 +89,8 @@ namespace llmbridge
     {
     public:
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
-                int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None);
+                int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
+                IoBackend io = IoBackend::Auto);
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -92,6 +103,9 @@ namespace llmbridge
         void request_stop() noexcept { _stop = true; }
 
         const Stats& stats() const noexcept { return _stats; }
+
+        // The configured event-loop backend (the requested mode; Auto stays Auto).
+        IoBackend io_backend() const noexcept { return _io; }
 
         // Actual bound listen port (resolves ephemeral when 0 was requested).
         uint16_t bound_port() const noexcept;
@@ -129,6 +143,7 @@ namespace llmbridge
         uint16_t _upstream_port;
         int64_t _warmup_ns;
         TranslateMode _translate;
+        IoBackend _io;
 
         int _epfd = -1;
         int _listen_fd = -1;
