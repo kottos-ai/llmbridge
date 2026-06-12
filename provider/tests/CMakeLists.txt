@@ -4,6 +4,10 @@ target_link_libraries(provider_json_test PRIVATE provider GTest::gtest_main)
 add_executable(provider_translate_test translate_test.cpp)
 target_link_libraries(provider_translate_test PRIVATE provider GTest::gtest_main)
 
+add_executable(provider_bijection_test translate_bijection_test.cpp)
+target_link_libraries(provider_bijection_test PRIVATE provider GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(provider_json_test)
 gtest_discover_tests(provider_translate_test)
+gtest_discover_tests(provider_bijection_test)
