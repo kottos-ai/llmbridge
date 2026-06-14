@@ -22,7 +22,23 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = os.path.join(HERE, "results", "phase-a-comparison.csv")
-OUT = os.path.join(HERE, "results", "comparison.svg")
+
+
+def chart_outputs(name):
+    """Where to write a generated chart. Always bench/results/ (the public OSS
+    README embeds these). Also private/website/assets/ when that site tree is
+    present, so the README copy and the deployed website never drift — one run,
+    no manual copying. Public OSS clones (no private/) just get bench/results/."""
+    outs = [os.path.join(HERE, "results", name)]
+    site = os.path.join(os.path.dirname(HERE), "private", "website")
+    if os.path.isdir(site):
+        assets = os.path.join(site, "assets")
+        os.makedirs(assets, exist_ok=True)
+        outs.append(os.path.join(assets, name))
+    return outs
+
+
+OUTS = chart_outputs("comparison.svg")
 
 rows = []
 with open(CSV) as f:
@@ -128,6 +144,7 @@ svg.append(
 
 svg.append('</svg>')
 
-with open(OUT, "w") as f:
-    f.write("\n".join(svg))
-print(f"wrote {OUT}")
+for out in OUTS:
+    with open(out, "w") as f:
+        f.write("\n".join(svg))
+    print(f"wrote {out}")
