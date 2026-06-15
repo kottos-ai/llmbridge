@@ -45,3 +45,10 @@ add_subdirectory(provider)
 add_subdirectory(gateway)
 add_subdirectory(app)
 add_subdirectory(bench)
+
+# Developer debug aids (tools/debug_translate — a steppable translator harness).
+# Top-level builds only; consumers embedding llmbridge don't get it.
+option(LLMBRIDGE_BUILD_TOOLS "Build developer debug tools (tools/)" ${PROJECT_IS_TOP_LEVEL})
+if (LLMBRIDGE_BUILD_TOOLS)
+    add_subdirectory(tools)
+endif ()
