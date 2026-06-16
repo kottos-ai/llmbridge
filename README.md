@@ -8,15 +8,15 @@
 
 ## What it does
 
-`llmbridge` is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, …) and the response back — adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation functions as a C++ library. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to HFT latency standards.
+`llmbridge`™ is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, …) and the response back — adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation functions as a C++ library. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to HFT latency standards.
 
 **Three properties that matter:**
 
 - **Drop-in OpenAI-compatible.** Point an existing OpenAI client at `llmbridge` and route to a different provider with one flag — no app changes.
-- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~58k RPS single-thread ceiling. No GC pauses, no allocation spikes — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
+- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~90k RPS single-thread ceiling. No GC pauses, no allocation spikes — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
 - **Zero runtime dependencies.** Self-contained C++20 — both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
-> **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI](https://kottosai.com) (see the bottom of this README).
+> **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottosai.com) (see the bottom of this README).
 
 **Current provider support — non-streaming chat completions:**
 
@@ -32,11 +32,11 @@
 
 ![llmbridge vs LiteLLM — added latency p99](bench/results/comparison.svg)
 
-At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **~0.075 ms p99** (self-measured) vs LiteLLM's **~125 ms** — and `llmbridge` holds 45–75 µs p99 across 100–5000 RPS while LiteLLM (1 uvicorn worker) saturates around **~250 RPS**.
+At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **~0.067 ms p99** (self-measured) vs LiteLLM's **~82 ms** (~1,200×) — and `llmbridge` holds 42–78 µs p99 across 100–5000 RPS while LiteLLM (1 uvicorn worker) saturates around **~250 RPS**.
 
 ![Throughput saturation — offered vs achieved RPS](bench/results/saturation.svg)
 
-Single-thread throughput ceiling is **~58k RPS**, with sub-millisecond p99 holding to ~50k RPS. *(Bifrost and Helicone not yet measured.)*
+Single-thread throughput ceiling is **~90k RPS** — and on this co-located dev box that ceiling is the loopback's packet-processing limit, not the CPU (the proxy uses ~1 core at saturation). *(Bifrost and Helicone not yet measured.)*
 
 **Reproduce:** `./bench/run_headtohead.sh` (latency) and `./bench/saturate.sh` (throughput) — see [`bench/`](./bench). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
@@ -129,7 +129,7 @@ _Python / Go / Rust packages are planned — see [Language bindings (planned)](#
 - **Lean hot path.** Zero-copy `string_view` over the input buffer; the translation builds its output in one growable buffer. A per-connection slab arena (to remove the last `new`/`delete`) is staged for the multi-loop phase.
 - **Hand-rolled, dependency-free JSON.** A small recursive-descent parser into an ordered DOM plus a string-append builder — scoped to the chat-completion shapes we translate, not a general-purpose library. No `nlohmann::json`, `jsoncpp`, or `simdjson` in the shipped binary.
 - **No GC pauses** (it's C++). Tail latency is bounded by `malloc`, not garbage collection.
-- **No locks on the hot path.** A single-threaded `epoll` event loop with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~58k RPS; scale out with `SO_REUSEPORT`. (Token-by-token SSE streaming is on the Phase B roadmap.)
+- **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~90k RPS; scale out with `SO_REUSEPORT`. (Token-by-token SSE streaming is on the Phase B roadmap.)
 
 The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules.
 
@@ -144,6 +144,13 @@ We follow semantic versioning. Pre-1.0 versions may break the API across minor v
 Apache License 2.0. See [LICENSE](./LICENSE).
 
 Copyright © 2026 Kottos AI, Inc.
+
+## Trademarks
+
+"Kottos AI"™ and "llmbridge"™, and the Kottos AI logo, are trademarks of Kottos AI, Inc.
+The Apache 2.0 license covers the **source code** in this repository; per its Section 6 it
+does **not** grant any right to use these names or logos. See [TRADEMARKS.md](./TRADEMARKS.md)
+for what's permitted.
 
 ## Contributions
 

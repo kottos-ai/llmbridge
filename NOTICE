@@ -9,7 +9,7 @@ distributed as a self-contained C++20 artifact under the Apache
 License, Version 2.0.
 
 Build-time and test-time tooling (not distributed with the runtime
-library) may include third-party components such as Catch2 (BSL-1.0)
+library) may include third-party components such as GoogleTest (BSD-3-Clause)
 and Google Benchmark (Apache-2.0). See the build documentation for
 details. These components are not linked into the distributed
 artifact and impose no obligations on downstream consumers.

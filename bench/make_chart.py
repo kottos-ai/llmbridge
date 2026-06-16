@@ -55,12 +55,16 @@ with open(CSV) as f:
             "litellm_sat": c[9].strip() == "yes",
         })
 
-# Geometry
-W, H = 920, 560
-ML, MR, MT, MB = 80, 30, 90, 90
+# Geometry — W/H kept IDENTICAL to make_saturation_chart.py so the two figures
+# render at exactly the same size on the page.
+W, H = 1000, 620
+ML, MR, MT, MB = 96, 44, 116, 116
 PW = W - ML - MR
 PH = H - MT - MB
 YMIN, YMAX = 0.01, 100000.0  # ms, log scale
+
+# Font sizes (bumped for legibility when the SVG is scaled to a page column).
+F_TITLE, F_SUB, F_AXIS, F_VAL, F_XLBL, F_LEG, F_ANNOT = 27, 15, 15, 16, 18, 15, 13
 
 
 def ly(v):
@@ -80,9 +84,11 @@ svg.append(
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">')
 svg.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 svg.append(
-    f'<text x="{ML}" y="34" font-size="22" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — gateway added latency (p99), 1 KB requests</text>')
+    f'<text x="{ML}" y="44" font-size="{F_TITLE}" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — added latency p99 (1 KB)</text>')
 svg.append(
-    f'<text x="{ML}" y="56" font-size="13" fill="{SUB}">Both gateways translate OpenAI&#8596;Anthropic (equal work), one worker each, 1 KB requests. 200 ms mock backend, open-loop load. Single co-located host. Lower is better; log scale.</text>')
+    f'<text x="{ML}" y="74" font-size="{F_SUB}" fill="{SUB}">Both gateways do the full OpenAI&#8596;Anthropic translation (equal work), one worker each.</text>')
+svg.append(
+    f'<text x="{ML}" y="95" font-size="{F_SUB}" fill="{SUB}">200 ms mock backend &#183; open-loop load &#183; single co-located host &#183; log y-axis &#183; lower is better.</text>')
 
 # y grid + labels (decades)
 dec = -2
@@ -90,8 +96,7 @@ while dec <= 5:
     v = 10.0 ** dec
     y = ly(v)
     svg.append(f'<line x1="{ML}" y1="{y:.1f}" x2="{ML + PW}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1"/>')
-    lbl = (f"{v:g} ms" if v >= 1 else f"{v:g} ms")
-    svg.append(f'<text x="{ML - 8}" y="{y + 4:.1f}" font-size="11" fill="{SUB}" text-anchor="end">{lbl}</text>')
+    svg.append(f'<text x="{ML - 10}" y="{y + 5:.1f}" font-size="{F_AXIS}" fill="{SUB}" text-anchor="end">{v:g} ms</text>')
     dec += 1
 
 # 1 ms PASS line
@@ -99,7 +104,7 @@ y1 = ly(1.0)
 svg.append(
     f'<line x1="{ML}" y1="{y1:.1f}" x2="{ML + PW}" y2="{y1:.1f}" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>')
 svg.append(
-    f'<text x="{ML + PW}" y="{y1 - 6:.1f}" font-size="11" fill="#2563eb" text-anchor="end" font-weight="600">Phase A pass bar: p99 &lt; 1 ms</text>')
+    f'<text x="{ML + 4}" y="{y1 - 8:.1f}" font-size="{F_ANNOT}" fill="#2563eb" text-anchor="start" font-weight="600">1 ms target</text>')
 
 # bars
 n = len(rows)
@@ -109,38 +114,39 @@ axis_y = ly(YMIN)
 for i, r in enumerate(rows):
     gx = ML + i * group_w + group_w / 2
     # llmbridge bar
-    cx = gx - bw - 4
+    cx = gx - bw - 5
     cy = ly(r["llmbridge_p99"])
     svg.append(f'<rect x="{cx:.1f}" y="{cy:.1f}" width="{bw:.1f}" height="{axis_y - cy:.1f}" fill="{LLMBRIDGE}" rx="2"/>')
     svg.append(
-        f'<text x="{cx + bw / 2:.1f}" y="{cy - 6:.1f}" font-size="11" fill="{LLMBRIDGE}" text-anchor="middle" font-weight="700">{r["llmbridge_p99"]:.3f}</text>')
+        f'<text x="{cx + bw / 2:.1f}" y="{cy - 7:.1f}" font-size="{F_VAL}" fill="{LLMBRIDGE}" text-anchor="middle" font-weight="700">{r["llmbridge_p99"]:.3f}</text>')
     # LiteLLM bar
-    lx = gx + 4
+    lx = gx + 5
     lyv = ly(r["litellm_p99"])
     svg.append(
         f'<rect x="{lx:.1f}" y="{lyv:.1f}" width="{bw:.1f}" height="{axis_y - lyv:.1f}" fill="{LITELLM}" rx="2"/>')
     val = f'{r["litellm_p99"]:.1f}' if r["litellm_p99"] >= 10 else f'{r["litellm_p99"]:.2f}'
-    warn = " ⚠" if r["litellm_sat"] else ""
+    warn = " &#9888;" if r["litellm_sat"] else ""
     svg.append(
-        f'<text x="{lx + bw / 2:.1f}" y="{lyv - 6:.1f}" font-size="11" fill="{LITELLM}" text-anchor="middle" font-weight="700">{val}{warn}</text>')
+        f'<text x="{lx + bw / 2:.1f}" y="{lyv - 7:.1f}" font-size="{F_VAL}" fill="{LITELLM}" text-anchor="middle" font-weight="700">{val}{warn}</text>')
     # x label
     svg.append(
-        f'<text x="{gx:.1f}" y="{axis_y + 20:.1f}" font-size="13" fill="{INK}" text-anchor="middle" font-weight="600">{r["rps"]} RPS</text>')
+        f'<text x="{gx:.1f}" y="{axis_y + 26:.1f}" font-size="{F_XLBL}" fill="{INK}" text-anchor="middle" font-weight="600">{r["rps"]} RPS</text>')
     if r["litellm_sat"]:
         svg.append(
-            f'<text x="{gx:.1f}" y="{axis_y + 36:.1f}" font-size="10" fill="{LITELLM}" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>')
+            f'<text x="{gx:.1f}" y="{axis_y + 45:.1f}" font-size="12" fill="{LITELLM}" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>')
 
 # x axis line
 svg.append(f'<line x1="{ML}" y1="{axis_y:.1f}" x2="{ML + PW}" y2="{axis_y:.1f}" stroke="{INK}" stroke-width="1.5"/>')
 
-# legend
-lgx, lgy = ML, H - 28
-svg.append(f'<rect x="{lgx}" y="{lgy - 12}" width="14" height="14" fill="{LLMBRIDGE}" rx="2"/>')
-svg.append(
-    f'<text x="{lgx + 20}" y="{lgy}" font-size="12" fill="{INK}">llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99</text>')
-svg.append(f'<rect x="{lgx + 430}" y="{lgy - 12}" width="14" height="14" fill="{LITELLM}" rx="2"/>')
-svg.append(
-    f'<text x="{lgx + 450}" y="{lgy}" font-size="12" fill="{INK}">LiteLLM (Python, 1 worker) — client-measured added p99</text>')
+# legend — two stacked rows (bottom-left), so the longer labels never overflow
+sw = 16
+for i, (col, label) in enumerate([
+    (LLMBRIDGE, "llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99"),
+    (LITELLM, "LiteLLM (Python, 1 worker) — client-measured added p99"),
+]):
+    yy = H - 50 + i * 24
+    svg.append(f'<rect x="{ML}" y="{yy - sw + 3}" width="{sw}" height="{sw}" fill="{col}" rx="2"/>')
+    svg.append(f'<text x="{ML + sw + 8}" y="{yy}" font-size="{F_LEG}" fill="{INK}">{label}</text>')
 
 svg.append('</svg>')
 
