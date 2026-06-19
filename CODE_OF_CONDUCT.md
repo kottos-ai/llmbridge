@@ -11,7 +11,7 @@ The full text is available at the link above. The short version:
 
 ## Reporting
 
-Violations should be reported to **conduct@kottosai.com**. All reports will be reviewed promptly and treated as confidential.
+Violations should be reported to **conduct@kottos.ai**. All reports will be reviewed promptly and treated as confidential.
 
 When reporting, please include:
 

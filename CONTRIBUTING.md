@@ -4,7 +4,7 @@ Thanks for your interest in `llmbridge`. Before you spend time preparing a contr
 
 ## Current policy: no external code contributions
 
-`llmbridge` is developed and maintained by [Kottos AI, Inc.](https://kottosai.com) At this time, **we do not accept external pull requests for code, features, or bug fixes.** Incoming code-modifying PRs will be politely closed with a pointer to this document.
+`llmbridge` is developed and maintained by [Kottos AI, Inc.](https://kottos.ai) At this time, **we do not accept external pull requests for code, features, or bug fixes.** Incoming code-modifying PRs will be politely closed with a pointer to this document.
 
 This is not personal, and it is not a reflection on your work. It reflects two things:
 
@@ -41,7 +41,7 @@ We do not promise to implement every suggestion, but we do read all of them, and
 
 Use [GitHub Discussions](https://github.com/kottosai/llmbridge/discussions) for usage questions, integration help, performance questions, and general conversation. Discussions are public and searchable, so your question helps the next person too.
 
-For commercial inquiries or anything sensitive, email `hello@kottosai.com`.
+For commercial inquiries or anything sensitive, email `hello@kottos.ai`.
 
 ### Share what you're building
 

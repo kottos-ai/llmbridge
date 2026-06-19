@@ -6,7 +6,7 @@ If you have discovered a security vulnerability in `llmbridge`, please report it
 
 ### How to report
 
-Email: **security@kottosai.com**
+Email: **security@kottos.ai**
 
 Please include:
 
@@ -15,7 +15,7 @@ Please include:
 - The version(s) of `llmbridge` affected
 - Your name and how you would like to be credited in any public disclosure (or your preference to remain anonymous)
 
-If you would like to encrypt your report, mention it in your initial email and we will exchange PGP keys. We will publish a static PGP key at `https://kottosai.com/.well-known/pgp-key.asc` once we have stood up that infrastructure.
+If you would like to encrypt your report, mention it in your initial email and we will exchange PGP keys. We will publish a static PGP key at `https://kottos.ai/.well-known/pgp-key.asc` once we have stood up that infrastructure.
 
 ### What to expect
 
@@ -36,7 +36,7 @@ Out of scope:
 
 - Vulnerabilities in build-time or test-time tooling (please report those to the upstream maintainers, though we are happy to coordinate if it affects our users). Note that `llmbridge` has **zero runtime dependencies** by design, so this is rarely relevant.
 - Vulnerabilities in user code that consumes `llmbridge`
-- Issues in commercial Kottos AI products (those have a separate disclosure path; email `security@kottosai.com` and we will route appropriately)
+- Issues in commercial Kottos AI products (those have a separate disclosure path; email `security@kottos.ai` and we will route appropriately)
 - Denial of service via excessive resource consumption from well-formed inputs (please file as a performance issue instead)
 
 ### Recognition
@@ -72,5 +72,5 @@ If you are deploying `llmbridge` in production, consider:
 
 ## Contact
 
-- Security reports: `security@kottosai.com`
-- General inquiries: `hello@kottosai.com`
+- Security reports: `security@kottos.ai`
+- General inquiries: `hello@kottos.ai`

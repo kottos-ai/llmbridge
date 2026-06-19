@@ -16,7 +16,7 @@
 - **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~90k RPS single-thread ceiling. No GC pauses, no allocation spikes — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
 - **Zero runtime dependencies.** Self-contained C++20 — both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
-> **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottosai.com) (see the bottom of this README).
+> **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottos.ai) (see the bottom of this README).
 
 **Current provider support — non-streaming chat completions:**
 
@@ -135,7 +135,7 @@ The implementation is small and commented — see the `net/`, `provider/`, and `
 
 ## Project status
 
-**Alpha.** API is unstable; expect breaking changes before v1.0. Built and maintained by [Kottos AI](https://kottosai.com), which uses it as the foundation for a hosted inference gateway.
+**Alpha.** API is unstable; expect breaking changes before v1.0. Built and maintained by [Kottos AI](https://kottos.ai), which uses it as the foundation for a hosted inference gateway.
 
 We follow semantic versioning. Pre-1.0 versions may break the API across minor versions. The 1.0 commitment will come after at least six months of public use and at least one production deployment with stable feedback.
 
@@ -160,8 +160,8 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for details on how to engage with the p
 
 ## Security
 
-For responsible disclosure of security vulnerabilities, see [SECURITY.md](./SECURITY.md) or email `security@kottosai.com`.
+For responsible disclosure of security vulnerabilities, see [SECURITY.md](./SECURITY.md) or email `security@kottos.ai`.
 
 ## About Kottos AI
 
-`llmbridge` is developed and sponsored by [Kottos AI, Inc.](https://kottosai.com), which builds exchange-grade inference infrastructure for AI applications. If you need this kind of performance at scale, with managed routing across providers, observability, and enterprise features — [get in touch](mailto:hello@kottosai.com).
+`llmbridge` is developed and sponsored by [Kottos AI, Inc.](https://kottos.ai), which builds exchange-grade inference infrastructure for AI applications. If you need this kind of performance at scale, with managed routing across providers, observability, and enterprise features — [get in touch](mailto:hello@kottos.ai).

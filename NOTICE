@@ -2,7 +2,7 @@ llmbridge — a sub-millisecond C++ LLM gateway
 Copyright 2026 Kottos AI, Inc.
 
 This product is developed and maintained by Kottos AI, Inc.
-(https://kottosai.com).
+(https://kottos.ai).
 
 This product has zero third-party runtime dependencies and is
 distributed as a self-contained C++20 artifact under the Apache

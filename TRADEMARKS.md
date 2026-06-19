@@ -23,4 +23,4 @@ code is open; the name and logo are not.
 - Name a modified or redistributed version "llmbridge" in a way that could
   confuse users about its source. Please rename forks.
 
-Questions or permission requests: **legal@kottosai.com**
+Questions or permission requests: **legal@kottos.ai**
