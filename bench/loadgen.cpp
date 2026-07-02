@@ -178,6 +178,20 @@ int main(int argc, char** argv)
         ::epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev); c->write_armed = false;
     };
 
+    // Recycle a broken connection: close it and open a fresh non-blocking connect,
+    // so the pool never silently shrinks under transient errors. (A shrinking pool
+    // would quietly cap achieved throughput and distort the published benchmark.)
+    // The new socket re-enters rotation via the connect-completion path
+    // (EPOLLOUT -> Idle -> idle vector), exactly like the initial connect.
+    auto reconnect = [&](Connection* c) {
+        if (c->fd >= 0) { ::epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, nullptr); ::close(c->fd); }
+        c->fd = -1; c->write_armed = false; c->woff = 0; c->rbuf.clear();
+        int fd = llmbridge::net::start_connect(args.ip.c_str(), args.port);
+        if (fd < 0) return; // couldn't reconnect right now; conn drops out of rotation
+        c->fd = fd; c->state = State::Connecting;
+        add_read(c); arm_write(c); // wait for connect completion
+    };
+
     // Open all connections up front (non-blocking connect).
     for (int i = 0; i < conns; ++i)
     {
@@ -194,20 +208,21 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "loadgen: %s:%u  rps=%.0f  conns=%d  duration=%ds  warmup=%.1fs\n",
                  args.ip.c_str(), args.port, args.rps, (int)pool.size(), args.duration, args.warmup);
 
-    auto send_on = [&](Connection* c) {
-        // Write the (tiny) request; handle the rare partial write via woff.
+    // Write the (tiny) request. Returns false on a hard write error (the caller
+    // reconnects the socket). On EAGAIN it arms EPOLLOUT and returns true — the
+    // write is finished by the EPOLLOUT handler.
+    auto send_on = [&](Connection* c) -> bool {
         c->woff = 0;
         while (c->woff < REQ.size())
         {
             ssize_t n = ::write(c->fd, REQ.data() + c->woff, REQ.size() - c->woff);
             if (n > 0) { c->woff += (size_t)n; continue; }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { arm_write(c); return; }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { arm_write(c); return true; }
             if (n < 0 && errno == EINTR) continue;
-            // write error — drop this conn from rotation
-            c->state = State::Idle; // will be retried as idle; simplest
-            return;
+            return false; // hard write error — caller recycles the socket
         }
         c->state = State::Awaiting;
+        return true;
     };
 
     const int64_t t_start = llmbridge::now_ns();
@@ -241,8 +256,8 @@ int main(int argc, char** argv)
             c->scheduled_ns = backlog.front();
             backlog.pop_front();
             c->rbuf.clear();
-            send_on(c);
-            ++sent;
+            if (send_on(c)) ++sent;
+            else { ++errors; reconnect(c); } // broken socket: recycle it, don't lose it
         }
 
         // 3) Wait for I/O, but no longer than until the next arrival.
@@ -268,18 +283,26 @@ int main(int argc, char** argv)
                 {
                     int err = llmbridge::net::connect_result(c->fd);
                     disarm_write(c);
-                    if (err != 0) { ++errors; c->state = State::Idle; idle.push_back(c); continue; }
+                    // Connect refused/failed: retire this conn (close, drop from rotation).
+                    // We do NOT reconnect here — a fully-down target would otherwise storm
+                    // reconnects. (Reconnect is for *established* conns that later error;
+                    // an unreachable target simply shrinks the pool and reports errors.)
+                    if (err != 0) { ++errors; ::close(c->fd); c->fd = -1; continue; }
                     c->state = State::Idle;
                     idle.push_back(c);
                     continue;
                 }
                 // finishing a partial request write
+                bool write_failed = false;
                 while (c->woff < REQ.size())
                 {
                     ssize_t w = ::write(c->fd, REQ.data() + c->woff, REQ.size() - c->woff);
                     if (w > 0) { c->woff += (size_t)w; continue; }
-                    break;
+                    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break; // stay armed, retry
+                    if (w < 0 && errno == EINTR) continue;
+                    write_failed = true; break; // hard error
                 }
+                if (write_failed) { ++errors; reconnect(c); continue; }
                 if (c->woff >= REQ.size()) { disarm_write(c); c->state = State::Awaiting; }
             }
 
@@ -297,12 +320,12 @@ int main(int argc, char** argv)
                 if (errno == EINTR) continue;
                 dead = true; break;
             }
-            if (dead) { ++errors; ::close(c->fd); c->fd = -1; continue; }
+            if (dead) { ++errors; reconnect(c); continue; } // recycle the socket back into the pool
 
             Message m;
             ParseStatus st = llmbridge::http::parse(c->rbuf, m);
             if (st == ParseStatus::NeedMore) continue;
-            if (st == ParseStatus::Error) { ++errors; ::close(c->fd); c->fd = -1; continue; }
+            if (st == ParseStatus::Error) { ++errors; reconnect(c); continue; }
 
             // Full response. Record CO-corrected latency, recycle the conn.
             int64_t lat = llmbridge::now_ns() - c->scheduled_ns;
