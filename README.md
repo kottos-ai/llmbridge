@@ -13,7 +13,7 @@
 **Three properties that matter:**
 
 - **Drop-in OpenAI-compatible.** Point an existing OpenAI client at `llmbridge` and route to a different provider with one flag — no app changes.
-- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~90k RPS single-thread ceiling. No GC pauses, no allocation spikes — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
+- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~90k RPS single-thread ceiling. No GC pauses — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
 - **Zero runtime dependencies.** Self-contained C++20 — both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
 > **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottos.ai) (see the bottom of this README).
@@ -75,8 +75,14 @@ llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
 ```
 
 Clients POST OpenAI-shaped requests to `:8088`; `llmbridge` translates to the upstream
-dialect and back. (Plain HTTP today — TLS and real provider endpoints are Phase C; for
-now front a local or already-proxied upstream.)
+dialect and back.
+
+> **Scope today (be precise):** translate mode targets a **local or mock upstream** —
+> this is exactly how the [benchmarks](#benchmarks) run. It does **not yet** add
+> provider auth (`Authorization` / `x-api-key` / `anthropic-version`), a `Host` header,
+> per-provider URL routing, or TLS — so it can't call `api.anthropic.com` directly yet.
+> That's Phase C. Today, point `--upstream` at your own mock, test server, or an
+> already-authenticating proxy.
 
 <!--
 ### Language bindings (planned)
@@ -126,12 +132,13 @@ _Python / Go / Rust packages are planned — see [Language bindings (planned)](#
 
 `llmbridge` is written in modern C++20 with these principles:
 
-- **Lean hot path.** Zero-copy `string_view` over the input buffer; the translation builds its output in one growable buffer. A per-connection slab arena (to remove the last `new`/`delete`) is staged for the multi-loop phase.
+- **Lean hot path.** Zero-copy `string_view` over the input buffer; the translation builds its output in one growable buffer. (It's allocation-*light*, not allocation-free — the JSON DOM allocates its node vectors and each request builds an output string; a per-connection slab arena to cut the remaining allocations is staged for the multi-loop phase.)
 - **Hand-rolled, dependency-free JSON.** A small recursive-descent parser into an ordered DOM plus a string-append builder — scoped to the chat-completion shapes we translate, not a general-purpose library. No `nlohmann::json`, `jsoncpp`, or `simdjson` in the shipped binary.
+- **Hardened, fuzzed parsers.** Both hand-rolled parsers are continuously **fuzzed** under ASan/UBSan (see [`fuzz/`](./fuzz)): the JSON parser is depth-limited (no stack-overflow bombs), request bodies are size-capped, and the HTTP framer is smuggling-safe — Content-Length only, with `Transfer-Encoding` and conflicting duplicate `Content-Length` rejected.
 - **No GC pauses** (it's C++). Tail latency is bounded by `malloc`, not garbage collection.
 - **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~90k RPS; scale out with `SO_REUSEPORT`. (Token-by-token SSE streaming is on the Phase B roadmap.)
 
-The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules.
+The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules, and [DESIGN.md](./DESIGN.md) for the full architecture, threading/memory model, and benchmark methodology.
 
 ## Project status
 
