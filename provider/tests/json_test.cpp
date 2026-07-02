@@ -149,6 +149,34 @@ TEST(Json, MalformedSetsNotOk)
     EXPECT_FALSE(ok);
 }
 
+TEST(Json, DeepNestingRejectedNotStackOverflow)
+{
+    // Recursion-bomb guard: thousands of '[' must fail cleanly (ok=false), not
+    // overflow the stack and crash the process. The DOM is unused; we only care
+    // that parse() returns and reports failure.
+    std::string bomb(8192, '[');
+    bool ok = true;
+    parse(bomb, ok); // must not crash
+    EXPECT_FALSE(ok);
+
+    std::string obj_bomb;
+    for (int k = 0; k < 8192; ++k) obj_bomb += R"({"a":)";
+    ok = true;
+    parse(obj_bomb, ok); // must not crash
+    EXPECT_FALSE(ok);
+}
+
+TEST(Json, NestingWithinLimitStillParses)
+{
+    // Just under kMaxDepth (64): must still parse successfully.
+    std::string s(60, '[');
+    s += '1';
+    s += std::string(60, ']');
+    bool ok = false;
+    parse(s, ok);
+    EXPECT_TRUE(ok);
+}
+
 TEST(JsonBuilder, EscapedFormIsSelfConsistent)
 {
     std::string out;

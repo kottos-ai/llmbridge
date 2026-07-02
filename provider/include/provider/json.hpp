@@ -9,8 +9,9 @@
 
 // Minimal, zero-dependency JSON for the llmbridge provider-translation layer.
 //
-// Deliberately hand-rolled (no library) — a tiny zero-alloc parser, like the
-// rest of llmbridge: a recursive-descent parser into an ordered DOM, plus a
+// Deliberately hand-rolled (no library) — a tiny, allocation-light parser (the
+// DOM does allocate its node vectors, but string values are zero-copy views into
+// the input): a recursive-descent parser into an ordered DOM, plus a
 // string-append builder with escaping. Scope is "enough to translate chat
 // completion request/response bodies between provider dialects" — objects,
 // arrays, strings, numbers, bools, null, and the common escape sequences. Not a
@@ -69,11 +70,18 @@ namespace llmbridge::json
 
     namespace detail
     {
+        // Recursion guard. Client-controlled bodies are parsed in translate mode,
+        // so an input like "[[[[[..." must fail cleanly instead of overflowing the
+        // stack. Chat-completion payloads nest well under 10 deep; 64 is generous
+        // headroom while capping recursion at a safe, small stack footprint.
+        inline constexpr int kMaxDepth = 64;
+
         struct Parser
         {
             std::string_view s;
             size_t i = 0;
             bool ok = true;
+            int depth = 0; // current object/array nesting; bounded by kMaxDepth
 
             void ws()
             {
@@ -104,8 +112,14 @@ namespace llmbridge::json
                 if (i >= s.size()) { ok = false; return {}; }
                 char c = s[i];
                 if (c == '"') { Value v; v.type = Value::Type::String; v.sv = parse_string(); return v; }
-                if (c == '{') return parse_object();
-                if (c == '[') return parse_array();
+                if (c == '{' || c == '[')
+                {
+                    if (depth >= kMaxDepth) { ok = false; return {}; } // too deep — refuse to recurse
+                    ++depth;
+                    Value v = (c == '{') ? parse_object() : parse_array();
+                    --depth;
+                    return v;
+                }
                 if (c == 't' || c == 'f') return parse_bool();
                 if (c == 'n')
                 {

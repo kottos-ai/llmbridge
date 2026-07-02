@@ -12,7 +12,8 @@
 //   - Complete  : methods, Content-Length values/whitespace/case, Connection
 //                 variants, header count/order, no-body requests.
 //   - NeedMore  : header + body truncations, empty input.
-//   - Error     : non-numeric / signed / empty Content-Length, oversize header.
+//   - Error     : non-numeric / signed / empty Content-Length, oversize header,
+//                 Transfer-Encoding, conflicting duplicate CL, over-cap body.
 //   - Pipeline  : concatenated messages -> first is framed, total_len = first.
 //   - Lenient   : documented parser quirks (trailing garbage after CL, dup CL,
 //                 "closed" prefix-matching "close").
@@ -147,6 +148,16 @@ namespace
         v.push_back({"oversize_no_terminator", "POST / HTTP/1.1\r\n" + std::string(kMaxHeaderLen + 50, 'a')});
         v.push_back({"oversize_with_terminator",
                      "POST / HTTP/1.1\r\nX-Big: " + std::string(kMaxHeaderLen, 'b') + "\r\n\r\n"});
+        // Hardening: reject Transfer-Encoding (we frame by CL only — anti-smuggling),
+        // conflicting duplicate Content-Length, and an over-cap body length.
+        v.push_back({"transfer_encoding_chunked",
+                     "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"});
+        v.push_back({"transfer_encoding_case",
+                     "POST / HTTP/1.1\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n"});
+        v.push_back({"dup_content_length_conflict",
+                     "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\n"});
+        v.push_back({"content_length_over_cap",
+                     "POST / HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n"});
         return v;
     }
 
@@ -256,12 +267,23 @@ TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
     ASSERT_EQ(parse(build("POST", {"Content-Length: 5 "}, "hello"), m), ParseStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
 }
-TEST(HttpQuirk, DuplicateContentLengthLastWins)
+TEST(HttpQuirk, DuplicateContentLengthIdenticalIsAccepted)
 {
+    // Identical repeats are harmless and collapse to one (a conflicting duplicate
+    // is rejected — see the HttpError `dup_content_length_conflict` case).
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 3", "Content-Length: 5"}, "hello"), m),
+    ASSERT_EQ(parse(build("POST", {"Content-Length: 5", "Content-Length: 5"}, "hello"), m),
               ParseStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
+}
+TEST(HttpQuirk, BodyLengthAtCapIsNotError)
+{
+    // A CL exactly at the cap frames normally (NeedMore until the body arrives),
+    // proving the guard is a true upper bound, not off-by-one strict.
+    Message m;
+    const std::string raw =
+        "POST / HTTP/1.1\r\nContent-Length: " + std::to_string(llmbridge::http::kMaxBodyLen) + "\r\n\r\n";
+    EXPECT_NE(parse(raw, m), ParseStatus::Error);
 }
 TEST(HttpQuirk, ConnectionClosedPrefixMatchesClose)
 {

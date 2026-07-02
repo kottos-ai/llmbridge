@@ -52,3 +52,10 @@ option(LLMBRIDGE_BUILD_TOOLS "Build developer debug tools (tools/)" ${PROJECT_IS
 if (LLMBRIDGE_BUILD_TOOLS)
     add_subdirectory(tools)
 endif ()
+
+# Fuzz targets for the hand-rolled parsers (json.hpp / http.hpp). Off by default;
+# Clang-only. Enable with -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++.
+option(LLMBRIDGE_BUILD_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
+if (LLMBRIDGE_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif ()

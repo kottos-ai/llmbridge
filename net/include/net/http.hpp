@@ -10,11 +10,13 @@
 // Minimal HTTP/1.1 message framing for the llmbridge proxy hot path.
 //
 // Scope (Phase A): just enough to (a) know when a full request/response has
-// arrived in a buffer, and (b) decide keep-alive. Content-Length framing
-// only — the mock provider and our loadgen both send Content-Length bodies,
-// so chunked transfer-encoding is intentionally out of scope until a real
-// provider needs it (Phase C). No allocation, no copy: everything is index
-// math over a caller-owned buffer — a zero-alloc, hand-written framer.
+// arrived in a buffer, and (b) decide keep-alive. Content-Length framing only.
+// Because we frame solely by Content-Length, any `Transfer-Encoding` header is
+// REJECTED rather than ignored — ignoring it (while an upstream honours it) is
+// the classic request-smuggling desync, dangerous with pooled upstreams. A
+// conflicting duplicate Content-Length is likewise rejected (RFC 9112 §6). No
+// allocation, no copy: everything is index math over a caller-owned buffer — a
+// zero-alloc, hand-written framer.
 
 #include <charconv>
 #include <cstddef>
@@ -70,6 +72,13 @@ namespace llmbridge::http
     // request/response header block.
     inline constexpr size_t kMaxHeaderLen = 32 * 1024;
 
+    // Cap on Content-Length. Without this, a `Content-Length: 9999999999` header
+    // followed by a slow byte trickle grows the receive buffer without bound —
+    // a trivial memory-exhaustion DoS. 16 MiB is far above any chat-completion
+    // body (including base64 vision images); genuine large/streaming payloads are
+    // a Phase C concern with their own backpressure.
+    inline constexpr size_t kMaxBodyLen = 16 * 1024 * 1024;
+
     // Parse framing info out of `buf`. Idempotent and cheap to re-run as more
     // bytes arrive: returns NeedMore until the full message is buffered.
     inline ParseStatus parse(std::string_view buf, Message& out) noexcept
@@ -88,6 +97,7 @@ namespace llmbridge::http
         // headers we care about. Default keep-alive for HTTP/1.1.
         out.body_len = 0;
         out.keep_alive = true;
+        bool have_cl = false; // to detect a conflicting duplicate Content-Length
         std::string_view headers = buf.substr(0, hdr_end);
 
         size_t pos = headers.find("\r\n");
@@ -105,7 +115,17 @@ namespace llmbridge::http
                 size_t n = 0;
                 auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
                 if (ec != std::errc{}) return ParseStatus::Error;
+                // Conflicting duplicate Content-Length → reject (smuggling vector,
+                // RFC 9112 §6.3). An identical repeat is harmless; collapse it.
+                if (have_cl && n != out.body_len) return ParseStatus::Error;
                 out.body_len = n;
+                have_cl = true;
+            }
+            else if (detail::line_is(line, "transfer-encoding:"))
+            {
+                // We frame by Content-Length only; refuse TE outright rather than
+                // risk a TE/CL desync against a TE-honouring upstream.
+                return ParseStatus::Error;
             }
             else if (detail::line_is(line, "connection:"))
             {
@@ -115,6 +135,9 @@ namespace llmbridge::http
             }
             pos = eol;
         }
+
+        // Reject a hostile / absurd body length before we ever buffer toward it.
+        if (out.body_len > kMaxBodyLen) return ParseStatus::Error;
 
         out.total_len = out.header_len + out.body_len;
         if (buf.size() < out.total_len) return ParseStatus::NeedMore;
