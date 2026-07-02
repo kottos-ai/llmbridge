@@ -22,3 +22,7 @@ bench/.litellm-venv/
 # Keep the committed artifacts: bench/results/*.svg and phase-a-comparison.csv
 bench/results/*.log
 bench/results/*.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
