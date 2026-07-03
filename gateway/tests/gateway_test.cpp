@@ -296,6 +296,14 @@ namespace
                 _buf.append(tmp, static_cast<size_t>(n));
             }
         }
+        // HTTP status code of the next framed response ("HTTP/1.1 XYZ ..."); 0 if
+        // no response arrives (closed/timeout).
+        int recv_status(int timeout_ms = 2000)
+        {
+            const std::string r = recv_response(timeout_ms);
+            if (r.size() < 12 || r.compare(0, 5, "HTTP/") != 0) return 0;
+            return (r[9] - '0') * 100 + (r[10] - '0') * 10 + (r[11] - '0');
+        }
         // Returns true if the peer closed within the timeout (read -> 0).
         bool wait_closed(int timeout_ms = 2000)
         {
@@ -460,7 +468,8 @@ TEST_F(ProxyIT, UpstreamRefusedClosesClientAndCountsError)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
-    EXPECT_TRUE(c.wait_closed()); // proxy aborts the client when upstream connect fails
+    EXPECT_EQ(c.recv_status(), 502); // upstream connect fails -> 502 to the client
+    EXPECT_TRUE(c.wait_closed());    // then the proxy closes the connection
     c.close();
     shutdown();
     EXPECT_GE(_gw->stats().errors, 1u);
@@ -681,6 +690,7 @@ TEST_F(ProxyIT, MalformedRequestClosedAndGatewaySurvives)
         ASSERT_TRUE(bad.connect(_proxy_port));
         // Valid framing, invalid Content-Length -> http::parse Error.
         ASSERT_TRUE(bad.send("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n"));
+        EXPECT_EQ(bad.recv_status(), 400); // malformed framing -> 400 Bad Request
         EXPECT_TRUE(bad.wait_closed());
         bad.close();
     }
@@ -702,7 +712,8 @@ TEST_F(ProxyIT, MalformedTranslateBodyClosedAndGatewaySurvives)
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
         ASSERT_TRUE(bad.send(make_request("this is not json {{{")));
-        EXPECT_TRUE(bad.wait_closed()); // translate returns empty -> client aborted
+        EXPECT_EQ(bad.recv_status(), 400); // unparseable body -> 400 Bad Request
+        EXPECT_TRUE(bad.wait_closed());
         bad.close();
     }
     _backend.set_response(http_ok(anthropic_resp_body("recovered")));
@@ -722,8 +733,8 @@ TEST_F(ProxyIT, UpstreamClosesMidResponseAbortsClient)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
-    // The proxy never gets a complete upstream response -> it aborts the client.
-    EXPECT_TRUE(c.recv_response().empty());
+    // Incomplete upstream response -> the proxy replies 502 (was: bare close).
+    EXPECT_EQ(c.recv_status(), 502);
     c.close();
     shutdown();
     EXPECT_GE(_gw->stats().errors, 1u);
@@ -913,6 +924,7 @@ TEST_P(ProxyBackend, MalformedRequestSurvives)
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
         ASSERT_TRUE(bad.send("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"));
+        EXPECT_EQ(bad.recv_status(), 400); // malformed framing -> 400
         EXPECT_TRUE(bad.wait_closed());
         bad.close();
     }
@@ -933,6 +945,7 @@ TEST_P(ProxyBackend, MalformedTranslateBodySurvives)
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
         ASSERT_TRUE(bad.send(make_request("not json {{{")));
+        EXPECT_EQ(bad.recv_status(), 400); // unparseable body -> 400
         EXPECT_TRUE(bad.wait_closed());
         bad.close();
     }
@@ -953,7 +966,7 @@ TEST_P(ProxyBackend, UpstreamClosesMidResponseAborts)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
-    EXPECT_TRUE(c.recv_response().empty());
+    EXPECT_EQ(c.recv_status(), 502); // incomplete upstream response -> 502
     c.close();
     shutdown();
     EXPECT_GE(_gw->stats().errors, 1u);
@@ -992,7 +1005,8 @@ TEST_P(ProxyBackend, ConnectRefusedAbortsClient)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
-    EXPECT_TRUE(c.wait_closed()); // upstream connect fails -> client aborted
+    EXPECT_EQ(c.recv_status(), 502); // upstream connect fails -> 502 to the client
+    EXPECT_TRUE(c.wait_closed());
     c.close();
     shutdown();
     EXPECT_GE(_gw->stats().errors, 1u);

@@ -73,6 +73,7 @@ namespace llmbridge
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
         bool doomed = false;          // closed this epoll batch; deleted after the batch
+        bool close_after_resp = false; // client-only: this is an error reply — close once it flushes
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
 
@@ -161,6 +162,10 @@ namespace llmbridge
         void close_client(Connection* c) noexcept;
         void close_upstream(Connection* u) noexcept;
         void abort_pair(Connection* client) noexcept;
+        // Reply to the client with a structured HTTP error (400 malformed request /
+        // 502 upstream failure) and close, instead of a bare TCP reset. Tears down
+        // any in-flight upstream peer.
+        void error_respond(Connection* client, int code) noexcept;
 
         bool drain_read(Connection* c) noexcept;
         bool pump_write(Connection* c, bool* done) noexcept;
@@ -198,6 +203,7 @@ namespace llmbridge
         bool u_retry_upstream(Connection* u) noexcept;
         void u_close(Connection* c) noexcept;
         void u_abort_pair(Connection* client) noexcept;
+        void u_error_respond(Connection* client, int code) noexcept; // uring mirror of error_respond
         void u_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;
