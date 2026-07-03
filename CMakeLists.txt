@@ -21,7 +21,22 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif ()
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -march=native -DNDEBUG")
+# Optimization. Default Release is -O2, applied via add_compile_options so it does
+# NOT clobber a user's CMAKE_CXX_FLAGS_RELEASE (which the default `-DNDEBUG` etc.
+# still supply). We deliberately do NOT force -march=native: it bakes in the build
+# machine's instruction set and crashes with SIGILL on a different/older CPU — a
+# footgun for packagers and CI. Opt in for a local, non-portable perf build (this
+# is what reproduces the published benchmark numbers):
+#   cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_NATIVE_ARCH=ON
+option(LLMBRIDGE_NATIVE_ARCH "Tune for THIS machine's CPU (-march=native; non-portable)" OFF)
+if (NOT MSVC)
+    add_compile_options($<$<CONFIG:Release>:-O2>)
+    if (LLMBRIDGE_NATIVE_ARCH)
+        add_compile_options($<$<CONFIG:Release>:-march=native>)
+    endif ()
+endif ()
+
+include(GNUInstallDirs) # CMAKE_INSTALL_{LIB,INCLUDE,BIN}DIR for the install rules below
 
 # All executables collect in <build>/bin so the bench scripts find them.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -58,4 +73,31 @@ endif ()
 option(LLMBRIDGE_BUILD_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
 if (LLMBRIDGE_BUILD_FUZZERS)
     add_subdirectory(fuzz)
+endif ()
+
+# ── Install / packaging (top-level builds only) ──────────────────────────────
+# Installs the embeddable translator library (llmbridge::provider) + its headers
+# (rules live in provider/), the `llmbridge` daemon (rule in app/), and a package
+# config so a downstream project can:
+#   find_package(llmbridge CONFIG REQUIRED)
+#   target_link_libraries(myapp PRIVATE llmbridge::provider)
+if (PROJECT_IS_TOP_LEVEL)
+    install(EXPORT llmbridgeTargets
+            FILE llmbridgeTargets.cmake
+            NAMESPACE llmbridge::
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llmbridge)
+
+    include(CMakePackageConfigHelpers)
+    configure_package_config_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llmbridgeConfig.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/llmbridgeConfig.cmake
+            INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llmbridge)
+    write_basic_package_version_file(
+            ${CMAKE_CURRENT_BINARY_DIR}/llmbridgeConfigVersion.cmake
+            VERSION ${PROJECT_VERSION}
+            COMPATIBILITY SameMajorVersion)
+    install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/llmbridgeConfig.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/llmbridgeConfigVersion.cmake
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llmbridge)
 endif ()

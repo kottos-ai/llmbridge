@@ -124,6 +124,22 @@ sudo cmake --install build
 
 Requires C++20 (GCC 13+, Clang 16+, MSVC 19.34+). Developed and tested on **Ubuntu 24.04 LTS** (kernel 6.8+) as the canonical platform. **Zero third-party runtime dependencies** — `llmbridge` is a self-contained C++20 artifact you can drop into your build without inheriting a transitive dependency tree. Build-time tools (testing, benchmarking) have their own dependencies but are not linked into the distributed library.
 
+> The default build is **portable** — it does *not* use `-march=native`. To reproduce
+> the published benchmark numbers, tune for your CPU with `-DLLMBRIDGE_NATIVE_ARCH=ON`.
+
+### Embed the translator as a library
+
+`cmake --install` also installs a package config, so a downstream CMake project can:
+
+```cmake
+find_package(llmbridge CONFIG REQUIRED)
+target_link_libraries(myapp PRIVATE llmbridge::provider)
+```
+```cpp
+#include "provider/translate.hpp"
+std::string anthropic = llmbridge::provider::openai_to_anthropic_request(openai_body);
+```
+
 <!--
 _Python / Go / Rust packages are planned — see [Language bindings (planned)](#language-bindings-planned) above. Today llmbridge is built from source as a C++ library + gateway binary._
 -->

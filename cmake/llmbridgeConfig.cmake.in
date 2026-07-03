@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# llmbridge package config. Exposes the embeddable dialect-translation library:
+#
+#   find_package(llmbridge CONFIG REQUIRED)
+#   target_link_libraries(myapp PRIVATE llmbridge::provider)
+#
+# The library is self-contained (no third-party runtime dependencies), so there is
+# nothing to find_dependency() here.
+
+include("${CMAKE_CURRENT_LIST_DIR}/llmbridgeTargets.cmake")
+
+check_required_components(llmbridge)
