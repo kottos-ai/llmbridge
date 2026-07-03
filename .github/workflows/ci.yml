@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build & test · ${{ matrix.cc }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc,   cxx: g++ }
+          - { cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Release, tests on)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: tests · ASan+UBSan
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (sanitized)
+        run: >
+          cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DLLMBRIDGE_BUILD_TESTS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Build
+        run: cmake --build build-san -j
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-san --output-on-failure
+
+  fuzz:
+    name: fuzz parsers · libFuzzer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fuzzers (Clang)
+        run: |
+          cmake -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLMBRIDGE_BUILD_FUZZERS=ON -DLLMBRIDGE_BUILD_TESTS=OFF
+          cmake --build build-fuzz -j
+      - name: Fuzz the JSON parser (60s, seeded)
+        run: ./build-fuzz/bin/fuzz_json -max_total_time=60 -print_final_stats=1 fuzz/corpus/json
+      - name: Fuzz the HTTP framer (60s, seeded)
+        run: ./build-fuzz/bin/fuzz_http -max_total_time=60 -print_final_stats=1 fuzz/corpus/http

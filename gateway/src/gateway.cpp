@@ -163,12 +163,6 @@ namespace llmbridge
         return ntohs(addr.sin_port);
     }
 
-    Connection* Gateway::client_by_id(uint64_t id) noexcept
-    {
-        auto it = _clients.find(id);
-        return it == _clients.end() ? nullptr : it->second;
-    }
-
     // epoll is level-triggered here (no EPOLLET): every readable handler first
     // drains the socket into rbuf, so EPOLLIN won't re-fire on unread bytes, and
     // EPOLLIN stays armed for the connection's whole life. Write interest is

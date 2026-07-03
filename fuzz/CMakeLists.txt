@@ -4,8 +4,8 @@
 #
 #   cmake -B build-fuzz -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
 #   cmake --build build-fuzz
-#   ./build-fuzz/fuzz/fuzz_json -max_total_time=120
-#   ./build-fuzz/fuzz/fuzz_http -max_total_time=120
+#   ./build-fuzz/bin/fuzz_json -max_total_time=120
+#   ./build-fuzz/bin/fuzz_http -max_total_time=120
 
 if (NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(WARNING "fuzz: libFuzzer needs Clang; skipping (compiler is ${CMAKE_CXX_COMPILER_ID}). "

@@ -10,7 +10,7 @@
 // over-read, and must return a bounded, self-consistent Message. Build (Clang):
 //   cmake -B build-fuzz -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
 //   cmake --build build-fuzz --target fuzz_http
-//   ./build-fuzz/fuzz/fuzz_http -max_total_time=120
+//   ./build-fuzz/bin/fuzz_http -max_total_time=120
 
 #include "net/http.hpp"
 

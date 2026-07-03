@@ -8,6 +8,7 @@
 #include "provider/translate.hpp"
 
 #include <charconv>
+#include <ctime>
 #include <string>
 #include <string_view>
 
@@ -22,6 +23,14 @@ namespace llmbridge::provider
             long long v = 0;
             std::from_chars(s.data(), s.data() + s.size(), v);
             return v;
+        }
+
+        // Current epoch seconds as text for the OpenAI response `created` field. A
+        // bare 0 confuses some SDK clients; the response is synthesized "now", which
+        // is exactly OpenAI's semantics. (time() is a fast vDSO read on Linux.)
+        std::string created_now()
+        {
+            return std::to_string(static_cast<long long>(std::time(nullptr)));
         }
 
         // Append the raw (already JSON-escaped) text of a content field — a plain
@@ -113,7 +122,7 @@ namespace llmbridge::provider
 
         std::string out = "{\"id\":";
         json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
-        out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
+        out += ",\"object\":\"chat.completion\",\"created\":" + created_now() + ",\"model\":";
         json::append_raw_string(out, v.str_or("model"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
         // content: array of blocks; emit the text of text-blocks verbatim.
@@ -222,7 +231,8 @@ namespace llmbridge::provider
         }
         if (total == 0) total = in_tok + out_tok;
 
-        std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":0,\"model\":";
+        std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":"
+                          + created_now() + ",\"model\":";
         json::append_raw_string(out, v.str_or("modelVersion"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
         if (parts)
@@ -295,7 +305,7 @@ namespace llmbridge::provider
 
         std::string out = "{\"id\":";
         json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
-        out += ",\"object\":\"chat.completion\",\"created\":0,\"model\":";
+        out += ",\"object\":\"chat.completion\",\"created\":" + created_now() + ",\"model\":";
         json::append_raw_string(out, v.str_or("model"));
         out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
         if (const json::Value* msg = v.find("message"))

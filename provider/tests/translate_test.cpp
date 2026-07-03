@@ -306,7 +306,6 @@ TEST(CohereReq, KeepsMessagesAndRemapsTopP)
     EXPECT_EQ(out.str_or("model"), "command-r-plus");
     EXPECT_EQ(out.num_or("max_tokens"), "128");
     EXPECT_EQ(out.num_or("p"), "0.8");                    // top_p -> p
-    EXPECT_EQ(out.find("p"), out.find("p"));
     EXPECT_EQ(out.find("top_p"), nullptr);                // not passed through as top_p
     const Value* m = out.find("messages");
     ASSERT_EQ(m->arr.size(), 2u);                         // system stays a message in Cohere v2

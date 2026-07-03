@@ -169,7 +169,6 @@ namespace llmbridge
 
         bool drain_read(Connection* c) noexcept;
         bool pump_write(Connection* c, bool* done) noexcept;
-        Connection* client_by_id(uint64_t id) noexcept;
 
         // ── backend dispatch ────────────────────────────────────────────────
         int run_epoll();

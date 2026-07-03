@@ -11,7 +11,7 @@
 // it may only set ok=false. Build (Clang):
 //   cmake -B build-fuzz -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
 //   cmake --build build-fuzz --target fuzz_json
-//   ./build-fuzz/fuzz/fuzz_json -max_total_time=120
+//   ./build-fuzz/bin/fuzz_json -max_total_time=120
 
 #include "provider/json.hpp"
 
