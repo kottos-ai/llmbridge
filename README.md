@@ -8,7 +8,7 @@
 
 ## What it does
 
-`llmbridge`™ is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, …) and the response back — adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation functions as a C++ library. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to HFT latency standards.
+`llmbridge`™ is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, …) and the response back — adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation functions as a C++ library. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to High Frequency Trading (HFT) latency standards.
 
 **Three properties that matter:**
 
@@ -28,7 +28,7 @@
 
 ## Benchmarks
 
-**Equal-work head-to-head:** both `llmbridge` and LiteLLM do the full OpenAI↔Anthropic translation against the same 200 ms mock backend, driven by the same open-loop, coordinated-omission-corrected load generator. Single Linux host (i7-9750H, 6c/12t), all processes co-located — so absolute tails are a dev-box upper bound. This measures **gateway overhead**, not end-to-end LLM latency.
+**Equal-work head-to-head:** both `llmbridge` and LiteLLM do the full OpenAI↔Anthropic translation against the same 200 ms mock backend, driven by the same open-loop, coordinated-omission-corrected load generator. Single Linux host (i7-9750H, 6cores/12threads), all processes co-located — so absolute tails are a dev-box upper bound. This measures **gateway overhead**, not end-to-end LLM latency.
 
 ![llmbridge vs LiteLLM — added latency p99](bench/results/comparison.svg)
 
@@ -77,12 +77,12 @@ llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
 Clients POST OpenAI-shaped requests to `:8088`; `llmbridge` translates to the upstream
 dialect and back.
 
-> **Scope today (be precise):** translate mode targets a **local or mock upstream** —
-> this is exactly how the [benchmarks](#benchmarks) run. It does **not yet** add
-> provider auth (`Authorization` / `x-api-key` / `anthropic-version`), a `Host` header,
-> per-provider URL routing, or TLS — so it can't call `api.anthropic.com` directly yet.
-> That's Phase C. Today, point `--upstream` at your own mock, test server, or an
-> already-authenticating proxy.
+> **What it talks to today.** The proxy translates and forwards to whatever you set
+> as `--upstream` — a mock, a local model server, or a gateway that already terminates
+> TLS and adds provider credentials (that's how the [benchmarks](#benchmarks) run).
+> Calling a hosted endpoint like `api.anthropic.com` *directly* needs outbound TLS plus
+> per-provider auth and routing, which are on the roadmap; until then, put it behind
+> your existing auth/TLS layer.
 
 <!--
 ### Language bindings (planned)

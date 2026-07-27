@@ -15,7 +15,7 @@ Please include:
 - The version(s) of `llmbridge` affected
 - Your name and how you would like to be credited in any public disclosure (or your preference to remain anonymous)
 
-If you would like to encrypt your report, mention it in your initial email and we will exchange PGP keys. We will publish a static PGP key at `https://kottos.ai/.well-known/pgp-key.asc` once we have stood up that infrastructure.
+If you would like to encrypt your report, mention it in your initial email and we will exchange PGP keys on request.
 
 ### What to expect
 
@@ -28,9 +28,7 @@ If you would like to encrypt your report, mention it in your initial email and w
 This policy covers the `llmbridge` library itself, including:
 
 - The C++ core
-- Official language bindings (Python, Go, Rust) published by Kottos AI
 - Build and packaging infrastructure
-- Official Docker images published under `kottosai/*`
 
 Out of scope:
 
