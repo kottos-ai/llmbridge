@@ -40,6 +40,18 @@ namespace llmbridge::json
         std::vector<Value> arr;                                  // Array elements
         std::vector<std::pair<std::string_view, Value>> obj;     // Object members, insertion order
 
+        // Value is self-referential (arr/obj hold Value), so its special members are
+        // declared here and defaulted out-of-line (just below the class). Defined
+        // inline, clang + libstdc++ eagerly instantiate the recursive vector/pair
+        // traits on an *incomplete* Value and hard-error; GCC defers, so it only
+        // breaks the clang CI leg. Out-of-line = instantiated once Value is complete.
+        Value();
+        Value(const Value&);
+        Value(Value&&) noexcept;
+        Value& operator=(const Value&);
+        Value& operator=(Value&&) noexcept;
+        ~Value();
+
         [[nodiscard]] bool is_object() const { return type == Type::Object; }
         [[nodiscard]] bool is_array() const { return type == Type::Array; }
         [[nodiscard]] bool is_string() const { return type == Type::String; }
@@ -67,6 +79,15 @@ namespace llmbridge::json
             return (v && v->type == Type::Number) ? v->sv : def;
         }
     };
+
+    // Out-of-line so the recursive vector<Value>/vector<pair<…,Value>> special
+    // members are only instantiated here, where Value is a complete type.
+    inline Value::Value() = default;
+    inline Value::Value(const Value&) = default;
+    inline Value::Value(Value&&) noexcept = default;
+    inline Value& Value::operator=(const Value&) = default;
+    inline Value& Value::operator=(Value&&) noexcept = default;
+    inline Value::~Value() = default;
 
     namespace detail
     {
