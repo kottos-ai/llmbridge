@@ -23,6 +23,39 @@ namespace llmbridge::provider
             // end_turn, stop_sequence, and anything else -> "stop"
             return "stop";
         }
+
+        // Append a raw (already JSON-escaped) span, neutralizing control bytes.
+        // Our lenient JSON parser accepts a literal control char (e.g. 0x0A)
+        // inside a string, which strict JSON forbids — and a raw newline emitted
+        // into our SSE output would let a hostile upstream inject fake events
+        // into the client stream ("\n\ndata: ..."). Escaping <0x20 as \u00XX
+        // closes that hole; everything else is a bulk copy, same pattern as
+        // json::append_escaped.
+        void append_sanitized(std::string& out, std::string_view raw)
+        {
+            static const char* hex = "0123456789abcdef";
+            size_t start = 0;
+            for (size_t i = 0; i < raw.size(); ++i)
+            {
+                const unsigned char c = static_cast<unsigned char>(raw[i]);
+                if (c >= 0x20) continue;                 // plain byte; keep scanning
+                out.append(raw.data() + start, i - start); // flush the plain run
+                out += "\\u00";
+                out += hex[(c >> 4) & 0xF];
+                out += hex[c & 0xF];
+                start = i + 1;
+            }
+            out.append(raw.data() + start, raw.size() - start);
+        }
+
+        // Sanitize into an owned string (for spans we store across events).
+        std::string sanitized(std::string_view raw)
+        {
+            std::string s;
+            s.reserve(raw.size());
+            append_sanitized(s, raw);
+            return s;
+        }
     } // namespace
 
     // Chunk envelope: everything up to the open of the delta object. Callers then
@@ -62,8 +95,8 @@ namespace llmbridge::provider
         {
             if (const json::Value* m = v.find("message"))
             {
-                if (const std::string_view id = m->str_or("id"); !id.empty()) _id.assign(id);
-                _model.assign(m->str_or("model"));
+                if (const std::string_view id = m->str_or("id"); !id.empty()) _id = sanitized(id);
+                _model = sanitized(m->str_or("model"));
             }
             if (_created.empty()) _created = std::to_string(static_cast<long long>(std::time(nullptr)));
             if (!_role_emitted) // OpenAI's first chunk carries the assistant role
@@ -88,20 +121,23 @@ namespace llmbridge::provider
                 }
                 emit_head(out);
                 out += "\"content\":\"";
-                out += d->str_or("text"); // raw escaped span -> zero-copy passthrough
+                append_sanitized(out, d->str_or("text")); // raw escaped span; control bytes neutralized
                 out += '"';
                 emit_tail(out, nullptr);
             }
         }
         else if (type == "message_delta")
         {
+            // Only a stop_reason ends the message — Anthropic also sends
+            // usage-only message_delta frames mid-stream, which must NOT emit a
+            // premature finish chunk.
             if (const json::Value* d = v.find("delta"))
                 if (const std::string_view sr = d->str_or("stop_reason"); !sr.empty())
                     _finish = map_stop_reason(sr);
-            if (!_finish_emitted) // finish chunk: empty delta + finish_reason
+            if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);
-                emit_tail(out, _finish ? _finish : "stop");
+                emit_tail(out, _finish);
                 _finish_emitted = true;
             }
         }
@@ -121,6 +157,8 @@ namespace llmbridge::provider
 
     bool AnthropicToOpenAiSse::feed(std::string_view bytes, std::string& out)
     {
+        if (_failed) return false; // sticky: a capped stream stays dead
+
         _pending.append(bytes);
 
         size_t pos = 0;
@@ -143,6 +181,13 @@ namespace llmbridge::provider
             {
                 std::string_view d = line.substr(5);
                 if (!d.empty() && d.front() == ' ') d.remove_prefix(1); // one optional space
+                if (_cur_data.size() + d.size() + 1 > kMaxEvent) // endless event -> refuse
+                {
+                    _failed = true;
+                    _pending.clear(); _pending.shrink_to_fit();
+                    _cur_data.clear(); _cur_data.shrink_to_fit();
+                    return false;
+                }
                 if (_have_data) _cur_data.push_back('\n'); // SSE: multi-line data joined by \n
                 _cur_data.append(d);
                 _have_data = true;
@@ -151,11 +196,20 @@ namespace llmbridge::provider
             // data payload's own "type" field, which is authoritative for Anthropic.
         }
         _pending.erase(0, pos);
+
+        if (_pending.size() > kMaxPending) // a single line this long is an attack, not a workload
+        {
+            _failed = true;
+            _pending.clear(); _pending.shrink_to_fit();
+            _cur_data.clear(); _cur_data.shrink_to_fit();
+            return false;
+        }
         return true;
     }
 
     bool AnthropicToOpenAiSse::finish(std::string& out)
     {
+        if (_failed) return false; // don't fabricate a clean [DONE] on a capped stream
         if (_done) return true;
         if (!_finish_emitted)
         {

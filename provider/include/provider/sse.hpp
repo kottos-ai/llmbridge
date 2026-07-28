@@ -31,11 +31,20 @@ namespace llmbridge::provider
     class AnthropicToOpenAiSse
     {
     public:
+        // The upstream is untrusted network input, so both internal buffers are
+        // hard-capped: an endless line (no '\n') or an endless event (no blank
+        // line) is a malfunctioning-or-malicious peer, not a workload. Generous
+        // vs. real Anthropic events (KBs), tight vs. a memory-exhaustion attempt.
+        static constexpr size_t kMaxPending = 1 << 20;  // 1 MiB: longest single line
+        static constexpr size_t kMaxEvent = 4 << 20;    // 4 MiB: one event's data
+
         // Feed raw upstream SSE bytes; append translated OpenAI SSE to `out`. An
         // incomplete trailing event is buffered internally until the next call.
-        // Returns false only on a hard internal error — odd-but-skippable upstream
-        // data (unknown event types, unparseable data payloads) is ignored, never
-        // fatal, so one malformed frame can't tear down a live stream.
+        // Odd-but-skippable upstream data (unknown event types, unparseable data
+        // payloads) is ignored, never fatal, so one malformed frame can't tear
+        // down a live stream. Returns false — permanently — only when a buffer
+        // cap is exceeded: the caller must treat that as a protocol failure and
+        // drop the upstream connection.
         bool feed(std::string_view bytes, std::string& out);
 
         // Signal upstream EOF. If the stream didn't already end with message_stop,
@@ -47,9 +56,10 @@ namespace llmbridge::provider
         void emit_head(std::string& out);                    // up to `"delta":{`
         void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
 
-        std::string _pending;   // bytes not yet forming a complete event (frag buffer)
+        std::string _pending;   // bytes not yet forming a complete line (frag buffer)
         std::string _cur_data;  // concatenated `data:` lines of the in-progress event
         bool _have_data = false;
+        bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
 
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
