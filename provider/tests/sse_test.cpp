@@ -166,3 +166,198 @@ TEST(Sse, EofWithoutMessageStopStillTerminates)
     Value fin = P(payloads[payloads.size() - 2]);
     EXPECT_EQ(fin.find("choices")->arr[0].str_or("finish_reason"), "stop");
 }
+
+// ── Coverage: robustness, framing, mapping, caps ────────────────────────────
+
+namespace
+{
+    // The invariant append_sanitized guarantees: our output carries no bare C0
+    // control byte other than the '\n' we frame with. (We never emit '\r'.)
+    bool output_is_strict(const std::string& out)
+    {
+        for (unsigned char c : out)
+            if (c < 0x20 && c != '\n') return false;
+        return true;
+    }
+
+    std::string crlf(std::string_view s) // rewrite LF -> CRLF
+    {
+        std::string o;
+        for (char c : s) { if (c == '\n') o += '\r'; o += c; }
+        return o;
+    }
+} // namespace
+
+// The property that matters: for ANY input (hostile or malformed), the emitted
+// stream is strict — no bare control bytes leak through passthrough — and the
+// translator never crashes (ASan/UBSan enforce the latter in CI).
+TEST(Sse, OutputIsAlwaysStrict)
+{
+    std::vector<std::string> evil;
+    // control bytes inside a text_delta
+    evil.push_back(std::string("data: {\"type\":\"content_block_delta\",\"delta\":"
+                               "{\"type\":\"text_delta\",\"text\":\"a") + char(0x01) + "b" + char(0x1f)
+                   + "c\"}}\n\n");
+    // control bytes inside id / model (stored across chunks)
+    evil.push_back(std::string("data: {\"type\":\"message_start\",\"message\":{\"id\":\"i") + char(0x02)
+                   + "d\",\"model\":\"m" + char(0x1b) + "l\"}}\n\n"
+                     "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n");
+    // raw newlines that try to smuggle a nested event
+    evil.emplace_back("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\n"
+                      "\ndata: junk\"}}\n\n");
+    // outright garbage
+    evil.emplace_back("data: not json at all\n\n");
+    evil.emplace_back(kAnthropicText); // and the well-formed one
+
+    for (const auto& in : evil)
+    {
+        std::string whole;
+        {
+            AnthropicToOpenAiSse t;
+            t.feed(in, whole);
+            t.finish(whole);
+        }
+        EXPECT_TRUE(output_is_strict(whole)) << "leaked a bare control byte";
+
+        std::string bybyte; // and under worst-case fragmentation
+        {
+            AnthropicToOpenAiSse t;
+            for (char c : in) t.feed(std::string_view(&c, 1), bybyte);
+            t.finish(bybyte);
+        }
+        EXPECT_TRUE(output_is_strict(bybyte));
+    }
+}
+
+TEST(Sse, CrlfLineEndingsMatchLf)
+{
+    EXPECT_EQ(translate_whole(crlf(kAnthropicText)), translate_whole(kAnthropicText));
+}
+
+TEST(Sse, PingCommentUnknownProduceNoOutput)
+{
+    AnthropicToOpenAiSse t;
+    std::string out;
+    t.feed(": a comment line\n\n"
+           "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+           "data: {\"type\":\"some_unknown_event\",\"index\":9}\n\n",
+           out);
+    EXPECT_TRUE(out.empty()); // none of these map to an OpenAI chunk
+    // ...and the stream still works afterward:
+    t.feed("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n", out);
+    EXPECT_NE(out.find("\"content\":\"hi\""), std::string::npos);
+}
+
+TEST(Sse, GarbledFrameIsSkippedStreamContinues)
+{
+    const char* s =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\"}}\n\n"
+        "data: {this is : not, valid json]\n\n" // garbage between good frames
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const auto p = data_payloads(translate_whole(s));
+    // role chunk, "OK", finish chunk, [DONE] — the garbage produced nothing.
+    ASSERT_EQ(p.size(), 4u);
+    EXPECT_EQ(P(p[1]).find("choices")->arr[0].find("delta")->str_or("content"), "OK");
+    EXPECT_EQ(p.back(), "[DONE]");
+}
+
+TEST(Sse, MultiLineDataIsJoined)
+{
+    // A JSON object split across two data: lines (joined by '\n', which our JSON
+    // parser treats as whitespace between tokens).
+    const char* s =
+        "data: {\"type\":\n"
+        "data: \"message_stop\"}\n\n";
+    EXPECT_EQ(data_payloads(translate_whole(s)).back(), "[DONE]");
+}
+
+TEST(Sse, StopSequenceMapsToStop)
+{
+    const char* s =
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const auto p = data_payloads(translate_whole(s));
+    EXPECT_EQ(P(p[p.size() - 2]).find("choices")->arr[0].str_or("finish_reason"), "stop");
+}
+
+TEST(Sse, MultipleTextBlocksAllFlow)
+{
+    const char* s =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\n"
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const auto p = data_payloads(translate_whole(s));
+    std::string content;
+    for (const auto& pay : p)
+    {
+        if (pay == "[DONE]") continue;
+        Value chunk = P(pay); // keep the DOM alive; find() returns views into it
+        if (const Value* d = chunk.find("choices")->arr[0].find("delta"))
+            content += std::string(d->str_or("content"));
+    }
+    EXPECT_EQ(content, "AB");
+}
+
+TEST(Sse, EmptyTextDeltaIsBenign)
+{
+    AnthropicToOpenAiSse t;
+    std::string out;
+    t.feed("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n", out);
+    EXPECT_TRUE(output_is_strict(out));
+    EXPECT_NE(out.find("\"content\":\"\""), std::string::npos); // empty content, well-formed
+}
+
+TEST(Sse, NoSpaceAfterDataColon)
+{
+    // SSE allows zero or one space after "data:"; the payload must still parse.
+    EXPECT_EQ(data_payloads(translate_whole("data:{\"type\":\"message_stop\"}\n\n")).back(), "[DONE]");
+}
+
+TEST(Sse, MissingIdModelFallBack)
+{
+    const char* s =
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+    Value first = P(data_payloads(translate_whole(s))[0]);
+    EXPECT_EQ(first.str_or("id"), "chatcmpl-llmbridge"); // default id
+    EXPECT_EQ(first.str_or("model"), "");                // empty, not garbage
+}
+
+TEST(Sse, CreatedIsStableAcrossChunks)
+{
+    std::string_view created;
+    bool first = true;
+    for (const auto& pay : data_payloads(translate_whole(kAnthropicText)))
+    {
+        if (pay == "[DONE]") continue;
+        std::string_view c = P(pay).num_or("created");
+        if (first) { created = c; first = false; }
+        else EXPECT_EQ(c, created); // OpenAI keeps `created` constant across a stream
+    }
+    EXPECT_FALSE(created.empty());
+}
+
+TEST(Sse, CapOnEndlessLineRejectsAndIsSticky)
+{
+    AnthropicToOpenAiSse t;
+    std::string out;
+    std::string endless(AnthropicToOpenAiSse::kMaxPending + 64, 'a'); // one line, no '\n'
+    EXPECT_FALSE(t.feed(endless, out));      // over the line cap
+    std::string out2;
+    EXPECT_FALSE(t.feed("more", out2));      // sticky: stays dead
+    std::string out3;
+    EXPECT_FALSE(t.finish(out3));            // and won't fabricate a clean [DONE]
+}
+
+TEST(Sse, CapOnEndlessEventRejects)
+{
+    AnthropicToOpenAiSse t;
+    std::string out;
+    // one complete data: line whose payload exceeds the per-event cap
+    std::string huge = "data: " + std::string(AnthropicToOpenAiSse::kMaxEvent + 64, 'a') + "\n";
+    EXPECT_FALSE(t.feed(huge, out));
+}
