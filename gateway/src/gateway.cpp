@@ -776,6 +776,12 @@ namespace llmbridge
         constexpr unsigned kBufGroup = 1;
         constexpr unsigned kBufCount = 4096; // power of two
         constexpr unsigned kBufSize = 4096;
+
+        // Cap on buffered SSE output for one stream. SSE is model-rate-limited, so
+        // this only trips for a pathologically slow client — rather than buffer
+        // without bound we drop that stream. (The epoll pump instead pauses reads;
+        // for a model-rate stream the cap is equivalent in practice.)
+        constexpr size_t kStreamBufCap = 8 << 20; // 8 MiB
     } // namespace
 
     bool Gateway::u_next_sqe(io_uring_sqe** out) noexcept
@@ -1036,6 +1042,7 @@ namespace llmbridge
         {
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
             if (c->is_client) { if (c->peer) u_abort_pair(c); else u_close(c); }
+            else if (c->peer && c->peer->streaming) u_stream_on_eof(c); // stream end, not a failure
             else if (!u_retry_upstream(c)) { if (c->peer) u_error_respond(c->peer, 502); else u_close(c); }
             return;
         }
@@ -1059,18 +1066,19 @@ namespace llmbridge
             // an idle pooled upstream (no peer) means it's unusable — drop it.
             if (!c->peer) { u_close(c); return; }
 
-            // Streaming (SSE) responses aren't handled on the io_uring backend yet
-            // (the pump lives only in the epoll loop). Detect a text/event-stream
-            // response and fail cleanly with a 502 rather than mis-framing it — the
-            // epoll pump handles streaming; io_uring streaming is a follow-up. Peek
-            // the head first (parse_response_head tolerates chunked, unlike parse()).
+            // Mid-stream: pump the newly-arrived body bytes and return.
+            if (c->peer->streaming) { u_stream_pump(c); return; }
+
+            // First response bytes: peek the head (parse_response_head tolerates
+            // chunked, unlike parse()); a text/event-stream response enters the
+            // streaming pump, everything else the whole-body path below.
             if (_translate == TranslateMode::Anthropic)
             {
                 http::ResponseHead h;
                 const auto hs = http::parse_response_head(c->rbuf, h);
                 if (hs == http::HeadStatus::NeedMore) return; // wait for the full head
                 if (hs == http::HeadStatus::Error) { u_error_respond(c->peer, 502); return; }
-                if (h.event_stream) { u_error_respond(c->peer, 502); return; } // TODO(uring streaming)
+                if (h.event_stream) { u_begin_stream(c, h); return; }
             }
 
             http::Message m;
@@ -1191,6 +1199,15 @@ namespace llmbridge
             // recv. KEEP wbuf so we can resend on a stale-connection failure.
             if (c->peer) c->peer->ts_up_sent = now_ns();
         }
+        else if (c->streaming)
+        {
+            // This SSE buffer is fully out. Free the send slot and either send the
+            // next pending bytes or finalize if the stream has ended.
+            c->wbuf.clear();
+            c->woff = 0;
+            c->send_inflight = false;
+            u_stream_kick(c);
+        }
         else
         {
             c->wbuf.clear();
@@ -1223,6 +1240,98 @@ namespace llmbridge
         // The client's multishot recv is still armed; a pipelined next request may
         // already sit in rbuf — forward it, else the armed recv delivers more.
         u_try_forward_buffered(c);
+    }
+
+    // ── io_uring streaming pump (Anthropic->OpenAI SSE) ─────────────────────
+    // Enter streaming: send the client SSE headers, then translate the body as it
+    // arrives. Output accumulates in wpending; u_stream_kick moves it into wbuf
+    // (kept immutable during an in-flight SEND) one send at a time.
+    void Gateway::u_begin_stream(Connection* u, const http::ResponseHead& h) noexcept
+    {
+        Connection* client = u->peer;
+        client->streaming = true;
+        client->up_head_done = true;
+        client->stream_chunked = h.chunked;
+        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
+        client->wpending =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
+        u_stream_pump(u);
+    }
+
+    void Gateway::u_stream_pump(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client) { u_close(u); return; }
+
+        std::string sse_in;
+        if (client->stream_chunked)
+        {
+            if (!client->chunkdec.feed(u->rbuf, sse_in)) // malformed chunked framing
+            {
+                u->rbuf.clear();
+                client->sse->finish(client->wpending); // end the client stream cleanly
+                client->stream_ended = true;
+                u_stream_kick(client);
+                return;
+            }
+        }
+        else
+        {
+            sse_in.swap(u->rbuf); // raw (close-delimited) body
+        }
+        u->rbuf.clear();
+
+        if (!sse_in.empty()) client->sse->feed(sse_in, client->wpending);
+        if (client->stream_chunked && client->chunkdec.done())
+        {
+            client->sse->finish(client->wpending);
+            client->stream_ended = true;
+        }
+        if (client->wpending.size() + client->wbuf.size() > kStreamBufCap) { u_abort_pair(client); return; }
+        u_stream_kick(client);
+    }
+
+    void Gateway::u_stream_on_eof(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client) { u_close(u); return; }
+        std::string sse_in;
+        if (client->stream_chunked) client->chunkdec.feed(u->rbuf, sse_in); // best-effort at EOF
+        else sse_in.swap(u->rbuf);
+        u->rbuf.clear();
+        if (!sse_in.empty()) client->sse->feed(sse_in, client->wpending);
+        if (!client->stream_ended) { client->sse->finish(client->wpending); client->stream_ended = true; }
+        u_stream_kick(client);
+    }
+
+    // Serialize sends: only one SEND SQE outstanding (concurrent sends on a fd would
+    // interleave). wbuf is (re)filled from wpending ONLY when idle, so its bytes stay
+    // put while the kernel reads them for an in-flight SEND — no realloc-under-kernel.
+    void Gateway::u_stream_kick(Connection* client) noexcept
+    {
+        if (client->send_inflight) return; // a send is already draining wbuf
+        if (client->wpending.empty())
+        {
+            if (client->stream_ended) u_finalize_stream(client); // nothing left + ended
+            return;
+        }
+        client->wbuf = std::move(client->wpending);
+        client->wpending.clear();
+        client->woff = 0;
+        client->send_inflight = true;
+        u_submit_send(client); // (closes the client on SQE exhaustion; nothing more to do)
+    }
+
+    void Gateway::u_finalize_stream(Connection* client) noexcept
+    {
+        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; u_close(u); }
+        ++_stats.requests; // streamed requests counted; latency histograms N/A
+        u_close(client);
     }
 
     int Gateway::run_uring()

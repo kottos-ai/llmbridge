@@ -112,6 +112,12 @@ namespace llmbridge
         bool read_paused = false;    // upstream EPOLLIN paused (client-write backpressure)
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
         http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
+        // io_uring streaming only: translated output accumulates in `wpending`
+        // while a client SEND SQE is in flight, so `wbuf` (the SEND's buffer) is
+        // never reallocated under the kernel's feet. `send_inflight` serializes
+        // sends (two concurrent SENDs on one fd would interleave).
+        std::string wpending;
+        bool send_inflight = false;
     };
 
     struct Stats
@@ -217,6 +223,13 @@ namespace llmbridge
         void u_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
         void u_on_response(Connection* u, const http::Message& m) noexcept;
         void u_finish_client(Connection* c) noexcept;
+        // io_uring streaming pump — completion-driven mirror of the epoll pump,
+        // with serialized sends (one SEND SQE in flight) and a bounded buffer.
+        void u_begin_stream(Connection* u, const http::ResponseHead& h) noexcept;
+        void u_stream_pump(Connection* u) noexcept;
+        void u_stream_on_eof(Connection* u) noexcept;
+        void u_stream_kick(Connection* client) noexcept; // send pending bytes, or finalize
+        void u_finalize_stream(Connection* client) noexcept;
         Connection* u_acquire_upstream() noexcept;
         void u_release_upstream(Connection* u) noexcept;
         // A pooled upstream failed before sending any response (it was almost
