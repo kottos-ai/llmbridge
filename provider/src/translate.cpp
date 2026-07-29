@@ -89,6 +89,10 @@ namespace llmbridge::provider
         }
         if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
         if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"top_p\":"; out += p; }
+        // Pass streaming through: Anthropic uses the same `stream` flag, so an
+        // OpenAI `stream:true` request becomes an Anthropic SSE response.
+        if (const json::Value* s = v.find("stream"); s && s->type == json::Value::Type::Bool && s->boolean)
+            out += ",\"stream\":true";
         out += ",\"messages\":";
         out += messages;
         out += "}";

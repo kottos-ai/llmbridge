@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +31,7 @@
 #include "gateway/metrics.hpp"
 #include "net/http.hpp"
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
+#include "provider/sse.hpp"
 #include "provider/translate.hpp"
 
 namespace llmbridge
@@ -98,6 +100,18 @@ namespace llmbridge
         // has this request already been retried once on a fresh connection.
         bool from_pool = false;
         bool retried = false;
+
+        // ── Streaming (SSE), held on the CLIENT conn for the active request ──
+        // Set when the upstream response is text/event-stream: the gateway then
+        // pumps (decode chunked -> translate -> write to client) instead of
+        // buffering a whole body. Streamed client responses are close-delimited.
+        bool streaming = false;
+        bool up_head_done = false;   // upstream response head parsed
+        bool stream_chunked = false; // upstream body uses chunked transfer-encoding
+        bool stream_ended = false;   // final [DONE] emitted; close once the client drains
+        bool read_paused = false;    // upstream EPOLLIN paused (client-write backpressure)
+        std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
+        http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
     };
 
     struct Stats
@@ -153,6 +167,15 @@ namespace llmbridge
         // Write the buffered response to the client; close out accounting.
         void respond(Connection* client) noexcept;
         void finish_client_response(Connection* c) noexcept;
+
+        // ── Streaming pump (epoll) ──────────────────────────────────────────
+        void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
+        void ep_resume_read(Connection* c) noexcept;  // restore EPOLLIN
+        void begin_stream(Connection* u, const http::ResponseHead& h) noexcept; // enter streaming
+        void stream_pump(Connection* u) noexcept;      // decode+translate new upstream body bytes
+        void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
+        void stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
+        void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
 
         Connection* acquire_upstream() noexcept;
         void release_upstream(Connection* u) noexcept;

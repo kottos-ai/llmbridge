@@ -195,6 +195,30 @@ namespace llmbridge
         c->write_armed = false;
     }
 
+    // Backpressure: pause/resume reading a connection. Used to stop pulling
+    // upstream SSE bytes while the client's write buffer is draining, so a slow
+    // client can't make us buffer an unbounded stream. (EPOLLHUP/EPOLLERR still
+    // fire while paused, so an upstream close is never missed.)
+    void Gateway::ep_pause_read(Connection* c) noexcept
+    {
+        if (c->read_paused) return;
+        epoll_event ev{};
+        ev.events = c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u;
+        ev.data.ptr = c;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+        c->read_paused = true;
+    }
+
+    void Gateway::ep_resume_read(Connection* c) noexcept
+    {
+        if (!c->read_paused) return;
+        epoll_event ev{};
+        ev.events = static_cast<uint32_t>(EPOLLIN) | (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
+        ev.data.ptr = c;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+        c->read_paused = false;
+    }
+
     bool Gateway::drain_read(Connection* c) noexcept
     {
         char tmp[16384];
@@ -468,13 +492,30 @@ namespace llmbridge
 
     void Gateway::on_upstream_readable(Connection* u) noexcept
     {
+        Connection* client = u->peer;
         if (!drain_read(u))
         {
-            if (u->peer == nullptr) close_upstream(u); // idle pooled conn dropped (eviction)
-            else if (!retry_upstream(u)) error_respond(u->peer, 502);
+            if (client && client->streaming) { stream_on_upstream_eof(u); return; }
+            if (client == nullptr) close_upstream(u); // idle pooled conn dropped (eviction)
+            else if (!retry_upstream(u)) error_respond(client, 502);
             return;
         }
-        if (u->peer == nullptr) return; // stray bytes on an idle pooled conn
+        if (client == nullptr) return; // stray bytes on an idle pooled conn
+
+        // Mid-stream: pump the newly-arrived body bytes and return.
+        if (client->streaming) { stream_pump(u); return; }
+
+        // First response bytes: for the Anthropic translate path, peek the head to
+        // decide whole-body vs streaming (text/event-stream). Other modes and
+        // non-streaming responses fall through to the whole-body path unchanged.
+        if (_translate == TranslateMode::Anthropic)
+        {
+            http::ResponseHead h;
+            const auto hs = http::parse_response_head(u->rbuf, h);
+            if (hs == http::HeadStatus::NeedMore) return;
+            if (hs == http::HeadStatus::Error) { error_respond(client, 502); return; }
+            if (h.event_stream) { begin_stream(u, h); return; }
+        }
 
         // Stamp just before framing so the response HTTP parse is counted in the
         // response-path overhead, without charging inter-packet network wait.
@@ -482,9 +523,8 @@ namespace llmbridge
         http::Message m;
         auto st = http::parse(u->rbuf, m);
         if (st == http::ParseStatus::NeedMore) return;
-        if (st == http::ParseStatus::Error) { error_respond(u->peer, 502); return; }
+        if (st == http::ParseStatus::Error) { error_respond(client, 502); return; }
 
-        Connection* client = u->peer;
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
 
         if (_translate != TranslateMode::None)
@@ -528,6 +568,7 @@ namespace llmbridge
 
     void Gateway::on_client_writable(Connection* c) noexcept
     {
+        if (c->streaming) { stream_flush(c); return; } // pump path has its own drain logic
         bool done = false;
         if (!pump_write(c, &done)) { abort_pair(c); return; }
         if (!done) { ep_arm_write(c); return; }
@@ -559,6 +600,111 @@ namespace llmbridge
         c->msg = http::Message{};
         if (close_now) { close_client(c); return; }
         on_client_readable(c); // service any pipelined next request already in rbuf
+    }
+
+    // ── Streaming pump (epoll, Anthropic->OpenAI SSE) ───────────────────────
+    // Enter streaming: the upstream response is text/event-stream. Send the
+    // client SSE headers (close-delimited) and translate the body as it arrives.
+    void Gateway::begin_stream(Connection* u, const http::ResponseHead& h) noexcept
+    {
+        Connection* client = u->peer;
+        client->streaming = true;
+        client->up_head_done = true;
+        client->stream_chunked = h.chunked;
+        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
+
+        // Client-facing SSE headers. Close-delimited: the response body ends when
+        // we close the socket, so no client-side chunk framing is needed.
+        client->wbuf =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        client->woff = 0;
+
+        u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
+        stream_pump(u);                 // translate any initial body + flush headers
+    }
+
+    // Decode + translate the upstream body bytes now sitting in u->rbuf, appending
+    // OpenAI SSE to the client's write buffer, then flush.
+    void Gateway::stream_pump(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client) { close_upstream(u); return; } // lost peer mid-stream
+
+        std::string sse_in;
+        if (client->stream_chunked)
+        {
+            if (!client->chunkdec.feed(u->rbuf, sse_in)) // malformed chunked framing
+            {
+                u->rbuf.clear();
+                client->sse->finish(client->wbuf); // still end the client stream cleanly
+                client->stream_ended = true;
+                stream_flush(client);
+                return;
+            }
+        }
+        else
+        {
+            sse_in.swap(u->rbuf); // raw (close-delimited) body
+        }
+        u->rbuf.clear();
+
+        if (!sse_in.empty()) client->sse->feed(sse_in, client->wbuf);
+        if (client->stream_chunked && client->chunkdec.done())
+        {
+            client->sse->finish(client->wbuf);
+            client->stream_ended = true;
+        }
+        stream_flush(client);
+    }
+
+    // Upstream closed the connection. Flush any buffered body, emit the terminal
+    // [DONE] if we haven't, and finalize.
+    void Gateway::stream_on_upstream_eof(Connection* u) noexcept
+    {
+        Connection* client = u->peer;
+        if (!client) { close_upstream(u); return; }
+
+        std::string sse_in;
+        if (client->stream_chunked) client->chunkdec.feed(u->rbuf, sse_in); // best-effort at EOF
+        else sse_in.swap(u->rbuf);
+        u->rbuf.clear();
+
+        if (!sse_in.empty()) client->sse->feed(sse_in, client->wbuf);
+        if (!client->stream_ended) { client->sse->finish(client->wbuf); client->stream_ended = true; }
+        stream_flush(client);
+    }
+
+    // Write buffered SSE to the client. If it doesn't all go, finish on writability
+    // and pause upstream reads (backpressure). On full flush, resume upstream — or
+    // finalize if the stream has ended.
+    void Gateway::stream_flush(Connection* client) noexcept
+    {
+        bool done = false;
+        if (!pump_write(client, &done)) { abort_pair(client); return; } // client gone
+        if (!done)
+        {
+            ep_arm_write(client);
+            if (client->peer && !client->peer->doomed) ep_pause_read(client->peer);
+            return;
+        }
+        client->wbuf.clear();
+        client->woff = 0;
+        ep_disarm_write(client);
+        if (client->stream_ended) { finalize_stream(client); return; }
+        if (client->peer && !client->peer->doomed) ep_resume_read(client->peer);
+    }
+
+    // Stream complete: drop the upstream (a just-streamed conn isn't pooled),
+    // count the request, and close the client (which delimits the SSE body).
+    void Gateway::finalize_stream(Connection* client) noexcept
+    {
+        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; close_upstream(u); }
+        ++_stats.requests; // streamed requests are counted; latency histograms N/A
+        close_client(client);
     }
 
     int Gateway::run()
