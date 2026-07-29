@@ -114,9 +114,19 @@ token-by-token, including the final usage chunk when the request sets
 `stream_options: {"include_usage": true}`. Both event-loop backends (epoll and
 io_uring) implement it, with back-pressure and an upstream idle timeout.
 
+**Direction.** Today `llmbridge` runs in **OpenAI-in** mode: your code speaks the
+OpenAI API and the gateway fronts a provider. (Each request is translated in both
+directions — OpenAI → provider on the way out, provider → OpenAI on the way back — so
+"forward/reverse" would be ambiguous; the mode is named for the API *your code* speaks.)
+**Anthropic-in** mode — an app written against the Anthropic SDK running unchanged
+against an OpenAI-compatible upstream — is planned, and is the harder direction because
+Anthropic's streaming protocol is richer, so the events must be synthesised rather than
+discarded.
+
 **Planned (Phase B):** tool calling (incl. streaming deltas), `tool_result`
-reconciliation, vision / image inputs, `cache_control`, AWS Bedrock, and streaming for
-the Gemini / Cohere dialects. Embeddings and audio (Whisper / TTS) are out of scope for now.
+reconciliation, vision / image inputs, `cache_control`, AWS Bedrock, streaming for the
+Gemini / Cohere dialects, and Anthropic-in mode. Embeddings and audio (Whisper / TTS)
+are out of scope for now.
 
 ## Installation
 

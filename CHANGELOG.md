@@ -9,8 +9,9 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Nothing yet. Next up: tool-call streaming, the reverse direction (OpenAI → Anthropic
-streams), and Gemini / Cohere streaming.
+Nothing yet. Next up: tool-call streaming, **Anthropic-in mode** (clients that speak
+the Anthropic API, fronting an OpenAI-compatible upstream), and Gemini / Cohere
+streaming.
 
 ## [0.3.0] — 2026-07-29
 

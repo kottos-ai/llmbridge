@@ -158,7 +158,9 @@ Stated plainly so there are no surprises:
 ## Roadmap
 
 - **Phase B:** tool calling, vision, `cache_control`, streaming for Gemini/Cohere,
-  language bindings. (Streaming SSE and structured HTTP error responses have landed:
+  **Anthropic-in mode** (client speaks Anthropic, upstream OpenAI-compatible — the
+  harder direction: Anthropic's richer event envelope must be synthesised from OpenAI's
+  flatter chunks), language bindings. (Streaming SSE and structured HTTP error responses have landed:
   the transport/dialect step is shared by both backends, upstream provider errors are
   relayed with their own status code, and an upstream idle timeout bounds stalls.)
 - **Phase C:** TLS, provider auth + per-provider endpoint routing, separate-host benchmark.
