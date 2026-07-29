@@ -1058,6 +1058,21 @@ namespace llmbridge
             // Upstream bytes are the response to the in-flight request. Stray data on
             // an idle pooled upstream (no peer) means it's unusable — drop it.
             if (!c->peer) { u_close(c); return; }
+
+            // Streaming (SSE) responses aren't handled on the io_uring backend yet
+            // (the pump lives only in the epoll loop). Detect a text/event-stream
+            // response and fail cleanly with a 502 rather than mis-framing it — the
+            // epoll pump handles streaming; io_uring streaming is a follow-up. Peek
+            // the head first (parse_response_head tolerates chunked, unlike parse()).
+            if (_translate == TranslateMode::Anthropic)
+            {
+                http::ResponseHead h;
+                const auto hs = http::parse_response_head(c->rbuf, h);
+                if (hs == http::HeadStatus::NeedMore) return; // wait for the full head
+                if (hs == http::HeadStatus::Error) { u_error_respond(c->peer, 502); return; }
+                if (h.event_stream) { u_error_respond(c->peer, 502); return; } // TODO(uring streaming)
+            }
+
             http::Message m;
             const auto st = http::parse(c->rbuf, m);
             if (st == http::ParseStatus::NeedMore) return; // armed recv delivers the rest
