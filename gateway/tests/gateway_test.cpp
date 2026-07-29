@@ -1533,3 +1533,24 @@ TEST_F(ProxyIT, StreamingSurvivesTrickledUpstream)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
+
+// A streaming request on the io_uring backend must NOT hang: the io_uring pump
+// isn't implemented, so it either rejects the SSE response with a clean 502
+// (guard) or — if io_uring is unavailable and the backend fell back to epoll —
+// streams normally. Robust across environments: we require a prompt, non-empty
+// response either way.
+TEST_F(ProxyIT, StreamingOnUringDoesNotHang)
+{
+    _backend.set_response(sse_chunked_response(4096));
+    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Uring);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string raw = c.recv_all(3000);
+    ASSERT_FALSE(raw.empty()) << "streaming request on io_uring hung (no response)";
+    const bool guarded = raw.find(" 502 ") != std::string::npos;              // io_uring guard
+    const bool streamed = raw.find("text/event-stream") != std::string::npos; // epoll fallback
+    EXPECT_TRUE(guarded || streamed) << raw.substr(0, 160);
+    c.close();
+    shutdown();
+}
