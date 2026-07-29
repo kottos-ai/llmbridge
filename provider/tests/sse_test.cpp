@@ -73,10 +73,14 @@ namespace
         return v;
     }
 
+    // A fixed `created` so byte-exact comparisons are deterministic (the wall
+    // clock would otherwise make two runs differ across a 1-second boundary).
+    constexpr long long kFixedCreated = 1785280000;
+
     // Feed the whole input in one shot.
     std::string translate_whole(std::string_view in)
     {
-        AnthropicToOpenAiSse t;
+        AnthropicToOpenAiSse t(kFixedCreated);
         std::string out;
         t.feed(in, out);
         t.finish(out);
@@ -86,7 +90,7 @@ namespace
     // Feed the input one byte at a time — worst-case fragmentation.
     std::string translate_byte_by_byte(std::string_view in)
     {
-        AnthropicToOpenAiSse t;
+        AnthropicToOpenAiSse t(kFixedCreated);
         std::string out;
         for (char c : in) t.feed(std::string_view(&c, 1), out);
         t.finish(out);

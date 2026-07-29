@@ -13,9 +13,10 @@ if (NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     return()
 endif ()
 
-# json.hpp and http.hpp are header-only; link the module libs purely for their
-# PUBLIC include dirs. Sanitize with fuzzer + ASan + UBSan for the sharpest signal.
-foreach (tgt json http)
+# Sanitize with fuzzer + ASan + UBSan for the sharpest signal. json.hpp/http.hpp
+# are header-only (linked for their PUBLIC include dirs); the SSE translator is
+# compiled into `provider`, so fuzz_sse links it for the object too.
+foreach (tgt json http sse)
     add_executable(fuzz_${tgt} fuzz_${tgt}.cpp)
     target_compile_options(fuzz_${tgt} PRIVATE -g -O1 -fsanitize=fuzzer,address,undefined)
     target_link_options(fuzz_${tgt} PRIVATE -fsanitize=fuzzer,address,undefined)
@@ -23,3 +24,4 @@ endforeach ()
 
 target_link_libraries(fuzz_json PRIVATE provider) # provider/include (json.hpp)
 target_link_libraries(fuzz_http PRIVATE net)      # net/include (http.hpp)
+target_link_libraries(fuzz_sse PRIVATE provider)  # provider/sse.hpp + compiled sse.cpp

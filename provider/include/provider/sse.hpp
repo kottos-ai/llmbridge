@@ -38,6 +38,13 @@ namespace llmbridge::provider
         static constexpr size_t kMaxPending = 1 << 20;  // 1 MiB: longest single line
         static constexpr size_t kMaxEvent = 4 << 20;    // 4 MiB: one event's data
 
+        // `created_secs` is the OpenAI `created` epoch stamp, held constant across
+        // every chunk of the stream (OpenAI's own invariant). Default (-1) means
+        // "stamp it once, lazily, from the wall clock" — the production path. Pass
+        // a fixed value to make the output fully deterministic (tests, and so the
+        // gateway can align a stream's `created` with its non-streaming path).
+        explicit AnthropicToOpenAiSse(long long created_secs = -1) : _created_secs(created_secs) {}
+
         // Feed raw upstream SSE bytes; append translated OpenAI SSE to `out`. An
         // incomplete trailing event is buffered internally until the next call.
         // Odd-but-skippable upstream data (unknown event types, unparseable data
@@ -53,6 +60,7 @@ namespace llmbridge::provider
 
     private:
         void dispatch(std::string_view data, std::string& out);
+        void ensure_created();                               // stamp _created once
         void emit_head(std::string& out);                    // up to `"delta":{`
         void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
 
@@ -64,7 +72,8 @@ namespace llmbridge::provider
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
         std::string _model;                     // from message_start
-        std::string _created;                   // epoch seconds, set once
+        std::string _created;                   // epoch seconds as text, set once
+        long long _created_secs = -1;           // fixed stamp, or -1 => wall clock
         const char* _finish = nullptr;          // mapped stop_reason (static literal)
         bool _role_emitted = false;
         bool _finish_emitted = false;

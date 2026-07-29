@@ -58,11 +58,21 @@ namespace llmbridge::provider
         }
     } // namespace
 
+    // Stamp `created` exactly once: a fixed value if one was supplied, else the
+    // wall clock. Constant across every chunk of the stream thereafter.
+    void AnthropicToOpenAiSse::ensure_created()
+    {
+        if (!_created.empty()) return;
+        const long long secs = _created_secs >= 0 ? _created_secs
+                                                   : static_cast<long long>(std::time(nullptr));
+        _created = std::to_string(secs);
+    }
+
     // Chunk envelope: everything up to the open of the delta object. Callers then
     // append the delta body (e.g. "content":"...") and call emit_tail().
     void AnthropicToOpenAiSse::emit_head(std::string& out)
     {
-        if (_created.empty()) _created = std::to_string(static_cast<long long>(std::time(nullptr)));
+        ensure_created();
         out += "data: {\"id\":\"";
         out += _id; // raw (already JSON-safe) span from message_start, or the default
         out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
@@ -98,7 +108,7 @@ namespace llmbridge::provider
                 if (const std::string_view id = m->str_or("id"); !id.empty()) _id = sanitized(id);
                 _model = sanitized(m->str_or("model"));
             }
-            if (_created.empty()) _created = std::to_string(static_cast<long long>(std::time(nullptr)));
+            ensure_created();
             if (!_role_emitted) // OpenAI's first chunk carries the assistant role
             {
                 emit_head(out);
@@ -159,17 +169,25 @@ namespace llmbridge::provider
     {
         if (_failed) return false; // sticky: a capped stream stays dead
 
+        // The tail retained from the previous call is known to contain no '\n',
+        // so resume the newline search at the join point rather than rescanning
+        // it. Without this, feeding one long line one byte at a time is O(n^2) —
+        // a hostile upstream dribbling bytes could pin a core (CPU-DoS the byte
+        // caps don't cover). With it, total scanning is O(bytes) regardless of
+        // how the stream is fragmented.
+        size_t from = _pending.size();
         _pending.append(bytes);
 
         size_t pos = 0;
         while (true)
         {
-            const size_t nl = _pending.find('\n', pos);
+            const size_t nl = _pending.find('\n', from);
             if (nl == std::string::npos) break; // no complete line yet; keep the remainder
 
             std::string_view line(_pending.data() + pos, nl - pos);
             if (!line.empty() && line.back() == '\r') line.remove_suffix(1); // tolerate CRLF
             pos = nl + 1;
+            from = pos;
 
             if (line.empty()) // blank line terminates an event
             {
