@@ -151,6 +151,8 @@ int main(int argc, char** argv)
         const llmbridge::Stats& s = g->stats();
         agg.requests += s.requests;
         agg.errors += s.errors;
+        agg.upstream_timeouts += s.upstream_timeouts;
+        agg.stream_pauses += s.stream_pauses;
         agg.upstream_conns_opened += s.upstream_conns_opened;
         agg.upstream_retries += s.upstream_retries;
         agg.overhead.merge(s.overhead);
@@ -159,6 +161,8 @@ int main(int argc, char** argv)
     }
     std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
+    std::fprintf(stderr, "timeouts=%llu  stream_pauses=%llu\n",
+                 (unsigned long long)agg.upstream_timeouts, (unsigned long long)agg.stream_pauses);
     std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  retries=%llu\n",
                  (unsigned long long)agg.requests, (unsigned long long)agg.errors,
                  (unsigned long long)agg.upstream_conns_opened, (unsigned long long)agg.upstream_retries);

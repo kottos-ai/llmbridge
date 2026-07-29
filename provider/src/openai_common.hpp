@@ -20,6 +20,29 @@
 
 namespace llmbridge::provider::detail
 {
+    // Append a raw (already JSON-escaped) span, neutralising C0 control bytes as
+    // \u00XX. Our JSON parser is lenient and accepts a literal control char inside
+    // a string, so a passthrough span from an untrusted upstream can carry bytes
+    // that are ILLEGAL in strict JSON (RFC 8259 §7) — emitting them would make our
+    // own output unparseable to a strict client. Bulk-copies the clean runs, so
+    // the common (control-free) case is a memcpy.
+    inline void append_sanitized(std::string& out, std::string_view raw)
+    {
+        static const char* hex = "0123456789abcdef";
+        size_t start = 0;
+        for (size_t i = 0; i < raw.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(raw[i]);
+            if (c >= 0x20) continue;                   // ordinary byte; keep scanning
+            out.append(raw.data() + start, i - start); // flush the clean run
+            out += "\\u00";
+            out += hex[(c >> 4) & 0xF];
+            out += hex[c & 0xF];
+            start = i + 1;
+        }
+        out.append(raw.data() + start, raw.size() - start);
+    }
+
     // Parse a JSON number's raw text. Returns 0 for empty/garbage — usage counts
     // are advisory, so a malformed one must not fail a translation.
     inline long long to_ll(std::string_view s)

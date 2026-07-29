@@ -153,11 +153,15 @@ namespace llmbridge::provider
             if (message.empty()) message = v.str_or("message");
         }
 
+        // Both spans come from an UNTRUSTED upstream body and our parser is
+        // lenient about control bytes, so sanitize on the way out — same rule the
+        // SSE passthrough follows. Otherwise a provider could make our own error
+        // envelope unparseable to a strict client.
         std::string out = "{\"error\":{\"message\":\"";
         if (message.empty()) out += "upstream provider error";
-        else out += message; // raw (already-escaped) span: zero-copy passthrough
+        else detail::append_sanitized(out, message);
         out += "\",\"type\":\"";
-        out += type;
+        detail::append_sanitized(out, type);
         out += "\",\"code\":null}}";
         return out;
     }

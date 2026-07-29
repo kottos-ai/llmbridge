@@ -18,13 +18,14 @@
 
 > **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottos.ai) (see the bottom of this README).
 
-**Current provider support — non-streaming chat completions:**
+**Current provider support — chat completions (streaming and non-streaming):**
 
 - ✅ OpenAI ↔ Anthropic
 - ✅ OpenAI ↔ Google Gemini
 - ✅ OpenAI ↔ Cohere
 - ✅ OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral, …) — passthrough, no body translation needed
-- 🚧 Streaming (SSE), tool calling, vision, `cache_control`, AWS Bedrock — planned (Phase B)
+- ✅ Streaming (SSE, token-by-token) — OpenAI ↔ Anthropic, incl. `stream_options.include_usage`
+- 🚧 Tool calling, vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere — planned (Phase B)
 
 ## Benchmarks
 
@@ -72,6 +73,7 @@ Run the binary in front of an upstream and translate on the fly:
 ```sh
 llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
 #                                                  --translate none|anthropic|gemini|cohere
+#          --upstream-timeout 120   # seconds of upstream silence before aborting (0 = off)
 ```
 
 Clients POST OpenAI-shaped requests to `:8088`; `llmbridge` translates to the upstream
@@ -93,7 +95,7 @@ Python (`pybind11`), Go (`cgo`), and Rust (FFI) bindings are on the roadmap and
 
 ## What's supported
 
-Today — **non-streaming chat completions**, via `--translate` or the `provider::` API:
+Today — **chat completions**, via `--translate` or the `provider::` API:
 
 | Provider dialect | OpenAI → provider | provider → OpenAI |
 |---|---|---|
@@ -106,9 +108,15 @@ Per-dialect coverage is the common chat path: model, system prompt, user/assista
 turns, `max_tokens` / `temperature` / `top_p`; and on the response, content /
 finish-reason / usage.
 
-**Planned (Phase B):** streaming (SSE, token-by-token), tool calling (incl. streaming
-deltas), `tool_result` reconciliation, vision / image inputs, `cache_control`, and
-AWS Bedrock. Embeddings and audio (Whisper / TTS) are out of scope for now.
+**Streaming (SSE)** is supported for OpenAI ⇄ Anthropic: send `"stream": true` and the
+gateway translates the Anthropic event stream into OpenAI `chat.completion.chunk`s
+token-by-token, including the final usage chunk when the request sets
+`stream_options: {"include_usage": true}`. Both event-loop backends (epoll and
+io_uring) implement it, with back-pressure and an upstream idle timeout.
+
+**Planned (Phase B):** tool calling (incl. streaming deltas), `tool_result`
+reconciliation, vision / image inputs, `cache_control`, AWS Bedrock, and streaming for
+the Gemini / Cohere dialects. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
 ## Installation
 
@@ -152,7 +160,7 @@ _Python / Go / Rust packages are planned — see [Language bindings (planned)](#
 - **Hand-rolled, dependency-free JSON.** A small recursive-descent parser into an ordered DOM plus a string-append builder — scoped to the chat-completion shapes we translate, not a general-purpose library. No `nlohmann::json`, `jsoncpp`, or `simdjson` in the shipped binary.
 - **Hardened, fuzzed parsers.** Both hand-rolled parsers are continuously **fuzzed** under ASan/UBSan (see [`fuzz/`](./fuzz)): the JSON parser is depth-limited (no stack-overflow bombs), request bodies are size-capped, and the HTTP framer is smuggling-safe — Content-Length only, with `Transfer-Encoding` and conflicting duplicate `Content-Length` rejected.
 - **No GC pauses** (it's C++). Tail latency is bounded by `malloc`, not garbage collection.
-- **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~90k RPS; scale out with `SO_REUSEPORT`. (Token-by-token SSE streaming is on the Phase B roadmap.)
+- **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~90k RPS (non-streaming); scale out with `SO_REUSEPORT`. Token-by-token SSE streaming runs on the same loop, with client back-pressure and an upstream idle timeout.
 
 The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules, and [DESIGN.md](./DESIGN.md) for the full architecture, threading/memory model, and benchmark methodology.
 

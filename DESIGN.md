@@ -145,7 +145,8 @@ Reproduce: `./bench/run_headtohead.sh` and `./bench/saturate.sh`.
 
 Stated plainly so there are no surprises:
 
-- **No streaming.** Non-streaming chat completions only; token-by-token SSE is Phase B.
+- **Streaming (SSE) is supported** for OpenAI ⇄ Anthropic only — Gemini/Cohere streaming
+  is Phase B. A streamed client response is close-delimited.
 - **No TLS, no provider auth, no per-provider URL routing.** Translate mode targets a
   local/mock/already-proxied upstream — it can't call `api.anthropic.com` directly yet
   (Phase C). This is also why the benchmark runs against a mock.
@@ -156,7 +157,8 @@ Stated plainly so there are no surprises:
 
 ## Roadmap
 
-- **Phase B:** streaming SSE (and the state-machine extraction that keeps the epoll/uring
-  backends from duplicating it), tool calling, vision, `cache_control`, structured HTTP
-  error responses, language bindings.
+- **Phase B:** tool calling, vision, `cache_control`, streaming for Gemini/Cohere,
+  language bindings. (Streaming SSE and structured HTTP error responses have landed:
+  the transport/dialect step is shared by both backends, upstream provider errors are
+  relayed with their own status code, and an upstream idle timeout bounds stalls.)
 - **Phase C:** TLS, provider auth + per-provider endpoint routing, separate-host benchmark.

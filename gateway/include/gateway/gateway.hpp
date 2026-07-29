@@ -109,7 +109,6 @@ namespace llmbridge
         // pumps (decode chunked -> translate -> write to client) instead of
         // buffering a whole body. Streamed client responses are close-delimited.
         bool streaming = false;
-        bool up_head_done = false;   // upstream response head parsed
         bool stream_chunked = false; // upstream body uses chunked transfer-encoding
         bool stream_ended = false;   // final [DONE] emitted; close once the client drains
         bool read_paused = false;    // upstream EPOLLIN paused (client-write backpressure)
