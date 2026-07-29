@@ -18,13 +18,6 @@ namespace llmbridge::provider
 {
     namespace
     {
-        long long to_ll(std::string_view s)
-        {
-            long long v = 0;
-            std::from_chars(s.data(), s.data() + s.size(), v);
-            return v;
-        }
-
         // Append the raw (already JSON-escaped) text of a content field — a plain
         // string, or an array of {type:"text",text:...} parts — to `out`, WITHOUT
         // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
@@ -112,8 +105,8 @@ namespace llmbridge::provider
         long long in_tok = 0, out_tok = 0;
         if (const json::Value* u = v.find("usage"))
         {
-            in_tok = to_ll(u->num_or("input_tokens", "0"));
-            out_tok = to_ll(u->num_or("output_tokens", "0"));
+            in_tok = detail::to_ll(u->num_or("input_tokens", "0"));
+            out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
         }
 
         std::string out = "{\"id\":";
@@ -167,6 +160,20 @@ namespace llmbridge::provider
         out += type;
         out += "\",\"code\":null}}";
         return out;
+    }
+
+    bool openai_wants_stream_usage(std::string_view openai_body)
+    {
+        // Fail fast: the field is absent from virtually every request, and a
+        // substring miss costs one scan instead of a full parse.
+        if (openai_body.find("include_usage") == std::string_view::npos) return false;
+        bool ok = false;
+        json::Value v = json::parse(openai_body, ok);
+        if (!ok || !v.is_object()) return false;
+        const json::Value* so = v.find("stream_options");
+        if (!so || !so->is_object()) return false;
+        const json::Value* iu = so->find("include_usage");
+        return iu && iu->type == json::Value::Type::Bool && iu->boolean;
     }
 
     // ── Google Gemini (generateContent) ─────────────────────────────────────
@@ -257,9 +264,9 @@ namespace llmbridge::provider
         long long in_tok = 0, out_tok = 0, total = 0;
         if (const json::Value* u = v.find("usageMetadata"))
         {
-            in_tok = to_ll(u->num_or("promptTokenCount", "0"));
-            out_tok = to_ll(u->num_or("candidatesTokenCount", "0"));
-            total = to_ll(u->num_or("totalTokenCount", "0"));
+            in_tok = detail::to_ll(u->num_or("promptTokenCount", "0"));
+            out_tok = detail::to_ll(u->num_or("candidatesTokenCount", "0"));
+            total = detail::to_ll(u->num_or("totalTokenCount", "0"));
         }
         if (total == 0) total = in_tok + out_tok;
 
@@ -331,8 +338,8 @@ namespace llmbridge::provider
         if (const json::Value* u = v.find("usage"))
             if (const json::Value* t = u->find("tokens"))
             {
-                in_tok = to_ll(t->num_or("input_tokens", "0"));
-                out_tok = to_ll(t->num_or("output_tokens", "0"));
+                in_tok = detail::to_ll(t->num_or("input_tokens", "0"));
+                out_tok = detail::to_ll(t->num_or("output_tokens", "0"));
             }
 
         std::string out = "{\"id\":";

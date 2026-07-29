@@ -527,6 +527,9 @@ namespace llmbridge
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
             if (tbody.empty()) { error_respond(c, 400); return; }
+            // Remember whether the client asked for a final usage chunk — the
+            // request bytes are consumed below, but the stream needs it later.
+            c->wants_usage = provider::openai_wants_stream_usage(body);
             upstream_bytes = build_http(start_line, tbody);
         }
         else
@@ -732,7 +735,7 @@ namespace llmbridge
         client->streaming = true;
         client->up_head_done = true;
         client->stream_chunked = h.chunked;
-        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
+        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wbuf.assign(kSseHead);
         client->woff = 0;
 
@@ -1271,6 +1274,7 @@ namespace llmbridge
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
             if (tbody.empty()) { u_error_respond(c, 400); return; }
+            c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             upstream_bytes = build_http(start_line, tbody);
         }
         else
@@ -1427,7 +1431,7 @@ namespace llmbridge
         client->streaming = true;
         client->up_head_done = true;
         client->stream_chunked = h.chunked;
-        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
+        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wpending.assign(kSseHead);
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         u_stream_pump(u);

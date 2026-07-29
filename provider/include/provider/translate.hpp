@@ -48,6 +48,12 @@ namespace llmbridge::provider
     // as the type — so the caller can always relay the upstream's status code.
     std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
 
+    // True if a streaming OpenAI request asked for the final usage chunk
+    // (`stream_options: {"include_usage": true}`). Cheap on the hot path: a
+    // substring pre-check short-circuits the parse for the common case where the
+    // field is absent entirely.
+    bool openai_wants_stream_usage(std::string_view openai_body);
+
     // ── Google Gemini (generateContent) ─────────────────────────────────────
     // OpenAI chat-completion request body  ->  Gemini generateContent body.
     std::string openai_to_gemini_request(std::string_view openai_body);

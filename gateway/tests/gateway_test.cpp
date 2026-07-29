@@ -1725,6 +1725,55 @@ INSTANTIATE_TEST_SUITE_P(
         return std::string(be_name(std::get<0>(i.param))) + "_" + std::to_string(std::get<1>(i.param));
     });
 
+// stream_options.include_usage: the client must receive a final usage chunk
+// carrying the provider's real token counts, just before [DONE].
+TEST_P(ProxyStream, IncludeUsageEmitsFinalUsageChunk)
+{
+    const std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-3-5-sonnet\","
+        "\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+        "{\"type\":\"text_delta\",\"text\":\"Hello, world\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+        "\"usage\":{\"output_tokens\":9}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 4096));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"include_usage\":true},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
+
+    const std::string raw = c.recv_all();
+    const Streamed s = parse_streamed(raw);
+    EXPECT_EQ(s.content, "Hello, world");
+    EXPECT_TRUE(s.done);
+    // The real provider counts reached the client.
+    EXPECT_NE(raw.find("\"prompt_tokens\":13"), std::string::npos) << raw.substr(0, 400);
+    EXPECT_NE(raw.find("\"completion_tokens\":9"), std::string::npos);
+    EXPECT_NE(raw.find("\"total_tokens\":22"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_P(ProxyStream, NoUsageChunkWhenNotRequested)
+{
+    _backend.set_response(sse_chunked_response(4096));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
+    const std::string raw = c.recv_all();
+    EXPECT_EQ(raw.find("prompt_tokens"), std::string::npos) << "usage must be opt-in";
+    EXPECT_TRUE(parse_streamed(raw).done);
+    c.close();
+    shutdown();
+}
+
 // ── Upstream idle timeouts ────────────────────────────────────────────────
 // A stalled provider must not pin the client + two fds forever.
 

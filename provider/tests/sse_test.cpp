@@ -367,6 +367,100 @@ TEST(Sse, CapOnEndlessEventRejects)
     EXPECT_FALSE(t.feed(huge, out));
 }
 
+// ── stream_options.include_usage ───────────────────────────────────────────
+namespace
+{
+    // Anthropic reports input tokens in message_start and CUMULATIVE output
+    // tokens in message_delta — this stream ends at 7 output tokens.
+    const char* kAnthropicWithUsage =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-3-5-sonnet\","
+        "\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+
+    std::string translate_usage(std::string_view in, bool include_usage)
+    {
+        AnthropicToOpenAiSse t(kFixedCreated, include_usage);
+        std::string out;
+        t.feed(in, out);
+        t.finish(out);
+        return out;
+    }
+} // namespace
+
+TEST(SseUsage, EmitsFinalUsageChunkBeforeDone)
+{
+    const auto p = data_payloads(translate_usage(kAnthropicWithUsage, /*include_usage=*/true));
+    ASSERT_GE(p.size(), 2u);
+    EXPECT_EQ(p.back(), "[DONE]");           // sentinel is last...
+    Value u = P(p[p.size() - 2]);            // ...and the usage chunk precedes it
+    const Value* usage = u.find("usage");
+    ASSERT_NE(usage, nullptr);
+    EXPECT_EQ(usage->num_or("prompt_tokens"), "11");     // from message_start
+    EXPECT_EQ(usage->num_or("completion_tokens"), "7");  // cumulative, from message_delta
+    EXPECT_EQ(usage->num_or("total_tokens"), "18");
+    // Per the OpenAI spec the usage chunk carries an EMPTY choices array.
+    const Value* ch = u.find("choices");
+    ASSERT_TRUE(ch && ch->is_array());
+    EXPECT_TRUE(ch->arr.empty());
+}
+
+TEST(SseUsage, NormalChunksCarryNullUsageWhenRequested)
+{
+    for (const auto& pay : data_payloads(translate_usage(kAnthropicWithUsage, true)))
+    {
+        if (pay == "[DONE]") continue;
+        Value v = P(pay);
+        const Value* ch = v.find("choices");
+        if (ch && ch->is_array() && !ch->arr.empty()) // a normal (non-usage) chunk
+        {
+            const Value* u = v.find("usage");
+            ASSERT_NE(u, nullptr) << "include_usage puts a usage key on every chunk";
+            EXPECT_EQ(u->type, Value::Type::Null) << "...and it is null on normal chunks";
+        }
+    }
+}
+
+TEST(SseUsage, OmittedEntirelyWhenNotRequested)
+{
+    const std::string out = translate_usage(kAnthropicWithUsage, /*include_usage=*/false);
+    EXPECT_EQ(out.find("\"usage\""), std::string::npos) << "no usage key unless asked";
+    const auto p = data_payloads(out);
+    EXPECT_EQ(p.back(), "[DONE]");
+    EXPECT_EQ(p.size(), 4u); // role, content, finish, [DONE] — no extra chunk
+}
+
+TEST(SseUsage, EmittedOnceEvenAtEofWithoutMessageStop)
+{
+    // Truncated stream: finish() must still produce usage-then-[DONE], exactly once.
+    std::string in(kAnthropicWithUsage);
+    in.erase(in.find("data: {\"type\":\"message_stop\"")); // drop message_stop
+    const std::string out = translate_usage(in, true);
+    EXPECT_EQ(out.find("[DONE]"), out.rfind("[DONE]"));               // one sentinel
+    EXPECT_EQ(out.find("prompt_tokens"), out.rfind("prompt_tokens")); // one usage chunk
+    const auto p = data_payloads(out);
+    EXPECT_EQ(p.back(), "[DONE]");
+    EXPECT_NE(P(p[p.size() - 2]).find("usage"), nullptr);
+}
+
+TEST(SseUsage, MissingUpstreamUsageYieldsZeros)
+{
+    // No usage anywhere upstream: still emit a well-formed chunk (zeros), never an
+    // estimate and never a malformed one.
+    const char* no_usage =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const auto p = data_payloads(translate_usage(no_usage, true));
+    Value u = P(p[p.size() - 2]);
+    const Value* usage = u.find("usage");
+    ASSERT_NE(usage, nullptr);
+    EXPECT_EQ(usage->num_or("prompt_tokens"), "0");
+    EXPECT_EQ(usage->num_or("total_tokens"), "0");
+}
+
 // ── Cross-path "reconstruction": stream-then-reassemble == translate-the-whole-body ─
 //
 // We have only the forward direction (Anthropic->OpenAI), so a true round-trip
@@ -398,19 +492,25 @@ namespace
                                  const std::vector<std::string>& deltas, const std::string& stop)
     {
         std::string s = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"" + id +
-                        "\",\"model\":\"" + model + "\"}}\n\n"
+                        "\",\"model\":\"" + model +
+                        "\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
                         "data: {\"type\":\"content_block_start\",\"index\":0,"
                         "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
         for (const auto& d : deltas)
             s += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
                  "{\"type\":\"text_delta\",\"text\":\"" + d + "\"}}\n\n";
         s += "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
-             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stop + "\"}}\n\n"
+             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stop +
+             "\"},\"usage\":{\"output_tokens\":5}}\n\n"
              "data: {\"type\":\"message_stop\"}\n\n";
         return s;
     }
 
-    struct Reassembled { std::string id, model, content, finish; };
+    struct Reassembled
+    {
+        std::string id, model, content, finish;
+        std::string prompt_tokens, completion_tokens, total_tokens; // from the usage chunk
+    };
 
     // Fold the emitted OpenAI chunk stream back into a whole completion.
     Reassembled reassemble(const std::string& out)
@@ -422,6 +522,13 @@ namespace
             if (pay == "[DONE]") continue;
             Value ch = P(pay); // named local: keep the DOM alive for find()
             if (first) { r.id.assign(ch.str_or("id")); r.model.assign(ch.str_or("model")); first = false; }
+            // The usage-only chunk has an EMPTY choices array; harvest it.
+            if (const Value* u = ch.find("usage"); u && u->is_object())
+            {
+                r.prompt_tokens.assign(u->num_or("prompt_tokens"));
+                r.completion_tokens.assign(u->num_or("completion_tokens"));
+                r.total_tokens.assign(u->num_or("total_tokens"));
+            }
             const Value* choices = ch.find("choices");
             if (!choices || !choices->is_array() || choices->arr.empty()) continue;
             const Value& c0 = choices->arr[0];
@@ -429,6 +536,16 @@ namespace
             if (const std::string_view fr = c0.str_or("finish_reason"); !fr.empty()) r.finish.assign(fr);
         }
         return r;
+    }
+
+    // Same as translate_whole, but asking for the final usage chunk.
+    std::string translate_whole_usage(std::string_view in)
+    {
+        AnthropicToOpenAiSse t(kFixedCreated, /*include_usage=*/true);
+        std::string out;
+        t.feed(in, out);
+        t.finish(out);
+        return out;
     }
 
     struct SsePayload { const char* name; std::string body; };
@@ -468,9 +585,24 @@ TEST(SseReconstruction, StreamReassemblesToWholeTranslation)
         EXPECT_EQ(r.model, std::string(w.str_or("model")));
         EXPECT_EQ(r.finish, std::string(w.find("choices")->arr[0].str_or("finish_reason")));
     }
-    // NOTE: `usage` is intentionally NOT cross-checked — the text-only streaming
-    // slice does not yet emit a usage chunk (OpenAI's include_usage). That's a
-    // known gap tracked for the next slice, not a bug here.
+}
+
+// The usage numbers must survive the streaming path identically to the whole-body
+// path: same provider counts, same OpenAI field names. (This closes the gap the
+// original reconstruction test could only note — streaming now emits usage.)
+TEST(SseReconstruction, UsageMatchesWholeTranslation)
+{
+    const std::string id = "msg_01", model = "claude-3-5-sonnet-20241022";
+    Value w = P(anthropic_to_openai_response(anthropic_body(id, model, "hi", "end_turn")));
+    const Value* wu = w.find("usage");
+    ASSERT_NE(wu, nullptr);
+
+    const Reassembled r =
+        reassemble(translate_whole_usage(anthropic_stream(id, model, {"hi"}, "end_turn")));
+    EXPECT_EQ(r.prompt_tokens, std::string(wu->num_or("prompt_tokens")));
+    EXPECT_EQ(r.completion_tokens, std::string(wu->num_or("completion_tokens")));
+    EXPECT_EQ(r.total_tokens, std::string(wu->num_or("total_tokens")));
+    EXPECT_EQ(r.total_tokens, "8"); // 3 in + 5 out, both paths
 }
 
 TEST(SseReconstruction, FinishReasonAgreesWithWholePath)

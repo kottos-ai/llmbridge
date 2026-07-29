@@ -13,12 +13,22 @@
 // paths can't drift: a new Anthropic stop_reason (or a change to how `created`
 // is stamped) must land identically for streaming and non-streaming.
 
+#include <charconv>
 #include <ctime>
 #include <string>
 #include <string_view>
 
 namespace llmbridge::provider::detail
 {
+    // Parse a JSON number's raw text. Returns 0 for empty/garbage — usage counts
+    // are advisory, so a malformed one must not fail a translation.
+    inline long long to_ll(std::string_view s)
+    {
+        long long v = 0;
+        std::from_chars(s.data(), s.data() + s.size(), v);
+        return v;
+    }
+
     // Current epoch seconds as text for the OpenAI `created` field. A bare 0
     // confuses some SDK clients; we synthesize "now", which is exactly OpenAI's
     // semantics. (time() is a fast vDSO read on Linux.)
