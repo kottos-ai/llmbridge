@@ -10,6 +10,7 @@
 // and every stream is replayed byte-by-byte to prove fragmentation-robustness.
 
 #include "provider/sse.hpp"
+#include "provider/translate.hpp" // cross-path reconstruction vs the whole-body translator
 
 #include <gtest/gtest.h>
 
@@ -364,4 +365,143 @@ TEST(Sse, CapOnEndlessEventRejects)
     // one complete data: line whose payload exceeds the per-event cap
     std::string huge = "data: " + std::string(AnthropicToOpenAiSse::kMaxEvent + 64, 'a') + "\n";
     EXPECT_FALSE(t.feed(huge, out));
+}
+
+// ── Cross-path "reconstruction": stream-then-reassemble == translate-the-whole-body ─
+//
+// We have only the forward direction (Anthropic->OpenAI), so a true round-trip
+// isn't possible yet. The strong analog is that the STREAMING path and the
+// NON-STREAMING path must agree: translating an Anthropic SSE stream and
+// reassembling its OpenAI chunks must recover exactly what
+// anthropic_to_openai_response() produces for the equivalent whole body. This
+// pins the two production paths together (the reason the shared helpers were
+// extracted) and — run over the same nasty escaping/UTF-8 payloads the request
+// reconstruction uses — proves the streaming raw-span passthrough is byte-faithful.
+
+namespace
+{
+    using llmbridge::provider::anthropic_to_openai_response;
+
+    // Anthropic non-streaming response with a single text block == `text_escaped`.
+    std::string anthropic_body(const std::string& id, const std::string& model,
+                               const std::string& text_escaped, const std::string& stop)
+    {
+        return "{\"id\":\"" + id + "\",\"model\":\"" + model +
+               "\",\"content\":[{\"type\":\"text\",\"text\":\"" + text_escaped +
+               "\"}],\"stop_reason\":\"" + stop +
+               "\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}";
+    }
+
+    // The equivalent Anthropic SSE stream: same id/model/stop, content delivered
+    // as `deltas` (each a valid escaped string, as Anthropic sends them).
+    std::string anthropic_stream(const std::string& id, const std::string& model,
+                                 const std::vector<std::string>& deltas, const std::string& stop)
+    {
+        std::string s = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"" + id +
+                        "\",\"model\":\"" + model + "\"}}\n\n"
+                        "data: {\"type\":\"content_block_start\",\"index\":0,"
+                        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        for (const auto& d : deltas)
+            s += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+                 "{\"type\":\"text_delta\",\"text\":\"" + d + "\"}}\n\n";
+        s += "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stop + "\"}}\n\n"
+             "data: {\"type\":\"message_stop\"}\n\n";
+        return s;
+    }
+
+    struct Reassembled { std::string id, model, content, finish; };
+
+    // Fold the emitted OpenAI chunk stream back into a whole completion.
+    Reassembled reassemble(const std::string& out)
+    {
+        Reassembled r;
+        bool first = true;
+        for (const auto& pay : data_payloads(out))
+        {
+            if (pay == "[DONE]") continue;
+            Value ch = P(pay); // named local: keep the DOM alive for find()
+            if (first) { r.id.assign(ch.str_or("id")); r.model.assign(ch.str_or("model")); first = false; }
+            const Value* choices = ch.find("choices");
+            if (!choices || !choices->is_array() || choices->arr.empty()) continue;
+            const Value& c0 = choices->arr[0];
+            if (const Value* d = c0.find("delta")) r.content += std::string(d->str_or("content"));
+            if (const std::string_view fr = c0.str_or("finish_reason"); !fr.empty()) r.finish.assign(fr);
+        }
+        return r;
+    }
+
+    struct SsePayload { const char* name; std::string body; };
+    std::vector<SsePayload> sse_payloads()
+    {
+        return {
+            {"plain", "hello world this is ordinary"},
+            {"escaped_quotes", R"(she said \"hi there\" then \"bye\")"},
+            {"backslashes", R"(path C:\\Users\\admin\\f.txt unc \\\\srv\\share)"},
+            {"escaped_newlines", R"(one\ntwo\nthree\nfour)"},
+            {"tabs_cr", R"(a\tb\tc\r\nd)"},
+            {"unicode_escapes", R"(café naïve 中文 ¡hola! — dash)"},
+            {"json_inside_string", R"({\"nested\":{\"k\":[1,2,3]}} as text)"},
+            {"all_escapes_mixed", R"(q=\" b=\\ n=\n t=\t r=\r done)"},
+            {"emoji_literal_utf8", "rocket \xF0\x9F\x9A\x80 sushi \xF0\x9F\x8D\xA3 done"},
+            {"adjacent_escapes", R"(\\\"\\\"\n\n\t\tABC)"},
+            {"only_escaped_quote", R"(\")"},
+        };
+    }
+} // namespace
+
+TEST(SseReconstruction, StreamReassemblesToWholeTranslation)
+{
+    const std::string id = "msg_01", model = "claude-3-5-sonnet-20241022";
+    for (const auto& p : sse_payloads())
+    {
+        SCOPED_TRACE(p.name);
+        const std::string whole = anthropic_to_openai_response(anthropic_body(id, model, p.body, "end_turn"));
+        ASSERT_FALSE(whole.empty());
+        Value w = P(whole);
+        const Value* wmsg = w.find("choices")->arr[0].find("message");
+
+        Reassembled r = reassemble(translate_whole(anthropic_stream(id, model, {p.body}, "end_turn")));
+        // The bytes both paths pass through must be identical (raw escaped span).
+        EXPECT_EQ(r.content, std::string(wmsg->str_or("content")));
+        EXPECT_EQ(r.id, std::string(w.str_or("id")));
+        EXPECT_EQ(r.model, std::string(w.str_or("model")));
+        EXPECT_EQ(r.finish, std::string(w.find("choices")->arr[0].str_or("finish_reason")));
+    }
+    // NOTE: `usage` is intentionally NOT cross-checked — the text-only streaming
+    // slice does not yet emit a usage chunk (OpenAI's include_usage). That's a
+    // known gap tracked for the next slice, not a bug here.
+}
+
+TEST(SseReconstruction, FinishReasonAgreesWithWholePath)
+{
+    const std::string id = "m", model = "x";
+    for (const char* stop : {"end_turn", "stop_sequence", "max_tokens", "tool_use"})
+    {
+        SCOPED_TRACE(stop);
+        Value w = P(anthropic_to_openai_response(anthropic_body(id, model, "hi", stop)));
+        const std::string whole_finish(w.find("choices")->arr[0].str_or("finish_reason"));
+        const std::string streamed_finish = reassemble(
+            translate_whole(anthropic_stream(id, model, {"hi"}, stop))).finish;
+        EXPECT_EQ(streamed_finish, whole_finish); // shared map => both paths agree
+    }
+}
+
+TEST(SseReconstruction, ContentSplitAcrossDeltasReassemblesWhole)
+{
+    const std::string id = "m", model = "x";
+    Reassembled one = reassemble(translate_whole(anthropic_stream(id, model, {"Hello, world!"}, "end_turn")));
+    Reassembled many = reassemble(translate_whole(
+        anthropic_stream(id, model, {"Hel", "lo, ", "wor", "ld!"}, "end_turn")));
+    EXPECT_EQ(one.content, "Hello, world!");
+    EXPECT_EQ(many.content, "Hello, world!"); // chunk boundaries don't change the message
+}
+
+// Guard against a tautological comparison: different content MUST reassemble
+// differently (so the equivalence tests above can actually fail).
+TEST(SseReconstruction, DetectsContentMismatch)
+{
+    const std::string a = reassemble(translate_whole(anthropic_stream("m", "x", {"original"}, "end_turn"))).content;
+    const std::string b = reassemble(translate_whole(anthropic_stream("m", "x", {"different"}, "end_turn"))).content;
+    EXPECT_NE(a, b);
 }

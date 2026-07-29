@@ -7,23 +7,22 @@
 
 #include "provider/sse.hpp"
 
-#include <ctime>
-
+#include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
 #include "provider/json.hpp"
+
+// NOTE (extract at second user): feed() below is two concerns bolted together —
+// (a) dialect-agnostic SSE *framing* (line splitting, the fragmentation buffer,
+// the byte caps, the O(n) resume-scan) and (b) Anthropic-specific *event mapping*
+// (dispatch -> OpenAI chunks). When the second streaming dialect lands (the
+// reverse direction, or Gemini/Cohere), lift (a) into a reusable SseFrameReader
+// with a per-dialect on_event() callback. Deliberately NOT abstracted yet:
+// with a single consumer the seams would be guesses. See CLAUDE.md — "no
+// premature abstraction".
 
 namespace llmbridge::provider
 {
     namespace
     {
-        // Anthropic stop_reason -> OpenAI finish_reason. Returns a static literal.
-        const char* map_stop_reason(std::string_view sr)
-        {
-            if (sr == "max_tokens") return "length";
-            if (sr == "tool_use") return "tool_calls";
-            // end_turn, stop_sequence, and anything else -> "stop"
-            return "stop";
-        }
-
         // Append a raw (already JSON-escaped) span, neutralizing control bytes.
         // Our lenient JSON parser accepts a literal control char (e.g. 0x0A)
         // inside a string, which strict JSON forbids — and a raw newline emitted
@@ -63,9 +62,7 @@ namespace llmbridge::provider
     void AnthropicToOpenAiSse::ensure_created()
     {
         if (!_created.empty()) return;
-        const long long secs = _created_secs >= 0 ? _created_secs
-                                                   : static_cast<long long>(std::time(nullptr));
-        _created = std::to_string(secs);
+        _created = _created_secs >= 0 ? std::to_string(_created_secs) : detail::created_now();
     }
 
     // Chunk envelope: everything up to the open of the delta object. Callers then
@@ -143,7 +140,7 @@ namespace llmbridge::provider
             // premature finish chunk.
             if (const json::Value* d = v.find("delta"))
                 if (const std::string_view sr = d->str_or("stop_reason"); !sr.empty())
-                    _finish = map_stop_reason(sr);
+                    _finish = detail::anthropic_finish_reason(sr);
             if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);
