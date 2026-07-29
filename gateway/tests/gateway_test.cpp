@@ -1478,10 +1478,14 @@ namespace
     }
 } // namespace
 
-TEST_F(ProxyIT, StreamingTranslatesAnthropicSseToOpenAiChunks)
+// The streaming correctness tests run on BOTH backends (epoll + io_uring). With
+// io_uring unavailable the Gateway falls back to epoll, so this is always safe.
+class ProxyStream : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyStream, TranslatesAnthropicSseToOpenAiChunks)
 {
     _backend.set_response(sse_chunked_response(4096)); // whole event body in one chunk
-    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    start(0, true, TranslateMode::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -1503,10 +1507,10 @@ TEST_F(ProxyIT, StreamingTranslatesAnthropicSseToOpenAiChunks)
     EXPECT_EQ(_gw->stats().requests, 1u);
 }
 
-TEST_F(ProxyIT, StreamingSurvivesTinyUpstreamChunks)
+TEST_P(ProxyStream, SurvivesTinyUpstreamChunks)
 {
     _backend.set_response(sse_chunked_response(5)); // 5-byte chunks: many decode/translate boundaries
-    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    start(0, true, TranslateMode::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -1518,11 +1522,11 @@ TEST_F(ProxyIT, StreamingSurvivesTinyUpstreamChunks)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
-TEST_F(ProxyIT, StreamingSurvivesTrickledUpstream)
+TEST_P(ProxyStream, SurvivesTrickledUpstream)
 {
     _backend.set_response(sse_chunked_response(9));
     _backend.set_trickle(2); // dribble the whole chunked response 2 bytes at a time
-    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    start(0, true, TranslateMode::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -1534,23 +1538,6 @@ TEST_F(ProxyIT, StreamingSurvivesTrickledUpstream)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
-// A streaming request on the io_uring backend must NOT hang: the io_uring pump
-// isn't implemented, so it either rejects the SSE response with a clean 502
-// (guard) or — if io_uring is unavailable and the backend fell back to epoll —
-// streams normally. Robust across environments: we require a prompt, non-empty
-// response either way.
-TEST_F(ProxyIT, StreamingOnUringDoesNotHang)
-{
-    _backend.set_response(sse_chunked_response(4096));
-    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Uring);
-    Client c;
-    ASSERT_TRUE(c.connect(_proxy_port));
-    ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string raw = c.recv_all(3000);
-    ASSERT_FALSE(raw.empty()) << "streaming request on io_uring hung (no response)";
-    const bool guarded = raw.find(" 502 ") != std::string::npos;              // io_uring guard
-    const bool streamed = raw.find("text/event-stream") != std::string::npos; // epoll fallback
-    EXPECT_TRUE(guarded || streamed) << raw.substr(0, 160);
-    c.close();
-    shutdown();
-}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
