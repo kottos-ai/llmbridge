@@ -133,6 +133,42 @@ namespace llmbridge::provider
         return out;
     }
 
+    std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type)
+    {
+        // Pull {type,message} from the shapes providers actually send:
+        //   Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
+        //   OpenAI-ish/Gemini: {"error":{"message":"...","type"|"status":"..."}}
+        // Anything unrecognised still yields a valid envelope (never empty), so the
+        // caller can always relay the upstream status instead of masking it as 502.
+        std::string_view type = fallback_type;
+        std::string_view message;
+        bool ok = false;
+        json::Value v = json::parse(body, ok);
+        if (ok && v.is_object())
+        {
+            const json::Value* e = v.find("error");
+            if (e && e->is_object())
+            {
+                if (std::string_view t = e->str_or("type"); !t.empty()) type = t;
+                else if (std::string_view s = e->str_or("status"); !s.empty()) type = s;
+                message = e->str_or("message");
+            }
+            else if (e && e->is_string()) // {"error":"some text"}
+            {
+                message = e->sv;
+            }
+            if (message.empty()) message = v.str_or("message");
+        }
+
+        std::string out = "{\"error\":{\"message\":\"";
+        if (message.empty()) out += "upstream provider error";
+        else out += message; // raw (already-escaped) span: zero-copy passthrough
+        out += "\",\"type\":\"";
+        out += type;
+        out += "\",\"code\":null}}";
+        return out;
+    }
+
     // ── Google Gemini (generateContent) ─────────────────────────────────────
 
     std::string openai_to_gemini_request(std::string_view openai_body)

@@ -298,6 +298,12 @@ namespace
                 _buf.append(tmp, static_cast<size_t>(n));
             }
         }
+        // HTTP status code of an already-received response ("HTTP/1.1 XYZ ...").
+        static int status_of(const std::string& r)
+        {
+            if (r.size() < 12 || r.compare(0, 5, "HTTP/") != 0) return 0;
+            return (r[9] - '0') * 100 + (r[10] - '0') * 10 + (r[11] - '0');
+        }
         // HTTP status code of the next framed response ("HTTP/1.1 XYZ ..."); 0 if
         // no response arrives (closed/timeout).
         int recv_status(int timeout_ms = 2000)
@@ -1537,6 +1543,165 @@ TEST_P(ProxyStream, SurvivesTrickledUpstream)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
+
+// Non-chunked (close-delimited) SSE upstream: some providers/proxies stream
+// without transfer-encoding and just close. The pump's non-chunked branch.
+TEST_P(ProxyStream, NonChunkedCloseDelimitedUpstream)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Connection: close\r\n\r\n" + anthropic_sse_events());
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    EXPECT_EQ(s.content, "Hello, world");
+    EXPECT_TRUE(s.done); // EOF finalizes the stream
+    c.close();
+    shutdown();
+}
+
+// Upstream truncates mid-stream (no message_stop, connection just drops): the
+// client still gets a well-formed terminal chunk + [DONE] so its SSE parser ends.
+TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
+{
+    const std::string ev = anthropic_sse_events();
+    const std::string cut = ev.substr(0, ev.find("event: message_delta")); // drop the tail
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Connection: close\r\n\r\n" + cut);
+    _backend.set_close_after_first(true); // the upstream really drops the connection
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    EXPECT_EQ(s.content, "Hello, world"); // everything received is delivered
+    EXPECT_TRUE(s.done);                  // finish() at EOF closes the stream cleanly
+    c.close();
+    shutdown();
+}
+
+// Corrupt chunked framing mid-stream must NOT fabricate a clean finish: the
+// client sees the partial content and an aborted stream (no [DONE]).
+TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
+{
+    const std::string ev = anthropic_sse_events();
+    const size_t half = ev.size() / 2;
+    std::string wire = sse_chunk_encode(ev.substr(0, half), 64);
+    wire.erase(wire.size() - 5);   // drop the 0-terminator
+    wire += "ZZZZ\r\ngarbage\r\n"; // invalid chunk-size line -> decoder error
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + wire);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    EXPECT_FALSE(s.done) << "corrupt framing must not emit a fabricated [DONE]";
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);   // counted as an error...
+    EXPECT_EQ(_gw->stats().requests, 0u); // ...not as a served request
+}
+
+// A streaming REQUEST whose upstream answers with a plain JSON completion (no
+// event-stream): the head-peek must fall through to the whole-body path.
+TEST_P(ProxyStream, StreamRequestWithNonStreamingUpstreamFallsBack)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("pong")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string body = body_of(c.recv_response());
+    EXPECT_NE(body.find("\"content\":\"pong\""), std::string::npos) << body;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// Client disconnects mid-stream: the gateway must tear the pair down and survive.
+TEST_P(ProxyStream, ClientDisconnectsMidStreamSurvives)
+{
+    _backend.set_response(sse_chunked_response(5));
+    _backend.set_trickle(2); // slow: the client leaves while the stream is live
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    for (int i = 0; i < 5; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << i;
+        ASSERT_TRUE(c.send(openai_stream_request("hi")));
+        c.close(); // abandon mid-stream
+    }
+    // The loop survived: a normal (non-streaming) request still works.
+    _backend.set_trickle(0);
+    _backend.set_response(http_ok(anthropic_resp_body("alive")));
+    Client good;
+    ASSERT_TRUE(good.connect(_proxy_port));
+    ASSERT_TRUE(good.send(openai_request("ping")));
+    EXPECT_NE(body_of(good.recv_response()).find("alive"), std::string::npos);
+    good.close();
+    shutdown();
+}
+
+// ── Upstream model/provider errors are relayed, not masked ─────────────────
+// A provider failure (rate limit, overloaded GPU, context length, auth) must
+// reach the client with the upstream's OWN status code and message.
+class ProxyUpstreamError
+    : public ProxyIT,
+      public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, int>>
+{
+};
+
+TEST_P(ProxyUpstreamError, RelaysStatusAndMessage)
+{
+    const auto [backend, status] = GetParam();
+    const std::string err =
+        R"({"type":"error","error":{"type":"overloaded_error","message":"Overloaded, retry"}})";
+    _backend.set_response("HTTP/1.1 " + std::to_string(status) + " Err\r\n"
+                          "Content-Type: application/json\r\nConnection: keep-alive\r\n"
+                          "Content-Length: " + std::to_string(err.size()) + "\r\n\r\n" + err);
+    start(0, true, TranslateMode::Anthropic, backend);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(c.status_of(resp), status) << "upstream status must be relayed, not masked as 502";
+    const std::string body = body_of(resp);
+    EXPECT_NE(body.find("overloaded_error"), std::string::npos) << body;   // real type
+    EXPECT_NE(body.find("Overloaded, retry"), std::string::npos) << body;  // real message
+    EXPECT_NE(body.find("\"error\""), std::string::npos);                  // OpenAI envelope
+    c.close();
+    shutdown();
+}
+
+// Same, but the provider sends the error as an event-stream (some do): it must be
+// relayed as an error, never laundered into a successful 200 stream.
+TEST_P(ProxyUpstreamError, EventStreamErrorIsNotLaunderedTo200)
+{
+    const auto [backend, status] = GetParam();
+    const std::string err = R"({"type":"error","error":{"type":"api_error","message":"boom"}})";
+    _backend.set_response("HTTP/1.1 " + std::to_string(status) + " Err\r\n"
+                          "Content-Type: text/event-stream\r\nConnection: keep-alive\r\n"
+                          "Content-Length: " + std::to_string(err.size()) + "\r\n\r\n" + err);
+    start(0, true, TranslateMode::Anthropic, backend);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(c.status_of(resp), 200) << "an error response must never become a 200 stream";
+    EXPECT_EQ(c.status_of(resp), status);
+    c.close();
+    shutdown();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Codes, ProxyUpstreamError,
+    ::testing::Combine(::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                       ::testing::Values(400, 401, 429, 500, 529)),
+    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, int>>& i) {
+        return std::string(be_name(std::get<0>(i.param))) + "_" + std::to_string(std::get<1>(i.param));
+    });
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),

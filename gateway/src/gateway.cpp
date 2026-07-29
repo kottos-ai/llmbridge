@@ -90,6 +90,95 @@ namespace llmbridge
             return out;
         }
 
+        // Client-facing SSE response head. The stream is close-delimited: the body
+        // ends when we close the socket, so no client-side chunk framing is needed.
+        constexpr std::string_view kSseHead =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        // Build a response that PRESERVES the upstream status code. Used to relay a
+        // provider's own failure (429 rate limit, 529 overloaded, 400 context
+        // length, 401 auth) to the client instead of flattening it to a gateway
+        // 502 — the client needs the real code to decide whether to back off/retry.
+        std::string build_http_status(int status, std::string_view reason, std::string_view body)
+        {
+            std::string out = "HTTP/1.1 " + std::to_string(status) + " ";
+            out.append(reason);
+            out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
+            out.append(std::to_string(body.size()));
+            out.append("\r\n\r\n");
+            out.append(body);
+            return out;
+        }
+
+        // A short reason phrase for the codes providers actually return.
+        const char* reason_for(int status)
+        {
+            switch (status)
+            {
+                case 400: return "Bad Request";
+                case 401: return "Unauthorized";
+                case 403: return "Forbidden";
+                case 404: return "Not Found";
+                case 408: return "Request Timeout";
+                case 413: return "Payload Too Large";
+                case 429: return "Too Many Requests";
+                case 500: return "Internal Server Error";
+                case 502: return "Bad Gateway";
+                case 503: return "Service Unavailable";
+                case 504: return "Gateway Timeout";
+                case 529: return "Overloaded";
+                default: return status < 500 ? "Client Error" : "Server Error";
+            }
+        }
+
+        // Outcome of one streaming translate step (shared by both backends).
+        enum class StreamStep
+        {
+            Ok,      // bytes translated (maybe none); stream continues
+            Ended,   // upstream signalled end; terminal [DONE] emitted
+            Corrupt, // malformed chunked framing — drop WITHOUT a fake clean [DONE]
+            Failed   // translator refused (cap tripped / protocol error) — drop
+        };
+
+        // The dialect/transport transform shared by the epoll and io_uring pumps:
+        // chunk-decode -> SSE-translate -> detect end. Lives in ONE place so a fix
+        // (e.g. honouring the translator's cap) can't land on one backend only; the
+        // backends keep their own idiomatic DELIVERY (flush+pause vs kick+cap).
+        // `in` is the upstream's raw buffer (consumed); `out` receives client SSE.
+        StreamStep stream_step(Connection* client, std::string& in, std::string& out, bool at_eof)
+        {
+            std::string sse_in;
+            if (client->stream_chunked)
+            {
+                const bool ok = client->chunkdec.feed(in, sse_in);
+                in.clear();
+                if (!ok) return StreamStep::Corrupt; // truncate honestly: no fake [DONE]
+            }
+            else
+            {
+                sse_in.swap(in);
+                in.clear();
+            }
+
+            // Honour the translator's own failure (its DoS caps are sticky): a
+            // hostile/broken upstream must tear the stream down, not silently
+            // produce nothing while we keep reading it forever.
+            if (!sse_in.empty() && !client->sse->feed(sse_in, out)) return StreamStep::Failed;
+
+            const bool ended = (client->stream_chunked && client->chunkdec.done()) || at_eof;
+            if (ended && !client->stream_ended)
+            {
+                if (!client->sse->finish(out)) return StreamStep::Failed;
+                client->stream_ended = true;
+                return StreamStep::Ended;
+            }
+            return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
+        }
+
         // Translate an upstream response body back to the OpenAI shape. Empty = bad.
         std::string xlate_resp(TranslateMode mode, std::string_view body)
         {
@@ -514,7 +603,11 @@ namespace llmbridge
             const auto hs = http::parse_response_head(u->rbuf, h);
             if (hs == http::HeadStatus::NeedMore) return;
             if (hs == http::HeadStatus::Error) { error_respond(client, 502); return; }
-            if (h.event_stream) { begin_stream(u, h); return; }
+            // Only a 200 carries a real event stream. A provider error (429 rate
+            // limit, 529 overloaded, 400 context length, 401 auth) must reach the
+            // client with ITS status — relayed below once the body is framed —
+            // never laundered into a 200 stream.
+            if (h.event_stream && h.status == 200) { begin_stream(u, h); return; }
         }
 
         // Stamp just before framing so the response HTTP parse is counted in the
@@ -530,6 +623,23 @@ namespace llmbridge
         if (_translate != TranslateMode::None)
         {
             std::string_view body(u->rbuf.data() + m.header_len, m.body_len);
+            // Relay a provider failure with ITS OWN status + message (rate limit,
+            // overloaded GPU, context length, auth) — translating a non-200 body as
+            // if it were a completion would fail and mask it as a generic 502.
+            http::ResponseHead h;
+            const bool have_head = http::parse_response_head(u->rbuf, h) == http::HeadStatus::Ok;
+            if (have_head && h.status != 0 && h.status != 200)
+            {
+                client->wbuf = build_http_status(
+                    h.status, reason_for(h.status),
+                    provider::upstream_error_to_openai(body, "upstream_error"));
+                client->woff = 0;
+                client->peer = nullptr;
+                if (m.keep_alive) release_upstream(u); else close_upstream(u);
+                ++_stats.errors;
+                respond(client);
+                return;
+            }
             std::string tbody = xlate_resp(_translate, body);
             if (tbody.empty())
             {
@@ -612,15 +722,7 @@ namespace llmbridge
         client->up_head_done = true;
         client->stream_chunked = h.chunked;
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
-
-        // Client-facing SSE headers. Close-delimited: the response body ends when
-        // we close the socket, so no client-side chunk framing is needed.
-        client->wbuf =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n";
+        client->wbuf.assign(kSseHead);
         client->woff = 0;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
@@ -634,47 +736,35 @@ namespace llmbridge
         Connection* client = u->peer;
         if (!client) { close_upstream(u); return; } // lost peer mid-stream
 
-        std::string sse_in;
-        if (client->stream_chunked)
+        const StreamStep st = stream_step(client, u->rbuf, client->wbuf, /*at_eof=*/false);
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
-            if (!client->chunkdec.feed(u->rbuf, sse_in)) // malformed chunked framing
-            {
-                u->rbuf.clear();
-                client->sse->finish(client->wbuf); // still end the client stream cleanly
-                client->stream_ended = true;
-                stream_flush(client);
-                return;
-            }
-        }
-        else
-        {
-            sse_in.swap(u->rbuf); // raw (close-delimited) body
-        }
-        u->rbuf.clear();
-
-        if (!sse_in.empty()) client->sse->feed(sse_in, client->wbuf);
-        if (client->stream_chunked && client->chunkdec.done())
-        {
-            client->sse->finish(client->wbuf);
+            // Truncate honestly: flush what we already translated, then close
+            // WITHOUT a terminal [DONE] so the client sees an aborted stream
+            // rather than a fabricated clean finish.
             client->stream_ended = true;
+            client->close_after_resp = true;
+            ++_stats.errors;
+            stream_flush(client);
+            return;
         }
         stream_flush(client);
     }
 
-    // Upstream closed the connection. Flush any buffered body, emit the terminal
+    // Upstream closed the connection: translate whatever remains, emit the terminal
     // [DONE] if we haven't, and finalize.
     void Gateway::stream_on_upstream_eof(Connection* u) noexcept
     {
         Connection* client = u->peer;
         if (!client) { close_upstream(u); return; }
 
-        std::string sse_in;
-        if (client->stream_chunked) client->chunkdec.feed(u->rbuf, sse_in); // best-effort at EOF
-        else sse_in.swap(u->rbuf);
-        u->rbuf.clear();
-
-        if (!sse_in.empty()) client->sse->feed(sse_in, client->wbuf);
-        if (!client->stream_ended) { client->sse->finish(client->wbuf); client->stream_ended = true; }
+        const StreamStep st = stream_step(client, u->rbuf, client->wbuf, /*at_eof=*/true);
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed)
+        {
+            client->stream_ended = true;
+            client->close_after_resp = true;
+            ++_stats.errors;
+        }
         stream_flush(client);
     }
 
@@ -703,7 +793,9 @@ namespace llmbridge
     void Gateway::finalize_stream(Connection* client) noexcept
     {
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; close_upstream(u); }
-        ++_stats.requests; // streamed requests are counted; latency histograms N/A
+        // Only a stream that terminated cleanly counts as a served request; an
+        // aborted one (close_after_resp) was already counted in _stats.errors.
+        if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
         close_client(client);
     }
 
@@ -1078,7 +1170,9 @@ namespace llmbridge
                 const auto hs = http::parse_response_head(c->rbuf, h);
                 if (hs == http::HeadStatus::NeedMore) return; // wait for the full head
                 if (hs == http::HeadStatus::Error) { u_error_respond(c->peer, 502); return; }
-                if (h.event_stream) { u_begin_stream(c, h); return; }
+                // Only a 200 is a real stream; a provider error is relayed with its
+                // own status by u_on_response below (never laundered into a 200).
+                if (h.event_stream && h.status == 200) { u_begin_stream(c, h); return; }
             }
 
             http::Message m;
@@ -1155,6 +1249,22 @@ namespace llmbridge
         if (_translate != TranslateMode::None)
         {
             std::string_view body(u->rbuf.data() + m.header_len, m.body_len);
+            // Relay a provider failure with ITS OWN status + message (see the epoll
+            // mirror): a 429/529/400 must not be flattened into a generic 502.
+            http::ResponseHead h;
+            const bool have_head = http::parse_response_head(u->rbuf, h) == http::HeadStatus::Ok;
+            if (have_head && h.status != 0 && h.status != 200)
+            {
+                client->wbuf = build_http_status(
+                    h.status, reason_for(h.status),
+                    provider::upstream_error_to_openai(body, "upstream_error"));
+                client->woff = 0;
+                client->peer = nullptr;
+                if (m.keep_alive) u_release_upstream(u); else u_close(u);
+                ++_stats.errors;
+                u_submit_send(client);
+                return;
+            }
             std::string tbody = xlate_resp(_translate, body);
             if (tbody.empty())
             {
@@ -1253,12 +1363,7 @@ namespace llmbridge
         client->up_head_done = true;
         client->stream_chunked = h.chunked;
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>();
-        client->wpending =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n";
+        client->wpending.assign(kSseHead);
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         u_stream_pump(u);
     }
@@ -1268,29 +1373,16 @@ namespace llmbridge
         Connection* client = u->peer;
         if (!client) { u_close(u); return; }
 
-        std::string sse_in;
-        if (client->stream_chunked)
+        const StreamStep st = stream_step(client, u->rbuf, client->wpending, /*at_eof=*/false);
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
-            if (!client->chunkdec.feed(u->rbuf, sse_in)) // malformed chunked framing
-            {
-                u->rbuf.clear();
-                client->sse->finish(client->wpending); // end the client stream cleanly
-                client->stream_ended = true;
-                u_stream_kick(client);
-                return;
-            }
-        }
-        else
-        {
-            sse_in.swap(u->rbuf); // raw (close-delimited) body
-        }
-        u->rbuf.clear();
-
-        if (!sse_in.empty()) client->sse->feed(sse_in, client->wpending);
-        if (client->stream_chunked && client->chunkdec.done())
-        {
-            client->sse->finish(client->wpending);
+            // Truncate honestly: no fabricated [DONE]. Flush what we have, then the
+            // finalize path closes the client (an aborted SSE body).
             client->stream_ended = true;
+            client->close_after_resp = true;
+            ++_stats.errors;
+            u_stream_kick(client);
+            return;
         }
         if (client->wpending.size() + client->wbuf.size() > kStreamBufCap) { u_abort_pair(client); return; }
         u_stream_kick(client);
@@ -1300,12 +1392,13 @@ namespace llmbridge
     {
         Connection* client = u->peer;
         if (!client) { u_close(u); return; }
-        std::string sse_in;
-        if (client->stream_chunked) client->chunkdec.feed(u->rbuf, sse_in); // best-effort at EOF
-        else sse_in.swap(u->rbuf);
-        u->rbuf.clear();
-        if (!sse_in.empty()) client->sse->feed(sse_in, client->wpending);
-        if (!client->stream_ended) { client->sse->finish(client->wpending); client->stream_ended = true; }
+        const StreamStep st = stream_step(client, u->rbuf, client->wpending, /*at_eof=*/true);
+        if (st == StreamStep::Corrupt || st == StreamStep::Failed)
+        {
+            client->stream_ended = true;
+            client->close_after_resp = true;
+            ++_stats.errors;
+        }
         u_stream_kick(client);
     }
 
@@ -1330,7 +1423,8 @@ namespace llmbridge
     void Gateway::u_finalize_stream(Connection* client) noexcept
     {
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; u_close(u); }
-        ++_stats.requests; // streamed requests counted; latency histograms N/A
+        // Only a cleanly-terminated stream counts as served (see the epoll mirror).
+        if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
         u_close(client);
     }
 

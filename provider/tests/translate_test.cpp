@@ -142,6 +142,53 @@ TEST(ReqXlate, OmitsStreamWhenAbsentOrFalse)
               nullptr);
 }
 
+// ── upstream error passthrough ──────────────────────────────────────────────
+TEST(UpstreamError, MapsAnthropicErrorEnvelope)
+{
+    // Anthropic overloaded (529) / rate limit (429) — the client must get the real
+    // type + message so it can back off, not a generic gateway failure.
+    Value out = P(llmbridge::provider::upstream_error_to_openai(
+        R"({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})", "upstream_error"));
+    const Value* e = out.find("error");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->str_or("type"), "overloaded_error");
+    EXPECT_EQ(e->str_or("message"), "Overloaded");
+}
+
+TEST(UpstreamError, MapsOpenAiStyleAndGeminiStatus)
+{
+    Value a = P(llmbridge::provider::upstream_error_to_openai(
+        R"({"error":{"message":"Rate limit reached","type":"rate_limit_error"}})", "upstream_error"));
+    EXPECT_EQ(a.find("error")->str_or("type"), "rate_limit_error");
+    EXPECT_EQ(a.find("error")->str_or("message"), "Rate limit reached");
+
+    // Gemini-style uses "status" instead of "type".
+    Value g = P(llmbridge::provider::upstream_error_to_openai(
+        R"({"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}})", "upstream_error"));
+    EXPECT_EQ(g.find("error")->str_or("type"), "RESOURCE_EXHAUSTED");
+    EXPECT_EQ(g.find("error")->str_or("message"), "Quota exceeded");
+}
+
+TEST(UpstreamError, UnparseableBodyStillYieldsValidEnvelope)
+{
+    // Never empty: the caller must always be able to relay the upstream status.
+    for (const char* body : {"", "not json at all", "<html>502</html>", "{}"})
+    {
+        Value out = P(llmbridge::provider::upstream_error_to_openai(body, "upstream_error"));
+        const Value* e = out.find("error");
+        ASSERT_NE(e, nullptr) << body;
+        EXPECT_EQ(e->str_or("type"), "upstream_error") << body;
+        EXPECT_FALSE(e->str_or("message").empty()) << body;
+    }
+}
+
+TEST(UpstreamError, PreservesEscapingInMessage)
+{
+    Value out = P(llmbridge::provider::upstream_error_to_openai(
+        R"({"error":{"type":"invalid_request_error","message":"bad \"quote\" and \\ slash"}})", "x"));
+    EXPECT_EQ(out.find("error")->str_or("message"), R"(bad \"quote\" and \\ slash)");
+}
+
 // ── response: Anthropic -> OpenAI ───────────────────────────────────────────
 TEST(RespXlate, JoinsTextBlocksToContent)
 {
