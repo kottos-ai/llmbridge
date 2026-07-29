@@ -90,6 +90,9 @@ namespace llmbridge
         int64_t ts_req_recvd = 0;
         int64_t ts_up_sent = 0;
         int64_t ts_up_recvd = 0;
+        // Last time this request saw ANY upstream progress (request forwarded, or
+        // bytes received). The idle-timeout sweep measures against this.
+        int64_t ts_up_activity = 0;
 
         // io_uring backend only: submitted-but-uncompleted SQEs referencing this
         // conn — it is freed only when this hits 0. (Multishot recv lands data in a
@@ -128,15 +131,25 @@ namespace llmbridge
         uint64_t requests = 0;
         uint64_t errors = 0;
         uint64_t upstream_conns_opened = 0;
-        uint64_t upstream_retries = 0; // stale pooled connection -> resent on a fresh one
+        uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
+        uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
+        uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
     };
 
     class Gateway
     {
     public:
+        // `upstream_idle_ns` bounds how long a request may sit with NO bytes from
+        // the upstream before the gateway gives up (0 = disabled). Without it a
+        // stalled provider pins a client connection and two fds forever — the
+        // classic slow-loris-by-upstream. Applies to the whole in-flight request
+        // and, once streaming, to the gap between events.
+        static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
+
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
-                IoBackend io = IoBackend::Auto);
+                IoBackend io = IoBackend::Auto,
+                int64_t upstream_idle_ns = kDefaultUpstreamIdleNs);
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -182,6 +195,12 @@ namespace llmbridge
         void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
         void stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
         void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
+
+        // Abort any request whose upstream has been silent for longer than
+        // _upstream_idle_ns. Runs on the loop's existing periodic tick (epoll's
+        // epoll_wait timeout / io_uring's timer CQE), so it costs nothing extra.
+        // `uring` selects the matching teardown primitives.
+        void sweep_idle(bool uring) noexcept;
 
         Connection* acquire_upstream() noexcept;
         void release_upstream(Connection* u) noexcept;
@@ -255,6 +274,8 @@ namespace llmbridge
         int64_t _warmup_ns;
         TranslateMode _translate;
         IoBackend _io;
+        int64_t _upstream_idle_ns; // 0 = no idle timeout
+        int64_t _last_sweep_ns = 0;
         bool _uring_active = false;
 
         int _epfd = -1;

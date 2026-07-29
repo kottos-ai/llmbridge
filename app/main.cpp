@@ -9,6 +9,7 @@
 //
 //   llmbridge [--listen PORT] [--upstream IP:PORT] [--duration SECONDS]
 //          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere]
+//          [--upstream-timeout SECONDS]
 //          [--io auto|epoll|uring]
 //
 // One self-contained event-loop class (llmbridge::Gateway) does everything:
@@ -50,6 +51,8 @@ int main(int argc, char** argv)
     uint16_t upstream_port = 9001;
     int duration = 0;
     double warmup = 0;
+    // Seconds of upstream silence before a request/stream is aborted (0 = off).
+    double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     int workers = 1;
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
@@ -76,6 +79,7 @@ int main(int argc, char** argv)
         }
         else if (a == "--duration") { if (const char* v = nextarg()) duration = std::atoi(v); }
         else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
+        else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--translate")
         {
@@ -103,6 +107,7 @@ int main(int argc, char** argv)
             std::printf("usage: %s [--listen PORT] [--upstream IP:PORT] "
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
+                        "[--upstream-timeout SECONDS] "
                         "[--io auto|epoll|uring] [--workers N]\n", argv[0]);
             return 0;
         }
@@ -115,10 +120,11 @@ int main(int argc, char** argv)
     // SO_REUSEPORT — the kernel load-balances connections across them. No locks on
     // the hot path; per-worker upstream pools and stats, merged at the end.
     const int64_t warmup_ns = static_cast<int64_t>(warmup * 1e9);
+    const int64_t up_timeout_ns = static_cast<int64_t>(up_timeout * 1e9);
     std::vector<std::unique_ptr<llmbridge::Gateway>> gateways;
     for (int i = 0; i < workers; ++i)
         gateways.push_back(std::make_unique<llmbridge::Gateway>(
-            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io));
+            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns));
     g_gateways = &gateways;
 
     std::signal(SIGINT, on_signal);
