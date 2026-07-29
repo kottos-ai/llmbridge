@@ -116,6 +116,32 @@ TEST(ReqXlate, PreservesModelString)
     EXPECT_EQ(out.str_or("model"), "claude-x");
 }
 
+TEST(ReqXlate, PassesStreamTrueThrough)
+{
+    // stream:true must survive to the Anthropic request, or the upstream never
+    // streams (and the gateway's SSE pump never engages).
+    Value out = P(openai_to_anthropic_request(
+        R"({"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]})"));
+    const Value* s = out.find("stream");
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->type, Value::Type::Bool);
+    EXPECT_TRUE(s->boolean);
+}
+
+TEST(ReqXlate, OmitsStreamWhenAbsentOrFalse)
+{
+    // Absent -> no stream key (non-streaming request).
+    EXPECT_EQ(P(openai_to_anthropic_request(
+                  R"({"model":"m","messages":[{"role":"user","content":"hi"}]})"))
+                  .find("stream"),
+              nullptr);
+    // Explicit false -> we only ever add stream when true.
+    EXPECT_EQ(P(openai_to_anthropic_request(
+                  R"({"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]})"))
+                  .find("stream"),
+              nullptr);
+}
+
 // ── response: Anthropic -> OpenAI ───────────────────────────────────────────
 TEST(RespXlate, JoinsTextBlocksToContent)
 {
