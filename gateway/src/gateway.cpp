@@ -733,7 +733,6 @@ namespace llmbridge
     {
         Connection* client = u->peer;
         client->streaming = true;
-        client->up_head_done = true;
         client->stream_chunked = h.chunked;
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wbuf.assign(kSseHead);
@@ -1429,7 +1428,6 @@ namespace llmbridge
     {
         Connection* client = u->peer;
         client->streaming = true;
-        client->up_head_done = true;
         client->stream_chunked = h.chunked;
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wpending.assign(kSseHead);

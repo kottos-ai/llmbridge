@@ -1,0 +1,6 @@
+data: {"11111111111111111111111111111111111111111111111111111111111type"event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","model":"claude-3-5-sonnet-20241022"}}
+
+event: content_block_delta
+data: {"typ:
+e":"content_block_delta","index":0,"delta"da"messagssa:{"type":"text_delta","text":"Hello"ge}_s

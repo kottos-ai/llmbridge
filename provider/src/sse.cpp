@@ -23,29 +23,12 @@ namespace llmbridge::provider
 {
     namespace
     {
-        // Append a raw (already JSON-escaped) span, neutralizing control bytes.
-        // Our lenient JSON parser accepts a literal control char (e.g. 0x0A)
-        // inside a string, which strict JSON forbids — and a raw newline emitted
-        // into our SSE output would let a hostile upstream inject fake events
-        // into the client stream ("\n\ndata: ..."). Escaping <0x20 as \u00XX
-        // closes that hole; everything else is a bulk copy, same pattern as
-        // json::append_escaped.
-        void append_sanitized(std::string& out, std::string_view raw)
-        {
-            static const char* hex = "0123456789abcdef";
-            size_t start = 0;
-            for (size_t i = 0; i < raw.size(); ++i)
-            {
-                const unsigned char c = static_cast<unsigned char>(raw[i]);
-                if (c >= 0x20) continue;                 // plain byte; keep scanning
-                out.append(raw.data() + start, i - start); // flush the plain run
-                out += "\\u00";
-                out += hex[(c >> 4) & 0xF];
-                out += hex[c & 0xF];
-                start = i + 1;
-            }
-            out.append(raw.data() + start, raw.size() - start);
-        }
+        // Control-byte neutralisation lives in openai_common.hpp so the SSE
+        // passthrough and the error-envelope passthrough (translate.cpp) can't
+        // drift: a raw newline emitted into our SSE output would let a hostile
+        // upstream inject fake events ("\n\ndata: ..."), and a raw control byte
+        // anywhere makes our JSON unparseable to a strict client.
+        using detail::append_sanitized;
 
         // Sanitize into an owned string (for spans we store across events).
         std::string sanitized(std::string_view raw)

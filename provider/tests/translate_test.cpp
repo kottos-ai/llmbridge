@@ -200,6 +200,24 @@ TEST(UpstreamError, UnparseableBodyStillYieldsValidEnvelope)
     }
 }
 
+TEST(UpstreamError, SanitizesControlBytesFromUpstream)
+{
+    // A hostile/broken provider can put a RAW control byte inside its error
+    // message (our parser is lenient); relaying it verbatim would make OUR error
+    // envelope invalid JSON for a strict client.
+    std::string body = "{\"error\":{\"type\":\"api_err\",\"message\":\"boom";
+    body += char(0x0A);
+    body += "next";
+    body += char(0x01);
+    body += "\"}}";
+    const std::string out = llmbridge::provider::upstream_error_to_openai(body, "upstream_error");
+    for (unsigned char c : out) EXPECT_GE(c, 0x20) << "raw control byte leaked into the envelope";
+    EXPECT_NE(out.find("\\u000a"), std::string::npos);
+    EXPECT_NE(out.find("\\u0001"), std::string::npos);
+    Value v = P(out); // and it still parses
+    EXPECT_EQ(v.find("error")->str_or("type"), "api_err");
+}
+
 TEST(UpstreamError, PreservesEscapingInMessage)
 {
     Value out = P(llmbridge::provider::upstream_error_to_openai(
