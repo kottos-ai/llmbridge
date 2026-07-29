@@ -159,6 +159,9 @@ namespace
         // Respond once (keep-alive), then close the connection — simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
+        // Stall modes for timeout tests: 1 = read the request then never reply;
+        // 2 = send half the response, then hold the connection open forever.
+        void set_stall(int mode) { _stall = mode; }
         int requests_seen() const { return _requests_seen.load(); }
         std::string last_request()
         {
@@ -195,6 +198,19 @@ namespace
                 buf.erase(0, m.total_len);
 
                 const std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                if (_stall == 1) // never answer; hold the connection open
+                {
+                    while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
+                    ::close(c);
+                    return;
+                }
+                if (_stall == 2) // partial answer, then hang (stalled mid-stream)
+                {
+                    (void)!::write(c, resp.data(), resp.size() / 2);
+                    while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
+                    ::close(c);
+                    return;
+                }
                 if (_close_mid)
                 {
                     // Send a partial response then drop — exercises the gateway's
@@ -232,6 +248,7 @@ namespace
         int _trickle_chunk = 0;
         bool _close_mid = false;
         bool _close_after_first = false;
+        int _stall = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
         std::atomic<bool> _stop{false};
@@ -245,9 +262,12 @@ namespace
     class Client
     {
     public:
-        bool connect(uint16_t port)
+        bool connect(uint16_t port, int rcvbuf = 0)
         {
             _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            // A tiny receive window makes the gateway's writes block quickly, so a
+            // non-reading client deterministically triggers write backpressure.
+            if (rcvbuf > 0) ::setsockopt(_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -351,13 +371,15 @@ namespace
     protected:
         void start(int64_t warmup_ns = 0, bool with_backend = true,
                    TranslateMode translate = TranslateMode::None,
-                   llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll)
+                   llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll,
+                   int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs)
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
             else up_port = free_port(); // nothing listening -> connection refused
 
-            _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend);
+            _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
+                                            upstream_idle_ns);
             _proxy_port = _gw->bound_port();
             _gt = std::thread([this] { _gw->run(); });
         }
@@ -1702,6 +1724,96 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, int>>& i) {
         return std::string(be_name(std::get<0>(i.param))) + "_" + std::to_string(std::get<1>(i.param));
     });
+
+// ── Upstream idle timeouts ────────────────────────────────────────────────
+// A stalled provider must not pin the client + two fds forever.
+
+TEST_P(ProxyStream, StalledUpstreamTimesOutWith504)
+{
+    _backend.set_stall(1); // read the request, never answer
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/300'000'000LL); // 300 ms
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    EXPECT_EQ(c.recv_status(3000), 504) << "stalled upstream must time out, not hang";
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_timeouts, 1u);
+}
+
+TEST_P(ProxyStream, StalledMidStreamTimesOutAndTruncates)
+{
+    _backend.set_response(sse_chunked_response(64));
+    _backend.set_stall(2); // send half the stream, then hang
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/300'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(3000)); // returns when the gateway closes
+    EXPECT_FALSE(s.done) << "a timed-out stream must not emit a fabricated [DONE]";
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().requests, 0u); // aborted, not served
+}
+
+TEST_P(ProxyStream, HealthyStreamIsNotTimedOut)
+{
+    // Guard against an over-eager sweep killing live streams: a trickled (but
+    // progressing) upstream must complete even with a short idle timeout.
+    _backend.set_response(sse_chunked_response(16));
+    _backend.set_trickle(4); // slow but continuously progressing
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/1'000'000'000LL); // 1 s
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(8000));
+    EXPECT_EQ(s.content, "Hello, world");
+    EXPECT_TRUE(s.done);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 0u);
+}
+
+// ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
+// Deterministic: a tiny client receive window + a multi-MB stream + a client that
+// stalls before reading forces the gateway's writes to block, which must engage
+// the pause path — and every byte must still arrive once the client drains.
+TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
+{
+    // ~1.6 MB of SSE: many deltas, each large enough to fill socket buffers fast.
+    const std::string filler(400, 'x');
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    const int kDeltas = 4000;
+    for (int i = 0; i < kDeltas; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+    ev += "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+          "data: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0); // no timeout: client is slow on purpose
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096)); // tiny window
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    // Don't read for a while: the gateway's client writes block and back up.
+    timespec ts{0, 400'000'000};
+    nanosleep(&ts, nullptr);
+
+    const Streamed s = parse_streamed(c.recv_all(15000)); // now drain everything
+    EXPECT_EQ(s.content.size(), filler.size() * kDeltas) << "backpressure must not lose bytes";
+    EXPECT_TRUE(s.done);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    // epoll implements backpressure by pausing upstream reads; io_uring instead
+    // bounds the buffer (kStreamBufCap), so only assert the counter on epoll.
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+        EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
+}
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),

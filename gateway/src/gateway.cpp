@@ -76,9 +76,15 @@ namespace llmbridge
         // 502 = upstream failure. Body uses the OpenAI error-envelope shape.
         std::string build_error(int code)
         {
-            const char* line = code == 400 ? "HTTP/1.1 400 Bad Request" : "HTTP/1.1 502 Bad Gateway";
-            const char* type = code == 400 ? "invalid_request_error" : "upstream_error";
-            const char* msg = code == 400 ? "malformed request" : "bad gateway: upstream failure";
+            const char* line = code == 400   ? "HTTP/1.1 400 Bad Request"
+                               : code == 504 ? "HTTP/1.1 504 Gateway Timeout"
+                                             : "HTTP/1.1 502 Bad Gateway";
+            const char* type = code == 400   ? "invalid_request_error"
+                               : code == 504 ? "timeout_error"
+                                             : "upstream_error";
+            const char* msg = code == 400   ? "malformed request"
+                              : code == 504 ? "upstream timed out"
+                                            : "bad gateway: upstream failure";
             std::string body = std::string("{\"error\":{\"message\":\"") + msg + "\",\"type\":\"" + type + "\"}}";
             std::string out;
             out.reserve(body.size() + 128);
@@ -194,9 +200,11 @@ namespace llmbridge
     } // namespace
 
     Gateway::Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
-                     int64_t warmup_ns, TranslateMode translate, IoBackend io)
+                     int64_t warmup_ns, TranslateMode translate, IoBackend io,
+                     int64_t upstream_idle_ns)
         : _listen_port(listen_port), _upstream_ip(std::move(upstream_ip)),
-          _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate), _io(io)
+          _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate), _io(io),
+          _upstream_idle_ns(upstream_idle_ns)
     {
         // Linux has no SO_NOSIGPIPE; ignore SIGPIPE process-wide so a write to a
         // peer-closed socket returns EPIPE instead of killing us. Idempotent, so
@@ -296,6 +304,7 @@ namespace llmbridge
         ev.data.ptr = c;
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = true;
+        ++_stats.stream_pauses; // observability: proves backpressure actually engaged
     }
 
     void Gateway::ep_resume_read(Connection* c) noexcept
@@ -533,6 +542,7 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
+        c->ts_up_activity = now_ns(); // idle-timeout baseline for this request
 
         // Optimistic send: if the pooled upstream is already connected (the common
         // case), write immediately and only arm EPOLLOUT if the socket buffer is
@@ -590,6 +600,7 @@ namespace llmbridge
             return;
         }
         if (client == nullptr) return; // stray bytes on an idle pooled conn
+        client->ts_up_activity = now_ns(); // upstream made progress
 
         // Mid-stream: pump the newly-arrived body bytes and return.
         if (client->streaming) { stream_pump(u); return; }
@@ -799,6 +810,53 @@ namespace llmbridge
         close_client(client);
     }
 
+    // Abort requests whose upstream has gone silent. Runs on the loop's existing
+    // periodic tick, so an idle gateway costs one cheap scan per tick. A client
+    // that hasn't been answered yet gets a real 504; a live stream (headers already
+    // sent) is closed WITHOUT a terminal [DONE], so the client sees a truncated
+    // stream rather than a fabricated clean finish.
+    void Gateway::sweep_idle(bool uring) noexcept
+    {
+        if (_upstream_idle_ns <= 0) return;
+        const int64_t now = now_ns();
+        if (now - _last_sweep_ns < 50'000'000LL) return; // at most ~20 sweeps/sec
+        _last_sweep_ns = now;
+
+        // Collect first: the teardown below erases from _clients.
+        std::vector<Connection*> stale;
+        for (auto& [id, c] : _clients)
+        {
+            if (c->doomed) continue;
+            const bool in_flight = c->peer != nullptr || c->streaming;
+            if (!in_flight || c->ts_up_activity == 0) continue;
+            if (now - c->ts_up_activity > _upstream_idle_ns) stale.push_back(c);
+        }
+        for (Connection* c : stale)
+        {
+            ++_stats.upstream_timeouts;
+            const bool streaming = c->streaming;
+            if (streaming)
+            {
+                // Response headers are already out; truncate honestly (no [DONE]).
+                c->stream_ended = true;
+                c->close_after_resp = true;
+                ++_stats.errors;
+            }
+#ifdef LLMBRIDGE_HAVE_URING
+            if (uring)
+            {
+                if (streaming) u_abort_pair(c);
+                else u_error_respond(c, 504);
+                continue;
+            }
+#else
+            (void)uring;
+#endif
+            if (streaming) abort_pair(c);
+            else error_respond(c, 504);
+        }
+    }
+
     int Gateway::run()
     {
 #ifdef LLMBRIDGE_HAVE_URING
@@ -840,6 +898,7 @@ namespace llmbridge
                     if (readable && !c->doomed) on_upstream_readable(c);
                 }
             }
+            sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
             for (Connection* d : _doomed) delete d;
             _doomed.clear();
         }
@@ -1078,7 +1137,11 @@ namespace llmbridge
     void Gateway::u_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept
     {
         const UOp op = ud_op(user_data);
-        if (op == UTimer) { if (!_draining && !_stop) u_submit_timer(); return; }
+        if (op == UTimer)
+        {
+            if (!_draining && !_stop) { sweep_idle(/*uring=*/true); u_submit_timer(); }
+            return;
+        }
         if (op == UCancel) return; // control op (cancel-by-fd); not inflight-counted
         if (op == UAccept) { u_on_accept(res, flags); return; } // not inflight-counted
 
@@ -1157,6 +1220,7 @@ namespace llmbridge
             // Upstream bytes are the response to the in-flight request. Stray data on
             // an idle pooled upstream (no peer) means it's unusable — drop it.
             if (!c->peer) { u_close(c); return; }
+            c->peer->ts_up_activity = now_ns(); // upstream made progress
 
             // Mid-stream: pump the newly-arrived body bytes and return.
             if (c->peer->streaming) { u_stream_pump(c); return; }
@@ -1222,6 +1286,7 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
+        c->ts_up_activity = now_ns(); // idle-timeout baseline for this request
 
         if (u->connected) u_submit_send(u);
         else u_submit_connect(u); // connect first; on completion we send the request
