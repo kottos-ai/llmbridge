@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <ctime>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "net/http.hpp"
+#include "provider/json.hpp" // reassemble the streamed OpenAI chunks
 
 using llmbridge::Gateway;
 using llmbridge::TranslateMode;
@@ -304,6 +306,23 @@ namespace
             if (r.size() < 12 || r.compare(0, 5, "HTTP/") != 0) return 0;
             return (r[9] - '0') * 100 + (r[10] - '0') * 10 + (r[11] - '0');
         }
+        // Read everything until the peer closes the connection (for close-delimited
+        // responses like a streamed SSE body). Returns all bytes received.
+        std::string recv_all(int timeout_ms = 3000)
+        {
+            std::string out = std::move(_buf);
+            _buf.clear();
+            char tmp[8192];
+            for (;;)
+            {
+                pollfd p{_fd, POLLIN, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) return out; // timeout: return what we have
+                ssize_t n = ::read(_fd, tmp, sizeof(tmp));
+                if (n <= 0) return out; // EOF or error: stream ended
+                out.append(tmp, static_cast<size_t>(n));
+            }
+        }
+
         // Returns true if the peer closed within the timeout (read -> 0).
         bool wait_closed(int timeout_ms = 2000)
         {
@@ -1361,4 +1380,156 @@ TEST(GatewayUnit, StatsStartZeroed)
     EXPECT_EQ(io.stats().requests, 0u);
     EXPECT_EQ(io.stats().errors, 0u);
     EXPECT_EQ(io.stats().upstream_conns_opened, 0u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Streaming (SSE), end-to-end on the epoll backend (Phase B). A mock upstream
+// returns a chunked Anthropic event stream; the gateway must translate it into
+// an OpenAI chat.completion.chunk stream and deliver it to the client, surviving
+// small chunks and byte-dribbled (partial-read) delivery.
+// (io_uring streaming is a follow-up; these run explicitly on IoBackend::Epoll.)
+// ════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    // A realistic Anthropic text stream.
+    std::string anthropic_sse_events()
+    {
+        return
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+            "{\"id\":\"msg_1\",\"model\":\"claude-3-5-sonnet-20241022\"}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\", world\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    }
+
+    std::string sse_chunk_encode(std::string_view p, size_t chunk)
+    {
+        std::string s;
+        size_t i = 0;
+        while (i < p.size())
+        {
+            const size_t n = std::min(chunk, p.size() - i);
+            char hex[32];
+            std::snprintf(hex, sizeof hex, "%zx", n);
+            s += hex;
+            s += "\r\n";
+            s.append(p.substr(i, n));
+            s += "\r\n";
+            i += n;
+        }
+        s += "0\r\n\r\n";
+        return s;
+    }
+
+    // Full chunked SSE HTTP response, with the event body split into `chunk`-byte
+    // transfer-encoding chunks.
+    std::string sse_chunked_response(size_t chunk)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(anthropic_sse_events(), chunk);
+    }
+
+    std::string openai_stream_request(const std::string& content)
+    {
+        return make_request("{\"model\":\"gpt-4o\",\"stream\":true,\"messages\":[{\"role\":\"user\","
+                            "\"content\":\"" + content + "\"}]}");
+    }
+
+    // Reassemble the client-facing OpenAI SSE stream back into a whole message.
+    struct Streamed { std::string content, finish; bool done = false, sse_headers = false, role = false; };
+    Streamed parse_streamed(const std::string& raw)
+    {
+        Streamed s;
+        const size_t hb = raw.find("\r\n\r\n");
+        s.sse_headers = raw.substr(0, hb == std::string::npos ? raw.size() : hb).find("text/event-stream") !=
+                        std::string::npos;
+        std::string body = hb == std::string::npos ? raw : raw.substr(hb + 4);
+        size_t i = 0;
+        while (i < body.size())
+        {
+            const size_t nl = body.find('\n', i);
+            std::string line = body.substr(i, (nl == std::string::npos ? body.size() : nl) - i);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            i = (nl == std::string::npos ? body.size() : nl + 1);
+            if (line.rfind("data: ", 0) != 0) continue;
+            const std::string pay = line.substr(6);
+            if (pay == "[DONE]") { s.done = true; continue; }
+            bool ok = false;
+            llmbridge::json::Value v = llmbridge::json::parse(pay, ok);
+            if (!ok) continue;
+            const llmbridge::json::Value* ch = v.find("choices");
+            if (!ch || !ch->is_array() || ch->arr.empty()) continue;
+            const llmbridge::json::Value& c0 = ch->arr[0];
+            if (const llmbridge::json::Value* d = c0.find("delta"))
+            {
+                if (!d->str_or("role").empty()) s.role = true;
+                s.content += std::string(d->str_or("content"));
+            }
+            if (const std::string_view fr = c0.str_or("finish_reason"); !fr.empty()) s.finish.assign(fr);
+        }
+        return s;
+    }
+} // namespace
+
+TEST_F(ProxyIT, StreamingTranslatesAnthropicSseToOpenAiChunks)
+{
+    _backend.set_response(sse_chunked_response(4096)); // whole event body in one chunk
+    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+
+    const Streamed s = parse_streamed(c.recv_all());
+    EXPECT_TRUE(s.sse_headers);            // client got text/event-stream
+    EXPECT_TRUE(s.role);                   // first chunk carried the assistant role
+    EXPECT_EQ(s.content, "Hello, world");  // deltas reassemble to the full message
+    EXPECT_EQ(s.finish, "stop");           // end_turn -> stop
+    EXPECT_TRUE(s.done);                   // terminal [DONE]
+
+    // End-to-end wiring: the upstream request carried stream:true to /v1/messages.
+    EXPECT_NE(_backend.last_request().find("\"stream\":true"), std::string::npos);
+    EXPECT_NE(_backend.last_request().find("/v1/messages"), std::string::npos);
+
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    EXPECT_EQ(_gw->stats().requests, 1u);
+}
+
+TEST_F(ProxyIT, StreamingSurvivesTinyUpstreamChunks)
+{
+    _backend.set_response(sse_chunked_response(5)); // 5-byte chunks: many decode/translate boundaries
+    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    EXPECT_EQ(s.content, "Hello, world");
+    EXPECT_TRUE(s.done);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+TEST_F(ProxyIT, StreamingSurvivesTrickledUpstream)
+{
+    _backend.set_response(sse_chunked_response(9));
+    _backend.set_trickle(2); // dribble the whole chunked response 2 bytes at a time
+    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Epoll);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(5000));
+    EXPECT_EQ(s.content, "Hello, world"); // incremental pump across TCP read boundaries
+    EXPECT_TRUE(s.done);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
 }
