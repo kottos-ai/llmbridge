@@ -1,0 +1,4 @@
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}
+
+data: {"type":"message_stop"}
+

@@ -1,0 +1,4 @@
+data: not json at all
+
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"after garbage"}}
+

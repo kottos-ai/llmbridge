@@ -5,6 +5,7 @@
 
 add_library(provider STATIC
         src/translate.cpp
+        src/sse.cpp
 )
 add_library(llmbridge::provider ALIAS provider) # namespaced alias — matches find_package()
 target_include_directories(provider PUBLIC
