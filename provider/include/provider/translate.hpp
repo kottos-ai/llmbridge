@@ -39,6 +39,15 @@ namespace llmbridge::provider
     // Anthropic Messages response body  ->  OpenAI chat-completion response body.
     std::string anthropic_to_openai_response(std::string_view anthropic_body);
 
+    // An upstream ERROR body -> the OpenAI error envelope, so a failing provider
+    // (rate limit, overloaded GPU, context-length, auth) reaches the client as a
+    // real, actionable error instead of a generic gateway failure. Anthropic sends
+    // {"type":"error","error":{"type":"overloaded_error","message":"..."}}; we emit
+    // {"error":{"message":"...","type":"...","code":null}}. Never returns empty —
+    // an unparseable/foreign body still yields a valid envelope carrying `fallback`
+    // as the type — so the caller can always relay the upstream's status code.
+    std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
+
     // ── Google Gemini (generateContent) ─────────────────────────────────────
     // OpenAI chat-completion request body  ->  Gemini generateContent body.
     std::string openai_to_gemini_request(std::string_view openai_body);
