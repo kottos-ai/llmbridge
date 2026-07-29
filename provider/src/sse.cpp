@@ -85,12 +85,48 @@ namespace llmbridge::provider
         out += "},\"finish_reason\":";
         if (finish) { out += '"'; out += finish; out += '"'; }
         else out += "null";
-        out += "}]}\n\n";
+        // With include_usage, OpenAI puts a null `usage` on every normal chunk;
+        // the real numbers ride the dedicated final chunk (emit_usage).
+        out += _include_usage ? "}],\"usage\":null}\n\n" : "}]}\n\n";
+    }
+
+    // The extra usage-only chunk OpenAI streams just before [DONE] when the client
+    // set stream_options.include_usage: `choices` is empty by spec, and the counts
+    // are Anthropic's own (input from message_start, cumulative output from
+    // message_delta) — re-shaped, never estimated.
+    void AnthropicToOpenAiSse::emit_usage(std::string& out)
+    {
+        if (!_include_usage || _usage_emitted) return;
+        ensure_created();
+        out += "data: {\"id\":\"";
+        out += _id;
+        out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
+        out += _created;
+        out += ",\"model\":\"";
+        out += _model;
+        out += "\",\"choices\":[],\"usage\":{\"prompt_tokens\":";
+        out += std::to_string(_in_tok);
+        out += ",\"completion_tokens\":";
+        out += std::to_string(_out_tok);
+        out += ",\"total_tokens\":";
+        out += std::to_string(_in_tok + _out_tok);
+        out += "}}\n\n";
+        _usage_emitted = true;
+    }
+
+    // Terminate the stream: the usage chunk (when requested) always precedes the
+    // sentinel, exactly as OpenAI orders them.
+    void AnthropicToOpenAiSse::emit_done(std::string& out)
+    {
+        if (_done) return;
+        emit_usage(out);
+        out += "data: [DONE]\n\n";
+        _done = true;
     }
 
     void AnthropicToOpenAiSse::dispatch(std::string_view data, std::string& out)
     {
-        if (data == "[DONE]") { if (!_done) { out += "data: [DONE]\n\n"; _done = true; } return; }
+        if (data == "[DONE]") { emit_done(out); return; }
 
         bool ok = false;
         json::Value v = json::parse(data, ok);
@@ -104,6 +140,11 @@ namespace llmbridge::provider
             {
                 if (const std::string_view id = m->str_or("id"); !id.empty()) _id = sanitized(id);
                 _model = sanitized(m->str_or("model"));
+                if (const json::Value* u = m->find("usage"))
+                {
+                    _in_tok = detail::to_ll(u->num_or("input_tokens", "0"));
+                    _out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
+                }
             }
             ensure_created();
             if (!_role_emitted) // OpenAI's first chunk carries the assistant role
@@ -141,6 +182,10 @@ namespace llmbridge::provider
             if (const json::Value* d = v.find("delta"))
                 if (const std::string_view sr = d->str_or("stop_reason"); !sr.empty())
                     _finish = detail::anthropic_finish_reason(sr);
+            // Anthropic reports output_tokens cumulatively on message_delta.
+            if (const json::Value* u = v.find("usage"))
+                if (const std::string_view ot = u->num_or("output_tokens"); !ot.empty())
+                    _out_tok = detail::to_ll(ot);
             if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);
@@ -156,7 +201,7 @@ namespace llmbridge::provider
                 emit_tail(out, _finish ? _finish : "stop");
                 _finish_emitted = true;
             }
-            if (!_done) { out += "data: [DONE]\n\n"; _done = true; }
+            emit_done(out);
         }
         // content_block_start / content_block_stop / ping / unknown: ignored for
         // the text-only slice (no OpenAI-side output).
@@ -232,8 +277,7 @@ namespace llmbridge::provider
             emit_tail(out, _finish ? _finish : "stop");
             _finish_emitted = true;
         }
-        out += "data: [DONE]\n\n";
-        _done = true;
+        emit_done(out);
         return true;
     }
 } // namespace llmbridge::provider

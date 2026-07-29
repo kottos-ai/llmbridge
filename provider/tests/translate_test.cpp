@@ -142,6 +142,24 @@ TEST(ReqXlate, OmitsStreamWhenAbsentOrFalse)
               nullptr);
 }
 
+// ── stream_options.include_usage detection ──────────────────────────────────
+TEST(StreamUsageFlag, DetectsIncludeUsage)
+{
+    using llmbridge::provider::openai_wants_stream_usage;
+    EXPECT_TRUE(openai_wants_stream_usage(
+        R"({"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[]})"));
+    EXPECT_FALSE(openai_wants_stream_usage(
+        R"({"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]})"));
+    EXPECT_FALSE(openai_wants_stream_usage(R"({"model":"m","stream":true,"messages":[]})"));
+    EXPECT_FALSE(openai_wants_stream_usage(R"({"model":"m","stream_options":{},"messages":[]})"));
+    // Not a bool -> not a request for usage (no coercion).
+    EXPECT_FALSE(openai_wants_stream_usage(
+        R"({"stream_options":{"include_usage":"true"},"messages":[]})"));
+    // Garbage must not throw or crash.
+    EXPECT_FALSE(openai_wants_stream_usage("include_usage but not json"));
+    EXPECT_FALSE(openai_wants_stream_usage(""));
+}
+
 // ── upstream error passthrough ──────────────────────────────────────────────
 TEST(UpstreamError, MapsAnthropicErrorEnvelope)
 {

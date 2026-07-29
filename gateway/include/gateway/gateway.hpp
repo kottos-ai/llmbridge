@@ -113,6 +113,7 @@ namespace llmbridge
         bool stream_chunked = false; // upstream body uses chunked transfer-encoding
         bool stream_ended = false;   // final [DONE] emitted; close once the client drains
         bool read_paused = false;    // upstream EPOLLIN paused (client-write backpressure)
+        bool wants_usage = false;    // client set stream_options.include_usage
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
         http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`

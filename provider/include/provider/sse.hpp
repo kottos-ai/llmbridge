@@ -43,7 +43,15 @@ namespace llmbridge::provider
         // "stamp it once, lazily, from the wall clock" — the production path. Pass
         // a fixed value to make the output fully deterministic (tests, and so the
         // gateway can align a stream's `created` with its non-streaming path).
-        explicit AnthropicToOpenAiSse(long long created_secs = -1) : _created_secs(created_secs) {}
+        // `include_usage` mirrors OpenAI's `stream_options.include_usage`: when set,
+        // every chunk carries `"usage": null` and ONE extra chunk — empty `choices`
+        // plus the real token counts — is emitted just before `data: [DONE]`.
+        // Anthropic supplies the numbers itself (input in message_start, cumulative
+        // output in message_delta), so this is pure re-shaping, never estimation.
+        explicit AnthropicToOpenAiSse(long long created_secs = -1, bool include_usage = false)
+            : _created_secs(created_secs), _include_usage(include_usage)
+        {
+        }
 
         // Feed raw upstream SSE bytes; append translated OpenAI SSE to `out`. An
         // incomplete trailing event is buffered internally until the next call.
@@ -63,6 +71,8 @@ namespace llmbridge::provider
         void ensure_created();                               // stamp _created once
         void emit_head(std::string& out);                    // up to `"delta":{`
         void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
+        void emit_usage(std::string& out);                    // the final usage-only chunk
+        void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
         std::string _pending;   // bytes not yet forming a complete line (frag buffer)
         std::string _cur_data;  // concatenated `data:` lines of the in-progress event
@@ -78,5 +88,11 @@ namespace llmbridge::provider
         bool _role_emitted = false;
         bool _finish_emitted = false;
         bool _done = false;
+
+        // Usage passthrough (only emitted when _include_usage).
+        bool _include_usage = false;
+        bool _usage_emitted = false;
+        long long _in_tok = 0;  // message_start:  usage.input_tokens
+        long long _out_tok = 0; // message_delta:  usage.output_tokens (cumulative)
     };
 } // namespace llmbridge::provider
