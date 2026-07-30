@@ -1195,6 +1195,28 @@ namespace llmbridge
     {
         const bool armed = flags & IORING_CQE_F_MORE;
 
+        // -ENOBUFS is NOT a connection error: the provided-buffer pool was momentarily
+        // empty, so the kernel declined to pick a buffer and ended the multishot without
+        // consuming one. The cure is to re-arm, not to tear down. Without this branch the
+        // fallthrough below would kill the client pair or, mid-stream, report a premature
+        // stream end.
+        //
+        // Measured scope, so nobody mistakes this for a fix to a live bug: on this kernel
+        // (7.0) with kBufCount=4096, `uring_enobufs` stayed at **0** even at 8192
+        // concurrent streams (16384 armed recvs, 4x the pool) — the kernel ends the
+        // multishot with res>0 and F_MORE clear under pool pressure, which the re-arm at
+        // the bottom of this function already handles. So this is DEFENSIVE hardening for
+        // a path that is reachable by contract but was never observed in practice; it is
+        // NOT the explanation for io_uring's high-concurrency tail latency (that was
+        // hypothesised from the kBufCount correlation and disproved by this counter).
+        // The regression test forces the condition by shrinking the pool.
+        if (res == -ENOBUFS)
+        {
+            ++_stats.uring_enobufs;
+            u_arm_recv(c);
+            return;
+        }
+
         if (res <= 0) // multishot ended: EOF (0) or error (<0)
         {
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
@@ -1508,7 +1530,8 @@ namespace llmbridge
             std::fprintf(stderr, "llmbridge: io_uring init failed; using epoll\n");
             return run_epoll();
         }
-        if (!_bufring.init(_ring, kBufGroup, kBufCount, kBufSize))
+        const unsigned bufcount = _uring_buf_count ? _uring_buf_count : kBufCount;
+        if (!_bufring.init(_ring, kBufGroup, bufcount, kBufSize))
         {
             std::fprintf(stderr, "llmbridge: io_uring provided-buffer ring unavailable; using epoll\n");
             return run_epoll();

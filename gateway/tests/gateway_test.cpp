@@ -372,7 +372,8 @@ namespace
         void start(int64_t warmup_ns = 0, bool with_backend = true,
                    TranslateMode translate = TranslateMode::None,
                    llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll,
-                   int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs)
+                   int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs,
+                   unsigned uring_buf_count = 0)
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
@@ -380,6 +381,7 @@ namespace
 
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
                                             upstream_idle_ns);
+            if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
             _proxy_port = _gw->bound_port();
             _gt = std::thread([this] { _gw->run(); });
         }
@@ -1867,3 +1869,67 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Provided-buffer exhaustion — io_uring only.
+//
+// The io_uring backend feeds its multishot recvs from a fixed pool of provided
+// buffers. When that pool is momentarily empty the kernel may end a multishot recv
+// with -ENOBUFS *without* consuming a buffer. That is a transient resource
+// shortage, not a connection error, and the only correct response is to re-arm.
+// Get it wrong and the failure is silent and ugly: the client pair is aborted, or
+// mid-stream the client is told the stream ended early — truncated output, not an
+// error the caller can see.
+//
+// Why the pool is shrunk here rather than driven by load: at the shipped size the
+// branch is not reachable in practice. Measured on this kernel at 8192 concurrent
+// streams (16384 armed recvs against a 4096-buffer pool), `uring_enobufs` stayed
+// at 0 — under pool pressure the kernel instead ends the multishot with res > 0
+// and F_MORE clear, which the ordinary re-arm already covers. So a load-driven
+// test would prove nothing and pass whether or not the recovery works. Shrinking
+// the pool to a single buffer forces the real condition, and the assertion on the
+// counter is what proves the test is actually exercising it.
+// ════════════════════════════════════════════════════════════════════════════
+TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
+{
+    constexpr int kClients = 8;
+    // Small upstream chunks => many separate arrivals => many buffer acquisitions,
+    // across 8 concurrent streams sharing a pool of exactly one buffer.
+    _backend.set_response(sse_chunked_response(5));
+    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Uring,
+          Gateway::kDefaultUpstreamIdleNs, /*uring_buf_count=*/1);
+
+    std::vector<std::unique_ptr<Client>> cs;
+    for (int i = 0; i < kClients; ++i)
+    {
+        auto c = std::make_unique<Client>();
+        ASSERT_TRUE(c->connect(_proxy_port)) << "client " << i;
+        ASSERT_TRUE(c->send(openai_stream_request("hi"))) << "client " << i;
+        cs.push_back(std::move(c));
+    }
+
+    // Every stream must arrive complete: buffer starvation may delay bytes, but it
+    // must never truncate them or fabricate an early end.
+    for (int i = 0; i < kClients; ++i)
+    {
+        const Streamed s = parse_streamed(cs[i]->recv_all(15000));
+        EXPECT_TRUE(s.sse_headers) << "client " << i << " never got the SSE head";
+        EXPECT_EQ(s.content, "Hello, world") << "client " << i << " lost or truncated deltas";
+        EXPECT_EQ(s.finish, "stop") << "client " << i;
+        EXPECT_TRUE(s.done) << "client " << i << " missing terminal [DONE]";
+        cs[i]->close();
+    }
+
+    const uint64_t enobufs = _gw->stats().uring_enobufs;
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u) << "buffer starvation must not be reported as an error";
+    EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kClients));
+
+    // The point of the test. If this fires, the pool never actually ran dry and the
+    // assertions above passed without touching the recovery path — so either the
+    // hook stopped working or the kernel no longer reports -ENOBUFS here, and the
+    // recovery branch in u_on_recv is dead code that needs re-examining.
+    EXPECT_GT(enobufs, 0u)
+        << "pool of 1 buffer across " << kClients
+        << " streams did not produce -ENOBUFS; this test is not exercising what it claims";
+}

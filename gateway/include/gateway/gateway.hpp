@@ -134,6 +134,7 @@ namespace llmbridge
         uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
+        uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
     };
 
     class Gateway
@@ -168,6 +169,13 @@ namespace llmbridge
 
         // Actual bound listen port (resolves ephemeral when 0 was requested).
         uint16_t bound_port() const noexcept;
+
+        // Size of the io_uring provided-buffer pool (power of two), or 0 for the default.
+        // Must be called before run(). Exists so a test can shrink the pool far enough to
+        // force -ENOBUFS deterministically — at the shipped size that branch was never
+        // reached even at 8192 concurrent streams, so without this hook the recovery path
+        // would be untestable and could rot silently. Not a tuning knob users need.
+        void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
 
     private:
         void ep_add_read(Connection* c) noexcept;
@@ -274,7 +282,8 @@ namespace llmbridge
         int64_t _warmup_ns;
         TranslateMode _translate;
         IoBackend _io;
-        int64_t _upstream_idle_ns; // 0 = no idle timeout
+        int64_t _upstream_idle_ns;         // 0 = no idle timeout
+        unsigned _uring_buf_count = 0;     // 0 = kBufCount default (test hook only)
         int64_t _last_sweep_ns = 0;
         bool _uring_active = false;
 

@@ -197,8 +197,19 @@ machine + re-serialisation costs ~2 µs on top of it** — within ~4% of the flo
 proxy pays. Every gateway sits at ~5% of one core, so none of this is compute-bound:
 it is kernel wakeup and scheduler dispatch latency.
 
-That also means the honest ceiling on optimising this path is ~2 µs/token. Claims of
-large streaming-latency wins from further micro-optimisation would be unfounded.
+That also means the honest ceiling on optimising *our code* on this path is ~2 µs/token.
+Claims of large streaming-latency wins from further micro-optimisation would be unfounded.
+
+The hop itself, however, **is** reducible — it is mostly CPU idle-state exit latency, not
+transit. Keeping the package awake takes it from 54 µs to 39 µs; a busy-polling relay that
+never sleeps takes it to **6 µs**. Both cost CPU. See
+[`bench/LATENCY-TUNING.md`](bench/LATENCY-TUNING.md) for the measurements, the three ways
+to disable C-states on the host, and why spinning workers cannot share a core.
+
+**All numbers in this document are taken with the host untuned** (default `intel_idle` +
+`menu` governor, all C-states enabled, turbo on). Tuning shrinks every path in the
+comparison, including the baselines, so the relative results stand — but the absolute
+figures should always be read alongside the tuning state.
 
 ### Why epoll and io_uring measure the same (and when io_uring wins)
 
