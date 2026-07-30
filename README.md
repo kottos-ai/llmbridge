@@ -39,7 +39,30 @@ At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **~0.067
 
 Single-thread throughput ceiling is **~90k RPS** — and on this co-located dev box that ceiling is the loopback's packet-processing limit, not the CPU (the proxy uses ~1 core at saturation). *(Bifrost and Helicone not yet measured.)*
 
-**Reproduce:** `./bench/run_headtohead.sh` (latency) and `./bench/saturate.sh` (throughput) — see [`bench/`](./bench). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
+### Streaming (SSE)
+
+A **separate** benchmark, because it measures a different unit of work — one token, not
+one request. Both gateways translate the same Anthropic event stream into OpenAI chunks
+at 50 tok/s per stream, measured by the same client-side instrument (neither gateway
+self-reports), against a no-gateway control run at the same concurrency. Median of 3.
+
+![Streaming: time to first token vs concurrent streams](bench/results/stream-comparison.svg)
+
+![Streaming: tokens delivered vs concurrent streams](bench/results/stream-saturation.svg)
+
+llmbridge's time to first token stays **on the no-gateway floor (~31 ms)** through 512
+concurrent streams while delivering ~100% of the achievable token stream, adding
+**54–129 µs per token**. A single LiteLLM worker holds at 16 streams, then queues: at 512
+streams it delivers **3%** of the tokens with **~14 s** to first token, ceiling ~1,100
+tokens/s. llmbridge's own knee is between **2,048 and 4,096 streams (~95–100k tokens/s)**.
+
+**Do not mix the two sets of numbers** — "requests/sec" is not a streaming axis, and
+"tokens/sec" says nothing about non-streaming throughput.
+
+**Reproduce:** `./bench/run_headtohead.sh` and `./bench/saturate.sh` (non-streaming),
+`./bench/run_stream_headtohead.sh` and `./bench/run_stream_saturate.sh` (streaming) —
+see [`bench/`](./bench), full methodology and fairness controls in
+[BENCHMARKS.md](./BENCHMARKS.md). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
 ## Quick start
 
