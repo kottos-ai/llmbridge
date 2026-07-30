@@ -184,8 +184,17 @@ int main(int argc, char** argv)
         if (!start_stream(c)) { std::fprintf(stderr, "connect failed\n"); return 1; }
     }
 
-    Histogram h_chunk, h_ttft, h_gap;
-    long completed = 0, total_chunks = 0, failures = 0;
+    // Histogram RANGE MATTERS HERE. The default (20ns x 131072 = 2.62ms ceiling) is
+    // sized for sub-millisecond proxy overhead; streaming under load produces
+    // multi-SECOND outliers, and percentile() returns _max once the target falls in
+    // the overflow region — so an overflowing histogram silently reports
+    // "p50 == p99 == max" that LOOKS like a percentile but is just the maximum.
+    // 1us buckets over 2s for latency/gap; 100us over 20s for TTFT (a saturated
+    // Python gateway can take >10s to first token).
+    Histogram h_chunk(1000, 2'000'000);   // 1us buckets, 2s range
+    Histogram h_gap(1000, 2'000'000);     // 1us buckets, 2s range
+    Histogram h_ttft(100'000, 200'000);   // 100us buckets, 20s range
+    long completed = 0, total_chunks = 0, measured_chunks = 0, failures = 0;
     const int64_t t0 = now_ns();
     const int64_t t_warm = t0 + static_cast<int64_t>(warmup * 1e9);
     const int64_t t_end = t0 + static_cast<int64_t>(duration * 1e9);
@@ -273,6 +282,7 @@ int main(int argc, char** argv)
                             ++total_chunks;
                             if (counting)
                             {
+                                ++measured_chunks; // rate must exclude warmup chunks
                                 const int64_t added = arrival - emitted;
                                 if (added >= 0) h_chunk.record(static_cast<uint64_t>(added));
                                 if (c->last_chunk_ns != 0)
@@ -315,8 +325,19 @@ int main(int argc, char** argv)
 
     const double secs = duration - warmup;
     std::printf("streams=%d  duration=%.0fs (warmup %.0fs)\n", streams, duration, warmup);
-    std::printf("chunks=%ld  completed_streams=%ld  failures=%ld  chunk_rate=%.0f/s\n",
-                total_chunks, completed, failures, secs > 0 ? total_chunks / secs : 0.0);
+    // chunk_rate counts ONLY post-warmup chunks over the post-warmup window;
+    // dividing all-chunks by the measured window inflated it by duration/(duration-warmup).
+    std::printf("chunks=%ld  measured=%ld  completed_streams=%ld  failures=%ld  chunk_rate=%.0f/s\n",
+                total_chunks, measured_chunks, completed, failures,
+                secs > 0 ? measured_chunks / secs : 0.0);
+    // Overflow must never be silent: if it happens the percentiles above are
+    // really just the max, and the run needs a wider histogram to be reportable.
+    if (h_chunk.overflow_count() || h_ttft.overflow_count() || h_gap.overflow_count())
+        std::printf("WARNING: histogram overflow (chunk=%llu ttft=%llu gap=%llu) —"
+                    " percentiles beyond the tracked range are NOT reliable\n",
+                    (unsigned long long)h_chunk.overflow_count(),
+                    (unsigned long long)h_ttft.overflow_count(),
+                    (unsigned long long)h_gap.overflow_count());
     std::printf("per-chunk added latency us: p50=%llu p99=%llu p99.9=%llu max=%llu\n",
                 (unsigned long long)(h_chunk.percentile(0.50) / 1000),
                 (unsigned long long)(h_chunk.percentile(0.99) / 1000),

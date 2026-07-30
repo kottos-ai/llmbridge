@@ -214,6 +214,12 @@ async def main():
         lambda r, w: handle(r, w, latency, args.format == "anthropic",
                             args.tokens, args.token_interval_ms / 1000.0),
         "127.0.0.1", args.port, limit=1 << 20,
+        # FAIRNESS: asyncio's default listen backlog is 100. A gateway that opens
+        # upstream connections in bursts (rather than pooling them) can overflow
+        # that at high concurrency and get its connects REFUSED — which would
+        # look like the gateway failing when it is really the mock's socket
+        # queue. A deep backlog removes the harness from the comparison.
+        backlog=4096,
     )
     addr = server.sockets[0].getsockname()
     print(f"mock provider on {addr}  latency={args.latency_ms}ms  format={args.format}"
