@@ -121,6 +121,15 @@ namespace llmbridge
         // sends (two concurrent SENDs on one fd would interleave).
         std::string wpending;
         bool send_inflight = false;
+        // Upstream said keep-alive on the streaming response, so the connection may
+        // be pooled once the body's terminal chunk has been consumed. Held on the
+        // CLIENT conn alongside the rest of the per-request streaming state.
+        bool stream_keep_alive = false;
+
+        // Upstream conns only: when this connection entered the idle pool. Idle
+        // keep-alives are reaped after kIdleUpstreamNs — providers drop them on
+        // their own schedule, and a pooled corpse costs a retry to discover.
+        int64_t ts_pooled = 0;
     };
 
     struct Stats
@@ -132,6 +141,7 @@ namespace llmbridge
         uint64_t errors = 0;
         uint64_t upstream_conns_opened = 0;
         uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
+        uint64_t upstream_reused = 0;   // requests served on a pooled keep-alive conn
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
         uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
@@ -146,6 +156,16 @@ namespace llmbridge
         // classic slow-loris-by-upstream. Applies to the whole in-flight request
         // and, once streaming, to the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
+
+        // Keep-alive pool bounds. Before streaming reuse these were academic: the
+        // pool only ever held the few conns that short non-streaming requests left
+        // behind. Once a streaming gateway pools one upstream per concurrent stream,
+        // an unbounded pool is an fd leak in slow motion — at 4k concurrent streams
+        // it would pin 4k idle fds indefinitely. So the pool is capped (excess conns
+        // are closed rather than pooled) and idle entries are reaped on the loop's
+        // existing periodic tick.
+        static constexpr size_t kMaxIdleUpstreams = 256;
+        static constexpr int64_t kIdleUpstreamNs = 30LL * 1000 * 1000 * 1000; // 30 s
 
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
