@@ -353,6 +353,36 @@ namespace llmbridge
         return true;
     }
 
+    namespace
+    {
+        // May this streaming upstream go back into the keep-alive pool?
+        //
+        // Same spirit as the non-streaming rule ("pool only what will stay open"),
+        // plus the framing conditions that make the end of the body knowable. Every
+        // clause is load-bearing:
+        //
+        //   stream_keep_alive  the provider didn't say Connection: close; pooling a
+        //                      conn it is about to close just buys a retry later
+        //   stream_chunked     a close-delimited body has NO end marker except EOF,
+        //                      so "the response finished" and "the connection died"
+        //                      are indistinguishable — never reuse one
+        //   chunkdec.done()    the terminal 0-length chunk was consumed, so we are
+        //                      at a real message boundary rather than mid-body
+        //   rbuf empty         no trailing/pipelined bytes left over; anything still
+        //                      buffered would be mis-read as the NEXT response
+        //   !close_after_resp  aborted, corrupt, or idle-timed-out streams are never
+        //                      pooled — we don't trust framing we already distrusted
+        //
+        // Conservative by construction: any doubt falls through to close, which is
+        // exactly the behaviour that shipped before reuse existed.
+        bool stream_upstream_reusable(const Connection* client, const Connection* u) noexcept
+        {
+            return client != nullptr && u != nullptr && !u->doomed && u->fd >= 0
+                   && client->stream_keep_alive && client->stream_chunked
+                   && client->chunkdec.done() && u->rbuf.empty() && !client->close_after_resp;
+        }
+    } // namespace
+
     Connection* Gateway::acquire_upstream() noexcept
     {
         if (!_idle_upstreams.empty())
@@ -361,6 +391,7 @@ namespace llmbridge
             _idle_upstreams.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
+            ++_stats.upstream_reused;
             return u;
         }
         int fd = net::start_connect(_upstream_ip.c_str(), _upstream_port);
@@ -410,11 +441,16 @@ namespace llmbridge
 
     void Gateway::release_upstream(Connection* u) noexcept
     {
+        // Bounded pool: past the cap, close rather than accumulate. A streaming
+        // gateway pools roughly one upstream per concurrent stream, so an unbounded
+        // pool would pin an fd per stream forever.
+        if (_idle_upstreams.size() >= kMaxIdleUpstreams) { close_upstream(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
         u->wbuf.clear();
         u->woff = 0;
         u->msg = http::Message{};
+        u->ts_pooled = now_ns(); // idle-eviction baseline
         ep_disarm_write(u);
         _idle_upstreams.push_back(u);
     }
@@ -734,6 +770,7 @@ namespace llmbridge
         Connection* client = u->peer;
         client->streaming = true;
         client->stream_chunked = h.chunked;
+        client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wbuf.assign(kSseHead);
         client->woff = 0;
@@ -805,7 +842,17 @@ namespace llmbridge
     // count the request, and close the client (which delimits the SSE body).
     void Gateway::finalize_stream(Connection* client) noexcept
     {
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; close_upstream(u); }
+        if (Connection* u = client->peer)
+        {
+            const bool reusable = stream_upstream_reusable(client, u);
+            client->peer = nullptr;
+            u->peer = nullptr;
+            // Reuse is the whole point: a streaming request otherwise costs a fresh
+            // upstream connect EVERY time, which measured as the dominant term in
+            // time-to-first-token. Pool it when the framing says that is safe.
+            if (reusable) release_upstream(u);
+            else close_upstream(u);
+        }
         // Only a stream that terminated cleanly counts as a served request; an
         // aborted one (close_after_resp) was already counted in _stats.errors.
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
@@ -819,10 +866,32 @@ namespace llmbridge
     // stream rather than a fabricated clean finish.
     void Gateway::sweep_idle(bool uring) noexcept
     {
-        if (_upstream_idle_ns <= 0) return;
         const int64_t now = now_ns();
         if (now - _last_sweep_ns < 50'000'000LL) return; // at most ~20 sweeps/sec
         _last_sweep_ns = now;
+
+        // Reap idle pooled upstreams. Providers close idle keep-alives on their own
+        // schedule, and discovering a corpse costs a request its retry — so drop them
+        // first. Pooled conns have peer == nullptr, so the in-flight scan below skips
+        // them and would otherwise hold them forever.
+        for (size_t i = 0; i < _idle_upstreams.size();)
+        {
+            Connection* u = _idle_upstreams[i];
+            if (u->ts_pooled != 0 && now - u->ts_pooled > kIdleUpstreamNs)
+            {
+                _idle_upstreams.erase(_idle_upstreams.begin() + static_cast<long>(i));
+#ifdef LLMBRIDGE_HAVE_URING
+                if (uring) { u_close(u); continue; }
+#endif
+                close_upstream(u);
+                continue;
+            }
+            ++i;
+        }
+
+        // The in-flight abort below is gated on the upstream idle timeout; pool
+        // eviction above is not — they are independent settings.
+        if (_upstream_idle_ns <= 0) return;
 
         // Collect first: the teardown below erases from _clients.
         std::vector<Connection*> stale;
@@ -1036,6 +1105,7 @@ namespace llmbridge
             _idle_upstreams.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
+            ++_stats.upstream_reused;
             return u;
         }
         const int fd = net::make_client_socket();
@@ -1085,11 +1155,14 @@ namespace llmbridge
 
     void Gateway::u_release_upstream(Connection* u) noexcept
     {
+        // See release_upstream: bounded pool, closed past the cap.
+        if (_idle_upstreams.size() >= kMaxIdleUpstreams) { u_close(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
         u->wbuf.clear();
         u->woff = 0;
         u->msg = http::Message{};
+        u->ts_pooled = now_ns(); // idle-eviction baseline
         _idle_upstreams.push_back(u);
     }
 
@@ -1451,6 +1524,7 @@ namespace llmbridge
         Connection* client = u->peer;
         client->streaming = true;
         client->stream_chunked = h.chunked;
+        client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         client->wpending.assign(kSseHead);
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
@@ -1511,7 +1585,14 @@ namespace llmbridge
 
     void Gateway::u_finalize_stream(Connection* client) noexcept
     {
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; u_close(u); }
+        if (Connection* u = client->peer)
+        {
+            const bool reusable = stream_upstream_reusable(client, u);
+            client->peer = nullptr;
+            u->peer = nullptr;
+            if (reusable) u_release_upstream(u); // see the epoll mirror
+            else u_close(u);
+        }
         // Only a cleanly-terminated stream counts as served (see the epoll mirror).
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
         u_close(client);

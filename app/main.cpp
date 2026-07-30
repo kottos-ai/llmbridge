@@ -156,6 +156,7 @@ int main(int argc, char** argv)
         agg.uring_enobufs += s.uring_enobufs;
         agg.upstream_conns_opened += s.upstream_conns_opened;
         agg.upstream_retries += s.upstream_retries;
+        agg.upstream_reused += s.upstream_reused;
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
         agg.resp_path.merge(s.resp_path);
@@ -165,9 +166,10 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "timeouts=%llu  stream_pauses=%llu  uring_enobufs=%llu\n",
                  (unsigned long long)agg.upstream_timeouts, (unsigned long long)agg.stream_pauses,
                  (unsigned long long)agg.uring_enobufs);
-    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  retries=%llu\n",
+    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu\n",
                  (unsigned long long)agg.requests, (unsigned long long)agg.errors,
-                 (unsigned long long)agg.upstream_conns_opened, (unsigned long long)agg.upstream_retries);
+                 (unsigned long long)agg.upstream_conns_opened,
+                 (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries);
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
     agg.resp_path.print(std::cerr, "  response-path");

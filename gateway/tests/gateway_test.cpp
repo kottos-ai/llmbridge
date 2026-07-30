@@ -1871,6 +1871,151 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Upstream connection REUSE across streaming requests.
+//
+// A streaming request used to close its upstream unconditionally at stream end,
+// so every stream paid a fresh connect. Measured at 4096 concurrent streams that
+// was 706 connects/sec and the single largest component of time-to-first-token —
+// on BOTH backends. The upstream is now returned to the keep-alive pool when the
+// framing proves that is safe.
+//
+// "Safe" is conjunctive and each clause has its own test below, because the
+// failure mode of getting this wrong is silent corruption of the NEXT request's
+// response rather than a visible error.
+// ════════════════════════════════════════════════════════════════════════════
+class ProxyStreamPool : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyStreamPool, ReusesUpstreamAcrossSequentialStreams)
+{
+    _backend.set_response(sse_chunked_response(4096)); // chunked + Connection: keep-alive
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    // Three sequential streams, each on its own CLIENT connection: only the
+    // upstream side should be reused.
+    for (int i = 0; i < 3; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port)) << "stream " << i;
+        ASSERT_TRUE(c.send(openai_stream_request("hi"))) << "stream " << i;
+        const Streamed s = parse_streamed(c.recv_all());
+        EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
+        EXPECT_TRUE(s.done) << "stream " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    EXPECT_EQ(_gw->stats().requests, 3u);
+    // The point: one connect, two reuses — not three connects.
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u) << "each stream re-connected instead of reusing";
+    EXPECT_EQ(_gw->stats().upstream_reused, 2u);
+}
+
+TEST_P(ProxyStreamPool, ReusedUpstreamCarriesNoStreamStateIntoTheNextRequest)
+{
+    // The dangerous bug this guards: a pooled connection resurrected with a
+    // half-finished SSE translator or undrained chunk decoder would splice one
+    // stream's bytes into the next. Distinct payloads make that visible.
+    _backend.set_response(sse_chunked_response(5)); // tiny chunks: many decoder boundaries
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    std::string first, second;
+    for (std::string* out : {&first, &second})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_stream_request("hi")));
+        const Streamed s = parse_streamed(c.recv_all());
+        *out = s.content;
+        EXPECT_TRUE(s.done);
+        EXPECT_TRUE(s.role) << "each response must start its own assistant role delta";
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(first, "Hello, world");
+    EXPECT_EQ(second, "Hello, world") << "second stream inherited state from the pooled connection";
+    EXPECT_EQ(_gw->stats().errors, 0u);
+    EXPECT_EQ(_gw->stats().upstream_reused, 1u);
+}
+
+TEST_P(ProxyStreamPool, DoesNotPoolWhenUpstreamSaysConnectionClose)
+{
+    // Connection: close means the provider is about to hang up; pooling it would
+    // only buy a stale-connection retry on the next request.
+    std::string resp = sse_chunked_response(4096);
+    const std::string ka = "Connection: keep-alive\r\n";
+    const size_t at = resp.find(ka);
+    ASSERT_NE(at, std::string::npos);
+    resp.replace(at, ka.size(), "Connection: close\r\n");
+
+    _backend.set_response(resp);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_stream_request("hi")));
+        const Streamed s = parse_streamed(c.recv_all());
+        EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u) << "pooled a connection the provider said it would close";
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 2u);
+}
+
+TEST_P(ProxyStreamPool, DoesNotPoolACloseDelimitedStream)
+{
+    // No Transfer-Encoding: chunked => the body ends only at EOF, so "response
+    // finished" and "connection died" are indistinguishable. Never reuse.
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n\r\n" + anthropic_sse_events());
+    _backend.set_close_after_first(true); // close-delimited: EOF is what ends it
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    // TWO requests: with only one, upstream_reused is trivially 0 and the test
+    // proves nothing. The second request is what would consume a wrongly-pooled
+    // connection.
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_stream_request("hi")));
+        const Streamed s = parse_streamed(c.recv_all());
+        EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u) << "pooled a close-delimited stream";
+}
+
+TEST_P(ProxyStreamPool, DoesNotPoolAnAbortedStream)
+{
+    // Upstream vanishes mid-body: framing is untrustworthy, so the conn must be
+    // dropped rather than handed to the next request.
+    _backend.set_response(sse_chunked_response(4096));
+    _backend.set_close_mid_response(true);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    // Two requests, for the same reason as the close-delimited case: a single
+    // request can never observe a bad pooling decision.
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_stream_request("hi")));
+        (void)c.recv_all(); // truncated stream; content is not the assertion here
+        c.close();
+    }
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u) << "pooled a connection whose stream was aborted";
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamPool,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
+
+// ════════════════════════════════════════════════════════════════════════════
 // Provided-buffer exhaustion — io_uring only.
 //
 // The io_uring backend feeds its multishot recvs from a fixed pool of provided
