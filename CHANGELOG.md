@@ -13,7 +13,7 @@ Next up: auth-header passthrough (forward the client's provider credentials upst
 then tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic API,
 fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
-## [0.3.1] — 2026-07-31
+## [0.4.0] — 2026-07-31
 
 TLS to the upstream. The gateway can now front an `https://` provider endpoint —
 `llmbridge --upstream https://host` — on both event-loop backends. **Opt-in at build
