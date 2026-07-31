@@ -342,12 +342,19 @@ TEST(FindHeader, ColonInNameStopsPrefixConfusion)
     EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "right");
 }
 
-TEST(FindHeader, ValueCannotContainCrlfByConstruction)
+TEST(FindHeader, CrlfEndsTheValue)
 {
-    // A "value" with an embedded CRLF is, by definition, two lines — the lookup
-    // returns only the first line's remainder, so re-emitting it cannot inject.
     const std::string_view h = "x-api-key: k\r\nX-Evil: 1\r\n";
+    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "k");
+}
+
+// Documents the SHARP EDGE deliberately: a bare CR does NOT terminate a line, so
+// it survives inside the value. Callers must validate before re-emitting; this
+// test exists so nobody "fixes" the comment back to claiming otherwise.
+TEST(FindHeader, BareCrSurvivesInsideValueSoCallersMustValidate)
+{
+    const std::string_view h = "x-api-key: k\rX-Smuggled: 1\r\nHost: a\r\n";
     const auto v = llmbridge::http::find_header(h, "x-api-key:");
-    EXPECT_EQ(v, "k");
-    EXPECT_EQ(v.find('\r'), std::string_view::npos);
+    EXPECT_NE(v.find('\r'), std::string_view::npos)
+        << "if this ever passes, find_header changed and gateway validation may be stale";
 }

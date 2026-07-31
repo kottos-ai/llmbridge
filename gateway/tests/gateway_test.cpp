@@ -749,6 +749,74 @@ TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
     EXPECT_NE(up.find("Authorization: Bearer co-test-9\r\n"), std::string::npos) << up;
 }
 
+// SECURITY: a credential value containing a BARE CR (not CRLF) must not be able
+// to inject a header line into the rebuilt upstream request. This matters more
+// than usual here because upstream connections are POOLED AND SHARED across
+// clients: smuggling on one is a cross-client request/response-splitting vector,
+// not just a self-inflicted malformed request.
+TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk\rX-Smuggled: yes\r\n")));
+    (void)c.recv_response();
+    // Fails CLOSED: 400 to the client, and the upstream is never contacted at all.
+    EXPECT_EQ(_backend.last_request().find("X-Smuggled"), std::string::npos)
+        << _backend.last_request();
+    EXPECT_TRUE(_backend.last_request().empty()) << "request reached upstream despite bad credential";
+}
+
+// A second Authorization header cannot smuggle past the check by hiding behind a
+// clean first one (first-wins means only the first is ever emitted).
+TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer clean\r\nAuthorization: Bearer bad\rX-S: 1\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("X-S:"), std::string::npos) << up;
+    if (!up.empty()) EXPECT_NE(up.find("x-api-key: clean"), std::string::npos) << up;
+}
+
+// An oversized credential is refused rather than forwarded (bounded work, and a
+// 8 KiB "key" is an attack or a bug, never a real provider key).
+TEST_P(ProxyAuth, OversizedCredentialRejected)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer " + std::string(9000, 'k') + "\r\n")));
+    const int st = c.recv_status();
+    EXPECT_TRUE(st == 400 || st == 0) << "status " << st;
+    EXPECT_TRUE(_backend.last_request().empty());
+}
+
+// Same class, other control characters: NUL, bare LF, tabs in the middle.
+TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    std::string hdr = "Authorization: Bearer sk";
+    hdr.push_back('\x01');
+    hdr += "bad\r\n";
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", hdr)));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find('\x01'), std::string::npos) << up;
+    EXPECT_TRUE(up.empty()) << "control-char credential reached upstream";
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {

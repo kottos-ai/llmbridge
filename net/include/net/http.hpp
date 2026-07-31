@@ -81,9 +81,12 @@ namespace llmbridge::http
     // the upstream request from a whitelist rather than echoing the block, the
     // duplicate never travels.
     //
-    // The returned value cannot contain CR or LF by construction (it is bounded
-    // by the line's own CRLF), which is what makes it safe to re-emit into a
-    // rebuilt header block without re-validation.
+    // ⚠ The returned value is NOT safe to re-emit as-is. Splitting on CRLF leaves
+    // a BARE CR (or any other control byte) inside the value — a lenient parser
+    // that treats bare CR as a line terminator then sees an injected header. An
+    // earlier revision of this comment claimed the opposite; it was wrong, and the
+    // injection was measured reaching an upstream. Callers that re-emit a value
+    // MUST validate its charset first (see header_value_safe in gateway.cpp).
     // `name` must be LOWERCASE and INCLUDE the trailing colon ("x-api-key:") —
     // same convention as the framer's own header matching, and the colon is what
     // stops "x-api-key-2:" from prefix-matching "x-api-key".

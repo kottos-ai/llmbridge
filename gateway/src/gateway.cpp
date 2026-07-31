@@ -92,15 +92,59 @@ namespace llmbridge
         // The credential is handled as a transient string_view over the client's
         // request buffer and written straight into the upstream bytes — it is
         // never copied anywhere that outlives the request, and never logged.
-        std::string auth_headers_for(TranslateMode mode, std::string_view client_headers)
+        // Is this safe to re-emit as an HTTP header VALUE?
+        //
+        // Do NOT trust find_header() to have made this safe. It splits on CRLF, so
+        // a value may still contain a BARE CR (or LF, NUL, any control byte) — and
+        // a lenient upstream parser that treats bare CR as a line terminator would
+        // then see an injected header. That is not hypothetical: it was measured
+        // reaching the upstream as `x-api-key: sk\rX-Smuggled: yes` before this
+        // check existed. It matters more than a self-inflicted malformed request
+        // because upstream connections are POOLED AND SHARED between clients, so
+        // smuggling on one is a cross-client request-splitting vector.
+        //
+        // RFC 7230 field-value permits obs-text (0x80-0xFF); we are deliberately
+        // stricter — a provider API key is printable ASCII, and narrowing the
+        // charset costs us nothing real.
+        bool header_value_safe(std::string_view v) noexcept
+        {
+            if (v.empty() || v.size() > 8192) return false;
+            for (const unsigned char ch : v)
+                if (ch < 0x20 || ch > 0x7E) return false; // CTLs (incl. CR/LF/NUL) and 8-bit
+            return true;
+        }
+
+        // Trailing OWS is legal in a header line but is not part of the credential;
+        // forwarding it verbatim has broken real provider auth before.
+        std::string_view rtrim_ows(std::string_view v) noexcept
+        {
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+            return v;
+        }
+
+        // Returns false when the client supplied a syntactically invalid credential
+        // (control characters). The caller MUST fail the request rather than
+        // forward — silently dropping would still send a credential-less request
+        // upstream, which is a confusing 401; a 400 names the client's own bug.
+        bool auth_headers_for(TranslateMode mode, std::string_view client_headers, std::string& out)
         {
             using http::find_header;
-            std::string out;
+            out.clear();
+
+            // Any credential-bearing header the client sent must be well-formed,
+            // whether or not this dialect ends up using it — otherwise a malformed
+            // value simply routes around the check by picking the other header.
+            for (const std::string_view name :
+                 {"authorization:", "x-api-key:", "x-goog-api-key:", "anthropic-version:"})
+            {
+                const std::string_view v = rtrim_ows(find_header(client_headers, name));
+                if (!v.empty() && !header_value_safe(v)) return false;
+            }
 
             // "Authorization: Bearer K" -> K (bearer scheme only; anything else
             // is not a provider API key and is dropped rather than guessed at).
             const auto bearer_token = [&]() -> std::string_view {
-                std::string_view v = find_header(client_headers, "authorization:");
+                const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
                 if (v.size() > 7 &&
                     (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
                     return http::detail::ltrim(v.substr(7));
@@ -113,7 +157,7 @@ namespace llmbridge
                 {
                     // Client already speaks Anthropic auth -> forward verbatim;
                     // else map the OpenAI-style bearer token.
-                    std::string_view key = find_header(client_headers, "x-api-key:");
+                    std::string_view key = rtrim_ows(find_header(client_headers, "x-api-key:"));
                     if (key.empty()) key = bearer_token();
                     if (!key.empty())
                     {
@@ -121,7 +165,7 @@ namespace llmbridge
                         out.append(key);
                         out.append("\r\n");
                     }
-                    std::string_view ver = find_header(client_headers, "anthropic-version:");
+                    std::string_view ver = rtrim_ows(find_header(client_headers, "anthropic-version:"));
                     if (ver.empty()) ver = kAnthropicVersionDefault;
                     out.append("anthropic-version: ");
                     out.append(ver);
@@ -130,7 +174,7 @@ namespace llmbridge
                 }
                 case TranslateMode::Gemini:
                 {
-                    std::string_view key = find_header(client_headers, "x-goog-api-key:");
+                    std::string_view key = rtrim_ows(find_header(client_headers, "x-goog-api-key:"));
                     if (key.empty()) key = bearer_token();
                     if (!key.empty())
                     {
@@ -143,7 +187,7 @@ namespace llmbridge
                 case TranslateMode::Cohere:
                 {
                     // Cohere speaks Bearer natively -> forward the whole value.
-                    const std::string_view v = find_header(client_headers, "authorization:");
+                    const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
                     if (!v.empty())
                     {
                         out.append("Authorization: ");
@@ -155,7 +199,7 @@ namespace llmbridge
                 case TranslateMode::None:
                     break; // byte-forward path; never called, but total anyway
             }
-            return out;
+            return true;
         }
 
         // Translate an OpenAI request body to the upstream dialect, also yielding
@@ -849,8 +893,10 @@ namespace llmbridge
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
-            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr,
-                                                auth_headers_for(_translate, client_hdrs));
+            std::string auth_hdrs;
+            // Malformed credential => 400, and NOTHING goes upstream.
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { error_respond(c, 400); return; }
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
         {
@@ -1795,8 +1841,10 @@ namespace llmbridge
             if (tbody.empty()) { u_error_respond(c, 400); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
-            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr,
-                                                auth_headers_for(_translate, client_hdrs));
+            std::string auth_hdrs;
+            // Malformed credential => 400, and NOTHING goes upstream.
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { error_respond(c, 400); return; }
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
         {

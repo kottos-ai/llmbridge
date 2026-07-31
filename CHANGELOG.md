@@ -12,36 +12,64 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
 API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
+## [0.5.0] — 2026-07-31
+
+Auth-header passthrough. Combined with 0.4.0's TLS, the gateway can now front a real
+provider end to end:
+`llmbridge --upstream https://api.anthropic.com --translate anthropic`, with the client
+sending its ordinary OpenAI-style key.
+
 ### Added
 
-- **Auth-header passthrough** — translated upstream requests now carry the client's
-  credentials, mapped across the dialect boundary: `Authorization: Bearer K` becomes
-  `x-api-key: K` for Anthropic (plus `anthropic-version`, pinned to `2023-06-01`
-  unless the client sends its own) and `x-goog-api-key: K` for Gemini; Cohere gets
-  the Bearer header verbatim; a client already speaking the target dialect's auth
-  (`x-api-key`) is forwarded untouched. **Whitelist, not echo**: a rebuilt request
-  forwards only the credential headers the target dialect understands — arbitrary
-  client headers (cookies, tracing, anything) do not cross, which is the
-  anti-smuggling stance the rebuild exists for. No credential → no header invented;
-  the provider's own `401` is the correct outcome. Credentials are written straight
-  from the client's request buffer into the upstream bytes — never stored, never
-  logged. `TranslateMode::None` is unchanged (byte-forwarding already carries all
-  headers). Streaming uses the same forward path, so streamed requests carry auth
-  identically.
-- **`Host` header on rebuilt upstream requests** — previously absent entirely
-  (HTTP/1.1 requires it; the benchmark mocks tolerated the omission, real providers
-  reject it). Derived from the parsed upstream hostname, falling back to `ip:port`;
-  default ports omitted.
-- `http::find_header()` — case-insensitive, zero-copy, first-occurrence-wins header
-  lookup (first-wins so duplicated credentials resolve deterministically; values are
-  CRLF-free by construction, so re-emitting one cannot inject). 5 unit tests.
-- 14 gateway auth tests across both backends: Bearer→`x-api-key` mapping, native-key
-  and version passthrough, no-credential-no-header, unrelated-headers-do-not-cross,
-  Host presence, Gemini and Cohere mappings.
+- **Credentials cross the dialect boundary.** Translated requests are *rebuilt*, so
+  auth must be mapped explicitly: `Authorization: Bearer K` becomes `x-api-key: K`
+  (Anthropic, plus `anthropic-version` pinned to `2023-06-01` unless the client sends
+  its own) or `x-goog-api-key: K` (Gemini); Cohere receives the Bearer header verbatim;
+  a client already speaking the target dialect's auth is forwarded untouched. No
+  credential → **no header invented** (the provider's own `401` is the right answer).
+  `TranslateMode::None` is unchanged — byte-forwarding already carries every header.
+  Streaming shares the forward path, so streamed requests carry auth identically.
+- **`Host` header on rebuilt upstream requests** — previously absent entirely. HTTP/1.1
+  requires it; the benchmark mocks tolerated the omission, real providers do not.
+  Derived from the parsed upstream hostname (falls back to `ip:port`), default ports
+  omitted.
+- `http::find_header()` — case-insensitive, zero-copy, first-occurrence-wins lookup.
+  First-wins is deliberate: a duplicated credential must resolve the same way for us
+  and for the upstream.
 
-With this, a TLS build can front a real provider end to end:
-`llmbridge --upstream https://api.anthropic.com --translate anthropic` with the
-client sending its OpenAI-style key.
+### Security
+
+- **Whitelist, not echo.** Only credential headers the target dialect understands cross
+  a rebuilt request. Arbitrary client headers — cookies, tracing, anything — do not.
+  Echoing them would be both a smuggling surface and a privacy leak to a third-party
+  provider.
+- **Header-injection fix, found by audit before any real key was used.** Credential
+  values are now charset-validated (printable ASCII only) and a malformed one fails the
+  request with `400` **without contacting the upstream at all**. This closes a real,
+  measured hole: `find_header` splits on CRLF, so a **bare CR** survived inside a value
+  and reached an upstream as `x-api-key: sk\rX-Smuggled: yes`. A lenient parser treating
+  bare CR as a line terminator would have seen an injected header — and because upstream
+  connections are **pooled and shared between clients**, that is a cross-client
+  request-splitting vector, not merely a self-inflicted malformed request. Regression
+  tests cover bare CR, control characters, a second credential header attempting to
+  hide behind a clean first one, and oversized values.
+- Trailing whitespace is trimmed from credential values (forwarding it verbatim breaks
+  real provider auth).
+- Credentials are read as a view over the client's request buffer and written straight
+  into the upstream bytes — never stored, never logged, never placed in stats or error
+  responses. Pooled upstream connections clear the request buffer on release.
+
+### Known gaps
+
+- **Buffers are not scrubbed.** `std::string::clear()` leaves the old bytes in the
+  allocation until overwritten, so a credential can persist in freed heap. Not reachable
+  through normal operation (string APIs respect `size()`); it would require a separate
+  memory-disclosure bug or a core dump. Scrubbing every request buffer would put a
+  `memset` on the hot path, so it is documented rather than done.
+- No gateway-side credential store — the gateway forwards the client's key and holds
+  none of its own. Per-client keys, rotation and quota live in the commercial layer.
+- Verified only against hermetic mocks (project policy forbids tests hitting live
+  provider APIs); no request has yet been made to a real provider through this path.
 
 ## [0.4.0] — 2026-07-31
 
