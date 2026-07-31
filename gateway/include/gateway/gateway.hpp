@@ -343,7 +343,7 @@ namespace llmbridge
         void u_forward(Connection* c) noexcept;
         void u_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
         void u_on_response(Connection* u, const http::ResponseHead& h,
-                           const std::string& body_buf, size_t total_len) noexcept;
+                           std::string_view body_buf, size_t total_len) noexcept;
         void u_finish_client(Connection* c) noexcept;
         // io_uring streaming pump — completion-driven mirror of the epoll pump,
         // with serialized sends (one SEND SQE in flight) and a bounded buffer.
@@ -380,6 +380,12 @@ namespace llmbridge
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
+        // Decode buffer for CHUNKED upstream responses (see http::parse_response).
+        // One per loop, not per connection: the loop is single-threaded and a
+        // response is framed and consumed entirely within one event, so there is no
+        // overlap. Reused across requests so the chunked path — which is the REAL
+        // provider path, not an edge case — does not allocate per response.
+        std::string _resp_scratch;
 #ifdef LLMBRIDGE_HAVE_TLS
         net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
         bool _tls_ctx_ok = false;
