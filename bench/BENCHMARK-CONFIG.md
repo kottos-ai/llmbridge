@@ -103,9 +103,35 @@ Measured: 20 LiteLLM connect failures *during measurement* with the default rang
 sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"   # 55,536 ports
 ```
 
-Three separate host limits have now produced this same failure mode (mock listen backlog,
-SYN backlog, ephemeral ports). **Assume there is a fourth**: always verify the competitor
-recorded zero connect failures before trusting a head-to-head.
+### The fourth: a listen port INSIDE the widened ephemeral range
+
+The fix above has a sting in its tail. Widening `ip_local_port_range` to `10000 65535`
+means **any listen port at or above 10000 can be stolen** by a lingering client socket
+from a previous run. `bind()` then fails and the gateway exits with
+`failed to bind listen port`.
+
+Measured: an A/B harness using listen ports 19xxx/20xxx had roughly half its runs die
+this way, *intermittently* — depending on whether that particular port happened to be in
+use. Because the harness recorded the dead runs as `achieved=0`, the first reading was
+"the new build crashes under load", which was wrong in both directions: nothing crashed,
+and the build was fine. The gateway aborting when it cannot bind is correct behaviour.
+
+**Rule: pick benchmark listen ports BELOW 10000** (or whatever
+`/proc/sys/net/ipv4/ip_local_port_range` starts at) and check before choosing:
+
+```sh
+cat /proc/sys/net/ipv4/ip_local_port_range   # listen ports must be below the low bound
+```
+
+A harness must also **verify the process is alive after starting it** and fail loudly
+rather than recording a zero — a silent `achieved=0` reads like a catastrophic
+regression and costs an hour of chasing a bug that does not exist.
+
+Four separate host limits have now produced the same failure mode (mock listen backlog,
+SYN backlog, ephemeral-port exhaustion, and a listen port inside the ephemeral range).
+**Assume there is a fifth**: always verify the competitor recorded zero connect failures
+before trusting a head-to-head, and verify the *control* held the offered rate before
+trusting any delta.
 
 ### Why no `idle-set -D 5` for the competitive runs
 
