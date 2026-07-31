@@ -364,10 +364,18 @@ namespace llmbridge::http
                         break;
                 }
             }
+            _consumed += i; // bytes of `in` this call actually took
             return _st != St::Error;
         }
 
         [[nodiscard]] bool done() const noexcept { return _st == St::Done; }
+
+        // Total input bytes consumed across all feeds. Needed to find where a
+        // chunked message ENDS: anything after that is the next pipelined response
+        // (or trailing junk that must not be mistaken for one). The loop above
+        // stops advancing `i` once Done, so this never over-counts past the
+        // terminating chunk.
+        [[nodiscard]] size_t consumed() const noexcept { return _consumed; }
         [[nodiscard]] bool failed() const noexcept { return _st == St::Error; }
 
     private:
@@ -376,6 +384,69 @@ namespace llmbridge::http
 
         St _st = St::Size;
         size_t _remaining = 0; // bytes left in the current chunk's data
+        size_t _consumed = 0;  // input bytes taken so far (see consumed())
         std::string _line;     // accumulates a size/CRLF/trailer line across reads
     };
+
+    // Frame a complete upstream RESPONSE, accepting BOTH body encodings.
+    //
+    // WHY THIS EXISTS SEPARATELY FROM parse(). HTTP/1.1 delimits a body either by
+    // Content-Length or by Transfer-Encoding: chunked. parse() implements only the
+    // former and REJECTS the latter — deliberately, because on the REQUEST path we
+    // are the server, the bytes are attacker-controlled, and framing TE as CL while
+    // an upstream honours TE is the classic smuggling desync (worse here, since a
+    // desync on a POOLED upstream lets one client's trailing bytes become the head
+    // of another client's request). That rule must not be relaxed.
+    //
+    // On the RESPONSE path the threat model is inverted: we are the client, talking
+    // to a configured and TLS-verified provider, and chunked is simply normal
+    // HTTP/1.1 — a server uses it whenever the body length is unknown when headers
+    // are sent, which is the usual case for a generated completion. Real providers
+    // do exactly this: Anthropic returns non-streaming completions as chunked over
+    // HTTP/1.1 (invisible over HTTP/2, which has native framing and no chunked at
+    // all — so a curl probe that negotiates h2 will not show it).
+    //
+    // The streaming path already accepted chunked via ChunkDecoder; only the
+    // whole-body path did not, which is the asymmetry this closes.
+    //
+    // Re-runnable: like parse(), it re-frames from the buffer start on every call
+    // and returns NeedMore until the whole message is present. `body` is filled
+    // ONLY on Complete — decoded for chunked, copied for Content-Length — so the
+    // caller has one contiguous body either way.
+    enum class RespStatus { NeedMore, Complete, Error };
+
+    inline RespStatus parse_response(std::string_view buf, ResponseHead& head, std::string& body,
+                                     size_t& total_len) noexcept
+    {
+        const HeadStatus hs = parse_response_head(buf, head);
+        if (hs == HeadStatus::NeedMore) return RespStatus::NeedMore;
+        if (hs == HeadStatus::Error) return RespStatus::Error;
+
+        // Both framings present is a smuggling signal even from a trusted origin
+        // (a compromised or buggy middlebox), so refuse rather than pick a winner.
+        if (head.chunked && head.has_content_length) return RespStatus::Error;
+
+        if (!head.chunked)
+        {
+            if (head.content_length > kMaxBodyLen) return RespStatus::Error;
+            const size_t need = head.header_len + head.content_length;
+            if (buf.size() < need) return RespStatus::NeedMore;
+            body.assign(buf.data() + head.header_len, head.content_length);
+            total_len = need;
+            return RespStatus::Complete;
+        }
+
+        // Chunked: decode from scratch each call. A fresh decoder per attempt keeps
+        // this function stateless and idempotent, matching parse()'s contract; the
+        // cost is re-decoding the bytes buffered so far, which is bounded by
+        // kMaxBodyLen and only paid on the non-streaming path (the streaming pump
+        // uses a persistent decoder precisely to avoid that).
+        ChunkDecoder dec;
+        body.clear();
+        if (!dec.feed(buf.substr(head.header_len), body)) return RespStatus::Error;
+        if (body.size() > kMaxBodyLen) return RespStatus::Error;
+        if (!dec.done()) return RespStatus::NeedMore;
+        total_len = head.header_len + dec.consumed();
+        return RespStatus::Complete;
+    }
 } // namespace llmbridge::http

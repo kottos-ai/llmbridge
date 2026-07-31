@@ -169,6 +169,10 @@ namespace
         // Respond once (keep-alive), then close the connection — simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
+        // Frame the reply with Transfer-Encoding: chunked and NO Content-Length —
+        // what real providers actually do for a non-streaming completion, since the
+        // body length is unknown when headers are sent. `n` = chunks to split into.
+        void set_chunked_response(int n) { _chunked_chunks = n; }
         // Stall modes for timeout tests: 1 = read the request then never reply;
         // 2 = send half the response, then hold the connection open forever.
         void set_stall(int mode) { _stall = mode; }
@@ -184,6 +188,48 @@ namespace
         {
             std::lock_guard<std::mutex> lk(_mu);
             return _all_requests;
+        }
+
+        // Re-frame a Content-Length reply as a chunked one, splitting the body.
+        // Line-wise on purpose: an earlier version erased the Content-Length header
+        // by byte range, and because it is the LAST header that left a dangling CRLF
+        // which terminated the header block early — producing a response with
+        // neither framing header. Rebuild from lines so header order cannot matter.
+        static std::string to_chunked(const std::string& resp, int nchunks)
+        {
+            const size_t hdr_end = resp.find("\r\n\r\n");
+            if (hdr_end == std::string::npos) return resp;
+            const std::string body = resp.substr(hdr_end + 4);
+
+            std::string out;
+            size_t pos = 0;
+            const std::string head = resp.substr(0, hdr_end);
+            while (pos <= head.size())
+            {
+                size_t eol = head.find("\r\n", pos);
+                if (eol == std::string::npos) eol = head.size();
+                const std::string line = head.substr(pos, eol - pos);
+                // Drop Content-Length: the two framings must never both appear.
+                if (line.rfind("Content-Length:", 0) != 0 && !line.empty())
+                {
+                    out += line;
+                    out += "\r\n";
+                }
+                if (eol == head.size()) break;
+                pos = eol + 2;
+            }
+            out += "Transfer-Encoding: chunked\r\n\r\n";
+
+            const size_t per = nchunks > 0 ? (body.size() + nchunks - 1) / nchunks : body.size();
+            for (size_t off = 0; off < body.size(); off += per)
+            {
+                const std::string part = body.substr(off, std::min(per, body.size() - off));
+                char len[16];
+                std::snprintf(len, sizeof len, "%zx", part.size());
+                out += std::string(len) + "\r\n" + part + "\r\n";
+            }
+            out += "0\r\n\r\n";
+            return out;
         }
 
     private:
@@ -218,7 +264,8 @@ namespace
                 _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
 
-                const std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                if (_chunked_chunks > 0) resp = to_chunked(resp, _chunked_chunks);
                 if (_stall == 1) // never answer; hold the connection open
                 {
                     while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
@@ -267,6 +314,7 @@ namespace
         uint16_t _port = 0;
         std::string _resp_override;
         int _trickle_chunk = 0;
+        int _chunked_chunks = 0;
         bool _close_mid = false;
         bool _close_after_first = false;
         int _stall = 0;
@@ -923,6 +971,86 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
                          });
+
+// ── Chunked non-streaming responses ──────────────────────────────────────────
+// REGRESSION: real providers return non-streaming completions with
+// Transfer-Encoding: chunked and no Content-Length (Anthropic does over HTTP/1.1;
+// it is invisible over HTTP/2, which has native framing). Every mock in this file
+// used to reply with Content-Length, so the whole-body path's inability to read a
+// chunked response survived 767 tests and only surfaced against the live API as a
+// 502. These tests make the mocks behave like the real thing.
+class ProxyChunkedResp : public ProxyIT,
+                         public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, int>>
+{
+};
+
+TEST_P(ProxyChunkedResp, TranslatedChunkedResponseRoundTrips)
+{
+    const auto [backend, nchunks] = GetParam();
+    _backend.set_response(http_ok(anthropic_resp_body("chunked-pong")));
+    _backend.set_chunked_response(nchunks);
+    start(0, true, TranslateMode::Anthropic, backend);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty()) << "no response for a chunked upstream reply";
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_NE(body_of(r).find("\"content\":\"chunked-pong\""), std::string::npos) << body_of(r);
+}
+
+TEST_P(ProxyChunkedResp, PassthroughChunkedResponseReframedWithContentLength)
+{
+    const auto [backend, nchunks] = GetParam();
+    _backend.set_chunked_response(nchunks);
+    start(0, true, TranslateMode::None, backend);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_EQ(body_of(r), kRespBody) << r;
+    // The client must get a self-framed message, not our upstream's chunking.
+    EXPECT_EQ(r.find("Transfer-Encoding"), std::string::npos) << r;
+    EXPECT_NE(r.find("Content-Length:"), std::string::npos) << r;
+}
+
+TEST_P(ProxyChunkedResp, PooledConnectionSurvivesAChunkedResponse)
+{
+    // The end of a chunked message is found by decoding, not by Content-Length. If
+    // total_len were wrong, leftover bytes would poison the pooled connection and
+    // the SECOND request would mis-frame — so two requests is the real test.
+    const auto [backend, nchunks] = GetParam();
+    _backend.set_response(http_ok(anthropic_resp_body("again")));
+    _backend.set_chunked_response(nchunks);
+    start(0, true, TranslateMode::Anthropic, backend);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_request("hi")));
+        const std::string r = c.recv_response();
+        ASSERT_FALSE(r.empty()) << "request " << i;
+        EXPECT_EQ(Client::status_of(r), 200) << "request " << i;
+        EXPECT_NE(body_of(r).find("again"), std::string::npos) << "request " << i;
+    }
+    shutdown();
+    EXPECT_GE(_gw->stats().upstream_reused, 1u) << "pool never exercised; test proves little";
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Backends, ProxyChunkedResp,
+    ::testing::Combine(::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                       ::testing::Values(1, 3, 17)), // whole-body, split, many tiny chunks
+    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, int>>& i) {
+        return std::string(std::get<0>(i.param) == llmbridge::IoBackend::Epoll ? "epoll" : "uring") +
+               "_" + std::to_string(std::get<1>(i.param)) + "chunks";
+    });
 
 // ── Large bodies ───────────────────────────────────────────────────────────────
 class ProxySize : public ProxyIT, public ::testing::WithParamInterface<size_t> {};

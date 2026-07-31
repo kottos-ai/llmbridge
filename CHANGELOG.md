@@ -12,6 +12,88 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
 API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
+## [0.5.1] — 2026-07-31
+
+Read chunked upstream responses on the non-streaming path. Found by the first live
+run against the real Anthropic API, which returned `502` for every non-streaming
+request while streaming worked — a gap no mock had ever exercised.
+
+### Fixed
+
+- **Non-streaming responses framed with `Transfer-Encoding: chunked` are now read
+  correctly** (previously `502 Bad Gateway`). Real providers return non-streaming
+  completions chunked over HTTP/1.1 — a server does this whenever the body length is
+  unknown when headers are sent, which is the normal case for a generated completion.
+  Anthropic does exactly this; it is invisible over HTTP/2 (native framing, no chunked
+  encoding exists there), so a `curl` probe that negotiates h2 will not reveal it.
+  The gateway's whole-body path used `http::parse()`, which rejects `Transfer-Encoding`
+  outright, so the response could not be framed at all.
+- `ChunkDecoder::consumed()` — a chunked message's end is found by *decoding*, not by
+  arithmetic on `Content-Length`. Without it the gateway could not tell where the
+  message stopped, which on a pooled connection would leave stray bytes to be
+  mis-read as the head of the next response.
+
+### Added
+
+- `http::parse_response()` — response-side framing that accepts **both** body
+  encodings, deliberately separate from `parse()` so the request path is untouched
+  (see "Why the asymmetry is safe"). Idempotent like `parse()`: re-frames from the
+  buffer start and returns `NeedMore` until the whole message is present.
+- 18 regression tests across both backends × {1, 3, 17} chunks: translated round-trip,
+  passthrough re-framing, and **three sequential requests over a pooled connection** —
+  a wrong end-of-message offset only shows up on the *second* request, so a single
+  request would not have caught it. The test mock can now reply chunked; every mock in
+  the suite previously replied with `Content-Length`, which is precisely why this
+  survived 767 tests.
+
+### Changed
+
+- A chunked response on the **passthrough** path (`--translate none`) is re-framed to
+  the client with `Content-Length` rather than relayed verbatim. We have already
+  decoded it, and forwarding framing we did not re-verify would push the problem
+  downstream.
+
+### Why the asymmetry is safe
+
+The gateway now **sends** `Content-Length` and **accepts** either encoding in
+responses. That is deliberate, and it is the standard posture for a proxy:
+
+| leg | framing | rationale |
+|---|---|---|
+| client → gateway (request) | `Content-Length` only; `Transfer-Encoding` **rejected** | we are the server, bytes are attacker-controlled, and a TE/CL desync against a TE-honouring upstream is the classic smuggling attack — worse here, since a desync on a **pooled** upstream lets one client's trailing bytes become the head of another client's request |
+| gateway → upstream (request) | `Content-Length`, built by us | nothing to desync: we choose the framing |
+| upstream → gateway (response) | `Content-Length` **or** chunked | we are the client of a configured, TLS-verified provider; chunked is ordinary HTTP/1.1 and refusing it means refusing real providers |
+| gateway → client (response) | `Content-Length` (non-streaming) | the client never sees framing we did not produce |
+
+**Content cannot break the framing.** Both encodings are *length-prefixed*, not
+delimiter-scanned: each chunk declares its size and the decoder copies exactly that
+many bytes regardless of what they contain. Model-generated text inside the body —
+including text engineered by prompt injection to look like `0\r\n\r\n` — is just
+bytes inside a chunk whose length the provider already declared. There is no
+delimiter for content to forge. (This is also why the request path can safely keep
+its stricter rule: the danger there was never content, it was two parties disagreeing
+about which *header* defines the length.)
+
+Defence in depth on the response path, all pre-existing and now load-bearing:
+
+- **`Transfer-Encoding` and `Content-Length` both present → refused.** Even from a
+  trusted origin that combination is a smuggling signal (a compromised or buggy
+  middlebox), so it is rejected rather than resolved by preference.
+- **Chunk sizes are bounded** — a size line over 64 bytes or a chunk over `kMaxBodyLen`
+  fails the stream; the framer is covered by the `fuzz_http` target in CI.
+- **A framing error never pools the connection.** `error_respond()` closes the upstream
+  rather than releasing it, so a connection we could not frame cannot be handed to the
+  next request.
+
+### Known gaps
+
+- The upstream is trusted to the extent that TLS verification makes it so. A genuinely
+  compromised provider could desync responses deliberately; a compromised provider can
+  already return arbitrary content to every one of its clients, so this changes little,
+  but it is the reason the bounds and the close-on-error rule above exist.
+- HTTP/2 to the upstream is still not implemented, so llmbridge always negotiates
+  HTTP/1.1 and therefore always meets chunked in practice.
+
 ## [0.5.0] — 2026-07-31
 
 Auth-header passthrough. Combined with 0.4.0's TLS, the gateway can now front a real
