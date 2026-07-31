@@ -246,6 +246,72 @@ llmbridge adds **~0.3-0.6 ms at p99 while carrying 4,096 concurrent streams**, a
 explained; it is present on both backends, so it is a gateway-wide question rather than
 an io_uring one.
 
+**4,096 concurrent streams is a stable operating point, not a limit being probed.** One
+worker, four independent client processes, 10 tok/s per stream, idle states capped at C1:
+
+| | delivered | p50 | p99 | p99.9 | failures |
+|---|---|---|---|---|---|
+| client 1 | 10,240 tok/s | 157 us | 449 us | 794 us | 0 |
+| client 2 | 10,240 tok/s | 180 us | 463 us | 952 us | 0 |
+| client 3 | 10,240 tok/s | 169 us | 452 us | 932 us | 0 |
+| client 4 | 10,240 tok/s | 170 us | 458 us | 839 us | 0 |
+
+**40,960 of 40,960 offered tokens/s delivered — exactly 100% — with zero client-side
+failures**, and the four clients agree to within 3% on p99. The gateway holds **8,192
+sockets** open throughout (one client plus one upstream per stream). Nothing is degrading:
+p50 under 200 us, p99 under 0.5 ms, p99.9 under 1 ms.
+
+**This table uses `cpupower idle-set -D 5`** (idle states capped at C1), which is
+permissible here because there is no competitor in it to disadvantage — unlike the
+head-to-head above, where the same setting would cut LiteLLM's capacity by 40%. It is
+worth ~30% at p50: the same run with stock idle states measures 226-245 us p50 and
+474-491 us p99, still with 99.998% delivery and zero failures. Absolute latency is also
+thermally sensitive (298-413 us p99 on a cool machine); the *stability* indicators —
+delivery, failure count, agreement between clients — are unaffected by either.
+
+### Concurrent-stream capacity: 16,384 on one worker
+
+The 4,096 table above is a *latency* measurement. This is a *capacity* one: how many
+simultaneous streams a single worker holds while still delivering essentially every token.
+Eight independent load-generator processes, 2 tok/s per stream, streams long enough that
+none completes inside the window (no connection churn).
+
+| | **16,384 streams** | 24,576 streams |
+|---|---|---|
+| offered | 32,768 tok/s | 49,152 tok/s |
+| **delivered** | **32,756 tok/s (99.96%)** | **49,118 tok/s (99.93%)** |
+| client-side failures | **0** | **0** |
+| p50 | **36-48 us** | 50-58 us |
+| p99 | **487-615 us** | 1.15-1.20 ms |
+| p99.9 | 2.1-2.9 ms | 2.3-2.4 ms |
+| gateway sockets | 32,774 | 49,158 |
+| **gateway RSS** | **189 MB** | 272 MB |
+| **gateway CPU** | **30-33% of ONE core** | 42-47% of one core |
+| established sockets (system) | 65,569 | 98,328 |
+
+**At 16,384 concurrent streams the gateway uses about a third of a single core and
+189 MB.** That is the number to quote: unambiguously comfortable, with p99 under 0.6 ms
+and zero failures across eight independent clients.
+
+**24,576 is not llmbridge's limit — it is the host's.** At that level 49,152 of the 55,536
+available ephemeral ports are in use (one per client->gateway connection, one per
+gateway->provider). The next power of two, 32,768 streams, would need 65,536 ports, which
+exceeds what a single source/destination IP pair can address. Measuring higher requires
+the load generator to spread across multiple loopback addresses — harness work that has
+not been done, so **no number above 24,576 is claimed.**
+
+CPU scales close to linearly across the two levels (31% -> 44% for 1.5x the streams), so
+the gateway itself would reach one core somewhere near 50,000 streams. That extrapolation
+is deliberately **not** published: it is arithmetic, not a measurement.
+
+Two caveats stated rather than buried: **p99 roughly doubles** between the two levels
+(0.5 ms -> 1.2 ms), so the capacity is not free even though delivery holds; and the
+reference laptop ran at 93-94 C throughout, which is this configuration's thermal floor.
+
+Config: `cpupower idle-set -D 5`, `performance` governor,
+`ip_local_port_range="10000 65535"`. llmbridge-only, so the idle-state tuning is
+permissible (no competitor in the table to disadvantage).
+
 Raw data: `bench/results/stream-steadystate.csv`.
 
 ### Connection reuse (and why the earlier numbers were worse)

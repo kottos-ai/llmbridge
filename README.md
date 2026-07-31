@@ -78,6 +78,17 @@ concurrent streams while delivering **99.9–100%** of the achievable token stre
 A single LiteLLM worker holds at 16 streams (94% delivered), then queues: at 512 streams
 it delivers **3%** of the tokens with **~13 s** to first token.
 
+**16,384 concurrent streams on a single worker**, using **a third of one CPU core and
+189 MB**: 32,756 of 32,768 offered tokens/s delivered (**99.96%**), **zero** client-side
+failures, **p50 36–48 µs**, p99 under 0.6 ms, holding 32,774 sockets open. Eight
+independent load generators agree within 5%.
+
+Pushed further to **24,576 streams** it still delivers 99.93% with zero failures, at
+42–47% of one core and 272 MB (p50 50–58 µs, p99 ~1.2 ms). That is **not llmbridge's
+ceiling — it is the host's**: 49,152 of the 55,536 available ephemeral ports are in use,
+and going higher needs the load generator spread across multiple loopback addresses. No
+number above 24,576 is claimed.
+
 **Do not mix the two sets of numbers** — "requests/sec" is not a streaming axis, and
 "tokens/sec" says nothing about non-streaming throughput.
 
