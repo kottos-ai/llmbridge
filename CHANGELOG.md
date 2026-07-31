@@ -9,9 +9,84 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Next up: auth-header passthrough (forward the client's provider credentials upstream),
-then tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic API,
-fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
+API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+
+## [0.5.0] — 2026-07-31
+
+Auth-header passthrough. Combined with 0.4.0's TLS, the gateway can now front a real
+provider end to end:
+`llmbridge --upstream https://api.anthropic.com --translate anthropic`, with the client
+sending its ordinary OpenAI-style key.
+
+### Added
+
+- **Credentials cross the dialect boundary.** Translated requests are *rebuilt*, so
+  auth must be mapped explicitly: `Authorization: Bearer K` becomes `x-api-key: K`
+  (Anthropic, plus `anthropic-version` pinned to `2023-06-01` unless the client sends
+  its own) or `x-goog-api-key: K` (Gemini); Cohere receives the Bearer header verbatim;
+  a client already speaking the target dialect's auth is forwarded untouched. No
+  credential → **no header invented** (the provider's own `401` is the right answer).
+  `TranslateMode::None` is unchanged — byte-forwarding already carries every header.
+  Streaming shares the forward path, so streamed requests carry auth identically.
+- **`Host` header on rebuilt upstream requests** — previously absent entirely. HTTP/1.1
+  requires it; the benchmark mocks tolerated the omission, real providers do not.
+  Derived from the parsed upstream hostname (falls back to `ip:port`), default ports
+  omitted.
+- `http::find_header()` — case-insensitive, zero-copy, first-occurrence-wins lookup.
+  First-wins is deliberate: a duplicated credential must resolve the same way for us
+  and for the upstream.
+
+### Security
+
+- **Whitelist, not echo.** Only credential headers the target dialect understands cross
+  a rebuilt request. Arbitrary client headers — cookies, tracing, anything — do not.
+  Echoing them would be both a smuggling surface and a privacy leak to a third-party
+  provider.
+- **Header-injection fix, found by audit before any real key was used.** Credential
+  values are now charset-validated (printable ASCII only) and a malformed one fails the
+  request with `400` **without contacting the upstream at all**. This closes a real,
+  measured hole: `find_header` splits on CRLF, so a **bare CR** survived inside a value
+  and reached an upstream as `x-api-key: sk\rX-Smuggled: yes`. A lenient parser treating
+  bare CR as a line terminator would have seen an injected header — and because upstream
+  connections are **pooled and shared between clients**, that is a cross-client
+  request-splitting vector, not merely a self-inflicted malformed request. Regression
+  tests cover bare CR, control characters, a second credential header attempting to
+  hide behind a clean first one, and oversized values.
+- Trailing whitespace is trimmed from credential values (forwarding it verbatim breaks
+  real provider auth).
+- Credentials are read as a view over the client's request buffer and written straight
+  into the upstream bytes — never stored, never logged, never placed in stats or error
+  responses.
+- **Pooled upstream buffers are scrubbed, not just cleared.** A pooled connection idles
+  up to 30 s; `std::string::clear()` leaves the credential bytes in the allocation, so
+  release now `explicit_bzero`s the request buffer first (`explicit_bzero`, not `memset`
+  — writing to soon-unused memory is a dead store the optimizer may delete). ~100 bytes
+  once per request, ≈0.04% of a core at 84k RPS.
+- **Cross-client leak tests.** Pooled connections are shared, so "one client's key can
+  never ride another client's request" is asserted rather than assumed: a key must appear
+  **exactly once** across every request the upstream ever saw (three-client variant too),
+  the pool is asserted to have actually been exercised, and no credential appears in any
+  response — including the `400` path, the likeliest place for a "helpful" echo.
+- **Plaintext warning at startup.** A non-loopback, non-TLS upstream now prints a loud
+  warning that forwarded credentials travel unencrypted. Loopback is exempt (mocks,
+  benchmarks, sidecar deployments).
+
+### Known gaps
+
+- **Scrubbing is targeted, not exhaustive.** The pooled upstream request buffer is
+  scrubbed (the only place a credential outlives its request). Transient buffers — the
+  client's `rbuf`, freed allocations after a move — are not: they are overwritten within
+  microseconds, and scrubbing every one would put a `memset` on the hot path for no real
+  gain. An attacker able to read live process memory would find the in-flight request and
+  the TLS session keys regardless.
+- **`--translate none` forwards every client header verbatim**, credentials included —
+  that is the byte-forward contract, not a leak, but it means the passthrough mode offers
+  no header whitelist.
+- No gateway-side credential store — the gateway forwards the client's key and holds
+  none of its own. Per-client keys, rotation and quota live in the commercial layer.
+- Verified only against hermetic mocks (project policy forbids tests hitting live
+  provider APIs); no request has yet been made to a real provider through this path.
 
 ## [0.4.0] — 2026-07-31
 

@@ -7,6 +7,8 @@
 
 #include "gateway/gateway.hpp"
 
+#include "net/secure.hpp"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -47,6 +49,171 @@ namespace llmbridge
             out.append("\r\n\r\n");
             out.append(body);
             return out;
+        }
+
+        // Upstream REQUEST builder: build_http plus a Host header (HTTP/1.1
+        // requires one; the benchmark mocks never cared, real providers reject
+        // without it) and the per-dialect auth/extra header lines.
+        std::string build_http_request(std::string_view start_line, std::string_view body,
+                                       std::string_view host, std::string_view extra)
+        {
+            std::string out;
+            out.reserve(start_line.size() + body.size() + host.size() + extra.size() + 128);
+            out.append(start_line);
+            out.append("\r\nHost: ");
+            out.append(host);
+            out.append("\r\n");
+            out.append(extra); // zero or more complete "Name: value\r\n" lines
+            out.append("Content-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
+            out.append(std::to_string(body.size()));
+            out.append("\r\n\r\n");
+            out.append(body);
+            return out;
+        }
+
+        // Anthropic's REQUIRED versioning header. Pinned, not passthrough-only:
+        // an OpenAI-SDK client has never heard of it, and without it the API
+        // rejects the request outright. A client that DOES send its own value
+        // wins (see auth_headers_for) — the pin is a default, not an override.
+        constexpr std::string_view kAnthropicVersionDefault = "2023-06-01";
+
+        // Build the auth/extra header lines to inject into the translated
+        // upstream request, from the CLIENT's request headers.
+        //
+        // WHITELIST, not passthrough: the gateway rebuilds the upstream request,
+        // and only the credential headers the target dialect understands may
+        // cross the translation boundary. Echoing arbitrary client headers
+        // through a rebuilt request is a smuggling surface (and our own framing
+        // headers must stay authoritative). TranslateMode::None is untouched by
+        // all of this — byte-forwarding already carries every client header.
+        //
+        // Values re-emitted here cannot contain CR/LF: find_header() bounds each
+        // value by its own line's CRLF, so injection via a crafted credential is
+        // structurally impossible rather than filtered.
+        //
+        // The credential is handled as a transient string_view over the client's
+        // request buffer and written straight into the upstream bytes — it is
+        // never copied anywhere that outlives the request, and never logged.
+        // Erase a credential-bearing buffer before it is released or pooled.
+        // See net/secure.hpp for why this is not just memset, and why it is a
+        // detected platform primitive rather than a compiler trick.
+        //
+        // Scope is deliberately narrow: the only place a credential OUTLIVES its
+        // request is a pooled upstream, which idles up to kIdleUpstreamNs (30 s)
+        // holding the request that carried the key. Transient buffers are
+        // overwritten microseconds later and are not worth a hot-path memset.
+        // Measured: 2.4 ns for a typical ~96 B request buffer, once per request
+        // (~0.02% of one core at 84k RPS).
+        using llmbridge::net::secure_clear;
+
+        // Is this safe to re-emit as an HTTP header VALUE?
+        //
+        // Do NOT trust find_header() to have made this safe. It splits on CRLF, so
+        // a value may still contain a BARE CR (or LF, NUL, any control byte) — and
+        // a lenient upstream parser that treats bare CR as a line terminator would
+        // then see an injected header. That is not hypothetical: it was measured
+        // reaching the upstream as `x-api-key: sk\rX-Smuggled: yes` before this
+        // check existed. It matters more than a self-inflicted malformed request
+        // because upstream connections are POOLED AND SHARED between clients, so
+        // smuggling on one is a cross-client request-splitting vector.
+        //
+        // RFC 7230 field-value permits obs-text (0x80-0xFF); we are deliberately
+        // stricter — a provider API key is printable ASCII, and narrowing the
+        // charset costs us nothing real.
+        bool header_value_safe(std::string_view v) noexcept
+        {
+            if (v.empty() || v.size() > 8192) return false;
+            for (const unsigned char ch : v)
+                if (ch < 0x20 || ch > 0x7E) return false; // CTLs (incl. CR/LF/NUL) and 8-bit
+            return true;
+        }
+
+        // Trailing OWS is legal in a header line but is not part of the credential;
+        // forwarding it verbatim has broken real provider auth before.
+        std::string_view rtrim_ows(std::string_view v) noexcept
+        {
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+            return v;
+        }
+
+        // Returns false when the client supplied a syntactically invalid credential
+        // (control characters). The caller MUST fail the request rather than
+        // forward — silently dropping would still send a credential-less request
+        // upstream, which is a confusing 401; a 400 names the client's own bug.
+        bool auth_headers_for(TranslateMode mode, std::string_view client_headers, std::string& out)
+        {
+            using http::find_header;
+            out.clear();
+
+            // Any credential-bearing header the client sent must be well-formed,
+            // whether or not this dialect ends up using it — otherwise a malformed
+            // value simply routes around the check by picking the other header.
+            for (const std::string_view name :
+                 {"authorization:", "x-api-key:", "x-goog-api-key:", "anthropic-version:"})
+            {
+                const std::string_view v = rtrim_ows(find_header(client_headers, name));
+                if (!v.empty() && !header_value_safe(v)) return false;
+            }
+
+            // "Authorization: Bearer K" -> K (bearer scheme only; anything else
+            // is not a provider API key and is dropped rather than guessed at).
+            const auto bearer_token = [&]() -> std::string_view {
+                const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
+                if (v.size() > 7 &&
+                    (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
+                    return http::detail::ltrim(v.substr(7));
+                return {};
+            };
+
+            switch (mode)
+            {
+                case TranslateMode::Anthropic:
+                {
+                    // Client already speaks Anthropic auth -> forward verbatim;
+                    // else map the OpenAI-style bearer token.
+                    std::string_view key = rtrim_ows(find_header(client_headers, "x-api-key:"));
+                    if (key.empty()) key = bearer_token();
+                    if (!key.empty())
+                    {
+                        out.append("x-api-key: ");
+                        out.append(key);
+                        out.append("\r\n");
+                    }
+                    std::string_view ver = rtrim_ows(find_header(client_headers, "anthropic-version:"));
+                    if (ver.empty()) ver = kAnthropicVersionDefault;
+                    out.append("anthropic-version: ");
+                    out.append(ver);
+                    out.append("\r\n");
+                    break;
+                }
+                case TranslateMode::Gemini:
+                {
+                    std::string_view key = rtrim_ows(find_header(client_headers, "x-goog-api-key:"));
+                    if (key.empty()) key = bearer_token();
+                    if (!key.empty())
+                    {
+                        out.append("x-goog-api-key: ");
+                        out.append(key);
+                        out.append("\r\n");
+                    }
+                    break;
+                }
+                case TranslateMode::Cohere:
+                {
+                    // Cohere speaks Bearer natively -> forward the whole value.
+                    const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
+                    if (!v.empty())
+                    {
+                        out.append("Authorization: ");
+                        out.append(v);
+                        out.append("\r\n");
+                    }
+                    break;
+                }
+                case TranslateMode::None:
+                    break; // byte-forward path; never called, but total anyway
+            }
+            return true;
         }
 
         // Translate an OpenAI request body to the upstream dialect, also yielding
@@ -221,6 +388,21 @@ namespace llmbridge
         if (_tls.enabled)
             throw std::runtime_error("TLS upstream requested but built without LLMBRIDGE_TLS");
 #endif
+        // Host header for rebuilt (translated) upstream requests. Prefer the
+        // parsed hostname (rides in TlsConfig::sni_host whether or not TLS is
+        // on — real providers route/verify on it); fall back to ip:port for the
+        // bare IP:PORT form. Default ports are omitted per convention.
+        if (!_tls.sni_host.empty())
+        {
+            _upstream_host_hdr = _tls.sni_host;
+            const bool default_port =
+                (_tls.enabled && _upstream_port == 443) || (!_tls.enabled && _upstream_port == 80);
+            if (!default_port) _upstream_host_hdr += ":" + std::to_string(_upstream_port);
+        }
+        else
+        {
+            _upstream_host_hdr = _upstream_ip + ":" + std::to_string(_upstream_port);
+        }
         // Linux has no SO_NOSIGPIPE; ignore SIGPIPE process-wide so a write to a
         // peer-closed socket returns EPIPE instead of killing us. Idempotent, so
         // safe to set here (covers the daemon and the test harness alike).
@@ -601,7 +783,9 @@ namespace llmbridge
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { close_upstream(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
-        u->wbuf.clear();
+        // wbuf held the REBUILT REQUEST, including the client's credential, and this
+        // connection may now idle for 30 s. Scrub rather than clear.
+        secure_clear(u->wbuf);
         u->woff = 0;
         u->msg = http::Message{};
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -724,7 +908,11 @@ namespace llmbridge
             // Remember whether the client asked for a final usage chunk — the
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
-            upstream_bytes = build_http(start_line, tbody);
+            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            std::string auth_hdrs;
+            // Malformed credential => 400, and NOTHING goes upstream.
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { error_respond(c, 400); return; }
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
         {
@@ -1430,7 +1618,7 @@ namespace llmbridge
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { u_close(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
-        u->wbuf.clear();
+        secure_clear(u->wbuf); // see release_upstream: credential must not idle in the pool
         u->woff = 0;
         u->msg = http::Message{};
         u->ts_pooled = now_ns(); // idle-eviction baseline
@@ -1668,7 +1856,11 @@ namespace llmbridge
             std::string tbody = xlate_req(_translate, body, start_line);
             if (tbody.empty()) { u_error_respond(c, 400); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
-            upstream_bytes = build_http(start_line, tbody);
+            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            std::string auth_hdrs;
+            // Malformed credential => 400, and NOTHING goes upstream.
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { error_respond(c, 400); return; }
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
         {

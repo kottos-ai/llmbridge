@@ -70,6 +70,16 @@ namespace
     }
 
     // A minimal valid OpenAI chat-completion request carrying `content`.
+    // OpenAI-shaped request with arbitrary extra header lines (auth tests).
+    std::string openai_request_hdrs(const std::string& content, const std::string& extra_hdrs)
+    {
+        const std::string body =
+            "{\"model\":\"gpt-4o\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"" +
+            content + "\"}]}";
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + extra_hdrs +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
     std::string openai_request(const std::string& content, bool keep_alive = true)
     {
         return make_request(
@@ -168,6 +178,13 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             return _last_request;
         }
+        // EVERY request the upstream saw, concatenated — for leak tests that must
+        // assert a credential appeared in NO request, not merely the most recent.
+        std::string all_requests()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _all_requests;
+        }
 
     private:
         void accept_loop()
@@ -193,7 +210,11 @@ namespace
                     if (n <= 0) { ::close(c); return; }
                     buf.append(tmp, static_cast<size_t>(n));
                 }
-                { std::lock_guard<std::mutex> lk(_mu); _last_request.assign(buf.data(), m.total_len); }
+                {
+                    std::lock_guard<std::mutex> lk(_mu);
+                    _last_request.assign(buf.data(), m.total_len);
+                    _all_requests.append(buf.data(), m.total_len);
+                }
                 _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
 
@@ -251,6 +272,7 @@ namespace
         int _stall = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
+        std::string _all_requests;
         std::atomic<bool> _stop{false};
         std::thread _acc;
         std::vector<std::thread> _conns;
@@ -632,6 +654,275 @@ INSTANTIATE_TEST_SUITE_P(Dialects, ProxyTranslateMode,
                          ::testing::Values(TranslateMode::Anthropic, TranslateMode::Gemini,
                                            TranslateMode::Cohere),
                          [](const testing::TestParamInfo<TranslateMode>& i) { return mode_name(i.param); });
+
+// ── Auth-header passthrough (translate modes rebuild the upstream request,
+//     so credentials must be explicitly mapped across the dialect boundary) ────
+class ProxyAuth : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-test-123\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-test-123\r\n"), std::string::npos) << up;
+    // The OpenAI-style header must NOT also cross — one credential, one shape.
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+    // Anthropic's required version header is pinned when the client has none.
+    EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "x-api-key: sk-native-456\r\nanthropic-version: 2024-10-22\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-native-456\r\n"), std::string::npos) << up;
+    // The client's own version wins over the pinned default.
+    EXPECT_NE(up.find("anthropic-version: 2024-10-22\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("2023-06-01"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, NoCredentialMeansNoAuthHeaderUpstream)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    // No credential invented; the provider's own 401 is the correct outcome.
+    EXPECT_EQ(up.find("x-api-key"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Authorization"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, UnrelatedClientHeadersDoNotCross)
+{
+    // WHITELIST semantics: a rebuilt request must not echo arbitrary client
+    // headers — that is the smuggling surface the rebuild exists to close.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk-1\r\nX-Evil: 1\r\nCookie: session=abc\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-1"), std::string::npos) << up;
+    EXPECT_EQ(up.find("X-Evil"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Cookie"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, RebuiltRequestCarriesHostHeader)
+{
+    // HTTP/1.1 requires Host; mocks tolerate its absence, api.anthropic.com
+    // does not. Without TlsConfig the gateway falls back to ip:port.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("Host: 127.0.0.1:"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, BearerTokenMapsToGoogApiKeyForGemini)
+{
+    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Gemini, "ok")));
+    start(0, true, TranslateMode::Gemini, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer AIza-test\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-goog-api-key: AIza-test\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
+{
+    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Cohere, "ok")));
+    start(0, true, TranslateMode::Cohere, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer co-test-9\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("Authorization: Bearer co-test-9\r\n"), std::string::npos) << up;
+}
+
+// SECURITY: a credential value containing a BARE CR (not CRLF) must not be able
+// to inject a header line into the rebuilt upstream request. This matters more
+// than usual here because upstream connections are POOLED AND SHARED across
+// clients: smuggling on one is a cross-client request/response-splitting vector,
+// not just a self-inflicted malformed request.
+TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk\rX-Smuggled: yes\r\n")));
+    (void)c.recv_response();
+    // Fails CLOSED: 400 to the client, and the upstream is never contacted at all.
+    EXPECT_EQ(_backend.last_request().find("X-Smuggled"), std::string::npos)
+        << _backend.last_request();
+    EXPECT_TRUE(_backend.last_request().empty()) << "request reached upstream despite bad credential";
+}
+
+// A second Authorization header cannot smuggle past the check by hiding behind a
+// clean first one (first-wins means only the first is ever emitted).
+TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer clean\r\nAuthorization: Bearer bad\rX-S: 1\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("X-S:"), std::string::npos) << up;
+    if (!up.empty()) EXPECT_NE(up.find("x-api-key: clean"), std::string::npos) << up;
+}
+
+// An oversized credential is refused rather than forwarded (bounded work, and a
+// 8 KiB "key" is an attack or a bug, never a real provider key).
+TEST_P(ProxyAuth, OversizedCredentialRejected)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer " + std::string(9000, 'k') + "\r\n")));
+    const int st = c.recv_status();
+    EXPECT_TRUE(st == 400 || st == 0) << "status " << st;
+    EXPECT_TRUE(_backend.last_request().empty());
+}
+
+// Same class, other control characters: NUL, bare LF, tabs in the middle.
+TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    std::string hdr = "Authorization: Bearer sk";
+    hdr.push_back('\x01');
+    hdr += "bad\r\n";
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", hdr)));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find('\x01'), std::string::npos) << up;
+    EXPECT_TRUE(up.empty()) << "control-char credential reached upstream";
+}
+
+// ── Credential-leak audit ────────────────────────────────────────────────────
+// The question these answer: can one client's key ever reach the provider on a
+// DIFFERENT client's request? Upstream connections are pooled and shared, so this
+// is not obvious by inspection — assert it.
+
+TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    // Client A authenticates. Its upstream connection goes back to the pool.
+    {
+        Client a;
+        ASSERT_TRUE(a.connect(_proxy_port));
+        ASSERT_TRUE(a.send(openai_request_hdrs("one", "Authorization: Bearer sk-CLIENT-A\r\n")));
+        ASSERT_FALSE(a.recv_response().empty());
+    }
+    // Client B sends NO credential and very likely reuses A's pooled connection.
+    {
+        Client b;
+        ASSERT_TRUE(b.connect(_proxy_port));
+        ASSERT_TRUE(b.send(openai_request("two")));
+        ASSERT_FALSE(b.recv_response().empty());
+    }
+    shutdown();
+
+    // A's key must appear EXACTLY ONCE across everything the provider ever saw —
+    // on A's own request, never re-sent on B's.
+    const std::string all = _backend.all_requests();
+    size_t occurrences = 0;
+    for (size_t p = all.find("sk-CLIENT-A"); p != std::string::npos;
+         p = all.find("sk-CLIENT-A", p + 1))
+        ++occurrences;
+    EXPECT_EQ(occurrences, 1u) << "credential re-sent on another client's request:\n" << all;
+    EXPECT_GE(_gw->stats().upstream_reused, 1u) << "pool was not exercised; test proves little";
+}
+
+TEST_P(ProxyAuth, DifferentClientsCredentialsNeverCross)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    for (const char* key : {"sk-AAA", "sk-BBB", "sk-CCC"})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_request_hdrs(
+            "hi", std::string("Authorization: Bearer ") + key + "\r\n")));
+        ASSERT_FALSE(c.recv_response().empty());
+    }
+    shutdown();
+    const std::string all = _backend.all_requests();
+    // Each request must carry exactly one key, and each key exactly once.
+    for (const char* key : {"sk-AAA", "sk-BBB", "sk-CCC"})
+    {
+        size_t n = 0;
+        for (size_t p = all.find(key); p != std::string::npos; p = all.find(key, p + 1)) ++n;
+        EXPECT_EQ(n, 1u) << key << " appeared " << n << " times:\n" << all;
+    }
+}
+
+TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
+{
+    // A credential must not come back in any response body/headers — an error
+    // path that echoed the request would leak it into client-side logs.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-ECHO-ME\r\n")));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(resp.find("sk-ECHO-ME"), std::string::npos) << resp;
+}
+
+TEST_P(ProxyAuth, MalformedRequestErrorDoesNotEchoCredential)
+{
+    // Same, on the 400 path — the most likely place for a "helpful" echo.
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Valid framing, body that fails translation -> 400 built by the gateway.
+    const std::string body = "{not json";
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                            "Authorization: Bearer sk-SECRET-400\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    ASSERT_TRUE(c.send(req));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(resp.find("sk-SECRET-400"), std::string::npos) << resp;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
 
 // ── Large bodies ───────────────────────────────────────────────────────────────
 class ProxySize : public ProxyIT, public ::testing::WithParamInterface<size_t> {};

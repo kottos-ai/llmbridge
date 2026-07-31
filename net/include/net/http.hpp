@@ -69,6 +69,42 @@ namespace llmbridge::http
         }
     } // namespace detail
 
+    // Case-insensitive single-header lookup over a raw header block (the bytes
+    // between the start line's CRLF and the terminating CRLFCRLF, or the whole
+    // message — start line simply never matches a `name:` prefix). Returns the
+    // FIRST occurrence's value, left-trimmed, or empty if absent. Zero-copy: the
+    // view aliases `headers`.
+    //
+    // First-wins is a deliberate anti-smuggling stance: when a client sends a
+    // duplicated header, the copies must not be interpreted differently by us
+    // and by the upstream. We take the first and, because the gateway REBUILDS
+    // the upstream request from a whitelist rather than echoing the block, the
+    // duplicate never travels.
+    //
+    // ⚠ The returned value is NOT safe to re-emit as-is. Splitting on CRLF leaves
+    // a BARE CR (or any other control byte) inside the value — a lenient parser
+    // that treats bare CR as a line terminator then sees an injected header. An
+    // earlier revision of this comment claimed the opposite; it was wrong, and the
+    // injection was measured reaching an upstream. Callers that re-emit a value
+    // MUST validate its charset first (see header_value_safe in gateway.cpp).
+    // `name` must be LOWERCASE and INCLUDE the trailing colon ("x-api-key:") —
+    // same convention as the framer's own header matching, and the colon is what
+    // stops "x-api-key-2:" from prefix-matching "x-api-key".
+    inline std::string_view find_header(std::string_view headers, std::string_view name) noexcept
+    {
+        size_t start = 0;
+        while (start < headers.size())
+        {
+            size_t eol = headers.find("\r\n", start);
+            if (eol == std::string_view::npos) eol = headers.size();
+            const std::string_view line = headers.substr(start, eol - start);
+            if (detail::line_is(line, name))
+                return detail::ltrim(line.substr(name.size()));
+            start = eol + 2;
+        }
+        return {};
+    }
+
     // Cap on header section size — a guard against an unbounded slow-loris
     // style buffer growth. 32 KiB is comfortably above any sane chat-completion
     // request/response header block.
