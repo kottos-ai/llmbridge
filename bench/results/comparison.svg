@@ -21,29 +21,40 @@
 <text x="86" y="121.0" font-size="15" fill="#6b7280" text-anchor="end">100000 ms</text>
 <line x1="96" y1="393.1" x2="956" y2="393.1" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>
 <text x="100" y="385.1" font-size="13" fill="#2563eb" text-anchor="start" font-weight="600">1 ms target</text>
-<rect x="134.0" y="458.2" width="64.5" height="45.8" fill="#16a34a" rx="2"/>
-<text x="166.2" y="451.2" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.067</text>
-<rect x="208.5" y="287.1" width="64.5" height="216.9" fill="#dc2626" rx="2"/>
-<text x="240.8" y="280.1" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">81.8</text>
-<text x="203.5" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">100 RPS</text>
-<rect x="349.0" y="456.5" width="64.5" height="47.5" fill="#16a34a" rx="2"/>
-<text x="381.2" y="449.5" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.072</text>
-<rect x="423.5" y="181.1" width="64.5" height="322.9" fill="#dc2626" rx="2"/>
-<text x="455.8" y="174.1" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">6678.4 &#9888;</text>
-<text x="418.5" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">500 RPS</text>
-<text x="418.5" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
-<rect x="564.0" y="454.6" width="64.5" height="49.4" fill="#16a34a" rx="2"/>
-<text x="596.2" y="447.6" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.078</text>
-<rect x="638.5" y="172.0" width="64.5" height="332.0" fill="#dc2626" rx="2"/>
-<text x="670.8" y="165.0" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">9782.0 &#9888;</text>
-<text x="633.5" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">1000 RPS</text>
-<text x="633.5" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
-<rect x="779.0" y="469.5" width="64.5" height="34.5" fill="#16a34a" rx="2"/>
-<text x="811.2" y="462.5" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.042</text>
-<rect x="853.5" y="166.2" width="64.5" height="337.8" fill="#dc2626" rx="2"/>
-<text x="885.8" y="159.2" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">12437.9 &#9888;</text>
-<text x="848.5" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">5000 RPS</text>
-<text x="848.5" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
+<rect x="119.7" y="453.9" width="43.0" height="50.1" fill="#16a34a" rx="2"/>
+<text x="141.2" y="446.9" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.080</text>
+<rect x="172.7" y="285.6" width="43.0" height="218.4" fill="#dc2626" rx="2"/>
+<text x="194.2" y="278.6" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">87.1</text>
+<text x="167.7" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">100 RPS</text>
+<rect x="263.0" y="459.7" width="43.0" height="44.3" fill="#16a34a" rx="2"/>
+<text x="284.5" y="452.7" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.063</text>
+<rect x="316.0" y="213.6" width="43.0" height="290.4" fill="#dc2626" rx="2"/>
+<text x="337.5" y="206.6" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">1734.6</text>
+<text x="311.0" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">250 RPS</text>
+<rect x="406.3" y="460.9" width="43.0" height="43.1" fill="#16a34a" rx="2"/>
+<text x="427.8" y="453.9" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.060</text>
+<rect x="459.3" y="171.9" width="43.0" height="332.1" fill="#dc2626" rx="2"/>
+<text x="480.8" y="164.9" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">9797.7 &#9888;</text>
+<text x="454.3" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">500 RPS</text>
+<text x="454.3" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
+<rect x="549.7" y="466.7" width="43.0" height="37.3" fill="#16a34a" rx="2"/>
+<text x="571.2" y="459.7" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.047</text>
+<rect x="602.7" y="163.0" width="43.0" height="341.0" fill="#dc2626" rx="2"/>
+<text x="624.2" y="156.0" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">14213.4 &#9888;</text>
+<text x="597.7" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">1000 RPS</text>
+<text x="597.7" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
+<rect x="693.0" y="463.0" width="43.0" height="41.0" fill="#16a34a" rx="2"/>
+<text x="714.5" y="456.0" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.055</text>
+<rect x="746.0" y="156.4" width="43.0" height="347.6" fill="#dc2626" rx="2"/>
+<text x="767.5" y="149.4" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">18678.4 &#9888;</text>
+<text x="741.0" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">2000 RPS</text>
+<text x="741.0" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
+<rect x="836.3" y="470.0" width="43.0" height="34.0" fill="#16a34a" rx="2"/>
+<text x="857.8" y="463.0" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.041</text>
+<rect x="889.3" y="156.4" width="43.0" height="347.6" fill="#dc2626" rx="2"/>
+<text x="910.8" y="149.4" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">18694.5 &#9888;</text>
+<text x="884.3" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">5000 RPS</text>
+<text x="884.3" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <line x1="96" y1="504.0" x2="956" y2="504.0" stroke="#111827" stroke-width="1.5"/>
 <rect x="96" y="557" width="16" height="16" fill="#16a34a" rx="2"/>
 <text x="120" y="570" font-size="15" fill="#111827">llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99</text>

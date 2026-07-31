@@ -13,7 +13,7 @@
 **Three properties that matter:**
 
 - **Drop-in OpenAI-compatible.** Point an existing OpenAI client at `llmbridge` and route to a different provider with one flag — no app changes.
-- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~90k RPS single-thread ceiling. No GC pauses — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
+- **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~84k RPS single-thread ceiling. No GC pauses — built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
 - **Zero runtime dependencies.** Self-contained C++20 — both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
 > **Open-core.** This repo is the fast gateway *core* — translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottos.ai) (see the bottom of this README).
@@ -33,11 +33,29 @@
 
 ![llmbridge vs LiteLLM — added latency p99](bench/results/comparison.svg)
 
-At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **~0.067 ms p99** (self-measured) vs LiteLLM's **~82 ms** (~1,200×) — and `llmbridge` holds 42–78 µs p99 across 100–5000 RPS while LiteLLM (1 uvicorn worker) saturates around **~250 RPS**.
+At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **80 µs p99** (self-measured) vs LiteLLM's **87 ms** (~**1,000×**) — and `llmbridge` holds 41–80 µs p99 across 100–5,000 RPS while LiteLLM (1 uvicorn worker) saturates around **~246 RPS**.
 
 ![Throughput saturation — offered vs achieved RPS](bench/results/saturation.svg)
 
-Single-thread throughput ceiling is **~90k RPS** — and on this co-located dev box that ceiling is the loopback's packet-processing limit, not the CPU (the proxy uses ~1 core at saturation). *(Bifrost and Helicone not yet measured.)*
+Single-thread throughput ceiling is **~84k RPS** (best single run 87k; mean of three 84.8k).
+
+**What sets it.** `llmbridge` runs as **one thread**, so its hard ceiling is one CPU core.
+At saturation that thread is **87–92% busy** — effectively out of headroom, and that is
+the cap. (The *machine* meanwhile reports ~95% idle, because one busy core out of 12
+logical CPUs is only ~8% of the box. It cannot use the other 11 cores because it is
+single-threaded — that is what `--workers N` is for.)
+
+Profiling that thread with `perf` splits **its own CPU time** as: **~89% executing Linux
+kernel code** and **~7% executing llmbridge code**. The largest single slice of the kernel
+side is the **TCP stack at 32.7%** — the unavoidable price of being a TCP proxy. In short:
+*nine of every ten cycles the gateway burns are in the kernel's networking path, not in
+ours.*
+
+Two consequences. Making our own code twice as fast would raise the ceiling by **at most
+~7%**, whereas `--workers 2` nearly doubles it. And the figure is **thermally dependent** —
+the same build measures 87k cold and 82k once the package reaches 85 °C on this laptop.
+*(An earlier revision of this README attributed the ceiling to the loopback packet path;
+profiling disproved that.)* *(Bifrost and Helicone not yet measured.)*
 
 ### Streaming (SSE)
 
@@ -50,18 +68,34 @@ self-reports), against a no-gateway control run at the same concurrency. Median 
 
 ![Streaming: tokens delivered vs concurrent streams](bench/results/stream-saturation.svg)
 
-llmbridge's time to first token stays **on the no-gateway floor (~31 ms)** through 512
-concurrent streams while delivering ~100% of the achievable token stream, adding
-**54–129 µs per token**. A single LiteLLM worker holds at 16 streams, then queues: at 512
-streams it delivers **3%** of the tokens with **~14 s** to first token, ceiling ~1,100
-tokens/s. llmbridge's own knee is between **2,048 and 4,096 streams (~95–100k tokens/s)**.
+"Concurrent streams" means responses in flight at once through **one** gateway process —
+512 streams is 512 simultaneous voice agents or chat responses, each receiving a token
+every 20 ms.
+
+llmbridge's time to first token stays **on the no-gateway floor (~30.8 ms)** through 512
+concurrent streams while delivering **99.9–100%** of the achievable token stream, adding
+**~50–120 µs per token** (against a 20 ms inter-token interval — under 1% of the budget).
+A single LiteLLM worker holds at 16 streams (94% delivered), then queues: at 512 streams
+it delivers **3%** of the tokens with **~13 s** to first token.
 
 **Do not mix the two sets of numbers** — "requests/sec" is not a streaming axis, and
 "tokens/sec" says nothing about non-streaming throughput.
 
-**Reproduce:** `./bench/run_headtohead.sh` and `./bench/saturate.sh` (non-streaming),
-`./bench/run_stream_headtohead.sh` and `./bench/run_stream_saturate.sh` (streaming) —
-see [`bench/`](./bench), full methodology and fairness controls in
+**Reproduce** — the host configuration matters as much as the commands; the full runbook
+is [`bench/BENCHMARK-CONFIG.md`](./bench/BENCHMARK-CONFIG.md):
+
+```sh
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192 net.core.somaxconn=8192
+sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
+sudo cpupower frequency-set -g performance
+
+BACKENDS=4 ./bench/saturate.sh 5 2 90000 130000                 # throughput ceiling
+./bench/run_headtohead.sh 200 15 4 100 250 500 1000 2000 5000   # non-streaming vs LiteLLM
+./bench/run_stream_headtohead.sh 60 20 20 6 "16 64 256 512"     # streaming vs LiteLLM
+```
+
+`BACKENDS=4` is not optional: at the default of 1 the *mock backend* is the ceiling
+(~65k), not the gateway. Full methodology and fairness controls in
 [BENCHMARKS.md](./BENCHMARKS.md). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
 ## Quick start
@@ -193,7 +227,7 @@ _Python / Go / Rust packages are planned — see [Language bindings (planned)](#
 - **Hand-rolled, dependency-free JSON.** A small recursive-descent parser into an ordered DOM plus a string-append builder — scoped to the chat-completion shapes we translate, not a general-purpose library. No `nlohmann::json`, `jsoncpp`, or `simdjson` in the shipped binary.
 - **Hardened, fuzzed parsers.** Both hand-rolled parsers are continuously **fuzzed** under ASan/UBSan (see [`fuzz/`](./fuzz)): the JSON parser is depth-limited (no stack-overflow bombs), request bodies are size-capped, and the HTTP framer is smuggling-safe — Content-Length only, with `Transfer-Encoding` and conflicting duplicate `Content-Length` rejected.
 - **No GC pauses** (it's C++). Tail latency is bounded by `malloc`, not garbage collection.
-- **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~90k RPS (non-streaming); scale out with `SO_REUSEPORT`. Token-by-token SSE streaming runs on the same loop, with client back-pressure and an upstream idle timeout.
+- **No locks on the hot path.** A single-threaded `io_uring` event loop (multishot accept/recv + provided buffers; `epoll` fallback for older kernels) with a keep-alive upstream connection pool — no shared mutable state. One core sustains ~84k RPS (non-streaming); scale out with `SO_REUSEPORT`. Token-by-token SSE streaming runs on the same loop, with client back-pressure and an upstream idle timeout.
 
 The implementation is small and commented — see the `net/`, `provider/`, and `gateway/` modules, and [DESIGN.md](./DESIGN.md) for the full architecture, threading/memory model, and benchmark methodology.
 

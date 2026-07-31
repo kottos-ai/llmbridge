@@ -157,14 +157,24 @@ namespace llmbridge
         // and, once streaming, to the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
 
-        // Keep-alive pool bounds. Before streaming reuse these were academic: the
-        // pool only ever held the few conns that short non-streaming requests left
-        // behind. Once a streaming gateway pools one upstream per concurrent stream,
-        // an unbounded pool is an fd leak in slow motion — at 4k concurrent streams
-        // it would pin 4k idle fds indefinitely. So the pool is capped (excess conns
-        // are closed rather than pooled) and idle entries are reaped on the loop's
-        // existing periodic tick.
-        static constexpr size_t kMaxIdleUpstreams = 256;
+        // Keep-alive pool bounds. The pool was unbounded until streaming reuse landed;
+        // a streaming gateway pools roughly one upstream per concurrent stream, so
+        // without a bound it is an fd leak in slow motion (4k streams => 4k idle fds
+        // pinned indefinitely). Excess conns are closed rather than pooled, and idle
+        // entries are reaped after kIdleUpstreamNs on the loop's periodic tick.
+        //
+        // SIZE THIS GENEROUSLY. The cap must exceed the number of upstreams in flight
+        // at peak, or it stops being a bound and becomes a reuse *killer*: once the
+        // pool is full every release closes its connection, so the next request must
+        // reconnect. A first cut of 256 did exactly that and cost the non-streaming
+        // path 2.4x its throughput (90k RPS target: 32,210 achieved at 256 versus
+        // 77,282 at 8192 and 78,445 before the pool existed) — the gateway was opening
+        // more upstream connections than it served requests. git-bisected; do not lower
+        // this without re-running ./bench/saturate.sh with BACKENDS=4.
+        //
+        // The real reclaim mechanism is the idle timeout, not the cap: the cap only
+        // has to stop pathological growth, so err high.
+        static constexpr size_t kMaxIdleUpstreams = 8192;
         static constexpr int64_t kIdleUpstreamNs = 30LL * 1000 * 1000 * 1000; // 30 s
 
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,

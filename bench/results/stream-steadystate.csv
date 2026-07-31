@@ -1,0 +1,13 @@
+# Steady-state streaming latency, no connection churn (4096 concurrent streams)
+# 1000 tokens/stream @ 100ms => no stream completes in the window => no reconnects.
+# Host: idle states capped at C1 (cpupower idle-set -D 5), governor performance.
+rep,path,p50_us,p99_us,p999_us,max_us
+0,direct,15,33,48,695
+0,epoll,211,559,721,2701
+0,uring,159,298,507,863
+1,direct,12,21,33,936
+1,epoll,179,505,622,5792
+1,uring,156,395,573,1773
+2,direct,12,23,44,811
+2,epoll,193,550,786,1225
+2,uring,178,413,608,29717

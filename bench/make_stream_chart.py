@@ -134,6 +134,19 @@ for i, s in enumerate(LEVELS):
     barw = bw * 0.3
     for j, (val, colour) in enumerate(((kb, LLMBRIDGE), (ll, LITELLM))):
         bx = x0 + bw * 0.18 + j * (barw + 8)
+        # A TTFT of 0 does NOT mean "instant": the generator records no TTFT sample when
+        # a path completes too few streams inside the window, and it writes 0. Plotting
+        # that as a bar renders the WORST result as the BEST one (LiteLLM at 256 streams
+        # completed 64 of 4096 and would have shown "0 ms"). Draw "n/a" instead.
+        if val <= 0:
+            svg.append(f'<text x="{bx + barw/2:.1f}" y="{MT + PH - 12:.1f}" font-size="{F_VAL}" '
+                       f'font-weight="600" fill="{colour}" text-anchor="middle" '
+                       f'opacity="0.75">n/a</text>')
+            svg.append(f'<text x="{bx + barw/2:.1f}" y="{MT + PH - 30:.1f}" font-size="{F_ANNOT}" '
+                       f'fill="{SUB}" text-anchor="middle">too few</text>')
+            svg.append(f'<text x="{bx + barw/2:.1f}" y="{MT + PH - 18:.1f}" font-size="{F_ANNOT}" '
+                       f'fill="{SUB}" text-anchor="middle">completed</text>')
+            continue
         y = ly(val)
         svg.append(f'<rect x="{bx:.1f}" y="{y:.1f}" width="{barw:.1f}" height="{MT + PH - y:.1f}" fill="{colour}" rx="3"/>')
         txt = f"{val/1000:.1f} s" if val >= 1000 else f"{val:.0f} ms"
