@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="1000" height="620" fill="white"/>
-<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">Throughput saturation — offered vs achieved RPS (1 KB)</text>
-<text x="96" y="74" font-size="15" fill="#6b7280">Both single-worker, 1 KB requests, instant backend &#183; log&#8211;log axes.</text>
+<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">Throughput saturation — offered vs achieved RPS (64 B body)</text>
+<text x="96" y="74" font-size="15" fill="#6b7280">Both single-worker, 64 B request bodies, instant backend &#183; log&#8211;log axes.</text>
 <text x="96" y="95" font-size="15" fill="#6b7280">On the dashed line = keeping up &#183; below it = dropping load.</text>
 <line x1="96.0" y1="116" x2="96.0" y2="520" stroke="#e5e7eb"/>
 <line x1="96" y1="520.0" x2="944" y2="520.0" stroke="#e5e7eb"/>
@@ -23,20 +23,19 @@
 <text x="30" y="318.0" font-size="16" fill="#111827" text-anchor="middle" transform="rotate(-90 30 318.0)" font-weight="600">achieved RPS</text>
 <line x1="96.0" y1="520.0" x2="944.0" y2="116.0" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6 4"/>
 <text x="463.1" y="339.9" font-size="14" fill="#9ca3af" text-anchor="start">ideal: achieved = offered</text>
-<polyline points="687.1,238.4 764.4,201.5 809.7,180.0 841.8,164.7 866.7,159.9 887.0,157.7" fill="none" stroke="#16a34a" stroke-width="2.5"/>
+<polyline points="687.1,238.4 764.4,201.5 841.8,164.7 854.9,165.3 887.0,164.8" fill="none" stroke="#16a34a" stroke-width="2.5"/>
 <circle cx="687.1" cy="238.4" r="4" fill="#16a34a"/>
 <circle cx="764.4" cy="201.5" r="4" fill="#16a34a"/>
-<circle cx="809.7" cy="180.0" r="4" fill="#16a34a"/>
 <circle cx="841.8" cy="164.7" r="4" fill="#16a34a"/>
-<circle cx="866.7" cy="159.9" r="4" fill="#16a34a"/>
-<circle cx="887.0" cy="157.7" r="4" fill="#16a34a"/>
-<polyline points="96.0,520.0 275.6,472.2 352.9,471.7 532.4,476.2" fill="none" stroke="#dc2626" stroke-width="2.5"/>
+<circle cx="854.9" cy="165.3" r="4" fill="#16a34a"/>
+<circle cx="887.0" cy="164.8" r="4" fill="#16a34a"/>
+<polyline points="96.0,520.0 275.6,472.2 352.9,472.6 532.4,474.4" fill="none" stroke="#dc2626" stroke-width="2.5"/>
 <circle cx="96.0" cy="520.0" r="4" fill="#dc2626"/>
 <circle cx="275.6" cy="472.2" r="4" fill="#dc2626"/>
-<circle cx="352.9" cy="471.7" r="4" fill="#dc2626"/>
-<circle cx="532.4" cy="476.2" r="4" fill="#dc2626"/>
-<text x="887.0" y="145.9" font-size="15" fill="#16a34a" text-anchor="end" font-weight="700">llmbridge ceiling &#8776; 90,000 RPS</text>
-<text x="532.4" y="459.3" font-size="15" fill="#dc2626" text-anchor="middle" font-weight="700">LiteLLM ceiling &#8776; 250 RPS</text>
+<circle cx="352.9" cy="472.6" r="4" fill="#dc2626"/>
+<circle cx="532.4" cy="474.4" r="4" fill="#dc2626"/>
+<text x="887.0" y="152.7" font-size="15" fill="#16a34a" text-anchor="end" font-weight="700">llmbridge ceiling &#8776; 84&#8211;87k RPS (cold boot)</text>
+<text x="532.4" y="459.3" font-size="15" fill="#dc2626" text-anchor="middle" font-weight="700">LiteLLM ceiling &#8776; 246 RPS</text>
 <rect x="644" y="454" width="290" height="60" fill="white" stroke="#e5e7eb" rx="5"/>
 <line x1="658" y1="476" x2="684" y2="476" stroke="#16a34a" stroke-width="3"/>
 <circle cx="671" cy="476" r="4" fill="#16a34a"/>

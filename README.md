@@ -62,7 +62,8 @@ profiling disproved that.)* *(Bifrost and Helicone not yet measured.)*
 A **separate** benchmark, because it measures a different unit of work — one token, not
 one request. Both gateways translate the same Anthropic event stream into OpenAI chunks
 at 50 tok/s per stream, measured by the same client-side instrument (neither gateway
-self-reports), against a no-gateway control run at the same concurrency. Median of 3.
+self-reports), against a no-gateway control run at the same concurrency. Single run per
+concurrency level.
 
 ![Streaming: time to first token vs concurrent streams](bench/results/stream-comparison.svg)
 
