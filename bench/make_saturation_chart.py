@@ -63,7 +63,7 @@ def ly(v): return MT + (math.log10(HI) - math.log10(max(v, LO))) / (math.log10(H
 
 
 INK, SUB, GRID = "#111827", "#6b7280", "#e5e7eb"
-CG, CR, CD = "#16a34a", "#dc2626", "#9ca3af"
+CG, CR, CD = "#16a34a", "#dc2626", "#9ca3af"  # green/red is pass/fail, not brand
 
 s = []
 s.append(

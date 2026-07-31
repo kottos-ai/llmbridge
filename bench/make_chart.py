@@ -16,7 +16,6 @@ would render llmbridge as a flat zero.
 
   python3 bench/make_chart.py            # -> bench/results/comparison.svg
 """
-import csv
 import math
 import os
 
@@ -73,7 +72,7 @@ def ly(v):
     return MT + t * PH
 
 
-LLMBRIDGE = "#16a34a"  # green
+LLMBRIDGE = "#16a34a"  # green: semantic pass/fail against red, NOT brand colour
 LITELLM = "#dc2626"  # red
 GRID = "#e5e7eb"
 INK = "#111827"
@@ -84,7 +83,7 @@ svg.append(
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">')
 svg.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 svg.append(
-    f'<text x="{ML}" y="44" font-size="{F_TITLE}" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — added latency p99 (1 KB)</text>')
+    f'<text x="{ML}" y="44" font-size="{F_TITLE}" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — added latency p99 (64 B body)</text>')
 svg.append(
     f'<text x="{ML}" y="74" font-size="{F_SUB}" fill="{SUB}">Both gateways do the full OpenAI&#8596;Anthropic translation (equal work), one worker each.</text>')
 svg.append(

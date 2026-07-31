@@ -71,7 +71,7 @@ PW = W - ML - MR
 PH = H - MT - MB
 F_TITLE, F_SUB, F_AXIS, F_VAL, F_XLBL, F_LEG, F_ANNOT = 27, 15, 15, 16, 18, 15, 13
 
-LLMBRIDGE = "#16a34a"
+LLMBRIDGE = "#16a34a"   # green: semantic pass/fail against red, NOT brand colour
 LITELLM = "#dc2626"
 FLOOR = "#2563eb"
 GRID = "#e5e7eb"
