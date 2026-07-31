@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-using namespace net::tls;
+using namespace llmbridge::net::tls;
 
 namespace
 {

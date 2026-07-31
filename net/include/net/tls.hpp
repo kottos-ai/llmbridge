@@ -59,7 +59,7 @@ extern "C"
     struct bio_st;
 }
 
-namespace net::tls
+namespace llmbridge::net::tls
 {
     /// What a session wants next. The loop uses this to decide whether to arm a
     /// read, flush a write, or tear the connection down.
@@ -176,6 +176,6 @@ namespace net::tls
         std::string _err{};
     };
 
-}  // namespace net::tls
+}  // namespace llmbridge::net::tls
 
 #endif  // LLMBRIDGE_HAVE_TLS

@@ -18,7 +18,7 @@
 #include <limits>
 #include <utility>
 
-namespace net::tls
+namespace llmbridge::net::tls
 {
     namespace
     {
@@ -334,6 +334,6 @@ namespace net::tls
         return _wbio && BIO_ctrl_pending(_wbio) > 0;
     }
 
-}  // namespace net::tls
+}  // namespace llmbridge::net::tls
 
 #endif  // LLMBRIDGE_HAVE_TLS

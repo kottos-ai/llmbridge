@@ -24,13 +24,10 @@ else ()
     message(STATUS "net: linux/io_uring.h not found — epoll only")
 endif ()
 
-# TLS for outbound provider connections. OpenSSL is the ONE sanctioned runtime
-# dependency (CLAUDE.md) and it is confined to the gateway path — the translator
-# library stays dependency-free, so `provider` must never link this. OFF by default
-# keeps the OSS build dependency-free for anyone who only wants the translator.
-option(LLMBRIDGE_TLS "Enable TLS for outbound gateway connections (needs OpenSSL)" OFF)
+# TLS for outbound provider connections (option + find_package live at the ROOT
+# CMakeLists so the imported OpenSSL::* targets are visible to sibling dirs — an
+# imported target is directory-scoped, and gateway/tests links it too).
 if (LLMBRIDGE_TLS)
-    find_package(OpenSSL 3.0 REQUIRED)
     target_sources(net PRIVATE src/tls.cpp)
     target_link_libraries(net PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(net PUBLIC LLMBRIDGE_HAVE_TLS)

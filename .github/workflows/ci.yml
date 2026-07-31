@@ -40,9 +40,13 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
-      - name: Configure (sanitized)
+      - name: Configure (sanitized, TLS on)
+        # LLMBRIDGE_TLS=ON here (only here) so the TLS transport + gateway pump run
+        # under ASan/UBSan every push; the build-test matrix stays TLS-off to prove
+        # the default build needs no OpenSSL.
         run: >
           cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DLLMBRIDGE_BUILD_TESTS=ON
+          -DLLMBRIDGE_TLS=ON
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build-san -j
