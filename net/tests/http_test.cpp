@@ -313,3 +313,41 @@ TEST(HttpQuirk, LargePaddingHeaderUnderCapIsNotError)
     Message m;
     EXPECT_NE(parse(build("GET", {"X-Pad: " + std::string(1024, 'p')}, ""), m), ParseStatus::Error);
 }
+
+// ── find_header ──────────────────────────────────────────────────────────────
+
+TEST(FindHeader, CaseInsensitiveNameLookupTrimsValue)
+{
+    const std::string_view h = "Host: x\r\nX-API-Key:   sk-123\r\nContent-Length: 4\r\n";
+    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "sk-123");
+    EXPECT_EQ(llmbridge::http::find_header(h, "host:"), "x");
+}
+
+TEST(FindHeader, MissingHeaderIsEmpty)
+{
+    EXPECT_TRUE(llmbridge::http::find_header("Host: x\r\n", "authorization:").empty());
+    EXPECT_TRUE(llmbridge::http::find_header("", "authorization:").empty());
+}
+
+TEST(FindHeader, FirstOccurrenceWinsOnDuplicates)
+{
+    // Anti-smuggling: duplicated credentials must resolve deterministically.
+    const std::string_view h = "x-api-key: first\r\nx-api-key: second\r\n";
+    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "first");
+}
+
+TEST(FindHeader, ColonInNameStopsPrefixConfusion)
+{
+    const std::string_view h = "x-api-key-2: wrong\r\nx-api-key: right\r\n";
+    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "right");
+}
+
+TEST(FindHeader, ValueCannotContainCrlfByConstruction)
+{
+    // A "value" with an embedded CRLF is, by definition, two lines — the lookup
+    // returns only the first line's remainder, so re-emitting it cannot inject.
+    const std::string_view h = "x-api-key: k\r\nX-Evil: 1\r\n";
+    const auto v = llmbridge::http::find_header(h, "x-api-key:");
+    EXPECT_EQ(v, "k");
+    EXPECT_EQ(v.find('\r'), std::string_view::npos);
+}

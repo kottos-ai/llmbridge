@@ -9,9 +9,39 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Next up: auth-header passthrough (forward the client's provider credentials upstream),
-then tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic API,
-fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
+API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+
+### Added
+
+- **Auth-header passthrough** — translated upstream requests now carry the client's
+  credentials, mapped across the dialect boundary: `Authorization: Bearer K` becomes
+  `x-api-key: K` for Anthropic (plus `anthropic-version`, pinned to `2023-06-01`
+  unless the client sends its own) and `x-goog-api-key: K` for Gemini; Cohere gets
+  the Bearer header verbatim; a client already speaking the target dialect's auth
+  (`x-api-key`) is forwarded untouched. **Whitelist, not echo**: a rebuilt request
+  forwards only the credential headers the target dialect understands — arbitrary
+  client headers (cookies, tracing, anything) do not cross, which is the
+  anti-smuggling stance the rebuild exists for. No credential → no header invented;
+  the provider's own `401` is the correct outcome. Credentials are written straight
+  from the client's request buffer into the upstream bytes — never stored, never
+  logged. `TranslateMode::None` is unchanged (byte-forwarding already carries all
+  headers). Streaming uses the same forward path, so streamed requests carry auth
+  identically.
+- **`Host` header on rebuilt upstream requests** — previously absent entirely
+  (HTTP/1.1 requires it; the benchmark mocks tolerated the omission, real providers
+  reject it). Derived from the parsed upstream hostname, falling back to `ip:port`;
+  default ports omitted.
+- `http::find_header()` — case-insensitive, zero-copy, first-occurrence-wins header
+  lookup (first-wins so duplicated credentials resolve deterministically; values are
+  CRLF-free by construction, so re-emitting one cannot inject). 5 unit tests.
+- 14 gateway auth tests across both backends: Bearer→`x-api-key` mapping, native-key
+  and version passthrough, no-credential-no-header, unrelated-headers-do-not-cross,
+  Host presence, Gemini and Cohere mappings.
+
+With this, a TLS build can front a real provider end to end:
+`llmbridge --upstream https://api.anthropic.com --translate anthropic` with the
+client sending its OpenAI-style key.
 
 ## [0.4.0] — 2026-07-31
 

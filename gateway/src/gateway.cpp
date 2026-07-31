@@ -49,6 +49,115 @@ namespace llmbridge
             return out;
         }
 
+        // Upstream REQUEST builder: build_http plus a Host header (HTTP/1.1
+        // requires one; the benchmark mocks never cared, real providers reject
+        // without it) and the per-dialect auth/extra header lines.
+        std::string build_http_request(std::string_view start_line, std::string_view body,
+                                       std::string_view host, std::string_view extra)
+        {
+            std::string out;
+            out.reserve(start_line.size() + body.size() + host.size() + extra.size() + 128);
+            out.append(start_line);
+            out.append("\r\nHost: ");
+            out.append(host);
+            out.append("\r\n");
+            out.append(extra); // zero or more complete "Name: value\r\n" lines
+            out.append("Content-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
+            out.append(std::to_string(body.size()));
+            out.append("\r\n\r\n");
+            out.append(body);
+            return out;
+        }
+
+        // Anthropic's REQUIRED versioning header. Pinned, not passthrough-only:
+        // an OpenAI-SDK client has never heard of it, and without it the API
+        // rejects the request outright. A client that DOES send its own value
+        // wins (see auth_headers_for) — the pin is a default, not an override.
+        constexpr std::string_view kAnthropicVersionDefault = "2023-06-01";
+
+        // Build the auth/extra header lines to inject into the translated
+        // upstream request, from the CLIENT's request headers.
+        //
+        // WHITELIST, not passthrough: the gateway rebuilds the upstream request,
+        // and only the credential headers the target dialect understands may
+        // cross the translation boundary. Echoing arbitrary client headers
+        // through a rebuilt request is a smuggling surface (and our own framing
+        // headers must stay authoritative). TranslateMode::None is untouched by
+        // all of this — byte-forwarding already carries every client header.
+        //
+        // Values re-emitted here cannot contain CR/LF: find_header() bounds each
+        // value by its own line's CRLF, so injection via a crafted credential is
+        // structurally impossible rather than filtered.
+        //
+        // The credential is handled as a transient string_view over the client's
+        // request buffer and written straight into the upstream bytes — it is
+        // never copied anywhere that outlives the request, and never logged.
+        std::string auth_headers_for(TranslateMode mode, std::string_view client_headers)
+        {
+            using http::find_header;
+            std::string out;
+
+            // "Authorization: Bearer K" -> K (bearer scheme only; anything else
+            // is not a provider API key and is dropped rather than guessed at).
+            const auto bearer_token = [&]() -> std::string_view {
+                std::string_view v = find_header(client_headers, "authorization:");
+                if (v.size() > 7 &&
+                    (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
+                    return http::detail::ltrim(v.substr(7));
+                return {};
+            };
+
+            switch (mode)
+            {
+                case TranslateMode::Anthropic:
+                {
+                    // Client already speaks Anthropic auth -> forward verbatim;
+                    // else map the OpenAI-style bearer token.
+                    std::string_view key = find_header(client_headers, "x-api-key:");
+                    if (key.empty()) key = bearer_token();
+                    if (!key.empty())
+                    {
+                        out.append("x-api-key: ");
+                        out.append(key);
+                        out.append("\r\n");
+                    }
+                    std::string_view ver = find_header(client_headers, "anthropic-version:");
+                    if (ver.empty()) ver = kAnthropicVersionDefault;
+                    out.append("anthropic-version: ");
+                    out.append(ver);
+                    out.append("\r\n");
+                    break;
+                }
+                case TranslateMode::Gemini:
+                {
+                    std::string_view key = find_header(client_headers, "x-goog-api-key:");
+                    if (key.empty()) key = bearer_token();
+                    if (!key.empty())
+                    {
+                        out.append("x-goog-api-key: ");
+                        out.append(key);
+                        out.append("\r\n");
+                    }
+                    break;
+                }
+                case TranslateMode::Cohere:
+                {
+                    // Cohere speaks Bearer natively -> forward the whole value.
+                    const std::string_view v = find_header(client_headers, "authorization:");
+                    if (!v.empty())
+                    {
+                        out.append("Authorization: ");
+                        out.append(v);
+                        out.append("\r\n");
+                    }
+                    break;
+                }
+                case TranslateMode::None:
+                    break; // byte-forward path; never called, but total anyway
+            }
+            return out;
+        }
+
         // Translate an OpenAI request body to the upstream dialect, also yielding
         // the upstream start line. Empty return = malformed body. Shared by both
         // event-loop backends.
@@ -221,6 +330,21 @@ namespace llmbridge
         if (_tls.enabled)
             throw std::runtime_error("TLS upstream requested but built without LLMBRIDGE_TLS");
 #endif
+        // Host header for rebuilt (translated) upstream requests. Prefer the
+        // parsed hostname (rides in TlsConfig::sni_host whether or not TLS is
+        // on — real providers route/verify on it); fall back to ip:port for the
+        // bare IP:PORT form. Default ports are omitted per convention.
+        if (!_tls.sni_host.empty())
+        {
+            _upstream_host_hdr = _tls.sni_host;
+            const bool default_port =
+                (_tls.enabled && _upstream_port == 443) || (!_tls.enabled && _upstream_port == 80);
+            if (!default_port) _upstream_host_hdr += ":" + std::to_string(_upstream_port);
+        }
+        else
+        {
+            _upstream_host_hdr = _upstream_ip + ":" + std::to_string(_upstream_port);
+        }
         // Linux has no SO_NOSIGPIPE; ignore SIGPIPE process-wide so a write to a
         // peer-closed socket returns EPIPE instead of killing us. Idempotent, so
         // safe to set here (covers the daemon and the test harness alike).
@@ -724,7 +848,9 @@ namespace llmbridge
             // Remember whether the client asked for a final usage chunk — the
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
-            upstream_bytes = build_http(start_line, tbody);
+            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr,
+                                                auth_headers_for(_translate, client_hdrs));
         }
         else
         {
@@ -1668,7 +1794,9 @@ namespace llmbridge
             std::string tbody = xlate_req(_translate, body, start_line);
             if (tbody.empty()) { u_error_respond(c, 400); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
-            upstream_bytes = build_http(start_line, tbody);
+            const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
+            upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr,
+                                                auth_headers_for(_translate, client_hdrs));
         }
         else
         {

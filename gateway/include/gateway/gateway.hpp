@@ -378,6 +378,7 @@ namespace llmbridge
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
+        std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
 #ifdef LLMBRIDGE_HAVE_TLS
         net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
         bool _tls_ctx_ok = false;

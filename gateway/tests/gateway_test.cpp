@@ -70,6 +70,16 @@ namespace
     }
 
     // A minimal valid OpenAI chat-completion request carrying `content`.
+    // OpenAI-shaped request with arbitrary extra header lines (auth tests).
+    std::string openai_request_hdrs(const std::string& content, const std::string& extra_hdrs)
+    {
+        const std::string body =
+            "{\"model\":\"gpt-4o\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"" +
+            content + "\"}]}";
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + extra_hdrs +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
     std::string openai_request(const std::string& content, bool keep_alive = true)
     {
         return make_request(
@@ -632,6 +642,118 @@ INSTANTIATE_TEST_SUITE_P(Dialects, ProxyTranslateMode,
                          ::testing::Values(TranslateMode::Anthropic, TranslateMode::Gemini,
                                            TranslateMode::Cohere),
                          [](const testing::TestParamInfo<TranslateMode>& i) { return mode_name(i.param); });
+
+// ── Auth-header passthrough (translate modes rebuild the upstream request,
+//     so credentials must be explicitly mapped across the dialect boundary) ────
+class ProxyAuth : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-test-123\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-test-123\r\n"), std::string::npos) << up;
+    // The OpenAI-style header must NOT also cross — one credential, one shape.
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+    // Anthropic's required version header is pinned when the client has none.
+    EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "x-api-key: sk-native-456\r\nanthropic-version: 2024-10-22\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-native-456\r\n"), std::string::npos) << up;
+    // The client's own version wins over the pinned default.
+    EXPECT_NE(up.find("anthropic-version: 2024-10-22\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("2023-06-01"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, NoCredentialMeansNoAuthHeaderUpstream)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    // No credential invented; the provider's own 401 is the correct outcome.
+    EXPECT_EQ(up.find("x-api-key"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Authorization"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, UnrelatedClientHeadersDoNotCross)
+{
+    // WHITELIST semantics: a rebuilt request must not echo arbitrary client
+    // headers — that is the smuggling surface the rebuild exists to close.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", "Authorization: Bearer sk-1\r\nX-Evil: 1\r\nCookie: session=abc\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-1"), std::string::npos) << up;
+    EXPECT_EQ(up.find("X-Evil"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Cookie"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, RebuiltRequestCarriesHostHeader)
+{
+    // HTTP/1.1 requires Host; mocks tolerate its absence, api.anthropic.com
+    // does not. Without TlsConfig the gateway falls back to ip:port.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("Host: 127.0.0.1:"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, BearerTokenMapsToGoogApiKeyForGemini)
+{
+    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Gemini, "ok")));
+    start(0, true, TranslateMode::Gemini, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer AIza-test\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-goog-api-key: AIza-test\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
+{
+    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Cohere, "ok")));
+    start(0, true, TranslateMode::Cohere, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer co-test-9\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("Authorization: Bearer co-test-9\r\n"), std::string::npos) << up;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
 
 // ── Large bodies ───────────────────────────────────────────────────────────────
 class ProxySize : public ProxyIT, public ::testing::WithParamInterface<size_t> {};
