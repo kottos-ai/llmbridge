@@ -410,30 +410,58 @@ namespace llmbridge::http
     // whole-body path did not, which is the asymmetry this closes.
     //
     // Re-runnable: like parse(), it re-frames from the buffer start on every call
-    // and returns NeedMore until the whole message is present. `body` is filled
-    // ONLY on Complete — decoded for chunked, copied for Content-Length — so the
-    // caller has one contiguous body either way.
+    // and returns NeedMore until the whole message is present.
+    //
+    // Returns everything in one value rather than through out-parameters: four of
+    // them (head, body, total_len + status) was unreadable at the call site.
+    //
+    // ZERO-COPY WHERE IT CAN BE. On Complete, `body` is a view of the decoded body:
+    //   Content-Length -> it aliases `buf` directly. The bytes are already
+    //                     contiguous, so copying them would be pure waste, and this
+    //                     is the path that runs at full request rate.
+    //   chunked        -> it aliases `scratch`, because the body bytes are
+    //                     interleaved with chunk-size lines and CANNOT be viewed in
+    //                     place. That copy is inherent to the encoding, not a
+    //                     choice.
+    // `scratch` is caller-owned so its capacity can be reused across requests
+    // instead of allocating per response. It is untouched in the Content-Length
+    // case. `body` is valid only while both `buf` and `scratch` outlive it, and
+    // only until either is modified — in the gateway that means before rbuf is
+    // erased or the upstream is released.
     enum class RespStatus { NeedMore, Complete, Error };
 
-    inline RespStatus parse_response(std::string_view buf, ResponseHead& head, std::string& body,
-                                     size_t& total_len) noexcept
+    struct ParsedResponse
     {
-        const HeadStatus hs = parse_response_head(buf, head);
-        if (hs == HeadStatus::NeedMore) return RespStatus::NeedMore;
-        if (hs == HeadStatus::Error) return RespStatus::Error;
+        RespStatus status = RespStatus::NeedMore;
+        ResponseHead head{};
+        std::string_view body{}; // valid only when status == Complete
+        size_t total_len = 0;    // bytes of `buf` this message occupies
+
+        [[nodiscard]] bool complete() const noexcept { return status == RespStatus::Complete; }
+        [[nodiscard]] bool failed() const noexcept { return status == RespStatus::Error; }
+    };
+
+    [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf,
+                                                       std::string& scratch) noexcept
+    {
+        ParsedResponse r;
+        const HeadStatus hs = parse_response_head(buf, r.head);
+        if (hs == HeadStatus::NeedMore) return r; // status stays NeedMore
+        if (hs == HeadStatus::Error) { r.status = RespStatus::Error; return r; }
 
         // Both framings present is a smuggling signal even from a trusted origin
         // (a compromised or buggy middlebox), so refuse rather than pick a winner.
-        if (head.chunked && head.has_content_length) return RespStatus::Error;
+        if (r.head.chunked && r.head.has_content_length) { r.status = RespStatus::Error; return r; }
 
-        if (!head.chunked)
+        if (!r.head.chunked)
         {
-            if (head.content_length > kMaxBodyLen) return RespStatus::Error;
-            const size_t need = head.header_len + head.content_length;
-            if (buf.size() < need) return RespStatus::NeedMore;
-            body.assign(buf.data() + head.header_len, head.content_length);
-            total_len = need;
-            return RespStatus::Complete;
+            if (r.head.content_length > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
+            const size_t need = r.head.header_len + r.head.content_length;
+            if (buf.size() < need) return r; // NeedMore
+            r.body = buf.substr(r.head.header_len, r.head.content_length); // no copy
+            r.total_len = need;
+            r.status = RespStatus::Complete;
+            return r;
         }
 
         // Chunked: decode from scratch each call. A fresh decoder per attempt keeps
@@ -442,11 +470,13 @@ namespace llmbridge::http
         // kMaxBodyLen and only paid on the non-streaming path (the streaming pump
         // uses a persistent decoder precisely to avoid that).
         ChunkDecoder dec;
-        body.clear();
-        if (!dec.feed(buf.substr(head.header_len), body)) return RespStatus::Error;
-        if (body.size() > kMaxBodyLen) return RespStatus::Error;
-        if (!dec.done()) return RespStatus::NeedMore;
-        total_len = head.header_len + dec.consumed();
-        return RespStatus::Complete;
+        scratch.clear(); // keeps capacity: no per-request allocation after warm-up
+        if (!dec.feed(buf.substr(r.head.header_len), scratch)) { r.status = RespStatus::Error; return r; }
+        if (scratch.size() > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
+        if (!dec.done()) return r; // NeedMore
+        r.body = scratch;
+        r.total_len = r.head.header_len + dec.consumed();
+        r.status = RespStatus::Complete;
+        return r;
     }
 } // namespace llmbridge::http

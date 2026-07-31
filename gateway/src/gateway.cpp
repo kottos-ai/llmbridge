@@ -136,29 +136,67 @@ namespace llmbridge
             return v;
         }
 
+        // Every credential header we might care about, collected in ONE pass.
+        //
+        // The first version called find_header() six times — four to validate, then
+        // up to two to fetch — i.e. six full walks of the client's header block per
+        // request. Measured on a thermally-gated A/B at 20k RPS that cost ~40 us at
+        // p99 (~8%), with p50 unchanged: exactly the shape of "a little extra work
+        // on every request". One walk removes it.
+        struct AuthHeaders
+        {
+            std::string_view authorization;
+            std::string_view x_api_key;
+            std::string_view x_goog_api_key;
+            std::string_view anthropic_version;
+        };
+
+        AuthHeaders scan_auth_headers(std::string_view headers) noexcept
+        {
+            AuthHeaders out;
+            size_t start = 0;
+            while (start < headers.size())
+            {
+                size_t eol = headers.find("\r\n", start);
+                if (eol == std::string_view::npos) eol = headers.size();
+                const std::string_view line = headers.substr(start, eol - start);
+                // First occurrence wins (anti-smuggling: a duplicated credential must
+                // resolve the same way for us and for the upstream), hence the
+                // empty() guards.
+                if (out.authorization.empty() && http::detail::line_is(line, "authorization:"))
+                    out.authorization = rtrim_ows(http::detail::ltrim(line.substr(14)));
+                else if (out.x_api_key.empty() && http::detail::line_is(line, "x-api-key:"))
+                    out.x_api_key = rtrim_ows(http::detail::ltrim(line.substr(10)));
+                else if (out.x_goog_api_key.empty() && http::detail::line_is(line, "x-goog-api-key:"))
+                    out.x_goog_api_key = rtrim_ows(http::detail::ltrim(line.substr(15)));
+                else if (out.anthropic_version.empty() &&
+                         http::detail::line_is(line, "anthropic-version:"))
+                    out.anthropic_version = rtrim_ows(http::detail::ltrim(line.substr(18)));
+                start = eol + 2;
+            }
+            return out;
+        }
+
         // Returns false when the client supplied a syntactically invalid credential
         // (control characters). The caller MUST fail the request rather than
         // forward — silently dropping would still send a credential-less request
         // upstream, which is a confusing 401; a 400 names the client's own bug.
         bool auth_headers_for(TranslateMode mode, std::string_view client_headers, std::string& out)
         {
-            using http::find_header;
             out.clear();
+            const AuthHeaders h = scan_auth_headers(client_headers);
 
-            // Any credential-bearing header the client sent must be well-formed,
-            // whether or not this dialect ends up using it — otherwise a malformed
-            // value simply routes around the check by picking the other header.
-            for (const std::string_view name :
-                 {"authorization:", "x-api-key:", "x-goog-api-key:", "anthropic-version:"})
-            {
-                const std::string_view v = rtrim_ows(find_header(client_headers, name));
+            // Validate every credential-bearing header the client sent, whether or
+            // not this dialect uses it — otherwise a malformed value routes around
+            // the check by picking the other header.
+            for (const std::string_view v :
+                 {h.authorization, h.x_api_key, h.x_goog_api_key, h.anthropic_version})
                 if (!v.empty() && !header_value_safe(v)) return false;
-            }
 
-            // "Authorization: Bearer K" -> K (bearer scheme only; anything else
-            // is not a provider API key and is dropped rather than guessed at).
-            const auto bearer_token = [&]() -> std::string_view {
-                const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
+            // "Bearer K" -> K (bearer scheme only; anything else is not a provider
+            // API key and is dropped rather than guessed at).
+            const auto bearer = [&]() -> std::string_view {
+                const std::string_view v = h.authorization;
                 if (v.size() > 7 &&
                     (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
                     return http::detail::ltrim(v.substr(7));
@@ -169,27 +207,22 @@ namespace llmbridge
             {
                 case TranslateMode::Anthropic:
                 {
-                    // Client already speaks Anthropic auth -> forward verbatim;
-                    // else map the OpenAI-style bearer token.
-                    std::string_view key = rtrim_ows(find_header(client_headers, "x-api-key:"));
-                    if (key.empty()) key = bearer_token();
+                    std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
                     if (!key.empty())
                     {
                         out.append("x-api-key: ");
                         out.append(key);
                         out.append("\r\n");
                     }
-                    std::string_view ver = rtrim_ows(find_header(client_headers, "anthropic-version:"));
-                    if (ver.empty()) ver = kAnthropicVersionDefault;
                     out.append("anthropic-version: ");
-                    out.append(ver);
+                    out.append(h.anthropic_version.empty() ? kAnthropicVersionDefault
+                                                           : h.anthropic_version);
                     out.append("\r\n");
                     break;
                 }
                 case TranslateMode::Gemini:
                 {
-                    std::string_view key = rtrim_ows(find_header(client_headers, "x-goog-api-key:"));
-                    if (key.empty()) key = bearer_token();
+                    std::string_view key = h.x_goog_api_key.empty() ? bearer() : h.x_goog_api_key;
                     if (!key.empty())
                     {
                         out.append("x-goog-api-key: ");
@@ -201,11 +234,10 @@ namespace llmbridge
                 case TranslateMode::Cohere:
                 {
                     // Cohere speaks Bearer natively -> forward the whole value.
-                    const std::string_view v = rtrim_ows(find_header(client_headers, "authorization:"));
-                    if (!v.empty())
+                    if (!h.authorization.empty())
                     {
                         out.append("Authorization: ");
-                        out.append(v);
+                        out.append(h.authorization);
                         out.append("\r\n");
                     }
                     break;
@@ -238,9 +270,6 @@ namespace llmbridge
             return {};
         }
 
-        // A minimal HTTP error response (Connection: close) so a client sees a real
-        // status code instead of a bare TCP reset. 400 = malformed client request;
-        // 502 = upstream failure. Body uses the OpenAI error-envelope shape.
         std::string build_error(int code)
         {
             const char* line = code == 400   ? "HTTP/1.1 400 Bad Request"
@@ -1067,18 +1096,20 @@ namespace llmbridge
         const int64_t t0 = now_ns();
         // parse_response, NOT parse: real providers return non-streaming bodies
         // chunked over HTTP/1.1, which parse() rejects by design (see http.hpp).
-        http::ResponseHead h;
-        std::string body_buf;
-        size_t total_len = 0;
-        const auto st = http::parse_response(u->rbuf, h, body_buf, total_len);
-        if (st == http::RespStatus::NeedMore) return;
-        if (st == http::RespStatus::Error) { error_respond(client, 502); return; }
+        // `r.body` aliases rbuf (Content-Length) or _resp_scratch (chunked); it is
+        // dead before rbuf is erased or the upstream released, below.
+        const auto r = http::parse_response(u->rbuf, _resp_scratch);
+        if (r.failed()) { error_respond(client, 502); return; }
+        if (!r.complete()) return;
+        const http::ResponseHead& h = r.head;
+        const std::string_view body_buf = r.body;
+        const size_t total_len = r.total_len;
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
 
         if (_translate != TranslateMode::None)
         {
-            const std::string_view body(body_buf);
+            const std::string_view body = body_buf;
             // Relay a provider failure with ITS OWN status + message (rate limit,
             // overloaded GPU, context length, auth) — translating a non-200 body as
             // if it were a completion would fail and mask it as a generic 502.
@@ -1835,14 +1866,11 @@ namespace llmbridge
 
             // parse_response, NOT parse: providers return non-streaming bodies
             // chunked over HTTP/1.1 and parse() rejects that by design (http.hpp).
-            http::ResponseHead rh;
-            std::string body_buf;
-            size_t total_len = 0;
-            const auto st = http::parse_response(c->rbuf, rh, body_buf, total_len);
-            if (st == http::RespStatus::NeedMore) return; // armed recv delivers the rest
-            if (st == http::RespStatus::Error) { u_error_respond(c->peer, 502); return; }
+            const auto r = http::parse_response(c->rbuf, _resp_scratch);
+            if (r.failed()) { u_error_respond(c->peer, 502); return; }
+            if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
-            u_on_response(c, rh, body_buf, total_len);
+            u_on_response(c, r.head, r.body, r.total_len);
         }
     }
 
@@ -1930,12 +1958,12 @@ namespace llmbridge
     }
 
     void Gateway::u_on_response(Connection* u, const http::ResponseHead& h,
-                                const std::string& body_buf, size_t total_len) noexcept
+                                std::string_view body_buf, size_t total_len) noexcept
     {
         Connection* client = u->peer;
         if (_translate != TranslateMode::None)
         {
-            const std::string_view body(body_buf);
+            const std::string_view body = body_buf;
             // Relay a provider failure with ITS OWN status + message (see the epoll
             // mirror): a 429/529/400 must not be flattened into a generic 502.
             if (h.status != 0 && h.status != 200)

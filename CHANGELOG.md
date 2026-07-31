@@ -12,6 +12,63 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
 API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
+## [0.5.2] — 2026-07-31
+
+Performance and API cleanup for the two preceding releases. No behaviour change: the
+same requests produce the same bytes. Found by an A/B regression check against the
+pre-0.5.0 build, not by profiling a guess.
+
+### Fixed
+
+- **Auth-header scanning walked the client's header block six times per request** —
+  four to validate the credential-bearing headers, then up to two more to fetch the
+  value it needed. One pass now collects all four into a struct. Measured on a
+  thermally-gated interleaved A/B at 20k RPS: this cost **~40 µs at p99 (~8%)** with
+  p50 unchanged — the signature of a little extra work on every request. After the
+  fix the two builds' p99 distributions interleave (min −20 µs, median +15 µs vs the
+  pre-0.5.0 baseline), i.e. no measurable difference. First-occurrence-wins is
+  preserved, and validation still covers every credential header the client sent, not
+  only the one the target dialect uses.
+- **`parse_response` copied the body on the `Content-Length` path**, where the
+  previous `parse()` handed out a `string_view` over the receive buffer. 0.5.1
+  introduced that copy on the highest-rate path for no reason; the body is already
+  contiguous there. It is now a view again. The copy remains only for **chunked**,
+  where it is inherent to the encoding — body bytes are interleaved with chunk-size
+  lines and cannot be viewed in place.
+- **The chunked decode buffer allocated per request.** It is now a single buffer
+  reused across requests (safe because the loop is single-threaded and a response is
+  framed and consumed entirely within one event). This matters more than it sounds:
+  chunked is the path real providers actually use, so that allocation was being paid
+  on every non-streaming call.
+
+### Changed
+
+- `http::parse_response()` returns a `ParsedResponse` struct (`status`, `head`,
+  `body`, `total_len`, with `complete()` / `failed()`) instead of writing through four
+  out-parameters. Call sites drop from five-variable preambles to two lines. `scratch`
+  stays a parameter because the caller owns the reusable buffer — that ownership is
+  the allocation-avoidance above.
+- **Lifetime contract, now explicit in the header:** `body` aliases the receive buffer
+  (`Content-Length`) or the scratch buffer (chunked), so it is valid only until either
+  is modified — in the gateway, before `rbuf` is erased or the upstream released. The
+  ordering is verified by the suite under ASan/UBSan, which is what would catch a
+  dangling view.
+
+### Benchmarks
+
+Verified against the pre-0.5.0 build on both paths, interleaved and temperature-gated:
+streaming per-token p50 **108 µs vs 109 µs** and p99 **182 µs vs 183 µs** at 64
+concurrent streams with 256/256 streams completing; non-streaming p99 restored as
+above. No published figure changes.
+
+`bench/BENCHMARK-CONFIG.md` gains **§3d, the A/B discipline** — interleave arms, gate
+on temperature, **re-run with the arms swapped**, report min as well as median, stay
+under the knee, and verify the process is alive. Every rule is there because its
+absence produced a confident wrong answer during this work: thermal noise hid the
+40 µs regression above; an ephemeral-port collision read as "the new build crashes";
+and first-run-is-colder invented a 0.3 ms TTFT regression that vanished when the arm
+order was reversed.
+
 ## [0.5.1] — 2026-07-31
 
 Read chunked upstream responses on the non-streaming path. Found by the first live

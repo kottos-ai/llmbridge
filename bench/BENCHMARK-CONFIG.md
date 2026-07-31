@@ -378,6 +378,55 @@ Revert by removing the token and rebooting. This is a **security tradeoff**, so 
 benchmarking/measurement step, not a production recommendation — quantify the cost, then
 decide separately whether the exposure is acceptable where it would actually run.
 
+## 3d. A/B runs (regression checks) — a different discipline
+
+A regression check is not a publication run. Nobody cares about the absolute number;
+the only thing that matters is whether **build A differs from build B**, which makes it
+vulnerable to a class of artifact the published runs are not. Everything below exists
+because it produced a confident wrong answer at least once.
+
+**Interleave the arms.** `base, cur, base, cur…`, never two blocks. This box's absolute
+numbers drift with package temperature over a few minutes, and a block layout converts
+that drift straight into a fake delta.
+
+**Gate on temperature before every run.** Refuse to start the next run until the package
+is back under a threshold, so no run is measured on a hotter box than its counterpart:
+
+```sh
+while [ "$(awk '{printf "%.0f", $1/1000}' /sys/class/thermal/thermal_zone0/temp)" -gt 70 ]; do sleep 2; done
+```
+
+**Run the whole thing a second time with the ARMS SWAPPED.** This is the control that
+catches what the gate cannot. A threshold gate still lets the *first* run after a long
+idle start genuinely colder (measured: 62 C versus 70 C for every subsequent run), so
+whichever arm goes first gets a free advantage. If a delta is real it survives the swap;
+if it is position bias it shrinks or inverts.
+
+> Measured example: a streaming A/B showed `cur` +0.30 ms on TTFT, five runs each,
+> distributions barely overlapping — it looked like a real regression. Re-run with the
+> order reversed, the same gap was **+0.10 ms**, i.e. two thirds of it was the arm that
+> happened to run first. Per-token latency, flat in both orderings, was the honest
+> signal.
+
+**Report MIN as well as median.** Thermal noise and scheduler interference only ever
+*add* latency, so the minimum across runs is the cleanest estimator of what the code
+itself does. A median can be dragged by one spike; the min cannot.
+
+**Stay well under the knee.** Latency percentiles from a saturated open-loop run are
+meaningless — the generator queues without bound and you are measuring backlog, not
+service time (`p50 == p99 == max` is the tell). Throughput ceilings are measured by
+`saturate.sh`; latency deltas are measured at a rate the box holds comfortably, with the
+**control confirmed to hold the offered rate** before and after the sweep.
+
+**Verify the process is alive after starting it.** A harness that records a dead run as
+`achieved=0` reads like a catastrophic regression. See §"The fourth" above — that is
+exactly how an ephemeral-port collision was misread as "the new build crashes".
+
+> What this discipline is worth: without it, a genuine **+40 us p99** regression was
+> invisible under thermal noise of 4,000-359,000 us and was reported as "no regression".
+> With it, the same regression showed up as six non-overlapping runs, was traced to six
+> redundant header scans per request, fixed, and confirmed gone.
+
 ## 4. Gateway flags
 
 ```
