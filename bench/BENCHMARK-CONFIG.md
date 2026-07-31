@@ -355,9 +355,18 @@ decide separately whether the exposure is acceptable where it would actually run
 ## 4. Gateway flags
 
 ```
---listen PORT           --upstream IP:PORT      --translate none|anthropic|gemini|cohere
---io auto|epoll|uring   --workers N             --upstream-timeout SECONDS
+--listen PORT           --upstream IP:PORT | HOST:PORT | http://HOST[:PORT]
+--io auto|epoll|uring   --translate none|anthropic|gemini|cohere
+--workers N             --upstream-timeout SECONDS
 --duration SECONDS      --warmup SECONDS
+```
+
+`--upstream` also parses `https://HOST[:PORT]` but refuses to start until the TLS
+transport is wired into the gateway loop. Hostnames resolve once at startup
+(first A record); all benchmarks use the literal `127.0.0.1:PORT` form, which
+bypasses the resolver entirely.
+
+```
 ```
 
 Compile-time constants that change benchmark results:

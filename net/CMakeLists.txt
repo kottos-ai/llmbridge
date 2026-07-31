@@ -6,6 +6,7 @@
 
 add_library(net STATIC
         src/socket_util.cpp
+        src/upstream.cpp
 )
 target_include_directories(net PUBLIC include)
 target_compile_features(net PUBLIC cxx_std_20)

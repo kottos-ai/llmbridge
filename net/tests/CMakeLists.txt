@@ -13,12 +13,16 @@ target_link_libraries(net_socket_util_test PRIVATE net GTest::gtest_main)
 add_executable(net_uring_test uring_test.cpp)
 target_link_libraries(net_uring_test PRIVATE net GTest::gtest_main)
 
+add_executable(net_upstream_test upstream_test.cpp)
+target_link_libraries(net_upstream_test PRIVATE net GTest::gtest_main)
+
 
 include(GoogleTest)
 gtest_discover_tests(net_http_test)
 gtest_discover_tests(net_http_stream_test)
 gtest_discover_tests(net_socket_util_test)
 gtest_discover_tests(net_uring_test)
+gtest_discover_tests(net_upstream_test)
 
 # Only when TLS is compiled in; the file is #ifdef'd but there is no point
 # building an empty translation unit.
