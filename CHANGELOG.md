@@ -9,9 +9,73 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Nothing yet. Next up: tool-call streaming, **Anthropic-in mode** (clients that speak
-the Anthropic API, fronting an OpenAI-compatible upstream), and Gemini / Cohere
-streaming.
+Next up: auth-header passthrough (forward the client's provider credentials upstream),
+then tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic API,
+fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+
+## [0.3.1] — 2026-07-31
+
+TLS to the upstream. The gateway can now front an `https://` provider endpoint —
+`llmbridge --upstream https://host` — on both event-loop backends. **Opt-in at build
+time** (`-DLLMBRIDGE_TLS=ON`, needs OpenSSL ≥ 3.0): the default build remains
+zero-dependency end to end, and the translator library never links OpenSSL in any
+configuration. See DESIGN.md § "TLS to the upstream" for the data-flow diagram.
+
+### Added
+
+- **TLS transport** (`net/tls.hpp`) — OpenSSL driven through **memory BIOs**, not
+  `SSL_set_fd`: the event loop keeps the socket and the `SSL` object is a pure byte
+  transform, which is the only shape that works on io_uring (multishot recv hands the
+  loop bytes that have *already* been read — there is no read left for OpenSSL to
+  perform). Same four calls on both backends.
+- **Gateway TLS integration**, both backends. Design invariant: `rbuf`/`wbuf` hold
+  **plaintext always** — TLS interposes strictly at the socket edge, so HTTP framing,
+  the SSE pump, translation, and stale-pool retry-resend are unchanged and unaware.
+  io_uring serializes one SEND at a time so the ciphertext buffer stays immutable
+  while the kernel reads it; ciphertext produced meanwhile stages in the write BIO.
+- **TLS sessions survive the keep-alive pool** — a pooled reuse pays no second
+  handshake (asserted by test: N requests, one handshake).
+- **`--upstream` now accepts `HOST:PORT`, `http://HOST[:PORT]`, `https://HOST[:PORT]`**
+  (`net/upstream.hpp`), with DNS resolution via `getaddrinfo` once at startup (A
+  records, resolver order kept for the future failover PR). `IP:PORT` unchanged. The
+  parser is a security boundary — the host string feeds the Host header and SNI — so
+  it rejects userinfo (`@` URL-confusion), non-LDH characters (header injection),
+  base paths (would be silently dropped), IPv6 literals, and sloppy ports
+  (`atoi`-style `"80x"`).
+- **Tests**: 10 hermetic transport tests (handshake under byte-at-a-time
+  fragmentation, close_notify vs truncation, garbage-is-fatal, multi-record payloads,
+  untrusted-cert and wrong-hostname rejection) + 16 end-to-end gateway tests on both
+  backends (round trip, pooled-reuse handshake count, SSE translation through TLS,
+  16 concurrent interleaved sessions, corrupt-record-mid-stream, provider closing
+  pooled conns, TCP close mid-handshake, hostname mismatch → 502 with zero requests
+  reaching the unverified peer) + 16 upstream-parser tests. CI's sanitizer job now
+  builds TLS-on so the path runs under ASan/UBSan every push; the gcc/clang matrix
+  stays TLS-off to keep proving the default build is dependency-free.
+
+### Security
+
+- **Certificate verification cannot be disabled** — no insecure flag exists. Chain
+  (`SSL_VERIFY_PEER`) and hostname (`SSL_set1_host`) both derive from one argument,
+  so SNI and the verified name cannot disagree; a partially-initialized session is
+  torn down so ignoring an init failure cannot yield an unverified handshake.
+- TLS 1.2 floor; server-initiated renegotiation refused (`SSL_OP_NO_RENEGOTIATION`);
+  `ERR_clear_error()` before every SSL operation (a stale thread-local error-queue
+  entry misclassifies a benign `WANT_READ` as fatal); span lengths clamped to
+  `INT_MAX` rather than cast.
+- **A fatal TLS record error mid-stream aborts the client on both backends** — found
+  by review on epoll, where corruption previously fell into the clean-EOF path and a
+  corrupted stream could be finalized with a well-formed `[DONE]`.
+
+### Known gaps
+
+- No OCSP/CRL revocation checking (usual for non-browser TLS clients; documented).
+- A provider EOF without `close_notify` is treated as a normal end of a
+  close-delimited stream — providers rarely send it, and strict truncation detection
+  would break real streams.
+- Re-resolution on DNS TTL expiry: a long-lived gateway pins the startup A record
+  (congruent with connection pooling; revisit with the failover PR).
+- Auth headers are **not yet forwarded** — calling a real provider still fails auth;
+  that is the next change.
 
 ## [0.3.0] — 2026-07-29
 
