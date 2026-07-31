@@ -130,6 +130,17 @@ namespace
         void pump() { SSL_do_handshake(ssl); }
     };
 
+    /// Feed the server one byte at a time, pumping after each, so BOTH directions
+    /// of the handshake see worst-case fragmentation.
+    void server_feed_bytewise(Server& s, const std::vector<uint8_t>& bytes)
+    {
+        for (uint8_t b : bytes)
+        {
+            BIO_write(s.rbio, &b, 1);
+            s.pump();
+        }
+    }
+
     /// Shuttle bytes both ways until the client handshake completes or we give up.
     /// The loop cap is a deadlock guard: a pump bug shows up as "never converges",
     /// and an infinite loop in CI is far worse than a failed assertion.
@@ -287,6 +298,125 @@ TEST_F(TlsPump, RejectsHostnameMismatch)
 
     EXPECT_FALSE(drive_handshake(c, s));
     EXPECT_EQ(c.want(), Want::Error);
+}
+
+// Handshake bytes are as fragmentable as application bytes -- the ClientHello can
+// arrive split across recv completions too. Same property, other phase.
+TEST_F(TlsPump, ToleratesHandshakeFragmentation)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+
+    std::vector<uint8_t> buf(16384);
+    for (int round = 0; round < 16 && !c.handshake_done(); ++round)
+    {
+        std::vector<uint8_t> c2s;
+        size_t n;
+        while ((n = c.pull_ciphertext(buf)) > 0) c2s.insert(c2s.end(), buf.data(), buf.data() + n);
+        server_feed_bytewise(s, c2s);
+
+        for (uint8_t b : s.pull())  // server flight, one byte at a time
+        {
+            ASSERT_EQ(c.feed_ciphertext({&b, 1}), 1u);
+            ASSERT_NE(c.want(), Want::Error) << c.last_error();
+        }
+    }
+    EXPECT_TRUE(c.handshake_done()) << c.last_error();
+}
+
+// A clean close_notify from the peer must surface as Want::Closed -- this is the
+// only test that exercises the SSL_ERROR_ZERO_RETURN branch of classify(), and the
+// gateway relies on it to tell "stream finished" from "stream died".
+TEST_F(TlsPump, PeerCloseNotifySurfacesAsClosed)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+    ASSERT_TRUE(drive_handshake(c, s)) << c.last_error();
+
+    SSL_shutdown(s.ssl);              // server sends close_notify
+    (void)c.feed_ciphertext(s.pull());
+
+    std::vector<uint8_t> buf(256);
+    EXPECT_EQ(c.read_plaintext(buf), 0u);
+    EXPECT_EQ(c.want(), Want::Closed);
+}
+
+// The inverse property: the ABSENCE of close_notify must NOT read as a clean
+// close. A TCP FIN with no close_notify is a truncation attack (strip the end of
+// a response, e.g. the SSE final-usage chunk); the session must stay un-Closed so
+// the gateway can flag the upstream response as truncated.
+TEST_F(TlsPump, TruncationWithoutCloseNotifyIsNotClosed)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+    ASSERT_TRUE(drive_handshake(c, s)) << c.last_error();
+
+    // Peer "closes" the TCP stream without a close_notify: nothing more arrives.
+    std::vector<uint8_t> buf(256);
+    EXPECT_EQ(c.read_plaintext(buf), 0u);
+    EXPECT_NE(c.want(), Want::Closed);   // must look like "waiting", never "done"
+    EXPECT_EQ(c.want(), Want::Read);
+}
+
+// Corrupt ciphertext must classify as Want::Error (SSL_ERROR_SSL), not crash, not
+// hang, not decrypt. This is the branch a malicious or broken middlebox hits.
+TEST_F(TlsPump, GarbageCiphertextIsFatal)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+    ASSERT_TRUE(drive_handshake(c, s)) << c.last_error();
+
+    std::vector<uint8_t> junk(512);
+    for (size_t i = 0; i < junk.size(); ++i) junk[i] = static_cast<uint8_t>(i * 7 + 13);
+    (void)c.feed_ciphertext(junk);
+
+    std::vector<uint8_t> buf(4096);
+    EXPECT_EQ(c.read_plaintext(buf), 0u);
+    EXPECT_EQ(c.want(), Want::Error);
+    EXPECT_FALSE(c.last_error().empty());
+}
+
+// A payload over the 16 KB TLS record limit forces multiple records each way.
+// Catches any assumption that one write_plaintext() == one pull_ciphertext() == one
+// record -- an assumption the fragmentation tests cannot catch from the other side.
+TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+    ASSERT_TRUE(drive_handshake(c, s)) << c.last_error();
+
+    std::string big(70 * 1024, '\0');  // > 4 records
+    for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('a' + i % 26);
+
+    // Client -> server. write_plaintext may take it in gulps; loop until consumed.
+    size_t off = 0;
+    std::vector<uint8_t> buf(32 * 1024), wire;
+    while (off < big.size())
+    {
+        const auto* p = reinterpret_cast<const uint8_t*>(big.data()) + off;
+        const size_t w = c.write_plaintext({p, big.size() - off});
+        ASSERT_GT(w, 0u) << c.last_error();
+        off += w;
+        size_t n;
+        while ((n = c.pull_ciphertext(buf)) > 0) wire.insert(wire.end(), buf.data(), buf.data() + n);
+    }
+    s.feed(wire);
+
+    std::string got;
+    char rb[16384];
+    int rn;
+    while ((rn = SSL_read(s.ssl, rb, sizeof rb)) > 0) got.append(rb, static_cast<size_t>(rn));
+    EXPECT_EQ(got, big);
 }
 
 #endif  // LLMBRIDGE_HAVE_TLS

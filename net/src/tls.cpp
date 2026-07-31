@@ -15,6 +15,7 @@
 #include <openssl/x509v3.h>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace net::tls
@@ -35,6 +36,15 @@ namespace net::tls
                 out += buf;
             }
             return out.empty() ? std::string{"unknown OpenSSL error"} : out;
+        }
+
+        /// BIO_* and SSL_* take int lengths. Clamp rather than cast: a span past
+        /// INT_MAX would otherwise go negative (error) or, past UINT_MAX, wrap to a
+        /// small positive and make us report bytes consumed that never were.
+        constexpr int clamp_len(size_t n) noexcept
+        {
+            constexpr size_t kMax = static_cast<size_t>(std::numeric_limits<int>::max());
+            return static_cast<int>(std::min(n, kMax));
         }
     }  // namespace
 
@@ -94,6 +104,11 @@ namespace net::tls
         // guaranteed to live at a stable address across a WANT_WRITE retry, and
         // without this OpenSSL treats that as a fatal API misuse.
         SSL_CTX_set_mode(_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+
+        // Refuse server-initiated renegotiation (TLS 1.2 only; 1.3 removed it). We
+        // never request it, and accepting it hands the peer a free CPU-amplification
+        // lever -- each forced renegotiation costs us asymmetric crypto.
+        SSL_CTX_set_options(_ctx, SSL_OP_NO_RENEGOTIATION);
         return true;
     }
 
@@ -171,6 +186,9 @@ namespace net::tls
         if (SSL_set_tlsext_host_name(_ssl, host_z.c_str()) != 1)
         {
             _err = drain_errors();
+            SSL_free(_ssl);  // fail CLOSED: a live _ssl here could be handshaken
+            _ssl = nullptr;  // without SNI/hostname checks by a caller that
+            _rbio = _wbio = nullptr;  // ignored our return value
             return false;
         }
 
@@ -180,6 +198,9 @@ namespace net::tls
         if (SSL_set1_host(_ssl, host_z.c_str()) != 1)
         {
             _err = drain_errors();
+            SSL_free(_ssl);  // fail CLOSED -- same reasoning as above: without
+            _ssl = nullptr;  // set1_host the handshake would verify the chain
+            _rbio = _wbio = nullptr;  // but not WHO it was issued to
             return false;
         }
 
@@ -222,6 +243,7 @@ namespace net::tls
     Want Session::start_handshake() noexcept
     {
         if (!_ssl) return Want::Error;
+        ERR_clear_error();  // stale queue entries corrupt SSL_get_error's verdict
         const int rc = SSL_do_handshake(_ssl);
         if (rc == 1) _hs_done = true;
         return classify(rc);
@@ -231,7 +253,7 @@ namespace net::tls
     {
         if (!_ssl || in.empty()) return 0;
 
-        const int n = BIO_write(_rbio, in.data(), static_cast<int>(in.size()));
+        const int n = BIO_write(_rbio, in.data(), clamp_len(in.size()));
         if (n <= 0)
         {
             _err = "TLS read BIO refused input";
@@ -244,6 +266,7 @@ namespace net::tls
         // picks up application data from the same buffered bytes.
         if (!_hs_done)
         {
+            ERR_clear_error();
             const int rc = SSL_do_handshake(_ssl);
             if (rc == 1) _hs_done = true;
             classify(rc);
@@ -254,14 +277,15 @@ namespace net::tls
     size_t Session::pull_ciphertext(std::span<uint8_t> out) noexcept
     {
         if (!_ssl || out.empty()) return 0;
-        const int n = BIO_read(_wbio, out.data(), static_cast<int>(out.size()));
+        const int n = BIO_read(_wbio, out.data(), clamp_len(out.size()));
         return n > 0 ? static_cast<size_t>(n) : 0;
     }
 
     size_t Session::read_plaintext(std::span<uint8_t> out) noexcept
     {
         if (!_ssl || !_hs_done || out.empty()) return 0;
-        const int n = SSL_read(_ssl, out.data(), static_cast<int>(out.size()));
+        ERR_clear_error();
+        const int n = SSL_read(_ssl, out.data(), clamp_len(out.size()));
         if (n > 0)
         {
             _want = has_pending_output() ? Want::Write : Want::None;
@@ -274,7 +298,8 @@ namespace net::tls
     size_t Session::write_plaintext(std::span<const uint8_t> in) noexcept
     {
         if (!_ssl || !_hs_done || in.empty()) return 0;
-        const int n = SSL_write(_ssl, in.data(), static_cast<int>(in.size()));
+        ERR_clear_error();
+        const int n = SSL_write(_ssl, in.data(), clamp_len(in.size()));
         if (n > 0)
         {
             _want = has_pending_output() ? Want::Write : Want::None;
@@ -287,6 +312,7 @@ namespace net::tls
     Want Session::shutdown() noexcept
     {
         if (!_ssl) return Want::Error;
+        ERR_clear_error();
         const int rc = SSL_shutdown(_ssl);
         // 0 = our close_notify is out, peer's not seen yet. That is a normal
         // half-closed state, not an error; the caller flushes and may stop there.
