@@ -143,6 +143,20 @@ int main(int argc, char** argv)
                              "(failover across the rest lands with the failover PR)\n",
                      up.host.c_str(), ips.size(), upstream_ip.c_str());
 
+    // Credentials over plaintext: the gateway forwards the client's provider key
+    // upstream, so a non-TLS upstream that is NOT loopback puts that key on the
+    // wire in the clear. Loopback is exempt — that is the benchmark/mock setup and
+    // the sidecar deployment, where there is no network to sniff.
+    {
+        const bool loopback = upstream_ip.rfind("127.", 0) == 0 || upstream_ip == "::1";
+        if (!up.tls && !loopback)
+            std::fprintf(stderr,
+                         "llmbridge: WARNING — upstream %s:%u is plaintext HTTP and not "
+                         "loopback. Any client credential forwarded to it travels "
+                         "UNENCRYPTED. Use https:// for a real provider.\n",
+                         up.host.c_str(), upstream_port);
+    }
+
     std::signal(SIGPIPE, SIG_IGN);
 
     // N shared-nothing workers, each its own event loop binding the same port with

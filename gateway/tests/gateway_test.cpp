@@ -178,6 +178,13 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             return _last_request;
         }
+        // EVERY request the upstream saw, concatenated — for leak tests that must
+        // assert a credential appeared in NO request, not merely the most recent.
+        std::string all_requests()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _all_requests;
+        }
 
     private:
         void accept_loop()
@@ -203,7 +210,11 @@ namespace
                     if (n <= 0) { ::close(c); return; }
                     buf.append(tmp, static_cast<size_t>(n));
                 }
-                { std::lock_guard<std::mutex> lk(_mu); _last_request.assign(buf.data(), m.total_len); }
+                {
+                    std::lock_guard<std::mutex> lk(_mu);
+                    _last_request.assign(buf.data(), m.total_len);
+                    _all_requests.append(buf.data(), m.total_len);
+                }
                 _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
 
@@ -261,6 +272,7 @@ namespace
         int _stall = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
+        std::string _all_requests;
         std::atomic<bool> _stop{false};
         std::thread _acc;
         std::vector<std::thread> _conns;
@@ -815,6 +827,95 @@ TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
     const std::string up = _backend.last_request();
     EXPECT_EQ(up.find('\x01'), std::string::npos) << up;
     EXPECT_TRUE(up.empty()) << "control-char credential reached upstream";
+}
+
+// ── Credential-leak audit ────────────────────────────────────────────────────
+// The question these answer: can one client's key ever reach the provider on a
+// DIFFERENT client's request? Upstream connections are pooled and shared, so this
+// is not obvious by inspection — assert it.
+
+TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    // Client A authenticates. Its upstream connection goes back to the pool.
+    {
+        Client a;
+        ASSERT_TRUE(a.connect(_proxy_port));
+        ASSERT_TRUE(a.send(openai_request_hdrs("one", "Authorization: Bearer sk-CLIENT-A\r\n")));
+        ASSERT_FALSE(a.recv_response().empty());
+    }
+    // Client B sends NO credential and very likely reuses A's pooled connection.
+    {
+        Client b;
+        ASSERT_TRUE(b.connect(_proxy_port));
+        ASSERT_TRUE(b.send(openai_request("two")));
+        ASSERT_FALSE(b.recv_response().empty());
+    }
+    shutdown();
+
+    // A's key must appear EXACTLY ONCE across everything the provider ever saw —
+    // on A's own request, never re-sent on B's.
+    const std::string all = _backend.all_requests();
+    size_t occurrences = 0;
+    for (size_t p = all.find("sk-CLIENT-A"); p != std::string::npos;
+         p = all.find("sk-CLIENT-A", p + 1))
+        ++occurrences;
+    EXPECT_EQ(occurrences, 1u) << "credential re-sent on another client's request:\n" << all;
+    EXPECT_GE(_gw->stats().upstream_reused, 1u) << "pool was not exercised; test proves little";
+}
+
+TEST_P(ProxyAuth, DifferentClientsCredentialsNeverCross)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    for (const char* key : {"sk-AAA", "sk-BBB", "sk-CCC"})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_request_hdrs(
+            "hi", std::string("Authorization: Bearer ") + key + "\r\n")));
+        ASSERT_FALSE(c.recv_response().empty());
+    }
+    shutdown();
+    const std::string all = _backend.all_requests();
+    // Each request must carry exactly one key, and each key exactly once.
+    for (const char* key : {"sk-AAA", "sk-BBB", "sk-CCC"})
+    {
+        size_t n = 0;
+        for (size_t p = all.find(key); p != std::string::npos; p = all.find(key, p + 1)) ++n;
+        EXPECT_EQ(n, 1u) << key << " appeared " << n << " times:\n" << all;
+    }
+}
+
+TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
+{
+    // A credential must not come back in any response body/headers — an error
+    // path that echoed the request would leak it into client-side logs.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-ECHO-ME\r\n")));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(resp.find("sk-ECHO-ME"), std::string::npos) << resp;
+}
+
+TEST_P(ProxyAuth, MalformedRequestErrorDoesNotEchoCredential)
+{
+    // Same, on the 400 path — the most likely place for a "helpful" echo.
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Valid framing, body that fails translation -> 400 built by the gateway.
+    const std::string body = "{not json";
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                            "Authorization: Bearer sk-SECRET-400\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+    ASSERT_TRUE(c.send(req));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(resp.find("sk-SECRET-400"), std::string::npos) << resp;
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,

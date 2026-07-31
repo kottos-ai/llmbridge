@@ -57,15 +57,32 @@ sending its ordinary OpenAI-style key.
   real provider auth).
 - Credentials are read as a view over the client's request buffer and written straight
   into the upstream bytes — never stored, never logged, never placed in stats or error
-  responses. Pooled upstream connections clear the request buffer on release.
+  responses.
+- **Pooled upstream buffers are scrubbed, not just cleared.** A pooled connection idles
+  up to 30 s; `std::string::clear()` leaves the credential bytes in the allocation, so
+  release now `explicit_bzero`s the request buffer first (`explicit_bzero`, not `memset`
+  — writing to soon-unused memory is a dead store the optimizer may delete). ~100 bytes
+  once per request, ≈0.04% of a core at 84k RPS.
+- **Cross-client leak tests.** Pooled connections are shared, so "one client's key can
+  never ride another client's request" is asserted rather than assumed: a key must appear
+  **exactly once** across every request the upstream ever saw (three-client variant too),
+  the pool is asserted to have actually been exercised, and no credential appears in any
+  response — including the `400` path, the likeliest place for a "helpful" echo.
+- **Plaintext warning at startup.** A non-loopback, non-TLS upstream now prints a loud
+  warning that forwarded credentials travel unencrypted. Loopback is exempt (mocks,
+  benchmarks, sidecar deployments).
 
 ### Known gaps
 
-- **Buffers are not scrubbed.** `std::string::clear()` leaves the old bytes in the
-  allocation until overwritten, so a credential can persist in freed heap. Not reachable
-  through normal operation (string APIs respect `size()`); it would require a separate
-  memory-disclosure bug or a core dump. Scrubbing every request buffer would put a
-  `memset` on the hot path, so it is documented rather than done.
+- **Scrubbing is targeted, not exhaustive.** The pooled upstream request buffer is
+  scrubbed (the only place a credential outlives its request). Transient buffers — the
+  client's `rbuf`, freed allocations after a move — are not: they are overwritten within
+  microseconds, and scrubbing every one would put a `memset` on the hot path for no real
+  gain. An attacker able to read live process memory would find the in-flight request and
+  the TLS session keys regardless.
+- **`--translate none` forwards every client header verbatim**, credentials included —
+  that is the byte-forward contract, not a leak, but it means the passthrough mode offers
+  no header whitelist.
 - No gateway-side credential store — the gateway forwards the client's key and holds
   none of its own. Per-client keys, rotation and quota live in the commercial layer.
 - Verified only against hermetic mocks (project policy forbids tests hitting live
