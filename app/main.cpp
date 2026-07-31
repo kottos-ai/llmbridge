@@ -7,7 +7,8 @@
 
 // llmbridge gateway daemon.
 //
-//   llmbridge [--listen PORT] [--upstream IP:PORT] [--duration SECONDS]
+//   llmbridge [--listen PORT] [--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]]
+//          [--duration SECONDS]
 //          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere]
 //          [--upstream-timeout SECONDS]
 //          [--io auto|epoll|uring]
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "gateway/gateway.hpp"
+#include "net/upstream.hpp"
 
 namespace
 {
@@ -47,8 +49,7 @@ namespace
 int main(int argc, char** argv)
 {
     uint16_t listen_port = 8088;
-    std::string upstream_ip = "127.0.0.1";
-    uint16_t upstream_port = 9001;
+    std::string upstream_arg = "127.0.0.1:9001";
     int duration = 0;
     double warmup = 0;
     // Seconds of upstream silence before a request/stream is aborted (0 = off).
@@ -67,15 +68,7 @@ int main(int argc, char** argv)
         }
         else if (a == "--upstream")
         {
-            if (const char* v = nextarg())
-            {
-                const char* colon = std::strrchr(v, ':');
-                if (colon)
-                {
-                    upstream_ip.assign(v, colon - v);
-                    upstream_port = static_cast<uint16_t>(std::atoi(colon + 1));
-                }
-            }
+            if (const char* v = nextarg()) upstream_arg = v;
         }
         else if (a == "--duration") { if (const char* v = nextarg()) duration = std::atoi(v); }
         else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
@@ -104,7 +97,8 @@ int main(int argc, char** argv)
         }
         else if (a == "--help" || a == "-h")
         {
-            std::printf("usage: %s [--listen PORT] [--upstream IP:PORT] "
+            std::printf("usage: %s [--listen PORT] "
+                        "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
                         "[--upstream-timeout SECONDS] "
@@ -113,6 +107,41 @@ int main(int argc, char** argv)
         }
     }
     if (workers < 1) workers = 1;
+
+    // Parse + resolve --upstream. Resolution happens ONCE, here, on the setup path:
+    // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
+    // TTL expiry is future work — providers rotate IPs, but a long-lived gateway
+    // pinning one A record is exactly what the pooled connections do anyway.)
+    const llmbridge::net::UpstreamSpec up = llmbridge::net::parse_upstream(upstream_arg);
+    if (!up.ok())
+    {
+        std::fprintf(stderr, "llmbridge: bad --upstream '%s': %s\n",
+                     upstream_arg.c_str(), up.error.c_str());
+        return 2;
+    }
+#ifndef LLMBRIDGE_HAVE_TLS
+    if (up.tls)
+    {
+        std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build — "
+                             "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
+                             "Refusing to speak plaintext to a TLS port.\n");
+        return 2;
+    }
+#endif
+    std::string resolve_err;
+    const std::vector<std::string> ips = llmbridge::net::resolve_host_ipv4(up.host, &resolve_err);
+    if (ips.empty())
+    {
+        std::fprintf(stderr, "llmbridge: cannot resolve upstream host '%s': %s\n",
+                     up.host.c_str(), resolve_err.c_str());
+        return 2;
+    }
+    const std::string& upstream_ip = ips.front();
+    const uint16_t upstream_port = up.port;
+    if (ips.size() > 1)
+        std::fprintf(stderr, "llmbridge: %s resolved to %zu addresses; using %s "
+                             "(failover across the rest lands with the failover PR)\n",
+                     up.host.c_str(), ips.size(), upstream_ip.c_str());
 
     std::signal(SIGPIPE, SIG_IGN);
 
@@ -123,8 +152,14 @@ int main(int argc, char** argv)
     const int64_t up_timeout_ns = static_cast<int64_t>(up_timeout * 1e9);
     std::vector<std::unique_ptr<llmbridge::Gateway>> gateways;
     for (int i = 0; i < workers; ++i)
+    {
+        llmbridge::TlsConfig tls;
+        tls.enabled = up.tls;
+        tls.sni_host = up.host; // SNI + hostname verification — the PARSED host,
+                                // never the resolved IP (verification needs the name)
         gateways.push_back(std::make_unique<llmbridge::Gateway>(
-            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns));
+            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls));
+    }
     g_gateways = &gateways;
 
     std::signal(SIGINT, on_signal);

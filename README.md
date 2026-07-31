@@ -141,6 +141,7 @@ Run the binary in front of an upstream and translate on the fly:
 
 ```sh
 llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
+#          --upstream also takes HOST:PORT or http://HOST[:PORT] (resolved at startup)
 #                                                  --translate none|anthropic|gemini|cohere
 #          --upstream-timeout 120   # seconds of upstream silence before aborting (0 = off)
 ```

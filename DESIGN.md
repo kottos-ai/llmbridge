@@ -144,6 +144,86 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
+## TLS to the upstream (`-DLLMBRIDGE_TLS=ON`)
+
+Off by default. The default build stays **zero-dependency** end to end; enabling TLS
+links OpenSSL (≥3.0) — the one sanctioned runtime dependency, confined to the gateway.
+The translator library (`provider/`) never links it, in any configuration. CI proves
+both states: the gcc/clang matrix builds TLS-off, the sanitizer job TLS-on.
+
+### Why memory BIOs, not `SSL_set_fd`
+
+`SSL_set_fd` assumes whoever owns the socket also makes the syscalls. On the io_uring
+backend we don't: multishot recv hands the loop bytes that have **already been read**
+into kernel-provided buffers — there is no read left for OpenSSL to perform. So the
+loop keeps the socket and the `SSL` object is a pure byte transform behind a pair of
+memory BIOs, identical on both backends. The cost is one memcpy per direction; the
+crypto itself (AES-GCM with AES-NI) is noise next to the handshake RTTs.
+
+### Data flow
+
+```
+                     PLAINTEXT ONLY                    │            CIPHERTEXT ONLY
+                                                       │
+ client ──► rbuf ──► translate ──► u->wbuf ────────────┤
+ (plain)                            (request,          │
+                                     kept intact       ▼
+                                     for retry)   write_plaintext()
+                                       woff ─────►┌─────────┐   pull_ciphertext()
+                                    (plaintext    │   SSL   │──────► u->tls_out ──► socket
+                                     fed so far)  │ session │                        send
+                                                  │  + BIOs │   feed_ciphertext()
+ client ◄── translate/SSE ◄── u->rbuf ◄───────────│         │◄────── recv bytes ◄── socket
+  pump         pump            read_plaintext()   └─────────┘
+                                                       │
+                                                       │  Session survives the keep-alive
+                                                       │  pool: a reused conn pays NO
+                                                       │  second handshake.
+```
+
+### The invariant everything hangs off
+
+**`Connection::rbuf` and `Connection::wbuf` hold plaintext, always.** TLS interposes
+strictly at the socket edge. Three things fall out of this for free:
+
+1. **Nothing downstream knows TLS exists** — HTTP framing, the SSE pump, translation,
+   and the response parse all read `rbuf` exactly as before.
+2. **Stale-pool retry works unchanged** — `wbuf` is never consumed by encryption
+   (`woff` counts plaintext *fed to the session*, not bytes destroyed), so a retry
+   re-pushes the identical request through a brand-new session.
+3. **The two backends share all TLS logic** — only the flush/kick differs: epoll
+   writes `tls_out` inline and arms `EPOLLOUT` on a partial; io_uring serializes one
+   SEND at a time (`send_inflight`), because a SEND SQE points into `tls_out` and the
+   buffer must stay immutable while the kernel reads it. Ciphertext produced meanwhile
+   stages inside the SSL write BIO until the send completes.
+
+### Security posture (decided, not defaulted)
+
+- **Verification cannot be disabled.** `SSL_VERIFY_PEER` plus `SSL_set1_host` — chain
+  *and* hostname, both derived from one argument so they cannot disagree. A failed
+  `init_client` tears the session down (fail closed: a caller ignoring the return
+  cannot handshake unverified). SNI and the verified name are set together.
+- TLS 1.2 floor, server-initiated renegotiation refused (`SSL_OP_NO_RENEGOTIATION`),
+  `ERR_clear_error()` before every operation (a stale thread-local queue entry
+  misclassifies a benign `WANT_READ` as fatal), int-length clamping on all spans.
+- A **fatal record error mid-stream aborts the client** on both backends — a corrupted
+  stream must never be finalized with a clean `[DONE]`.
+- **Not done, stated:** no OCSP/CRL revocation checking (usual for non-browser
+  clients); a provider EOF without `close_notify` is treated as normal end-of-stream
+  (providers rarely send it; strict truncation detection would break real streams).
+
+### Tests
+
+Two layers. `net/tests/tls_test.cpp` proves the transport hermetically (handshake
+through byte-at-a-time fragmentation, close_notify vs truncation, garbage-is-fatal,
+multi-record payloads, untrusted-cert and wrong-hostname rejection). The end-to-end
+layer (`gateway/tests/gateway_tls_test.cpp`, both backends) proves the loop wiring:
+round trip, pooled reuse pays one handshake for N requests, SSE translation through
+TLS, 16 concurrent interleaved sessions, corrupt-record-mid-stream aborts without
+`[DONE]`, provider closing pooled conns, provider dropping the TCP connection
+mid-handshake, and wrong-hostname surfacing as a client 502 with **zero** requests
+reaching the unverified peer.
+
 ## Benchmark methodology
 
 The benchmark is designed to be honest first and impressive second:

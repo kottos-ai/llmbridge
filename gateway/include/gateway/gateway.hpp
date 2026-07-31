@@ -30,6 +30,7 @@
 
 #include "gateway/metrics.hpp"
 #include "net/http.hpp"
+#include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 #include "provider/sse.hpp"
 #include "provider/translate.hpp"
@@ -44,6 +45,22 @@ namespace llmbridge
         Anthropic,
         Gemini,
         Cohere,
+    };
+
+    // TLS towards the upstream. Declared unconditionally so callers don't need
+    // ifdefs; when the build has no TLS support (LLMBRIDGE_TLS=OFF), enabling it
+    // makes run() fail fast with an error rather than silently speaking plaintext.
+    //
+    // The DESIGN INVARIANT the whole integration hangs off: `Connection::rbuf` and
+    // `Connection::wbuf` hold PLAINTEXT always. TLS interposes at the socket edge
+    // only — ciphertext lives in `Connection::tls_out` on the way out and inside
+    // the Session's BIO on the way in. Nothing downstream (HTTP framing, SSE pump,
+    // retry-resend of wbuf on a stale pooled conn) knows TLS exists.
+    struct TlsConfig
+    {
+        bool enabled = false;
+        std::string sni_host; // DNS name for SNI + certificate hostname verification
+        std::string ca_file;  // empty = system trust store (tests pass their own CA)
     };
 
     // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.
@@ -130,6 +147,19 @@ namespace llmbridge
         // keep-alives are reaped after kIdleUpstreamNs — providers drop them on
         // their own schedule, and a pooled corpse costs a retry to discover.
         int64_t ts_pooled = 0;
+
+#ifdef LLMBRIDGE_HAVE_TLS
+        // ── TLS state (upstream conns only; null = plaintext) ────────────────
+        // The Session outlives requests: it stays attached across keep-alive pool
+        // cycles, so a pooled reuse pays no second handshake.
+        std::unique_ptr<net::tls::Session> tls;
+        // Ciphertext awaiting the socket. wbuf (plaintext) is NOT what gets
+        // written for a TLS conn — for these, `woff` counts plaintext bytes fed
+        // into the Session, and tls_out/tls_out_off track the encrypted write.
+        // The request's plaintext stays intact in wbuf for stale-conn retry.
+        std::string tls_out;
+        size_t tls_out_off = 0;
+#endif
     };
 
     struct Stats
@@ -180,7 +210,8 @@ namespace llmbridge
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
                 IoBackend io = IoBackend::Auto,
-                int64_t upstream_idle_ns = kDefaultUpstreamIdleNs);
+                int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
+                TlsConfig tls = {});
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -256,6 +287,39 @@ namespace llmbridge
         bool drain_read(Connection* c) noexcept;
         bool pump_write(Connection* c, bool* done) noexcept;
 
+#ifdef LLMBRIDGE_HAVE_TLS
+        // ── TLS plumbing (upstream side only; every helper is a no-op-safe
+        //     building block the two backends share) ──────────────────────────
+        // Attach a fresh Session to a new upstream conn (SNI + hostname from
+        // _tls.sni_host). Returns false on failure — treated like connect refusal.
+        bool tls_attach(Connection* u) noexcept;
+        // Move whatever ciphertext the Session has pending into u->tls_out.
+        void tls_pump_out(Connection* u) noexcept;
+        // Feed ciphertext from the socket. Drains resulting plaintext into u->rbuf,
+        // advances the handshake, and pushes wbuf plaintext once the handshake
+        // completes. Returns false on a fatal TLS error.
+        bool tls_feed(Connection* u, const char* p, size_t n) noexcept;
+        // Push un-fed request plaintext (wbuf[woff..]) into the Session.
+        void tls_push_request(Connection* u) noexcept;
+        // True when the request is fully on the wire: all plaintext fed AND all
+        // ciphertext flushed. This is the TLS analogue of pump_write's `done`,
+        // and the point where ts_up_sent is stamped.
+        bool tls_request_flushed(const Connection* u) const noexcept;
+
+        // Epoll only: write tls_out to the socket (non-blocking), arming EPOLLOUT
+        // on a partial write. False = socket error.
+        bool tls_flush_epoll(Connection* u, bool* done) noexcept;
+        // Epoll only: TLS-aware replacement for drain_read on upstream conns.
+        bool tls_drain_read_epoll(Connection* u) noexcept;
+
+#ifdef LLMBRIDGE_HAVE_URING
+        // io_uring only: submit a SEND for tls_out if non-empty and none in
+        // flight (send_inflight serializes; handshake flights and request bytes
+        // must not interleave on the wire).
+        void u_tls_kick_send(Connection* u) noexcept;
+#endif
+#endif
+
         // ── backend dispatch ────────────────────────────────────────────────
         int run_epoll();
 
@@ -313,6 +377,11 @@ namespace llmbridge
         TranslateMode _translate;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
+        TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
+#ifdef LLMBRIDGE_HAVE_TLS
+        net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
+        bool _tls_ctx_ok = false;
+#endif
         unsigned _uring_buf_count = 0;     // 0 = kBufCount default (test hook only)
         int64_t _last_sweep_ns = 0;
         bool _uring_active = false;

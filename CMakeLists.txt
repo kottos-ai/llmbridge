@@ -55,6 +55,18 @@ if (LLMBRIDGE_BUILD_TESTS)
 endif ()
 
 # ── llmbridge modules (bottom-up) ────────────────────────────────────────────────
+# TLS for outbound gateway connections. OpenSSL is the ONE sanctioned runtime
+# dependency (CLAUDE.md), confined to the gateway path — the translator library
+# (`provider`) stays dependency-free and must never link it. OFF by default so a
+# plain build of the OSS remains dependency-free end to end. find_package here at
+# the root because imported targets are directory-scoped and both net/ and
+# gateway/tests/ link them.
+option(LLMBRIDGE_TLS "Enable TLS for outbound gateway connections (needs OpenSSL)" OFF)
+if (LLMBRIDGE_TLS)
+    find_package(OpenSSL 3.0 REQUIRED)
+    message(STATUS "llmbridge: TLS enabled — OpenSSL ${OPENSSL_VERSION}")
+endif ()
+
 add_subdirectory(net)
 add_subdirectory(provider)
 add_subdirectory(gateway)
@@ -71,6 +83,7 @@ endif ()
 # Fuzz targets for the hand-rolled parsers (json.hpp / http.hpp). Off by default;
 # Clang-only. Enable with -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++.
 option(LLMBRIDGE_BUILD_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
+
 if (LLMBRIDGE_BUILD_FUZZERS)
     add_subdirectory(fuzz)
 endif ()

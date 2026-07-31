@@ -6,6 +6,7 @@
 
 add_library(net STATIC
         src/socket_util.cpp
+        src/upstream.cpp
 )
 target_include_directories(net PUBLIC include)
 target_compile_features(net PUBLIC cxx_std_20)
@@ -21,6 +22,18 @@ if (LLMBRIDGE_HAVE_URING)
     message(STATUS "net: io_uring available — building raw uring wrapper")
 else ()
     message(STATUS "net: linux/io_uring.h not found — epoll only")
+endif ()
+
+# TLS for outbound provider connections (option + find_package live at the ROOT
+# CMakeLists so the imported OpenSSL::* targets are visible to sibling dirs — an
+# imported target is directory-scoped, and gateway/tests links it too).
+if (LLMBRIDGE_TLS)
+    target_sources(net PRIVATE src/tls.cpp)
+    target_link_libraries(net PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(net PUBLIC LLMBRIDGE_HAVE_TLS)
+    message(STATUS "net: TLS enabled — OpenSSL ${OPENSSL_VERSION}")
+else ()
+    message(STATUS "net: TLS disabled (-DLLMBRIDGE_TLS=ON to enable)")
 endif ()
 
 if (LLMBRIDGE_BUILD_TESTS)
