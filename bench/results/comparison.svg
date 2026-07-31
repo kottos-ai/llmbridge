@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="1000" height="620" fill="white"/>
-<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">llmbridge vs LiteLLM — added latency p99 (1 KB)</text>
+<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">llmbridge vs LiteLLM — added latency p99 (64 B body)</text>
 <text x="96" y="74" font-size="15" fill="#6b7280">Both gateways do the full OpenAI&#8596;Anthropic translation (equal work), one worker each.</text>
 <text x="96" y="95" font-size="15" fill="#6b7280">200 ms mock backend &#183; open-loop load &#183; single co-located host &#183; log y-axis &#183; lower is better.</text>
 <line x1="96" y1="504.0" x2="956" y2="504.0" stroke="#e5e7eb" stroke-width="1"/>
