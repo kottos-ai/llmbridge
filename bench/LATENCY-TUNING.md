@@ -20,9 +20,12 @@ roughly like this:
 | `nullrelay` — 2 hops, zero work | 106 µs | **54 µs** |
 | `llmbridge` — 2 hops, full SSE translation | 108 µs | 56 µs |
 
-llmbridge's own work is therefore **~2 µs**; the other ~54 µs is the cost of the extra
-hop. And that hop cost is *mostly CPU idle-state exit latency* — the time for a core to
-climb out of a sleep state to service the arriving token.
+llmbridge's own work is therefore small and the rest is the cost of the extra hop, which
+is *mostly CPU idle-state exit latency* — the time for a core to climb out of a sleep
+state to service the arriving token. Measured with idle states capped at C1, where the
+noise floor is 4x lower, the same decomposition reads: floor 13 µs, hop 14 µs, and
+**llmbridge's own work ~5 µs** (the ~2 µs implied by the untuned numbers above was inside
+that configuration's noise; the tuned figure supersedes it).
 
 Two measurements on the reference box (i7-9750H, `intel_idle` driver, `menu` governor):
 
@@ -53,6 +56,25 @@ absolute figures are only meaningful alongside the tuning state, which is why
 `BENCHMARKS.md` records it.
 
 ---
+
+## ⚠ Do not leave this tuning applied — it heats the machine
+
+Capping idle states stops cores sleeping, and the `performance` governor pins clocks at
+maximum. On a thermally-limited laptop that raises the *idle* package temperature from
+~60 C to ~80 C, which eats the turbo headroom a throughput benchmark depends on:
+
+| | idle temp | max clock | saturation throughput |
+|---|---|---|---|
+| tuned (`-D 5` + performance) | ~80 C | 4002 MHz | ~75k RPS |
+| defaults (`-E` + powersave) | ~60-64 C | 4289-4396 MHz | **~81.6k RPS** |
+
+So the tuning helps *latency* measurements (it removes the C-state exit from every
+wakeup) and hurts *throughput* measurements. Apply it for the streaming latency runs,
+restore defaults for saturation runs, and restore defaults when you are done:
+
+```sh
+sudo cpupower idle-set -E && sudo cpupower frequency-set -g powersave
+```
 
 ## Method 1 — `cpupower` (no reboot, instantly reversible) ← recommended for A/B runs
 
@@ -145,6 +167,40 @@ means constant fan and thermal throttling, which **lowers clocks and therefore d
 the very latency being measured.** Only defensible on a desktop or server with headroom.
 
 ---
+
+## Harness prerequisite: the listen / SYN queue (run this before ANY head-to-head)
+
+```sh
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192 net.core.somaxconn=8192
+```
+
+**When:** before any benchmark where clients open connections at a high rate — which is
+every streaming head-to-head, because the load generator opens a new connection per
+stream. Both settings revert on reboot, so there is nothing to undo.
+
+**Why this is not optional.** The defaults on this box are `tcp_max_syn_backlog = 1024`
+and `somaxconn = 4096`. Above roughly 256 concurrent streams the mock's accept queue
+overflows, the kernel silently drops SYNs (`tcp_abort_on_overflow = 0`), and connects
+stall or fail. That makes the *harness* the limiter rather than the software under test.
+
+It is worse than merely noisy, because **it does not penalise both sides equally**:
+`llmbridge` pools its upstream connections and barely notices, while a gateway that
+opens a fresh upstream per request absorbs the full cost. A run in that state reports a
+competitor's connect failures as if they were its latency. One measured run took **18
+LiteLLM connect failures during measurement** and had to be discarded entirely.
+
+**Always verify afterwards** — the count must not move during the run:
+
+```sh
+nstat -az | grep ListenOverflows      # snapshot before
+# ... run the benchmark ...
+nstat -az | grep ListenOverflows      # must be UNCHANGED; if it grew, the result is void
+```
+
+A non-zero delta invalidates the run no matter how plausible the numbers look. Raising
+the queue buys headroom but does not make the mock's single accept loop faster, so at
+high enough concurrency this will bite again; the fix then is a narrower comparison or a
+multi-threaded accept path, not a bigger number here.
 
 ## Related knobs worth recording (not yet applied here)
 

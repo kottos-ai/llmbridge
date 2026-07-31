@@ -50,6 +50,29 @@ into the loop. Nothing above `net/` has a third-party dependency.
 - **Optimistic writes.** Responses are written straight away and only fall back to
   arming `EPOLLOUT` / a queued send on `EAGAIN`, keeping the common case one syscall.
 
+### Kernel bypass (OpenOnload / DPDK) — considered, deferred
+
+Profiling the saturated worker shows **~89% of its CPU inside the kernel**, the largest
+slice being the TCP stack (32.7%). That is precisely what userspace networking exists to
+remove — OpenOnload, DPDK with a userspace TCP stack, or AF_XDP — and on packet-heavy
+workloads those routinely cut CPU-per-packet several-fold. It is deliberately **not** on
+the near-term roadmap, for three reasons:
+
+1. **It is unmeasurable on the current benchmark.** Every run is over `127.0.0.1`, which
+   has no NIC. A real-NIC, two-host baseline is a prerequisite for any before/after, and
+   the kernel profile may look different once a driver and IRQ path are involved.
+2. **It conflicts with zero runtime dependencies.** DPDK or a userspace TCP stack is a
+   large dependency plus dedicated poll-mode cores; Onload requires specific NICs. That
+   is defensible for a deployment you operate, much less so for a library people drop
+   into their own infrastructure.
+3. **`--workers N` buys the same throughput for none of the cost.** The machine is ~95%
+   idle at saturation, so a second worker nearly doubles throughput today.
+
+Where it *would* pay is a hosted deployment large enough for CPU-per-request to be a
+cost-of-goods line — fewer instances per token served. Note also that this is a
+**throughput/efficiency** lever, not a latency one: the gateway adds ~80 us p99 against
+upstream model latencies measured in hundreds of milliseconds.
+
 ### io_uring lifetime handling
 
 The sharp edge of io_uring is object lifetime: a `Connection` can have kernel ops in
@@ -135,11 +158,18 @@ The benchmark is designed to be honest first and impressive second:
 - **Latency accounting** excludes the upstream wait and inter-packet network time, so
   the headline number is *proxy-added* latency, not end-to-end LLM latency.
 - **Caveats, stated up front:** a single co-located dev box (i7-9750H), single
-  worker/thread each, plain HTTP (no TLS/WAN). The ~90k RPS single-thread ceiling is
-  the **loopback's packet-processing limit on this box, not the CPU** (the proxy uses
-  ~1 core at saturation) — a separate-host run is the next credibility upgrade.
+  worker/thread each, plain HTTP (no TLS/WAN). The ~84k RPS single-thread ceiling is
+  set by **the worker's own CPU on its single thread**. llmbridge is single-threaded, so
+  one core is its hard ceiling and at saturation that thread is 87-92% busy — out of
+  headroom. (The machine reports ~95% idle only because one busy core is ~8% of 12 logical
+  CPUs; reaching the rest needs `--workers N`.) Splitting *that thread's own* CPU time:
+  **89% kernel, 6.7% llmbridge**, the largest kernel slice being the TCP stack at 32.7%. An earlier revision attributed it to the
+  loopback packet path; that was wrong. Two consequences: optimising our code can win at
+  most ~7%, and the number is **thermally dependent** (87k cold, 82k at 85 °C on this
+  laptop). A separate-host run is the next credibility upgrade.
 
-Reproduce: `./bench/run_headtohead.sh` and `./bench/saturate.sh`.
+Reproduce: see [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md) — the host
+configuration (`BACKENDS=4`, governor, sysctls) changes the result as much as the code.
 
 ## What this repo does NOT do (yet)
 
