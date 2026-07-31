@@ -1065,29 +1065,31 @@ namespace llmbridge
         // Stamp just before framing so the response HTTP parse is counted in the
         // response-path overhead, without charging inter-packet network wait.
         const int64_t t0 = now_ns();
-        http::Message m;
-        auto st = http::parse(u->rbuf, m);
-        if (st == http::ParseStatus::NeedMore) return;
-        if (st == http::ParseStatus::Error) { error_respond(client, 502); return; }
+        // parse_response, NOT parse: real providers return non-streaming bodies
+        // chunked over HTTP/1.1, which parse() rejects by design (see http.hpp).
+        http::ResponseHead h;
+        std::string body_buf;
+        size_t total_len = 0;
+        const auto st = http::parse_response(u->rbuf, h, body_buf, total_len);
+        if (st == http::RespStatus::NeedMore) return;
+        if (st == http::RespStatus::Error) { error_respond(client, 502); return; }
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
 
         if (_translate != TranslateMode::None)
         {
-            std::string_view body(u->rbuf.data() + m.header_len, m.body_len);
+            const std::string_view body(body_buf);
             // Relay a provider failure with ITS OWN status + message (rate limit,
             // overloaded GPU, context length, auth) — translating a non-200 body as
             // if it were a completion would fail and mask it as a generic 502.
-            http::ResponseHead h;
-            const bool have_head = http::parse_response_head(u->rbuf, h) == http::HeadStatus::Ok;
-            if (have_head && h.status != 0 && h.status != 200)
+            if (h.status != 0 && h.status != 200)
             {
                 client->wbuf = build_http_status(
                     h.status, reason_for(h.status),
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
                 client->peer = nullptr;
-                if (m.keep_alive) release_upstream(u); else close_upstream(u);
+                if (h.keep_alive) release_upstream(u); else close_upstream(u);
                 ++_stats.errors;
                 respond(client);
                 return;
@@ -1104,7 +1106,12 @@ namespace llmbridge
         }
         else
         {
-            client->wbuf.assign(u->rbuf.data(), m.total_len);
+            // Passthrough: forward the upstream's own bytes. A chunked response is
+            // re-framed with Content-Length rather than relayed verbatim — we have
+            // already decoded it, and handing the client a chunked body we did not
+            // re-verify would push our framing problem downstream.
+            if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
+            else client->wbuf.assign(u->rbuf.data(), total_len);
         }
         client->woff = 0;
 
@@ -1113,8 +1120,11 @@ namespace llmbridge
         // close); otherwise it's about to close, so drop it rather than reuse a
         // stale connection.
         const bool pool_upstream =
-            m.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
+            h.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
         client->peer = nullptr;
+        // Drop the framed message so a pipelined next response is not mis-read as
+        // part of this one; anything left is the start of the next message.
+        u->rbuf.erase(0, total_len);
         if (pool_upstream) release_upstream(u);
         else close_upstream(u);
         respond(client);
@@ -1823,12 +1833,16 @@ namespace llmbridge
                 if (h.event_stream && h.status == 200) { u_begin_stream(c, h); return; }
             }
 
-            http::Message m;
-            const auto st = http::parse(c->rbuf, m);
-            if (st == http::ParseStatus::NeedMore) return; // armed recv delivers the rest
-            if (st == http::ParseStatus::Error) { u_error_respond(c->peer, 502); return; }
+            // parse_response, NOT parse: providers return non-streaming bodies
+            // chunked over HTTP/1.1 and parse() rejects that by design (http.hpp).
+            http::ResponseHead rh;
+            std::string body_buf;
+            size_t total_len = 0;
+            const auto st = http::parse_response(c->rbuf, rh, body_buf, total_len);
+            if (st == http::RespStatus::NeedMore) return; // armed recv delivers the rest
+            if (st == http::RespStatus::Error) { u_error_respond(c->peer, 502); return; }
             c->peer->ts_up_recvd = now_ns();
-            u_on_response(c, m);
+            u_on_response(c, rh, body_buf, total_len);
         }
     }
 
@@ -1915,24 +1929,23 @@ namespace llmbridge
         u_submit_send(u); // then send the request
     }
 
-    void Gateway::u_on_response(Connection* u, const http::Message& m) noexcept
+    void Gateway::u_on_response(Connection* u, const http::ResponseHead& h,
+                                const std::string& body_buf, size_t total_len) noexcept
     {
         Connection* client = u->peer;
         if (_translate != TranslateMode::None)
         {
-            std::string_view body(u->rbuf.data() + m.header_len, m.body_len);
+            const std::string_view body(body_buf);
             // Relay a provider failure with ITS OWN status + message (see the epoll
             // mirror): a 429/529/400 must not be flattened into a generic 502.
-            http::ResponseHead h;
-            const bool have_head = http::parse_response_head(u->rbuf, h) == http::HeadStatus::Ok;
-            if (have_head && h.status != 0 && h.status != 200)
+            if (h.status != 0 && h.status != 200)
             {
                 client->wbuf = build_http_status(
                     h.status, reason_for(h.status),
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
                 client->peer = nullptr;
-                if (m.keep_alive) u_release_upstream(u); else u_close(u);
+                if (h.keep_alive) u_release_upstream(u); else u_close(u);
                 ++_stats.errors;
                 u_submit_send(client);
                 return;
@@ -1949,16 +1962,21 @@ namespace llmbridge
         }
         else
         {
-            client->wbuf.assign(u->rbuf.data(), m.total_len);
+            // See the epoll mirror: a decoded chunked body is re-framed with
+            // Content-Length rather than relayed verbatim.
+            if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
+            else client->wbuf.assign(u->rbuf.data(), total_len);
         }
         // Pool the upstream only if it will stay open: the response must say
         // keep-alive AND (for passthrough, where the client's Connection header was
         // forwarded verbatim) the client must not have asked to close. Otherwise the
         // upstream is about to close on us — drop it instead of reusing a corpse.
         const bool pool_upstream =
-            m.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
+            h.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
         client->woff = 0;
         client->peer = nullptr;
+        // Drop the framed message; anything left is the next pipelined response.
+        u->rbuf.erase(0, total_len);
         if (pool_upstream) u_release_upstream(u);
         else u_close(u);
         u_submit_send(client);

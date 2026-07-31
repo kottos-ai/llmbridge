@@ -342,7 +342,8 @@ namespace llmbridge
         void u_on_connect(Connection* u, int res) noexcept;
         void u_forward(Connection* c) noexcept;
         void u_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
-        void u_on_response(Connection* u, const http::Message& m) noexcept;
+        void u_on_response(Connection* u, const http::ResponseHead& h,
+                           const std::string& body_buf, size_t total_len) noexcept;
         void u_finish_client(Connection* c) noexcept;
         // io_uring streaming pump — completion-driven mirror of the epoll pump,
         // with serialized sends (one SEND SQE in flight) and a bounded buffer.
