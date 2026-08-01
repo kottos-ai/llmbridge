@@ -105,6 +105,13 @@ namespace llmbridge
 
         // Latency stamps (ns), held on the CLIENT conn for the active request.
         int64_t ts_req_recvd = 0;
+        // When the upstream request bytes were BUILT (translated + auth applied),
+        // i.e. the end of our request-side compute. Separates our work from the
+        // TCP connect + TLS handshake that may follow before the bytes go out:
+        // measured live, a cold connection to api.anthropic.com put 56 ms of setup
+        // inside what was labelled "gateway overhead", against 47-63 us once the
+        // connection was pooled. Reporting those as one number is indefensible.
+        int64_t ts_req_built = 0;
         int64_t ts_up_sent = 0;
         int64_t ts_up_recvd = 0;
         // Last time this request saw ANY upstream progress (request forwarded, or
@@ -211,7 +218,7 @@ namespace llmbridge
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
                 IoBackend io = IoBackend::Auto,
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
-                TlsConfig tls = {});
+                TlsConfig tls = {}, bool timing_headers = false);
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -379,6 +386,7 @@ namespace llmbridge
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
+        bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
         // Decode buffer for CHUNKED upstream responses (see http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a

@@ -12,6 +12,110 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
 API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
+## [0.6.0] — 2026-08-01
+
+Per-request observability metadata. A client can now see, for every response, what the
+gateway cost versus what the provider cost, **when** the request arrived, **where it
+sits in a total order**, and how many tokens it moved. Opt-in (`--timing-headers`,
+default off), because adding a header is a visible API change.
+
+### Added
+
+- **`--timing-headers`** — response headers decomposing where the time went. Metadata
+  only: durations and one timestamp, never prompt or completion text. "Prompt content is
+  never logged" is a public commitment and this path does not touch it.
+
+  ```
+  t0 ────────► t1 ────────► t2 ──────────────────► t3 ──────────► t4
+  client req    upstream     bytes on the wire      provider       response
+  fully framed  request      (connect + TLS done)   first byte     written to client
+                BUILT
+  ```
+
+  | header | interval | meaning |
+  |---|---|---|
+  | `x-llmbridge-t0` | — | epoch **nanoseconds** at request arrival |
+  | `x-llmbridge-seq` | — | monotonic sequence number — a total order needing no clock |
+  | `x-llmbridge-gateway-us` | (t1−t0)+(t4−t3) | **our compute**: framing, translation, auth mapping, re-serialisation |
+  | `x-llmbridge-connect-us` | t2−t1 | TCP connect + TLS handshake; ~0 on a pooled connection |
+  | `x-llmbridge-upstream-us` | t3−t2 | the provider: network + inference |
+  | `x-llmbridge-tokens-in` | — | prompt tokens, **the provider's own count** (non-streaming) |
+  | `x-llmbridge-tokens-out` | — | completion tokens, likewise (non-streaming) |
+
+  Streaming cannot report t4 — headers precede the body — so it emits
+  `x-llmbridge-upstream-ttfb-us` (time to the provider's first byte) instead of a total
+  it does not yet have.
+
+  Measured live against `api.anthropic.com`: **gateway 17–51 µs** against **1.2–2.6 s**
+  of provider time — a gateway share of **0.001%** — with `connect-us` falling from
+  ~50,000 µs on the cold connection to ~36 µs once pooled, which incidentally makes
+  connection reuse visible per request.
+
+- **`x-llmbridge-seq`** — a process-wide monotonic sequence number, `std::atomic<uint64_t>`
+  with `fetch_add(relaxed)`. **Not `volatile`**: volatile provides neither atomicity nor
+  inter-thread ordering in C++, and workers are `std::thread`s sharing the process, so a
+  volatile counter would be a data race that hands two requests the same number. Relaxed
+  ordering is sufficient and cheapest — every atomic has a single total modification
+  order, so the values are unique and increasing in the order the increments happened;
+  we need the counter ordered, not the memory around it.
+
+  **Why it exists:** two requests can share a nanosecond, and clocks on different hosts
+  cannot be trusted to sub-millisecond agreement without PTP. `(t0, seq)` is a total
+  order that needs neither. This is the sequencer pattern — an exchange defines order by
+  arrival at a sequencing point, not by comparing timestamps — and it is the argument
+  for the shadow order book **sequencing rather than timestamping**.
+- **`x-llmbridge-tokens-in` / `-out`** — the provider's own counts, never estimated,
+  asserted by a test that the header value **equals the body value exactly** (one source
+  of truth). Extraction is a bounded scan of the last 256 bytes, since `usage` is the
+  tail object of the response we build — a multi-KB completion does not pay an extra
+  full pass. No match means the headers are omitted rather than guessed.
+- **`metrics::wall_ns()`** — an orderable wall clock. `now_ns()` is `steady_clock`:
+  correct for intervals, but it has no epoch and cannot order anything. A raw
+  `CLOCK_REALTIME` read is not a substitute either, because NTP can **step** it, leaving
+  two requests orderable by arrival but not by timestamp — the one property an order
+  book cannot lose. So realtime is read **once** at startup and every later stamp is
+  that anchor plus a monotonic delta: epoch-meaningful, strictly increasing, immune to
+  NTP steps. Trade-off stated at the definition: ppm drift from true wall time over long
+  runs, and cross-host joins at sub-millisecond accuracy need PTP, which one gateway
+  cannot promise alone.
+- New `Connection::ts_req_built` stamp — the end of our request-side work, which is what
+  makes the gateway/connect split possible.
+
+### Why `connect-us` is separate
+
+The first implementation folded connection setup into `gateway-us`, and the live API
+said **56 ms**. It was measuring truthfully and reporting misleadingly: a cold TCP+TLS
+handshake to Anthropic, against 47–63 µs for the same gateway once the connection was
+pooled. A customer reading 56 ms as gateway overhead would be right to walk away and
+wrong about the software. One number cannot honestly carry both, so there are two.
+
+### Tests
+
+16 new, both backends: headers absent by default; all present when enabled; **t0 is
+epoch-scale** (>1.7e18 — a monotonic uptime counter would be ~1e10); **t0 strictly
+increasing across five requests**; the JSON body byte-identical with headers on;
+streaming emitting TTFB while *not* claiming a gateway total it cannot have; token
+headers matching the body exactly; and streaming asserted to carry `seq` but **no**
+token headers.
+
+The sequence-number test drives **4 threads × 6 concurrent requests and asserts no
+duplicate** — the one failure this must never have, and the one a non-atomic counter
+would produce.
+
+### Known gaps
+
+- **Passthrough (`--translate none`) emits no headers at all.** That mode forwards the
+  upstream's bytes verbatim by contract; injecting headers would break the byte-exact
+  guarantee. Translated and streaming responses carry them.
+- **Streaming carries no token counts and no chunk count.** Both are end-of-stream
+  facts and headers precede the body; inventing them would be worse than omitting them.
+  A streaming client that wants counts sets `stream_options.include_usage` and reads
+  the provider's own numbers from the final chunk. A chunk count would have to go
+  somewhere other than the response — gateway stats, or the telemetry path.
+- Timestamps are per-process. Ordering holds within one gateway; across workers or hosts
+  it needs synchronised clocks, which is a shadow-order-book concern rather than a
+  gateway one.
+
 ## [0.5.2] — 2026-07-31
 
 Performance and API cleanup for the two preceding releases. No behaviour change: the

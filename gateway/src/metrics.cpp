@@ -19,6 +19,17 @@ namespace llmbridge
             .count();
     }
 
+    int64_t wall_ns(int64_t mono_ns) noexcept
+    {
+        // Anchors captured together, once, on first use. `static` init is
+        // thread-safe in C++11+ and this is not a hot path (once per response).
+        static const int64_t mono0 = now_ns();
+        static const int64_t wall0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+        return wall0 + (mono_ns - mono0);
+    }
+
     namespace
     {
         // Format a ns duration in whatever unit reads best.

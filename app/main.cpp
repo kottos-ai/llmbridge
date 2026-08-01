@@ -55,6 +55,7 @@ int main(int argc, char** argv)
     // Seconds of upstream silence before a request/stream is aborted (0 = off).
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     int workers = 1;
+    bool timing_headers = false;
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
@@ -74,6 +75,7 @@ int main(int argc, char** argv)
         else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
+        else if (a == "--timing-headers") timing_headers = true;
         else if (a == "--translate")
         {
             if (const char* v = nextarg())
@@ -102,7 +104,7 @@ int main(int argc, char** argv)
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
                         "[--upstream-timeout SECONDS] "
-                        "[--io auto|epoll|uring] [--workers N]\n", argv[0]);
+                        "[--io auto|epoll|uring] [--workers N] [--timing-headers]\n", argv[0]);
             return 0;
         }
     }
@@ -172,7 +174,8 @@ int main(int argc, char** argv)
         tls.sni_host = up.host; // SNI + hostname verification — the PARSED host,
                                 // never the resolved IP (verification needs the name)
         gateways.push_back(std::make_unique<llmbridge::Gateway>(
-            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls));
+            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
+            timing_headers));
     }
     g_gateways = &gateways;
 
