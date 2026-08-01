@@ -310,6 +310,61 @@ namespace llmbridge
         // Metadata only, by construction: durations and one timestamp. No prompt,
         // no completion, no token text. "Prompt content is never logged" is a
         // public commitment and this path must never be the thing that breaks it.
+        // Total order across ALL workers, independent of any clock.
+        //
+        // std::atomic, NOT volatile: volatile provides neither atomicity nor
+        // inter-thread ordering in C++ (it is for memory-mapped I/O), and workers are
+        // std::threads sharing this process, so a plain or volatile counter would be a
+        // data race that hands two requests the same number.
+        //
+        // relaxed is sufficient and is the cheapest correct choice: every atomic has a
+        // single total modification order, so fetch_add yields unique, increasing
+        // values in the order the increments occurred. We need uniqueness and
+        // ordering of the counter itself, not ordering of surrounding memory, so no
+        // fences are warranted.
+        //
+        // WHY THIS EXISTS AT ALL: two requests can share a nanosecond, and clocks on
+        // different hosts cannot be trusted to sub-millisecond agreement without PTP.
+        // (t0, seq) is a total order that needs neither. This is the sequencer
+        // pattern — an exchange defines order by arrival at a sequencing point, not by
+        // comparing timestamps — and it is why the shadow order book should sequence
+        // rather than timestamp.
+        std::atomic<uint64_t> g_seq{0};
+
+        // Pull `prompt_tokens` / `completion_tokens` out of a translated OpenAI body.
+        //
+        // BOUNDED on purpose: `usage` is the last object in the response we build, so
+        // this searches only the tail rather than scanning a body that may be many KB
+        // of completion text. On no match the headers are simply omitted — the
+        // existing rule everywhere in this file is to omit rather than report a
+        // number we did not measure.
+        struct BodyUsage { long long in = -1, out = -1; };
+
+        BodyUsage scan_usage(std::string_view body) noexcept
+        {
+            BodyUsage u;
+            constexpr size_t kTail = 256;
+            const std::string_view tail =
+                body.size() > kTail ? body.substr(body.size() - kTail) : body;
+            const auto num_after = [&tail](std::string_view key) -> long long {
+                const size_t k = tail.find(key);
+                if (k == std::string_view::npos) return -1;
+                size_t i = k + key.size();
+                while (i < tail.size() && (tail[i] == ':' || tail[i] == ' ')) ++i;
+                long long v = 0;
+                bool any = false;
+                for (; i < tail.size() && tail[i] >= '0' && tail[i] <= '9'; ++i)
+                {
+                    v = v * 10 + (tail[i] - '0');
+                    any = true;
+                }
+                return any ? v : -1;
+            };
+            u.in = num_after("\"prompt_tokens\"");
+            u.out = num_after("\"completion_tokens\"");
+            return u;
+        }
+
         void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
                                    int64_t connect_us, int64_t upstream_us,
                                    const char* upstream_key)
@@ -322,9 +377,32 @@ namespace llmbridge
                 out.append("\r\n");
             };
             add("x-llmbridge-t0", wall_ns(t0));
+            add("x-llmbridge-seq", static_cast<int64_t>(g_seq.fetch_add(1, std::memory_order_relaxed)));
             add("x-llmbridge-gateway-us", gateway_us);
             add("x-llmbridge-connect-us", connect_us); // 0 = pooled connection reused
             add(upstream_key, upstream_us);
+        }
+
+        // Token counts, non-streaming only. A stream cannot carry these: headers
+        // precede the body, and both the token totals and the chunk count are
+        // end-of-stream facts. They are NOT invented for streams — a streaming client
+        // that wants them sets `stream_options.include_usage` and reads the provider's
+        // own counts from the final chunk.
+        void append_usage_headers(std::string& out, std::string_view translated_body)
+        {
+            const BodyUsage u = scan_usage(translated_body);
+            if (u.in >= 0)
+            {
+                out.append("x-llmbridge-tokens-in: ");
+                out.append(std::to_string(u.in));
+                out.append("\r\n");
+            }
+            if (u.out >= 0)
+            {
+                out.append("x-llmbridge-tokens-out: ");
+                out.append(std::to_string(u.out));
+                out.append("\r\n");
+            }
         }
 
         std::string build_error(int code)
@@ -1224,6 +1302,7 @@ namespace llmbridge
                 const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
                 append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
                                       up_ns / 1000, "x-llmbridge-upstream-us");
+                append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
         }
@@ -2106,6 +2185,7 @@ namespace llmbridge
                 const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
                 append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
                                       up_ns / 1000, "x-llmbridge-upstream-us");
+                append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
         }

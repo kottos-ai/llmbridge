@@ -2583,6 +2583,86 @@ TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
     EXPECT_NE(all.find("[DONE]"), std::string::npos);
 }
 
+TEST_P(ProxyTiming, SeqIsUniqueAndIncreasingUnderConcurrency)
+{
+    // The sequencer property: a TOTAL order that needs no clock. Driven from
+    // several client threads at once, because the counter is shared across workers
+    // and a non-atomic increment would hand two requests the same number — the one
+    // failure this must never have.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+
+    std::mutex m;
+    std::vector<long long> seqs;
+    std::vector<std::thread> ths;
+    for (int th = 0; th < 4; ++th)
+        ths.emplace_back([&] {
+            for (int i = 0; i < 6; ++i)
+            {
+                Client c;
+                if (!c.connect(_proxy_port)) return;
+                if (!c.send(openai_request("hi"))) return;
+                const std::string r = c.recv_response();
+                const size_t p = r.find("x-llmbridge-seq: ");
+                if (p == std::string::npos) continue;
+                const long long s = std::stoll(r.substr(p + 17, r.find("\r\n", p) - (p + 17)));
+                std::lock_guard<std::mutex> lk(m);
+                seqs.push_back(s);
+            }
+        });
+    for (auto& t2 : ths) t2.join();
+
+    ASSERT_GE(seqs.size(), 20u);
+    std::sort(seqs.begin(), seqs.end());
+    EXPECT_EQ(std::adjacent_find(seqs.begin(), seqs.end()), seqs.end())
+        << "duplicate sequence number — the counter is racing";
+}
+
+TEST_P(ProxyTiming, TokenCountsComeFromTheProviderNotEstimated)
+{
+    // Counts must match the upstream's own usage exactly; we never estimate.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    ASSERT_NE(r.find("x-llmbridge-tokens-in:"), std::string::npos) << r;
+    ASSERT_NE(r.find("x-llmbridge-tokens-out:"), std::string::npos) << r;
+
+    // Header values must equal what the body reports — one source of truth.
+    // Skip the key, then any spaces — a header has "key: 3", JSON has "key":3.
+    // (An earlier version assumed a space in both and skipped past the digit.)
+    const auto num_at = [](const std::string& s, const char* k) {
+        size_t p = s.find(k);
+        EXPECT_NE(p, std::string::npos) << k;
+        p += std::string(k).size();
+        while (p < s.size() && s[p] == ' ') ++p;
+        return std::stoll(s.substr(p, 12));
+    };
+    const std::string b = body_of(r);
+    const auto hdr = [&](const char* k) { return num_at(r, k); };
+    const auto in_body = [&](const char* k) { return num_at(b, k); };
+    EXPECT_EQ(hdr("x-llmbridge-tokens-in:"), in_body("\"prompt_tokens\":"));
+    EXPECT_EQ(hdr("x-llmbridge-tokens-out:"), in_body("\"completion_tokens\":"));
+}
+
+TEST_P(ProxyTiming, StreamingHasNoTokenHeaders)
+{
+    // Deliberate absence: token totals and chunk counts are end-of-stream facts and
+    // headers precede the body. Inventing them would be worse than omitting them.
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string all = c.recv_all();
+    const std::string head = all.substr(0, all.find("\r\n\r\n"));
+    EXPECT_EQ(head.find("x-llmbridge-tokens-"), std::string::npos) << head;
+    EXPECT_NE(head.find("x-llmbridge-seq:"), std::string::npos) << head;
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyTiming,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
