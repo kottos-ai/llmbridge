@@ -443,14 +443,14 @@ namespace
                    TranslateMode translate = TranslateMode::None,
                    llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll,
                    int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs,
-                   unsigned uring_buf_count = 0)
+                   unsigned uring_buf_count = 0, bool timing_headers = false)
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
             else up_port = free_port(); // nothing listening -> connection refused
 
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
-                                            upstream_idle_ns);
+                                            upstream_idle_ns, llmbridge::TlsConfig{}, timing_headers);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
             _proxy_port = _gw->bound_port();
             _gt = std::thread([this] { _gw->run(); });
@@ -2497,3 +2497,95 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
         << "pool of 1 buffer across " << kClients
         << " streams did not produce -ENOBUFS; this test is not exercising what it claims";
 }
+
+// ── Timing headers (opt-in) ──────────────────────────────────────────────────
+class ProxyTiming : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyTiming, OffByDefaultNoHeadersAppear)
+{
+    // Default must stay byte-identical: a header is a visible API change.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(r.find("x-llmbridge-"), std::string::npos) << r;
+}
+
+TEST_P(ProxyTiming, EmitsOrderableT0AndDurations)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    for (const char* h : {"x-llmbridge-t0:", "x-llmbridge-gateway-us:", "x-llmbridge-upstream-us:"})
+        EXPECT_NE(r.find(h), std::string::npos) << h << " missing:\n" << r;
+
+    // t0 must be a plausible epoch-nanosecond wall clock, not a monotonic counter
+    // (steady_clock has no epoch; a raw uptime value would be ~1e10, not ~1.7e18).
+    const size_t p = r.find("x-llmbridge-t0: ") + 16;
+    const long long t0 = std::stoll(r.substr(p, r.find("\r\n", p) - p));
+    EXPECT_GT(t0, 1700000000000000000LL) << "t0 is not epoch nanoseconds: " << t0;
+}
+
+TEST_P(ProxyTiming, T0IsStrictlyIncreasingAcrossRequests)
+{
+    // The ordering property the shadow order book depends on. Must hold even if
+    // the system clock is disciplined mid-run, which is why t0 is an anchored
+    // monotonic value rather than a raw CLOCK_REALTIME read.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    long long prev = 0;
+    for (int i = 0; i < 5; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(openai_request("hi")));
+        const std::string r = c.recv_response();
+        ASSERT_EQ(Client::status_of(r), 200) << "request " << i;
+        const size_t p = r.find("x-llmbridge-t0: ") + 16;
+        const long long t0 = std::stoll(r.substr(p, r.find("\r\n", p) - p));
+        EXPECT_GT(t0, prev) << "t0 not increasing at request " << i;
+        prev = t0;
+    }
+}
+
+TEST_P(ProxyTiming, BodyIsUnchangedWhenHeadersAreOn)
+{
+    // The headers must be additive: the JSON a client parses cannot differ.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    const std::string with = body_of(c.recv_response());
+    EXPECT_NE(with.find("\"content\":\"ok\""), std::string::npos) << with;
+    EXPECT_EQ(with.find("x-llmbridge"), std::string::npos) << "timing leaked into the body";
+}
+
+TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
+{
+    // A stream cannot know total gateway time when headers go out, so it must
+    // report TTFB instead — and must NOT claim a gateway-total it cannot have.
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string all = c.recv_all();
+    EXPECT_NE(all.find("x-llmbridge-t0:"), std::string::npos) << all.substr(0, 400);
+    EXPECT_NE(all.find("x-llmbridge-upstream-ttfb-us:"), std::string::npos) << all.substr(0, 400);
+    EXPECT_EQ(all.find("x-llmbridge-upstream-us:"), std::string::npos) << all.substr(0, 400);
+    EXPECT_NE(all.find("[DONE]"), std::string::npos);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyTiming,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
+

@@ -12,6 +12,78 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
 API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
 
+## [0.6.0] — 2026-07-31
+
+Per-request timing headers. A client can now see, for every response, what the gateway
+cost versus what the provider cost — and, in one absolute timestamp, **when** the
+request arrived. Opt-in (`--timing-headers`, default off), because adding a header is a
+visible API change.
+
+### Added
+
+- **`--timing-headers`** — response headers decomposing where the time went. Metadata
+  only: durations and one timestamp, never prompt or completion text. "Prompt content is
+  never logged" is a public commitment and this path does not touch it.
+
+  ```
+  t0 ────────► t1 ────────► t2 ──────────────────► t3 ──────────► t4
+  client req    upstream     bytes on the wire      provider       response
+  fully framed  request      (connect + TLS done)   first byte     written to client
+                BUILT
+  ```
+
+  | header | interval | meaning |
+  |---|---|---|
+  | `x-llmbridge-t0` | — | epoch **nanoseconds** at request arrival |
+  | `x-llmbridge-gateway-us` | (t1−t0)+(t4−t3) | **our compute**: framing, translation, auth mapping, re-serialisation |
+  | `x-llmbridge-connect-us` | t2−t1 | TCP connect + TLS handshake; ~0 on a pooled connection |
+  | `x-llmbridge-upstream-us` | t3−t2 | the provider: network + inference |
+
+  Streaming cannot report t4 — headers precede the body — so it emits
+  `x-llmbridge-upstream-ttfb-us` (time to the provider's first byte) instead of a total
+  it does not yet have.
+
+  Measured live against `api.anthropic.com`: **gateway 14–52 µs** against **1.4–4.0 s**
+  of provider time, with `connect-us` falling from 52,907 µs on the cold connection to
+  ~35 µs once pooled — which incidentally makes connection reuse visible per request.
+
+- **`metrics::wall_ns()`** — an orderable wall clock. `now_ns()` is `steady_clock`:
+  correct for intervals, but it has no epoch and cannot order anything. A raw
+  `CLOCK_REALTIME` read is not a substitute either, because NTP can **step** it, leaving
+  two requests orderable by arrival but not by timestamp — the one property an order
+  book cannot lose. So realtime is read **once** at startup and every later stamp is
+  that anchor plus a monotonic delta: epoch-meaningful, strictly increasing, immune to
+  NTP steps. Trade-off stated at the definition: ppm drift from true wall time over long
+  runs, and cross-host joins at sub-millisecond accuracy need PTP, which one gateway
+  cannot promise alone.
+- New `Connection::ts_req_built` stamp — the end of our request-side work, which is what
+  makes the gateway/connect split possible.
+
+### Why `connect-us` is separate
+
+The first implementation folded connection setup into `gateway-us`, and the live API
+said **56 ms**. It was measuring truthfully and reporting misleadingly: a cold TCP+TLS
+handshake to Anthropic, against 47–63 µs for the same gateway once the connection was
+pooled. A customer reading 56 ms as gateway overhead would be right to walk away and
+wrong about the software. One number cannot honestly carry both, so there are two.
+
+### Tests
+
+10 new, both backends: headers absent by default; all four present when enabled; **t0 is
+epoch-scale** (>1.7e18 — a monotonic uptime counter would be ~1e10); **t0 strictly
+increasing across five requests** (the ordering property); the JSON body byte-identical
+with headers on; and streaming emitting TTFB while *not* claiming a gateway total it
+cannot have.
+
+### Known gaps
+
+- **Passthrough (`--translate none`) emits no timing headers.** That mode forwards the
+  upstream's bytes verbatim by contract; injecting headers would break the byte-exact
+  guarantee. Translated and streaming responses carry them.
+- Timestamps are per-process. Ordering holds within one gateway; across workers or hosts
+  it needs synchronised clocks, which is a shadow-order-book concern rather than a
+  gateway one.
+
 ## [0.5.2] — 2026-07-31
 
 Performance and API cleanup for the two preceding releases. No behaviour change: the

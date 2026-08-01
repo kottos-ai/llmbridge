@@ -26,6 +26,22 @@ namespace llmbridge
     // measuring intervals (never steps backward, unaffected by NTP).
     int64_t now_ns() noexcept;
 
+    // Epoch nanoseconds for a monotonic now_ns() stamp — a timestamp that is both
+    // orderable and meaningful as wall time.
+    //
+    // Why not just read CLOCK_REALTIME: it can STEP, forwards or backwards, when NTP
+    // disciplines it. Two requests would then be orderable by arrival but not by
+    // timestamp, which is exactly the property an order book cannot lose. So the
+    // realtime clock is read ONCE at startup and every later timestamp is that anchor
+    // plus a monotonic delta: epoch-meaningful, strictly increasing within the
+    // process, immune to NTP steps.
+    //
+    // The trade: without NTP correction this drifts from true wall time over a long
+    // run (ppm-scale). Ordering and intra-process deltas are unaffected; joining
+    // timestamps ACROSS hosts to sub-millisecond accuracy needs PTP or a periodic
+    // re-anchor, and is not something a single gateway can promise on its own.
+    int64_t wall_ns(int64_t mono_ns) noexcept;
+
     class Histogram
     {
     public:

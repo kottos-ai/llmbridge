@@ -39,14 +39,19 @@ namespace llmbridge
         // translated request/response. The benchmark backend ignores path and
         // most headers; a real Anthropic target would add x-api-key /
         // anthropic-version here (same cost class).
-        std::string build_http(std::string_view start_line, std::string_view body)
+        // `extra` is zero or more complete "Name: value\r\n" lines, inserted before
+        // the terminating CRLF (used for the opt-in timing headers).
+        std::string build_http(std::string_view start_line, std::string_view body,
+                               std::string_view extra = {})
         {
             std::string out;
-            out.reserve(start_line.size() + body.size() + 96);
+            out.reserve(start_line.size() + body.size() + extra.size() + 96);
             out.append(start_line);
             out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
             out.append(std::to_string(body.size()));
-            out.append("\r\n\r\n");
+            out.append("\r\n");
+            out.append(extra);
+            out.append("\r\n");
             out.append(body);
             return out;
         }
@@ -270,6 +275,58 @@ namespace llmbridge
             return {};
         }
 
+        // ── Timing headers (opt-in: --timing-headers) ───────────────────────
+        //
+        // Four stamps bound three intervals. All monotonic; only t0 is also emitted
+        // as wall time, and that one is anchored so it can never step backward.
+        //
+        //   t0 ────────► t1 ────────► t2 ──────────────────► t3 ──────────► t4
+        //   client req    upstream     bytes on the wire       provider       response
+        //   fully framed  request      (connect + TLS done)    first byte     written to
+        //                 BUILT                                               the client
+        //
+        //   x-llmbridge-t0            wall-clock epoch NANOSECONDS at t0. The one
+        //                             absolute value: what orders two requests
+        //                             against each other, which is why it is here
+        //                             at all. Strictly increasing within a process.
+        //   x-llmbridge-gateway-us    (t1-t0) + (t4-t3) — OUR compute, and nothing
+        //                             else: framing, translation, auth mapping,
+        //                             re-serialisation.
+        //   x-llmbridge-connect-us    (t2-t1) — TCP connect + TLS handshake. ZERO
+        //                             on a pooled connection, which is the point:
+        //                             it shows when reuse worked.
+        //   x-llmbridge-upstream-us   (t3-t2) — the provider: network + inference.
+        //
+        // Why connect is split out rather than folded into gateway-us: measured
+        // against the live API, a COLD connection put 56 ms of TCP+TLS setup inside
+        // the "gateway" figure while the same gateway needed 47-63 us once pooled.
+        // A customer reading 56 ms as our overhead would be right to walk away, and
+        // wrong about the software. One number cannot honestly carry both.
+        //
+        // Streaming cannot report t3 (headers precede the body), so it emits t0 and
+        // x-llmbridge-upstream-ttfb-us = (t2-t1) instead — time to the provider's
+        // first byte.
+        //
+        // Metadata only, by construction: durations and one timestamp. No prompt,
+        // no completion, no token text. "Prompt content is never logged" is a
+        // public commitment and this path must never be the thing that breaks it.
+        void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
+                                   int64_t connect_us, int64_t upstream_us,
+                                   const char* upstream_key)
+        {
+            const auto add = [&out](const char* k, int64_t v) {
+                if (v < 0) return; // a stamp we never took; omit rather than lie
+                out.append(k);
+                out.append(": ");
+                out.append(std::to_string(v));
+                out.append("\r\n");
+            };
+            add("x-llmbridge-t0", wall_ns(t0));
+            add("x-llmbridge-gateway-us", gateway_us);
+            add("x-llmbridge-connect-us", connect_us); // 0 = pooled connection reused
+            add(upstream_key, upstream_us);
+        }
+
         std::string build_error(int code)
         {
             const char* line = code == 400   ? "HTTP/1.1 400 Bad Request"
@@ -300,6 +357,18 @@ namespace llmbridge
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
             "\r\n";
+
+        // Same head with a timing block spliced in before the terminating CRLF.
+        // A stream cannot report total gateway time in a header (headers precede
+        // the body), so it reports what IS known at this point: t0, the request-path
+        // cost, and time to the provider's first byte.
+        std::string sse_head_with_timing(std::string_view extra)
+        {
+            std::string out(kSseHead.substr(0, kSseHead.size() - 2)); // drop final CRLF
+            out.append(extra);
+            out.append("\r\n");
+            return out;
+        }
 
         // Build a response that PRESERVES the upstream status code. Used to relay a
         // provider's own failure (429 rate limit, 529 overloaded, 400 context
@@ -397,10 +466,11 @@ namespace llmbridge
 
     Gateway::Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                      int64_t warmup_ns, TranslateMode translate, IoBackend io,
-                     int64_t upstream_idle_ns, TlsConfig tls)
+                     int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers)
         : _listen_port(listen_port), _upstream_ip(std::move(upstream_ip)),
           _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate), _io(io),
-          _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls))
+          _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls)),
+          _timing_headers(timing_headers)
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         if (_tls.enabled)
@@ -956,7 +1026,8 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
-        c->ts_up_activity = now_ns(); // idle-timeout baseline for this request
+        c->ts_req_built = now_ns();   // end of OUR request-side work
+        c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
 
         // Optimistic send: if the pooled upstream is already connected (the common
         // case), write immediately and only arm EPOLLOUT if the socket buffer is
@@ -1088,7 +1159,16 @@ namespace llmbridge
             // limit, 529 overloaded, 400 context length, 401 auth) must reach the
             // client with ITS status — relayed below once the body is framed —
             // never laundered into a 200 stream.
-            if (h.event_stream && h.status == 200) { begin_stream(u, h); return; }
+            if (h.event_stream && h.status == 200)
+            {
+                // t2 for a stream: the provider's first response byte. The
+                // non-streaming path stamps this after framing, which this branch
+                // returns before reaching — so stamp it here or it stays 0 and the
+                // TTFB timing header reports garbage.
+                client->ts_up_recvd = now_ns();
+                begin_stream(u, h);
+                return;
+            }
         }
 
         // Stamp just before framing so the response HTTP parse is counted in the
@@ -1133,7 +1213,19 @@ namespace llmbridge
                 error_respond(client, 502);
                 return;
             }
-            client->wbuf = build_http("HTTP/1.1 200 OK", tbody);
+            std::string timing;
+            if (_timing_headers)
+            {
+                // t3 is now: the response is built here and written immediately after.
+                const int64_t t4 = now_ns();
+                const int64_t gw_ns = (client->ts_req_built - client->ts_req_recvd) +
+                                      (t4 - client->ts_up_recvd);
+                const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
+                const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
+                append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
+                                      up_ns / 1000, "x-llmbridge-upstream-us");
+            }
+            client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
         }
         else
         {
@@ -1215,7 +1307,19 @@ namespace llmbridge
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
-        client->wbuf.assign(kSseHead);
+        if (_timing_headers)
+        {
+            // t2 = provider's first response byte, stamped by the caller.
+            std::string timing;
+            const int64_t gw_ns = client->ts_req_built - client->ts_req_recvd;
+            const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
+            const int64_t ttfb_ns = client->ts_up_recvd - client->ts_up_sent;
+            append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
+                                  ttfb_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+            client->wbuf.assign(sse_head_with_timing(timing));
+        }
+        else
+            client->wbuf.assign(kSseHead);
         client->woff = 0;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
@@ -1861,7 +1965,12 @@ namespace llmbridge
                 if (hs == http::HeadStatus::Error) { u_error_respond(c->peer, 502); return; }
                 // Only a 200 is a real stream; a provider error is relayed with its
                 // own status by u_on_response below (never laundered into a 200).
-                if (h.event_stream && h.status == 200) { u_begin_stream(c, h); return; }
+                if (h.event_stream && h.status == 200)
+                {
+                    c->peer->ts_up_recvd = now_ns(); // t2 — see the epoll mirror
+                    u_begin_stream(c, h);
+                    return;
+                }
             }
 
             // parse_response, NOT parse: providers return non-streaming bodies
@@ -1917,7 +2026,8 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
-        c->ts_up_activity = now_ns(); // idle-timeout baseline for this request
+        c->ts_req_built = now_ns();   // end of OUR request-side work
+        c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
 
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)
@@ -1986,7 +2096,18 @@ namespace llmbridge
                 u_error_respond(client, 502);
                 return;
             }
-            client->wbuf = build_http("HTTP/1.1 200 OK", tbody);
+            std::string timing;
+            if (_timing_headers)
+            {
+                const int64_t t4 = now_ns();
+                const int64_t gw_ns = (client->ts_req_built - client->ts_req_recvd) +
+                                      (t4 - client->ts_up_recvd);
+                const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
+                const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
+                append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
+                                      up_ns / 1000, "x-llmbridge-upstream-us");
+            }
+            client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
         }
         else
         {
@@ -2097,7 +2218,19 @@ namespace llmbridge
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
-        client->wpending.assign(kSseHead);
+        if (_timing_headers)
+        {
+            // t2 = provider's first response byte, stamped by the caller.
+            std::string timing;
+            const int64_t gw_ns = client->ts_req_built - client->ts_req_recvd;
+            const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
+            const int64_t ttfb_ns = client->ts_up_recvd - client->ts_up_sent;
+            append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
+                                  ttfb_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+            client->wpending.assign(sse_head_with_timing(timing));
+        }
+        else
+            client->wpending.assign(kSseHead);
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         u_stream_pump(u);
     }
