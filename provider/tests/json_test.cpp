@@ -205,3 +205,79 @@ TEST(JsonBuilder, EscapesControlChars)
     append_escaped(out, raw);
     EXPECT_NE(out.find("\\u0001"), std::string::npos);
 }
+
+// ── Raw subtree spans + escape/unescape (added for tool calling) ─────────────
+
+TEST(RawSpan, ObjectAndArraySpansIncludeTheirBrackets)
+{
+    // Tool schemas are forwarded by span, so the span must be the EXACT source text
+    // including delimiters — anything else corrupts a customer's JSON Schema.
+    const std::string src = R"({"o":{"a":[1,2,{"b":null}]},"arr":[{"x":1}],"s":"str"})";
+    bool ok = false;
+    const auto v = llmbridge::json::parse(src, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(v.find("o")->sv, R"({"a":[1,2,{"b":null}]})");
+    EXPECT_EQ(v.find("arr")->sv, R"([{"x":1}])");
+    EXPECT_EQ(v.find("s")->sv, "str") << "string spans stay quote-free";
+}
+
+TEST(RawSpan, PreservesWhitespaceAndNumberFormatting)
+{
+    // A rebuilt schema could normalise 1.50 -> 1.5 or drop spacing. Byte-for-byte
+    // forwarding must not.
+    const std::string src = "{\"p\": { \"n\" : 1.50 , \"e\":1e+3 }}";
+    bool ok = false;
+    const auto v = llmbridge::json::parse(src, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(v.find("p")->sv, "{ \"n\" : 1.50 , \"e\":1e+3 }");
+}
+
+TEST(EscapeRoundTrip, JsonBecomesAStringAndBack)
+{
+    const std::string original = R"({"city":"Paris","q":"say \"hi\"","n":-1.5})";
+    std::string escaped;
+    llmbridge::json::append_escaped_string(escaped, original);
+    bool ok = false;
+    const auto v = llmbridge::json::parse(escaped, ok);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(v.is_string());
+    EXPECT_EQ(llmbridge::json::unescape_string(v.sv), original);
+}
+
+TEST(EscapeRoundTrip, ControlCharactersAreEscapedNotEmittedRaw)
+{
+    std::string out;
+    llmbridge::json::append_escaped_string(out, std::string("a\tb\nc\x01""d"));
+    // A raw control byte inside a JSON string is invalid JSON that some parsers
+    // accept and others reject — exactly the ambiguity to avoid on a provider wire.
+    EXPECT_EQ(out.find('\x01'), std::string::npos);
+    EXPECT_NE(out.find("\\u0001"), std::string::npos) << out;
+    EXPECT_NE(out.find("\\t"), std::string::npos);
+    EXPECT_NE(out.find("\\n"), std::string::npos);
+    bool ok = false;
+    llmbridge::json::parse(out, ok);
+    EXPECT_TRUE(ok) << "escaper produced invalid JSON: " << out;
+}
+
+TEST(Unescape, DecodesUnicodeIncludingSurrogatePairs)
+{
+    EXPECT_EQ(llmbridge::json::unescape_string("caf\\u00e9"), "café");
+    EXPECT_EQ(llmbridge::json::unescape_string("\\ud83d\\ude00"), "😀"); // U+1F600
+    EXPECT_EQ(llmbridge::json::unescape_string("a\\/b"), "a/b");
+}
+
+TEST(Unescape, LoneSurrogateBecomesReplacementNotInvalidUtf8)
+{
+    // Emitting a lone surrogate as UTF-8 would be malformed and the provider would
+    // reject the whole body; U+FFFD keeps the request valid and the failure local.
+    const std::string out = llmbridge::json::unescape_string("\\ud800");
+    EXPECT_EQ(out, "\xEF\xBF\xBD");
+}
+
+TEST(Unescape, TruncatedEscapesDoNotReadPastTheEnd)
+{
+    // Malformed input must terminate, not scan off the end.
+    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("abc\\"));
+    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("\\u12"));
+    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("\\ud83d\\u"));
+}
