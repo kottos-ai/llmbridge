@@ -36,6 +36,11 @@ namespace llmbridge::json
         // a view into the parsed input, never decoded, never owned. For Number, it's
         // the raw number text. This makes the DOM zero-copy: a passthrough value is
         // emitted verbatim, since the input's escaping is exactly the output's.
+        // For Array and Object, `sv` is the RAW span INCLUDING the surrounding
+        // brackets/braces — set by the parser so a subtree can be forwarded byte for
+        // byte. Tool calling needs this: a tool's `parameters` is an arbitrary JSON
+        // Schema we must pass through unaltered, and re-serialising from the DOM
+        // would risk changing it (number formatting, escape forms, key order).
         std::string_view sv;
         std::vector<Value> arr;                                  // Array elements
         std::vector<std::pair<std::string_view, Value>> obj;     // Object members, insertion order
@@ -136,9 +141,11 @@ namespace llmbridge::json
                 if (c == '{' || c == '[')
                 {
                     if (depth >= kMaxDepth) { ok = false; return {}; } // too deep — refuse to recurse
+                    const size_t start = i; // for the raw-subtree span
                     ++depth;
                     Value v = (c == '{') ? parse_object() : parse_array();
                     --depth;
+                    v.sv = s.substr(start, i - start); // includes the braces/brackets
                     return v;
                 }
                 if (c == 't' || c == 'f') return parse_bool();
@@ -230,6 +237,128 @@ namespace llmbridge::json
     // Append a RAW (already JSON-escaped) span as a quoted string literal — the
     // zero-copy passthrough path. The bytes came from valid JSON input, so the
     // escaping is already correct; emit verbatim, no decode/re-encode.
+    // Emit `text` as a JSON string literal (with quotes), escaping what must be
+    // escaped. Use when the SOURCE IS NOT already JSON-escaped — e.g. turning a raw
+    // JSON subtree into OpenAI's `arguments`, which is a *string* containing JSON.
+    inline void append_escaped_string(std::string& out, std::string_view text)
+    {
+        out += '"';
+        for (const char c : text)
+        {
+            switch (c)
+            {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20)
+                    {
+                        // Control characters must be \u-escaped or the output is
+                        // invalid JSON that some parsers accept and others reject.
+                        static const char* kHex = "0123456789abcdef";
+                        out += "\\u00";
+                        out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
+                        out += kHex[static_cast<unsigned char>(c) & 0xF];
+                    }
+                    else out += c;
+            }
+        }
+        out += '"';
+    }
+
+    // Decode a raw (still-escaped) string span into plain bytes. The inverse of the
+    // above, needed because OpenAI carries tool arguments as a JSON string while
+    // Anthropic carries them as a JSON object: to cross that boundary the escaped
+    // text has to become real JSON.
+    //
+    // \uXXXX is decoded to UTF-8; a lone surrogate is passed through as U+FFFD
+    // rather than emitting invalid UTF-8, since the output goes to a provider that
+    // will reject a malformed body.
+    inline std::string unescape_string(std::string_view raw)
+    {
+        std::string out;
+        out.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i)
+        {
+            if (raw[i] != '\\' || i + 1 >= raw.size()) { out += raw[i]; continue; }
+            switch (raw[++i])
+            {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case '/':  out += '/';  break;
+                case 'n':  out += '\n'; break;
+                case 'r':  out += '\r'; break;
+                case 't':  out += '\t'; break;
+                case 'b':  out += '\b'; break;
+                case 'f':  out += '\f'; break;
+                case 'u':
+                {
+                    if (i + 4 >= raw.size()) return out;
+                    unsigned cp = 0;
+                    for (int k = 1; k <= 4; ++k)
+                    {
+                        const char h = raw[i + k];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+                        else return out;
+                    }
+                    i += 4;
+                    // Surrogate pair -> one code point.
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < raw.size() && raw[i + 1] == '\\' &&
+                        raw[i + 2] == 'u')
+                    {
+                        unsigned lo = 0;
+                        bool okpair = true;
+                        for (int k = 3; k <= 6; ++k)
+                        {
+                            const char h = raw[i + k];
+                            lo <<= 4;
+                            if (h >= '0' && h <= '9') lo |= static_cast<unsigned>(h - '0');
+                            else if (h >= 'a' && h <= 'f') lo |= static_cast<unsigned>(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo |= static_cast<unsigned>(h - 'A' + 10);
+                            else { okpair = false; break; }
+                        }
+                        if (okpair && lo >= 0xDC00 && lo <= 0xDFFF)
+                        {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    }
+                    if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD; // lone surrogate
+                    // UTF-8 encode.
+                    if (cp < 0x80) out += static_cast<char>(cp);
+                    else if (cp < 0x800)
+                    {
+                        out += static_cast<char>(0xC0 | (cp >> 6));
+                        out += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    else if (cp < 0x10000)
+                    {
+                        out += static_cast<char>(0xE0 | (cp >> 12));
+                        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                        out += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    else
+                    {
+                        out += static_cast<char>(0xF0 | (cp >> 18));
+                        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                        out += static_cast<char>(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out += raw[i]; break;
+            }
+        }
+        return out;
+    }
+
     inline void append_raw_string(std::string& out, std::string_view raw)
     {
         out += '"';
