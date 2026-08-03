@@ -16,7 +16,16 @@
 // beyond buffer growth — it sustains far more RPS than the proxy in front of
 // it, so the proxy is provably the bottleneck in the ramp.
 //
-//   fastbackend [--port 9002] [--latency-us N]   (default 0 = instant)
+//   fastbackend [--port 9002] [--latency-us N] [--anthropic] [--tools]
+//                                               (latency default 0 = instant)
+//
+// --tools serves an Anthropic response containing tool_use blocks. That path is
+// NOT covered by the plain body: a tool response makes the translator decode the
+// tool_use input object and re-emit it as an OpenAI `arguments` STRING (escaping
+// it), which is measurably more work than copying text through. Without this the
+// regression sweep would report "no change" for edits that only affect the tool
+// path — which is exactly what happened once: a live check showed 19 us for tool
+// responses against 15 us for plain, a difference the benchmark could not see.
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -58,6 +67,49 @@ namespace
         "{\"id\":\"msg_fast\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fast-1\","
         "\"content\":[{\"type\":\"text\",\"text\":\"pong\"}],\"stop_reason\":\"end_turn\","
         "\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}";
+
+    // Anthropic response carrying TWO tool_use blocks (parallel calls are the
+    // common agent shape) plus a text block, so the translator exercises: block
+    // iteration, input-object -> arguments-string escaping, and the tool_calls
+    // array build. Kept deliberately small — this measures the translation, not
+    // the memcpy of a large body.
+    const std::string kBodyTools =
+        "{\"id\":\"msg_fast\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fast-1\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"checking\"},"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\","
+        "\"input\":{\"city\":\"Paris\",\"units\":\"c\"}},"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"get_weather\","
+        "\"input\":{\"city\":\"Rome\",\"units\":\"c\"}}],"
+        "\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":24,\"output_tokens\":18}}";
+
+    // Which canned body to serve. An enum rather than a bool: the dialect list
+    // already has more than two members in the translator (Gemini, Cohere) and
+    // will grow, and "bool anthropic" plus "bool tools" cannot express that —
+    // two bools also admit a nonsense state (openai+tools) the enum makes
+    // unrepresentable.
+    enum class Body { OpenAi, Anthropic, AnthropicTools };
+
+    const std::string& body_for(Body b)
+    {
+        switch (b)
+        {
+            case Body::Anthropic:      return kBodyAnthropic;
+            case Body::AnthropicTools: return kBodyTools;
+            case Body::OpenAi:         break;
+        }
+        return kBodyOpenAI;
+    }
+
+    const char* body_name(Body b)
+    {
+        switch (b)
+        {
+            case Body::Anthropic:      return "anthropic";
+            case Body::AnthropicTools: return "anthropic+tools";
+            case Body::OpenAi:         break;
+        }
+        return "openai";
+    }
 
     std::string g_resp;
     int g_epfd = -1;
@@ -102,18 +154,21 @@ int main(int argc, char** argv)
 {
     uint16_t port = 9002;
     long latency_us = 0;
-    bool anthropic = false;
+    Body body = Body::OpenAi;
     for (int i = 1; i < argc; ++i)
     {
         const std::string_view a = argv[i];
         if (a == "--port" && i + 1 < argc) port = (uint16_t)std::atoi(argv[++i]);
         else if (a == "--latency-us" && i + 1 < argc) latency_us = std::atol(argv[++i]);
-        else if (a == "--anthropic") anthropic = true; // serve Anthropic-shape body
+        else if (a == "--anthropic") body = Body::Anthropic;      // Anthropic-shape body
+        else if (a == "--tools") body = Body::AnthropicTools;     // + tool_use blocks
     }
 
     std::signal(SIGPIPE, SIG_IGN);
 
-    const std::string& kBody = anthropic ? kBodyAnthropic : kBodyOpenAI;
+    // --tools selects the Anthropic shape too: tool_use is an Anthropic construct,
+    // so "openai + tools" is not a thing the enum can express.
+    const std::string& kBody = body_for(body);
     g_resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
              std::to_string(kBody.size()) + "\r\nConnection: keep-alive\r\n\r\n" + kBody;
 
@@ -122,7 +177,8 @@ int main(int argc, char** argv)
     if (lfd < 0) { std::fprintf(stderr, "bind :%u failed\n", port); return 1; }
     Connection* lc = new Connection(); lc->fd = lfd;
     add_read(lc);
-    std::fprintf(stderr, "fastbackend: :%u latency=%ldus\n", port, latency_us);
+    std::fprintf(stderr, "fastbackend: :%u latency=%ldus body=%s\n", port, latency_us,
+                 body_name(body));
 
     epoll_event events[2048];
     for (;;)
