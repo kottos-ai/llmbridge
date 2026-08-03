@@ -19,9 +19,12 @@ Streamed tool calls. A `"stream": true` request whose model calls a tool now pro
 proper OpenAI `tool_calls` deltas, so an agent loop works over SSE. This **supersedes
 the guard added in 0.7.0**, which aborted such streams rather than mis-reporting them.
 
-Verified against the live Anthropic API: two parallel calls arrived as fragments
-(`{"city": "P` / `ar` / `is"}`) and reassembled client-side into valid JSON, with
-`finish_reason: "tool_calls"` and a clean `[DONE]`.
+Verified against the live Anthropic API, and re-verified after every round of audit
+fixes below — most recently on all three paths at once (streamed parallel calls,
+streamed text with tools declared, non-streaming):
+two parallel calls arrived as fragments (`{"city": "P` / `ar` / `is"}`) and
+reassembled client-side into valid JSON, with `finish_reason: "tool_calls"` and a
+clean `[DONE]`; a text stream with tools declared is unaffected.
 
 ### Added
 
@@ -53,9 +56,66 @@ customer's argument bytes; the test asserts fragments reassemble byte-for-byte
 including `1.50`, which a re-serialising implementation would normalise to `1.5`.
 Control bytes are still neutralised on the way out, as for text.
 
+### Hardening found by pre-merge audit
+
+Seven defects across three review passes, **every one caught by probing edge cases
+rather than reading the code** — the reasoning pass before them found none. Two were
+introduced by earlier fixes in this same list, which is why the last pass was done as
+a cold second reading of `dispatch()` and `finish()` rather than another look by their
+author.
+
+- **A malformed `index` stole another call's arguments.** `detail::to_ll()` wraps
+  `std::from_chars`, which on overflow or garbage leaves its output **untouched** — so
+  `"index": 99999999999999999999` came back as `0` and its argument fragments were
+  attached to whichever tool call occupied block 0. In an agent loop, arguments on the
+  wrong tool means the wrong action. A strict parser now rejects overflow, garbage and
+  trailing characters; the event is ignored.
+- **A truncated tool call fabricated a clean ending.** Arguments cut mid-JSON still
+  produced `[DONE]`, so a client concatenated unparseable JSON inside a stream that
+  looked complete — the exact "corrupt framing fabricated a clean ending" failure
+  0.3.0 fixed for text, reintroduced by streaming tool calls. Truncated prose is still
+  readable; truncated arguments are garbage a client may dispatch. `finish()` now
+  returns `false`, which the gateway already maps to `Failed`.
+- **Unnamed tools were emitted.** The non-streaming translator drops a tool with no
+  name ("unusable without a name"); streaming emitted `"name":""`, so the same
+  upstream produced a usable response one way and an undispatchable call the other.
+  Now consistent.
+- **`finish()` reported failure on an already-complete stream** — a regression
+  introduced by the truncation guard above. It checked the open-tool flag *before*
+  `_done`, so an upstream sending `message_stop` without a preceding `message_delta`
+  got `[DONE]` from `dispatch()` and then a failure from `finish()`, making the
+  gateway count an error and close abruptly on a correct response. Order fixed, and
+  `message_stop` now clears the flag too, so the invariant holds whichever terminator
+  arrives.
+- **The tool-ordinal counter was unbounded.** A reopened block index could increment
+  it without limit; signed overflow is UB. Capped at 256 — no legitimate response has
+  more tool calls than that.
+- **`finish_reason: "stop"` was reported after emitting tool calls** — the worst bug in
+  the release, because it fails *silently*. Every OpenAI SDK branches on
+  `finish_reason == "tool_calls"` to decide whether to dispatch, so a client receiving
+  `"stop"` treats the call as a plain answer and **never runs the tool**: no error, no
+  exception, just a tool that quietly does not fire. Reachable whenever the upstream
+  sends `message_stop` without a preceding `message_delta`. The default is now
+  `"tool_calls"` once any call has been emitted, and a text-only stream still defaults
+  to `"stop"` (pinned by its own test so the new default cannot leak).
+- **A foreign `data: [DONE]` vouched for a truncated call.** `[DONE]` is an OpenAI-ism —
+  Anthropic ends with `message_stop` — and the handler jumped straight to the sentinel.
+  That gave a truncated tool call a clean ending *and* skipped the finish chunk, so the
+  stream ended with `finish_reason: null` and a client had no way to know the message
+  had ended. It now routes through the same path (a complete stream still gets its
+  finish chunk) but does **not** clear the open-tool flag: a foreign terminator cannot
+  vouch that arguments are whole.
+
+**Fuzz coverage.** The SSE corpus contained **no tool events**, so
+`content_block_start` and `input_json_delta` were never fuzzed. Two seeds added
+(parallel calls behind a leading text block; hostile indices with escaped `id`/`name`).
+2.87M executions clean afterwards — which matters most for invariant (2),
+fragmentation-invariance, since this release added cross-event state and the fuzzer's
+own comment calls that "the property most likely to break as state grows".
+
 ### Tests
 
-**8 new**, replacing 0.7.0's four guard tests: opening chunk shape and role ordering;
+**21 new** in the translator, replacing 0.7.0's four guard tests: opening chunk shape and role ordering;
 fragments reassemble exactly; **block index ≠ tool ordinal**; interleaved fragments
 route to their own call without cross-contamination; `finish_reason:"tool_calls"` now
 has calls behind it — the regression this feature existed to fix; a fragment for a
@@ -63,7 +123,35 @@ block whose `content_block_start` was never seen is **ignored rather than guesse
 (attaching a customer's arguments to the wrong call is worse than dropping them); an
 absurd block index does not allocate; plain text streams unaffected.
 
-Suites: **847/847** with TLS, **821/821** default.
+From the audit: malformed indices (overflow, negative-overflow, `1e5`, `0x10`) are
+rejected rather than aliased to block 0; a malformed index opens no call; every
+emitted chunk stays valid JSON under hostile escaping (escaped quotes, trailing
+backslashes, `\uXXXX`, tabs, and a hostile `id`/`name`); tool chunks carry
+`usage:null` when `include_usage` is set; unnamed tools are dropped; a truncated call
+refuses a clean ending while a completed one still gets `[DONE]`; `message_stop`
+without `message_delta` still ends cleanly; the ordinal counter is bounded.
+
+**6 new gateway tests**, both backends × chunk sizes {7, 64, 4096}: a streamed tool
+call survives the gateway pump and reassembles, with ordinals 0/1 despite Anthropic
+using blocks 1/2. Small chunk sizes matter because tool events are longer than text
+events and so more likely to straddle a boundary mid-JSON. Before this, the string
+`input_json_delta` appeared **zero** times in the gateway suite — the pump path was
+verified only by hand against the live API.
+
+Suites: **866/866** with TLS, **840/840** default, **866/866** under ASan+UBSan.
+
+### Known gaps
+
+- **The end-to-end streaming benchmark has not been re-run** on a quiet box. A
+  microbenchmark of the translator's per-event path shows **+4.5 ns/event (<1%)**
+  against the pre-change build, but that does not cover the gateway pump. Absolute
+  streaming figures in `BENCHMARKS.md` are unchanged and were not re-measured.
+- **An empty tool `id` is still forwarded.** The non-streaming translator does not
+  check it either, so both paths agree; making them both reject it belongs in a change
+  that touches the two together.
+- Streaming remains OpenAI ⇄ Anthropic only — Gemini and Cohere have no streaming
+  translator, tool calls or otherwise.
+
 
 ## [0.7.0] — 2026-08-03
 

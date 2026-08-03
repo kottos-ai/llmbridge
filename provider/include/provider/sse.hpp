@@ -75,6 +75,7 @@ namespace llmbridge::provider
         void emit_tool_open(std::string& out, int ord, std::string_view id, std::string_view name);
         void emit_tool_args(std::string& out, int ord, std::string_view frag);
         int tool_ordinal_for(long long block_index);          // Anthropic index -> OpenAI ordinal
+        const char* default_finish() const noexcept;          // "tool_calls" once any call was emitted
         void emit_usage(std::string& out);                    // the final usage-only chunk
         void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
@@ -95,6 +96,9 @@ namespace llmbridge::provider
         static constexpr size_t kMaxBlocks = 256;
         std::vector<int> _block_tool_ord;  // block index -> OpenAI ordinal, or -1
         int _next_tool_ord = 0;
+        // A tool call was opened and the message has not reported a stop_reason.
+        // At EOF that means truncated arguments — see finish().
+        bool _tool_open = false;
 
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id

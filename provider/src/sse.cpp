@@ -5,6 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
+#include <charconv>
 #include "provider/sse.hpp"
 
 #include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
@@ -107,9 +108,54 @@ namespace llmbridge::provider
         _done = true;
     }
 
+    // STRICT index parse. detail::to_ll() cannot be used here: it wraps
+    // std::from_chars, which on overflow or garbage leaves its output UNTOUCHED —
+    // so `"index": 99999999999999999999` and `"index": "abc"` both come back as 0.
+    // Measured: that made a malformed index alias onto block 0 and attach its
+    // argument fragments to whichever call lived there, i.e. a customer's arguments
+    // routed to the WRONG tool. Anything not a clean, fully-consumed, in-range
+    // integer is rejected as -1 and the event is ignored.
+    static long long parse_block_index(const json::Value& v)
+    {
+        const std::string_view s = v.num_or("index");
+        if (s.empty()) return -1;
+        long long out = 0;
+        const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+        if (ec != std::errc{} || ptr != s.data() + s.size()) return -1; // overflow/garbage/trailing
+        return out;
+    }
+
+    // The finish reason to report when the upstream never supplied a stop_reason.
+    //
+    // "stop" is wrong once tool calls have been emitted: every OpenAI SDK branches on
+    // finish_reason == "tool_calls" to decide whether to dispatch them, so reporting
+    // "stop" makes the client treat a tool call as a plain answer and SILENTLY IGNORE
+    // it — no error, just a tool that never runs. Reachable whenever the upstream
+    // sends message_stop without a preceding message_delta.
+    const char* AnthropicToOpenAiSse::default_finish() const noexcept
+    {
+        return _next_tool_ord > 0 ? "tool_calls" : "stop";
+    }
+
     void AnthropicToOpenAiSse::dispatch(std::string_view data, std::string& out)
     {
-        if (data == "[DONE]") { emit_done(out); return; }
+        if (data == "[DONE]")
+        {
+            // Not an Anthropic event — Anthropic ends with message_stop. Honour it as
+            // a terminator, but route it through the same path so the stream still
+            // gets its finish chunk (jumping straight to emit_done left the client
+            // with finish_reason:null and no way to know the message ended), and do
+            // NOT clear _tool_open: a foreign terminator cannot vouch that a tool
+            // call's arguments are complete.
+            if (!_finish_emitted && !_tool_open)
+            {
+                emit_head(out);
+                emit_tail(out, _finish ? _finish : default_finish());
+                _finish_emitted = true;
+            }
+            if (!_tool_open) emit_done(out);
+            return;
+        }
 
         bool ok = false;
         json::Value v = json::parse(data, ok);
@@ -145,7 +191,7 @@ namespace llmbridge::provider
             // addressed by the block index they belong to.
             if (d && d->str_or("type") == "input_json_delta")
             {
-                const int ord = tool_ordinal_for(detail::to_ll(v.num_or("index", "-1")));
+                const int ord = tool_ordinal_for(parse_block_index(v));
                 if (ord >= 0) emit_tool_args(out, ord, d->str_or("partial_json"));
                 return; // never falls through to the text path
             }
@@ -172,7 +218,10 @@ namespace llmbridge::provider
             // premature finish chunk.
             if (const json::Value* d = v.find("delta"))
                 if (const std::string_view sr = d->str_or("stop_reason"); !sr.empty())
+                {
                     _finish = detail::anthropic_finish_reason(sr);
+                    _tool_open = false; // the message completed; arguments are whole
+                }
             // Anthropic reports output_tokens cumulatively on message_delta.
             if (const json::Value* u = v.find("usage"))
                 if (const std::string_view ot = u->num_or("output_tokens"); !ot.empty())
@@ -186,10 +235,11 @@ namespace llmbridge::provider
         }
         else if (type == "message_stop")
         {
+            _tool_open = false; // the message ended; arguments are whole
             if (!_finish_emitted)
             {
                 emit_head(out);
-                emit_tail(out, _finish ? _finish : "stop");
+                emit_tail(out, _finish ? _finish : default_finish());
                 _finish_emitted = true;
             }
             emit_done(out);
@@ -198,12 +248,21 @@ namespace llmbridge::provider
         {
             const json::Value* b = v.find("content_block");
             if (!b || b->str_or("type") != "tool_use") return; // text block: nothing to emit
-            const long long idx = detail::to_ll(v.num_or("index", "-1"));
+            // A call with no name cannot be dispatched by the client. The
+            // non-streaming translator already drops these ("unusable without a
+            // name"); streaming must agree, or the same upstream produces a usable
+            // response one way and a broken one the other.
+            if (b->str_or("name").empty()) return;
+            // Bound the ordinal counter: a reopened index would otherwise let a
+            // hostile stream increment it without limit, and signed overflow is UB.
+            if (static_cast<size_t>(_next_tool_ord) >= kMaxBlocks) return;
+            const long long idx = parse_block_index(v);
             if (idx < 0 || static_cast<size_t>(idx) >= kMaxBlocks) return; // refuse to grow
             if (static_cast<size_t>(idx) >= _block_tool_ord.size())
                 _block_tool_ord.resize(static_cast<size_t>(idx) + 1, -1);
             const int ord = _next_tool_ord++;
             _block_tool_ord[static_cast<size_t>(idx)] = ord;
+            _tool_open = true; // cleared by message_delta's stop_reason
             if (!_role_emitted) // a stream can open with a tool call and no text
             {
                 emit_head(out);
@@ -322,11 +381,22 @@ namespace llmbridge::provider
     bool AnthropicToOpenAiSse::finish(std::string& out)
     {
         if (_failed) return false; // don't fabricate a clean [DONE] on a capped stream
+        // ORDER MATTERS: _done first. A stream that already emitted [DONE] is over,
+        // and reporting failure for it makes the gateway count an error and close
+        // abruptly on a response that completed correctly. (An earlier revision of
+        // this function checked _tool_open first and did exactly that whenever the
+        // upstream sent message_stop without a preceding message_delta.)
         if (_done) return true;
+        // A tool call still open at EOF means its arguments were CUT MID-JSON. The
+        // client would concatenate them into something unparseable inside a stream
+        // that looked complete — the "corrupt framing fabricated a clean ending"
+        // failure 0.3.0 fixed for text, which streamed tool calls reintroduced.
+        // Same signal: no [DONE], and the gateway counts it as an error.
+        if (_tool_open) return false;
         if (!_finish_emitted)
         {
             emit_head(out);
-            emit_tail(out, _finish ? _finish : "stop");
+            emit_tail(out, _finish ? _finish : default_finish());
             _finish_emitted = true;
         }
         emit_done(out);

@@ -784,6 +784,204 @@ TEST(SseTools, AbsurdBlockIndexDoesNotAllocate)
     EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
 }
 
+TEST(SseTools, MalformedIndexIsRejectedNotAliasedToBlockZero)
+{
+    // to_ll()/from_chars leave their output UNTOUCHED on overflow, so a naive parse
+    // turns a garbage index into 0 — attaching a customer's argument fragments to
+    // whichever tool call happens to occupy block 0. Found by audit before merge.
+    for (const char* bad : {"99999999999999999999", "-99999999999999999999", "1e5", "0x10"})
+    {
+        llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+        std::string out;
+        ASSERT_TRUE(t.feed(blk_start_tool(0, "REAL", "f"), out));
+        out.clear();
+        ASSERT_TRUE(t.feed(std::string("event: content_block_delta\ndata: ") +
+                           R"({"type":"content_block_delta","index":)" + bad +
+                           R"(,"delta":{"type":"input_json_delta","partial_json":"STOLEN"}})" "\n\n",
+                           out));
+        EXPECT_EQ(out.find("STOLEN"), std::string::npos)
+            << "index " << bad << " was aliased onto block 0:\n" << out;
+    }
+}
+
+TEST(SseTools, MalformedIndexDoesNotOpenACall)
+{
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed("event: content_block_start\ndata: "
+                       R"({"type":"content_block_start","index":99999999999999999999,)"
+                       R"("content_block":{"type":"tool_use","id":"x","name":"f"}})" "\n\n", out));
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+}
+
+TEST(SseTools, EveryEmittedChunkIsValidJsonUnderHostileEscaping)
+{
+    // id, name and every argument fragment are forwarded as RAW (still-escaped)
+    // spans. A span that terminated in a lone backslash would escape our closing
+    // quote and corrupt the chunk. The parser's escape-skipping makes that
+    // impossible; this pins it so a future parser change cannot silently break it.
+    const char* frags[] = {R"({"a":1})", R"(say "hi")", R"(path\)", R"(café)", R"(a	b
+c)"};
+    for (const char* f : frags)
+    {
+        llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+        std::string out;
+        ASSERT_TRUE(t.feed(blk_start_tool(0, R"(id\"q)", R"(name\\)"), out));
+        ASSERT_TRUE(t.feed(blk_args(0, f), out));
+        size_t p = 0;
+        int checked = 0;
+        while ((p = out.find("data: ", p)) != std::string::npos)
+        {
+            const size_t e = out.find('\n', p);
+            const std::string line = out.substr(p + 6, e - (p + 6));
+            p = e;
+            if (line == "[DONE]") continue;
+            bool ok = false;
+            llmbridge::json::parse(line, ok);
+            EXPECT_TRUE(ok) << "fragment " << f << " produced invalid JSON:\n" << line;
+            ++checked;
+        }
+        EXPECT_GT(checked, 0);
+    }
+}
+
+TEST(SseTools, ToolChunksCarryUsageNullWhenIncludeUsageIsSet)
+{
+    // include_usage puts "usage":null on every normal chunk; tool chunks go through
+    // the same tail and must not be an exception, or a client that reads usage off
+    // each chunk sees an inconsistent stream.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, /*include_usage=*/true);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}"), out));
+    size_t n = 0, p = 0;
+    while ((p = out.find("tool_calls", p)) != std::string::npos) { ++n; ++p; }
+    ASSERT_EQ(n, 2u) << out;
+    // Count chunks, then assert EVERY one carries usage:null — the role chunk does
+    // too, so pinning a literal 2 would have been wrong for the wrong reason.
+    size_t q = 0, chunks = 0, usage = 0;
+    while ((q = out.find("data: ", q)) != std::string::npos) { ++chunks; ++q; }
+    q = 0;
+    while ((q = out.find(R"("usage":null)", q)) != std::string::npos) { ++usage; ++q; }
+    EXPECT_EQ(usage, chunks) << "a chunk is missing usage:null\n" << out;
+    EXPECT_GE(chunks, 3u) << out; // role + open + args
+}
+
+TEST(SseTools, ToolWithNoNameIsDroppedLikeNonStreaming)
+{
+    // The non-streaming translator drops a tool with no name ("unusable without a
+    // name"). Streaming must agree, or the same upstream yields a usable response
+    // one way and a call the client cannot dispatch the other.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "") + blk_args(0, "{}"), out));
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+    EXPECT_EQ(out.find(R"("name":"")"), std::string::npos) << out;
+}
+
+TEST(SseTools, TruncatedToolCallRefusesACleanEnding)
+{
+    // Arguments cut mid-JSON. Emitting [DONE] would hand the client unparseable
+    // arguments inside a stream that looked complete — the same "corrupt framing
+    // fabricated a clean ending" failure 0.3.0 fixed for text.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, R"({\"city\":)"), out));
+    EXPECT_FALSE(t.finish(out)) << "a truncated tool call must not report success";
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos) << out;
+}
+
+TEST(SseTools, CompletedToolCallStillEndsCleanly)
+{
+    // The guard above must not fire on a well-formed stream.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}") +
+                       ev("message_delta",
+                          R"({"type":"message_delta","delta":{"stop_reason":"tool_use"}})"), out));
+    EXPECT_TRUE(t.finish(out));
+    EXPECT_NE(out.find("[DONE]"), std::string::npos) << out;
+}
+
+TEST(SseTools, MessageStopWithoutMessageDeltaStillEndsCleanly)
+{
+    // Regression for a bug the truncation guard itself introduced: dispatch()
+    // emits [DONE] on message_stop, but the guard was checked BEFORE _done, so a
+    // stream that had already ended correctly was reported as a failure — the
+    // gateway then counts an error and closes abruptly on a good response.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}") +
+                       ev("message_stop", R"({"type":"message_stop"})"), out));
+    ASSERT_NE(out.find("[DONE]"), std::string::npos) << out;
+    EXPECT_TRUE(t.finish(out)) << "already-complete stream reported as failed";
+}
+
+TEST(SseTools, ToolOpenCounterIsBounded)
+{
+    // A reopened index would otherwise increment the ordinal without limit
+    // (signed overflow is UB). Past the cap, further opens are refused.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    for (int i = 0; i < 300; ++i) ASSERT_TRUE(t.feed(blk_start_tool(0, "id", "f"), out));
+    // Ordinals never exceed the cap.
+    EXPECT_EQ(out.find(R"("index":256,)"), std::string::npos) << "ordinal ran past the cap";
+    EXPECT_NE(out.find(R"("index":255,)"), std::string::npos) << "cap should be reachable";
+}
+
+TEST(SseTools, FinishReasonDefaultsToToolCallsOnceACallWasEmitted)
+{
+    // Found by second-pass review. Every OpenAI SDK branches on
+    // finish_reason == "tool_calls" to decide whether to dispatch; reporting "stop"
+    // makes the client treat the call as a plain answer and SILENTLY ignore it.
+    // Reachable whenever the upstream sends message_stop with no message_delta.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}") +
+                       ev("message_stop", R"({"type":"message_stop"})"), out));
+    EXPECT_NE(out.find(R"("finish_reason":"tool_calls")"), std::string::npos) << out;
+    EXPECT_EQ(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
+}
+
+TEST(SseTools, TextOnlyStreamStillDefaultsToStop)
+{
+    // The default above must not leak into streams that emitted no tool call.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(ev("content_block_delta",
+                          R"({"type":"content_block_delta","index":0,)"
+                          R"("delta":{"type":"text_delta","text":"hi"}})") +
+                       ev("message_stop", R"({"type":"message_stop"})"), out));
+    EXPECT_NE(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+}
+
+TEST(SseTools, ForeignDoneCannotVouchForATruncatedCall)
+{
+    // `data: [DONE]` is an OpenAI-ism; Anthropic ends with message_stop. Honouring
+    // it blindly gave a truncated tool call a clean ending AND skipped the finish
+    // chunk, leaving finish_reason:null with no way for a client to know.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, R"({\"a\":)") +
+                       "data: [DONE]\n\n", out));
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos) << "truncated call ended cleanly:\n" << out;
+    EXPECT_FALSE(t.finish(out));
+}
+
+TEST(SseTools, ForeignDoneOnACompleteStreamStillEmitsAFinishChunk)
+{
+    // ...but a well-formed stream terminated by [DONE] must still get its finish
+    // chunk, not jump straight to the sentinel with finish_reason never set.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}") +
+                       ev("message_delta",
+                          R"({"type":"message_delta","delta":{"stop_reason":"tool_use"}})") +
+                       "data: [DONE]\n\n", out));
+    EXPECT_NE(out.find(R"("finish_reason":"tool_calls")"), std::string::npos) << out;
+    EXPECT_NE(out.find("[DONE]"), std::string::npos) << out;
+}
+
 TEST(SseTools, PlainTextStreamsAreUnaffected)
 {
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
