@@ -33,6 +33,133 @@ namespace llmbridge::provider
         }
     } // namespace
 
+
+    namespace
+    {
+        // ── Tool calling: OpenAI <-> Anthropic ──────────────────────────────
+        //
+        // The two dialects disagree in three places, and each one is a real
+        // conversion rather than a rename:
+        //
+        //  1. TOOL DECLARATION
+        //       OpenAI     {"type":"function","function":{name,description,parameters}}
+        //       Anthropic  {name,description,input_schema}
+        //     `parameters`/`input_schema` is an arbitrary JSON Schema: forwarded as a
+        //     RAW SPAN, never rebuilt, so we cannot corrupt a customer's schema.
+        //
+        //  2. THE ASSISTANT'S CALL
+        //       OpenAI     tool_calls[].function.arguments  -> a JSON *string*
+        //       Anthropic  content[].input                  -> a JSON *object*
+        //     So crossing this boundary means unescaping a string into JSON one way
+        //     and escaping JSON into a string the other. This is the fiddly part and
+        //     the reason json.hpp grew unescape_string/append_escaped_string.
+        //
+        //  3. THE RESULT
+        //       OpenAI     a message with role:"tool" + tool_call_id
+        //       Anthropic  a USER message whose content is a tool_result block
+        //     Consecutive OpenAI tool messages merge into ONE Anthropic user turn.
+        //     NOT because the API demands it: measured against the live API, two
+        //     consecutive user turns return 200, and an earlier version of this
+        //     comment claimed otherwise. We merge because a parallel tool call IS
+        //     semantically one turn of results, so this produces the canonical shape
+        //     the model was trained on instead of leaning on provider-side
+        //     turn-combining we do not control.
+        //
+        // Anything malformed is dropped rather than guessed at: a half-translated
+        // tool call would make the provider fail in a way the client cannot read.
+
+        // OpenAI tool_choice -> Anthropic tool_choice. Returns "" when nothing
+        // should be emitted (OpenAI's default, or "none" which we express by
+        // omitting tools entirely — Anthropic has no exact equivalent).
+        std::string anthropic_tool_choice(const json::Value* tc)
+        {
+            if (!tc) return {};
+            if (tc->is_string())
+            {
+                const std::string_view s = tc->sv;
+                if (s == "auto") return R"({"type":"auto"})";
+                if (s == "required") return R"({"type":"any"})";
+                return {}; // "none" -> caller omits tools
+            }
+            if (tc->is_object())
+            {
+                // {"type":"function","function":{"name":"x"}}
+                if (const json::Value* f = tc->find("function"))
+                {
+                    const std::string_view n = f->str_or("name");
+                    if (!n.empty())
+                    {
+                        std::string out = R"({"type":"tool","name":)";
+                        json::append_raw_string(out, n);
+                        out += '}';
+                        return out;
+                    }
+                }
+            }
+            return {};
+        }
+
+        // OpenAI tools[] -> Anthropic tools[]. Empty if nothing usable.
+        std::string anthropic_tools(const json::Value* tools)
+        {
+            if (!tools || !tools->is_array() || tools->arr.empty()) return {};
+            std::string out = "[";
+            bool first = true;
+            for (const auto& tl : tools->arr)
+            {
+                const json::Value* fn = tl.find("function");
+                if (!fn || !fn->is_object()) continue; // only type:"function" exists today
+                const std::string_view name = fn->str_or("name");
+                if (name.empty()) continue; // unusable without a name
+                if (!first) out += ',';
+                first = false;
+                out += "{\"name\":";
+                json::append_raw_string(out, name);
+                if (const std::string_view d = fn->str_or("description"); !d.empty())
+                {
+                    out += ",\"description\":";
+                    json::append_raw_string(out, d);
+                }
+                // The schema, byte for byte. Absent -> the empty object, which is
+                // what Anthropic requires for a no-argument tool.
+                out += ",\"input_schema\":";
+                const json::Value* params = fn->find("parameters");
+                if (params && (params->is_object() || params->is_array()) && !params->sv.empty())
+                    out.append(params->sv);
+                else
+                    out += R"({"type":"object","properties":{}})";
+                out += '}';
+            }
+            out += ']';
+            return first ? std::string{} : out;
+        }
+
+        // Anthropic content blocks -> OpenAI tool_calls[]. Empty if none.
+        std::string openai_tool_calls(const json::Value* content)
+        {
+            if (!content || !content->is_array()) return {};
+            std::string out = "[";
+            bool first = true;
+            for (const auto& blk : content->arr)
+            {
+                if (blk.str_or("type") != "tool_use") continue;
+                if (!first) out += ',';
+                first = false;
+                out += "{\"id\":";
+                json::append_raw_string(out, blk.str_or("id"));
+                out += ",\"type\":\"function\",\"function\":{\"name\":";
+                json::append_raw_string(out, blk.str_or("name"));
+                // input (object) -> arguments (string containing that JSON).
+                out += ",\"arguments\":";
+                const json::Value* in = blk.find("input");
+                json::append_escaped_string(out, (in && !in->sv.empty()) ? in->sv : std::string_view{"{}"});
+                out += "}}";
+            }
+            out += ']';
+            return first ? std::string{} : out;
+        }
+    } // namespace
+
     // ── Anthropic Messages ──────────────────────────────────────────────────
 
     std::string openai_to_anthropic_request(std::string_view openai_body)
@@ -47,6 +174,7 @@ namespace llmbridge::provider
         bool first = true;
         if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
         {
+            bool in_tool_results = false; // merging consecutive OpenAI tool messages
             for (const auto& m : msgs->arr)
             {
                 const std::string_view role = m.str_or("role");
@@ -58,6 +186,74 @@ namespace llmbridge::provider
                     has_system = true;
                     continue;
                 }
+
+                // OpenAI role:"tool" -> an Anthropic USER turn holding tool_result
+                // blocks. Consecutive tool messages MERGE into one turn: Anthropic
+                // rejects two user turns in a row, and a parallel tool call produces
+                // exactly that shape.
+                if (role == "tool")
+                {
+                    if (!in_tool_results)
+                    {
+                        if (!first) messages += ',';
+                        first = false;
+                        messages += R"({"role":"user","content":[)";
+                        in_tool_results = true;
+                    } // else: keep appending into the open turn
+                    else
+                    {
+                        messages += ',';
+                    }
+                    messages += R"({"type":"tool_result","tool_use_id":)";
+                    json::append_raw_string(messages, m.str_or("tool_call_id"));
+                    messages += R"(,"content":")";
+                    append_text(messages, content);
+                    messages += "\"}";
+                    continue;
+                }
+                if (in_tool_results) { messages += "]}"; in_tool_results = false; }
+
+                // An assistant turn carrying tool_calls becomes an Anthropic
+                // assistant turn whose content is an ARRAY: optional text, then one
+                // tool_use block per call.
+                const json::Value* tcs = m.find("tool_calls");
+                if (role == "assistant" && tcs && tcs->is_array() && !tcs->arr.empty())
+                {
+                    if (!first) messages += ',';
+                    first = false;
+                    messages += R"({"role":"assistant","content":[)";
+                    bool any = false;
+                    std::string text;
+                    append_text(text, content);
+                    if (!text.empty())
+                    {
+                        messages += R"({"type":"text","text":")";
+                        messages += text;
+                        messages += "\"}";
+                        any = true;
+                    }
+                    for (const auto& call : tcs->arr)
+                    {
+                        const json::Value* fn = call.find("function");
+                        if (!fn) continue;
+                        const std::string_view name = fn->str_or("name");
+                        if (name.empty()) continue; // unusable; drop rather than guess
+                        if (any) messages += ',';
+                        any = true;
+                        messages += R"({"type":"tool_use","id":)";
+                        json::append_raw_string(messages, call.str_or("id"));
+                        messages += ",\"name\":";
+                        json::append_raw_string(messages, name);
+                        // arguments (a JSON *string*) -> input (a JSON *object*).
+                        messages += ",\"input\":";
+                        const std::string args = json::unescape_string(fn->str_or("arguments"));
+                        messages += args.empty() ? "{}" : args;
+                        messages += '}';
+                    }
+                    messages += "]}";
+                    continue;
+                }
+
                 if (!first) messages += ',';
                 first = false;
                 messages += "{\"role\":";
@@ -66,6 +262,7 @@ namespace llmbridge::provider
                 append_text(messages, content);
                 messages += "\"}";
             }
+            if (in_tool_results) messages += "]}"; // close a trailing tool_result turn
         }
         messages += ']';
 
@@ -86,6 +283,23 @@ namespace llmbridge::provider
         // OpenAI `stream:true` request becomes an Anthropic SSE response.
         if (const json::Value* s = v.find("stream"); s && s->type == json::Value::Type::Bool && s->boolean)
             out += ",\"stream\":true";
+        // Tools. tool_choice:"none" means "do not call tools", which Anthropic
+        // expresses by there being none — so we omit the whole tools block.
+        const json::Value* tc = v.find("tool_choice");
+        const bool choice_none = tc && tc->is_string() && tc->sv == "none";
+        if (!choice_none)
+        {
+            if (const std::string tools = anthropic_tools(v.find("tools")); !tools.empty())
+            {
+                out += ",\"tools\":";
+                out += tools;
+                if (const std::string ch = anthropic_tool_choice(tc); !ch.empty())
+                {
+                    out += ",\"tool_choice\":";
+                    out += ch;
+                }
+            }
+        }
         out += ",\"messages\":";
         out += messages;
         out += "}";
@@ -113,12 +327,27 @@ namespace llmbridge::provider
         json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
         out += ",\"object\":\"chat.completion\",\"created\":" + detail::created_now() + ",\"model\":";
         json::append_raw_string(out, v.str_or("model"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
         // content: array of blocks; emit the text of text-blocks verbatim.
-        if (const json::Value* c = v.find("content"); c && c->is_array())
-            for (const auto& blk : c->arr)
-                if (blk.str_or("type") == "text") out += blk.str_or("text");
-        out += "\"},\"finish_reason\":\"";
+        const json::Value* c = v.find("content");
+        const std::string tool_calls = openai_tool_calls(c);
+        {
+            std::string text;
+            if (c && c->is_array())
+                for (const auto& blk : c->arr)
+                    if (blk.str_or("type") == "text") text += blk.str_or("text");
+            // OpenAI sets content to NULL (not "") on a pure tool call. SDKs branch
+            // on that, so emitting "" would look like an empty answer instead of a
+            // call.
+            if (text.empty() && !tool_calls.empty()) out += "null";
+            else { out += '"'; out += text; out += '"'; }
+        }
+        if (!tool_calls.empty())
+        {
+            out += ",\"tool_calls\":";
+            out += tool_calls;
+        }
+        out += "},\"finish_reason\":\"";
         out += finish;
         out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +

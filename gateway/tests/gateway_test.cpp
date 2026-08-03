@@ -2669,3 +2669,164 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyTiming,
                              return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
                          });
 
+// ── Tool calling through the gateway ────────────────────────────────────────
+// The translator tests prove the shapes. These prove the shapes SURVIVE the
+// gateway: framing, the rebuilt upstream request, auth-header injection, and both
+// event-loop backends. A tool schema is the largest and most escape-heavy thing a
+// client ever sends, so it is also a good stress on the request path.
+class ProxyTools : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+namespace
+{
+    std::string tool_request(const std::string& extra_hdrs = "")
+    {
+        const std::string body =
+            R"({"model":"claude","max_tokens":64,)"
+            R"("messages":[{"role":"user","content":"weather in Paris?"}],)"
+            R"("tools":[{"type":"function","function":{"name":"get_weather",)"
+            R"("description":"Get weather","parameters":{"type":"object",)"
+            R"("properties":{"city":{"type":"string"}},"required":["city"]}}}],)"
+            R"("tool_choice":"auto"})";
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + extra_hdrs +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
+    // Anthropic answering with a tool_use block.
+    std::string anthropic_tool_use_body()
+    {
+        return R"({"id":"msg_1","model":"claude","stop_reason":"tool_use","content":[)"
+               R"({"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Paris"}}],)"
+               R"("usage":{"input_tokens":10,"output_tokens":5}})";
+    }
+} // namespace
+
+TEST_P(ProxyTools, ToolCallRoundTripsThroughTheGateway)
+{
+    _backend.set_response(http_ok(anthropic_tool_use_body()));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(tool_request()));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    const std::string b = body_of(r);
+    EXPECT_NE(b.find(R"("finish_reason":"tool_calls")"), std::string::npos) << b;
+    EXPECT_NE(b.find(R"("id":"toolu_1")"), std::string::npos) << b;
+    EXPECT_NE(b.find(R"("name":"get_weather")"), std::string::npos) << b;
+    EXPECT_NE(b.find(R"("content":null)"), std::string::npos) << b;
+}
+
+TEST_P(ProxyTools, UpstreamReceivesAnthropicToolShape)
+{
+    _backend.set_response(http_ok(anthropic_tool_use_body()));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(tool_request()));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find(R"("input_schema")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("tool_choice":{"type":"auto"})"), std::string::npos) << up;
+    EXPECT_EQ(up.find(R"("parameters")"), std::string::npos) << "OpenAI key leaked upstream";
+    // The schema itself must arrive byte-for-byte.
+    EXPECT_NE(up.find(R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})"),
+              std::string::npos) << up;
+}
+
+TEST_P(ProxyTools, ToolsAndAuthHeadersCoexist)
+{
+    // Both features rebuild the upstream request. This is the test that would catch
+    // one clobbering the other.
+    _backend.set_response(http_ok(anthropic_tool_use_body()));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(tool_request("Authorization: Bearer sk-tools-1\r\n")));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-tools-1\r\n"), std::string::npos) << up;
+    EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("input_schema")"), std::string::npos) << up;
+    EXPECT_NE(up.find("Host: 127.0.0.1:"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+}
+
+TEST_P(ProxyTools, ToolResultTurnForwardsCorrectly)
+{
+    // The second half of an agent loop: the client returns the tool result.
+    _backend.set_response(http_ok(anthropic_resp_body("18C in Paris")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    const std::string body =
+        R"({"model":"claude","max_tokens":64,"messages":[)"
+        R"({"role":"user","content":"weather?"},)"
+        R"({"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function",)"
+        R"("function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},)"
+        R"({"role":"tool","tool_call_id":"t1","content":"18C"}]})";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string r = c.recv_response();
+    ASSERT_EQ(Client::status_of(r), 200) << r;
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find(R"("type":"tool_use")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("type":"tool_result")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("tool_use_id":"t1")"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("input":{"city":"Paris"})"), std::string::npos)
+        << "arguments string did not become an object upstream:\n" << up;
+}
+
+TEST_P(ProxyTools, StreamingRequestWithToolsStillStreams)
+{
+    // Tools in a STREAMING request must not break the SSE path. (Tool-call DELTAS
+    // are not implemented yet — this asserts the stream still works when tools are
+    // merely declared, which is the case that would silently regress.)
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    const std::string body =
+        R"({"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}],)"
+        R"("tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]})";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string all = c.recv_all();
+    EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 300);
+    EXPECT_NE(all.find("[DONE]"), std::string::npos);
+    // and the upstream still saw both the stream flag and the tools
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find(R"("stream":true)"), std::string::npos) << up;
+    EXPECT_NE(up.find(R"("input_schema")"), std::string::npos) << up;
+}
+
+TEST_P(ProxyTools, LargeSchemaSurvivesFraming)
+{
+    // A big schema exercises the request path's buffering; it must arrive intact.
+    std::string props;
+    for (int i = 0; i < 60; ++i)
+    {
+        if (i) props += ',';
+        props += "\"field_" + std::to_string(i) + "\":{\"type\":\"string\",\"description\":\"d" +
+                 std::to_string(i) + "\"}";
+    }
+    const std::string schema = "{\"type\":\"object\",\"properties\":{" + props + "}}";
+    const std::string body =
+        R"({"model":"claude","max_tokens":8,"messages":[{"role":"user","content":"hi"}],)"
+        R"("tools":[{"type":"function","function":{"name":"big","parameters":)" + schema + "}}]}";
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    EXPECT_NE(_backend.last_request().find(schema), std::string::npos)
+        << "large schema was altered in transit";
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyTools,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });

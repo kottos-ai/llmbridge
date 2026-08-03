@@ -14,10 +14,18 @@
 // framework, no external dependencies — just net (sockets + HTTP framing) and
 // provider (dialect translation).
 //
-// Per-request added latency (the headline metric) is four wall-clock stamps:
-//   added = (upstream_request_sent - client_request_received)
-//         + (client_response_sent  - upstream_response_received)
-// i.e. request-path + response-path work, with the upstream wait excluded.
+// Per-request added latency (the headline metric) is FOUR stamps giving three
+// intervals, of which only two are ours:
+//
+//   added = (upstream_request_BUILT - client_request_received)   request path
+//         + (client_response_sent   - upstream_response_recvd)   response path
+//
+// Excluded on purpose: the upstream's own time, and the TCP connect + TLS
+// handshake between "request built" and "bytes on the wire" (recorded separately
+// as Stats::connect). An earlier version folded connect into the request path,
+// which was harmless against a warm pooled mock and badly wrong against a cold
+// real provider — a live single-request run reported 52.66 ms of "request path"
+// that was 99.9% handshake.
 
 #include <netinet/in.h>
 
@@ -112,6 +120,14 @@ namespace llmbridge
         // inside what was labelled "gateway overhead", against 47-63 us once the
         // connection was pooled. Reporting those as one number is indefensible.
         int64_t ts_req_built = 0;
+        // When the upstream socket was READY to carry the request: equal to
+        // ts_req_built for a pooled connection, later by the TCP+TLS handshake for a
+        // fresh one. Splitting here matters because ts_req_built -> ts_up_sent is
+        // NOT one thing: on a pooled conn it is purely the write() syscall (measured
+        // 4.4 us p50), which IS our cost, while on a cold conn it is dominated by a
+        // ~50 ms handshake, which is not. Folding them together either inflates the
+        // added-latency claim or flatters it, depending which case you sample.
+        int64_t ts_wire_ready = 0;
         int64_t ts_up_sent = 0;
         int64_t ts_up_recvd = 0;
         // Last time this request saw ANY upstream progress (request forwarded, or
@@ -171,8 +187,15 @@ namespace llmbridge
 
     struct Stats
     {
-        Histogram overhead;  // total proxy-added latency per request
-        Histogram req_path;  // client-recv -> upstream-sent
+        // The four stamps (see append_timing_headers) split three ways. Keeping
+        // `connect` OUT of req_path and overhead is the whole point: a cold TCP+TLS
+        // handshake is 50 ms and would otherwise sit inside a metric that claims to
+        // measure OUR work and is sized for microseconds. Measured live: a single
+        // cold request reported req-path p50 = 52.66 ms **[overflow!]**, of which
+        // ~52.6 ms was the handshake and ~60 us was the gateway.
+        Histogram overhead;  // req_path + resp_path — everything the gateway does
+        Histogram req_path;  // framing/translate/auth PLUS the write() to the upstream
+        Histogram connect;   // TCP + TLS handshake only; exactly 0 on a pooled conn
         Histogram resp_path; // upstream-recv -> client-sent
         uint64_t requests = 0;
         uint64_t errors = 0;

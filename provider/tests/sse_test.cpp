@@ -637,3 +637,78 @@ TEST(SseReconstruction, DetectsContentMismatch)
     const std::string b = reassemble(translate_whole(anthropic_stream("m", "x", {"different"}, "end_turn"))).content;
     EXPECT_NE(a, b);
 }
+
+// ── Streamed tool calls: fail, never fake ───────────────────────────────────
+// The translator cannot yet render Anthropic tool_use / input_json_delta as
+// OpenAI tool_calls deltas. The one thing it must NOT do is drop the call and
+// still report finish_reason:"tool_calls" — that hands an agent loop a tool call
+// it never received, which is worse than an error because it looks valid.
+
+TEST(SseTools, StreamedToolCallAbortsInsteadOfClaimingAToolCall)
+{
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    const bool ok = t.feed(
+        "event: message_start\n"
+        R"(data: {"type":"message_start","message":{"id":"m1","model":"c"}})" "\n\n"
+        "event: content_block_start\n"
+        R"(data: {"type":"content_block_start","index":0,"content_block":)"
+        R"({"type":"tool_use","id":"t1","name":"f","input":{}}})" "\n\n"
+        "event: message_delta\n"
+        R"(data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}})" "\n\n",
+        out);
+    EXPECT_FALSE(ok) << "a stream we cannot render faithfully must fail";
+    t.finish(out);
+    EXPECT_EQ(out.find(R"("finish_reason":"tool_calls")"), std::string::npos)
+        << "claimed a tool call it never delivered:\n" << out;
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos)
+        << "an aborted stream must not end cleanly";
+}
+
+TEST(SseTools, ArgumentFragmentsAlsoAbort)
+{
+    // Detected via input_json_delta even if content_block_start were missed.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    EXPECT_FALSE(t.feed(
+        "event: content_block_delta\n"
+        R"(data: {"type":"content_block_delta","index":0,"delta":)"
+        R"({"type":"input_json_delta","partial_json":"{\"city\":"}})" "\n\n",
+        out));
+}
+
+TEST(SseTools, FailureIsStickyLikeACappedStream)
+{
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    EXPECT_FALSE(t.feed(
+        "event: content_block_start\n"
+        R"(data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"f"}})"
+        "\n\n", out));
+    // Later well-formed text must not resurrect the stream.
+    EXPECT_FALSE(t.feed(
+        "event: content_block_delta\n"
+        R"(data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})"
+        "\n\n", out));
+    EXPECT_EQ(out.find("hi"), std::string::npos);
+}
+
+TEST(SseTools, PlainTextStreamsAreUnaffected)
+{
+    // The guard must not cost the normal path anything.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    EXPECT_TRUE(t.feed(
+        "event: message_start\n"
+        R"(data: {"type":"message_start","message":{"id":"m1","model":"c"}})" "\n\n"
+        "event: content_block_delta\n"
+        R"(data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})" "\n\n"
+        "event: message_delta\n"
+        R"(data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}})" "\n\n"
+        "event: message_stop\n"
+        R"(data: {"type":"message_stop"})" "\n\n",
+        out));
+    EXPECT_NE(out.find(R"("content":"hi")"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
+    EXPECT_NE(out.find("[DONE]"), std::string::npos) << out;
+}

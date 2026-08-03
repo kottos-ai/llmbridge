@@ -71,6 +71,7 @@ namespace llmbridge::provider
         void ensure_created();                               // stamp _created once
         void emit_head(std::string& out);                    // up to `"delta":{`
         void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
+        bool fail_tool_unsupported() noexcept;                // abort: streamed tool call
         void emit_usage(std::string& out);                    // the final usage-only chunk
         void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
@@ -78,6 +79,13 @@ namespace llmbridge::provider
         std::string _cur_data;  // concatenated `data:` lines of the in-progress event
         bool _have_data = false;
         bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
+        // Set when the upstream streams a TOOL CALL, which this translator cannot
+        // yet render as OpenAI tool_calls deltas. It fails the stream rather than
+        // dropping the call, because dropping it while still reporting
+        // finish_reason:"tool_calls" hands the client a call it never received —
+        // a response that looks valid and is not. An aborted stream (no [DONE]) is
+        // the same signal this translator already uses for a corrupt body.
+        bool _tool_unsupported = false;
 
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
