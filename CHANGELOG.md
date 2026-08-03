@@ -9,9 +9,61 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Next up: **tool-call streaming deltas** (0.7.0 makes a streamed tool call fail
-cleanly; rendering it is the remaining work), then **Anthropic-in mode** and
-Gemini / Cohere streaming.
+Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting an
+OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
+`cache_control`.
+
+## [0.8.0] — 2026-08-03
+
+Streamed tool calls. A `"stream": true` request whose model calls a tool now produces
+proper OpenAI `tool_calls` deltas, so an agent loop works over SSE. This **supersedes
+the guard added in 0.7.0**, which aborted such streams rather than mis-reporting them.
+
+Verified against the live Anthropic API: two parallel calls arrived as fragments
+(`{"city": "P` / `ar` / `is"}`) and reassembled client-side into valid JSON, with
+`finish_reason: "tool_calls"` and a clean `[DONE]`.
+
+### Added
+
+- **`content_block_start` → the opening `tool_calls` delta**, carrying `index`, `id`,
+  `type:"function"` and `function.name` with an empty `arguments` — the chunk an
+  OpenAI client keys off to begin a new call. The role chunk is emitted first even
+  when a stream opens straight into a tool call with no text.
+- **`input_json_delta` → `arguments` fragments** under the same index, which the
+  client concatenates.
+
+### The index mapping (the part that is easy to get wrong)
+
+Anthropic indexes **every content block**, text included; OpenAI's
+`tool_calls[].index` counts **only tool calls**. The two diverge the moment text
+precedes a call — Anthropic blocks 1 and 2 must become OpenAI ordinals 0 and 1.
+Forwarding Anthropic's index directly would emit `tool_calls[1]` with no `[0]`, which
+breaks reassembly in every SDK. A dedicated test (`BlockIndexIsNotTheToolOrdinal`)
+pins this.
+
+The map is a bounded vector (256 blocks) holding `-1` for non-tool blocks, so a
+hostile index cannot make the translator allocate.
+
+### Arguments forward as raw spans
+
+Anthropic's `partial_json` and OpenAI's `arguments` are both JSON strings whose
+*contents* are JSON text, escaped identically — so fragments pass through **verbatim**
+rather than being decoded and re-encoded. A round trip through the DOM could alter a
+customer's argument bytes; the test asserts fragments reassemble byte-for-byte
+including `1.50`, which a re-serialising implementation would normalise to `1.5`.
+Control bytes are still neutralised on the way out, as for text.
+
+### Tests
+
+**8 new**, replacing 0.7.0's four guard tests: opening chunk shape and role ordering;
+fragments reassemble exactly; **block index ≠ tool ordinal**; interleaved fragments
+route to their own call without cross-contamination; `finish_reason:"tool_calls"` now
+has calls behind it — the regression this feature existed to fix; a fragment for a
+block whose `content_block_start` was never seen is **ignored rather than guessed at**
+(attaching a customer's arguments to the wrong call is worse than dropping them); an
+absurd block index does not allocate; plain text streams unaffected.
+
+Suites: **847/847** with TLS, **821/821** default.
 
 ## [0.7.0] — 2026-08-03
 
@@ -22,6 +74,9 @@ Anthropic upstream. Verified end to end against the live API: Claude called
 weather in Paris is 18°C with light rain."*
 
 ### Streaming tool calls fail cleanly (rendering them is next)
+
+> **Superseded by 0.8.0**, which renders streamed tool calls properly. The guard
+> below describes 0.7.0 only; tool calls no longer require a non-streaming request.
 
 Tool calls require a **non-streaming** request. Rendering Anthropic's streamed
 `tool_use` / `input_json_delta` as OpenAI `tool_calls` deltas is the next change.
