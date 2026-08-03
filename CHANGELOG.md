@@ -9,8 +9,169 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ## [Unreleased]
 
-Next up: tool-call streaming, **Anthropic-in mode** (clients that speak the Anthropic
-API, fronting an OpenAI-compatible upstream), and Gemini / Cohere streaming.
+Next up: **tool-call streaming deltas** (0.7.0 makes a streamed tool call fail
+cleanly; rendering it is the remaining work), then **Anthropic-in mode** and
+Gemini / Cohere streaming.
+
+## [0.7.0] — 2026-08-03
+
+Tool calling, non-streaming. An OpenAI-dialect client can declare tools, receive a
+tool call, execute it and return the result — the full agent loop — against an
+Anthropic upstream. Verified end to end against the live API: Claude called
+`get_weather` twice in parallel and, given the results, answered *"The current
+weather in Paris is 18°C with light rain."*
+
+### Streaming tool calls fail cleanly (rendering them is next)
+
+Tool calls require a **non-streaming** request. Rendering Anthropic's streamed
+`tool_use` / `input_json_delta` as OpenAI `tool_calls` deltas is the next change.
+
+Until then a streamed tool call **aborts the stream** — no `[DONE]`, the same signal
+this translator already uses for a corrupt body — rather than completing with a
+misleading result.
+
+That guard is the point. Before it, the SSE path handled `text_delta` only, so the
+`tool_use` block and its argument fragments were **silently dropped while
+`stop_reason: tool_use` still mapped through to `finish_reason: "tool_calls"`**. The
+client was told *"I called a tool"* and handed no `tool_calls` array: a response that
+looks valid, is not, and would send an agent loop hunting for a call it never
+received. Failing is strictly better than that, and it is what a client can actually
+detect.
+
+### Added
+
+- **Tool declarations** — OpenAI `tools[].function{name,description,parameters}` →
+  Anthropic `{name,description,input_schema}`. The schema is forwarded as a **raw
+  byte span**, never rebuilt: a customer's JSON Schema is arbitrary, and
+  re-serialising it from the DOM could change number formatting (`1.50`), escape
+  forms or key order. Tested by asserting the exact source text appears in the
+  output.
+- **`tool_choice`** — `"auto"` → `{"type":"auto"}`, `"required"` → `{"type":"any"}`,
+  `{"type":"function","function":{"name":…}}` → `{"type":"tool","name":…}`, and
+  `"none"` → the tools block is omitted entirely, which is how Anthropic expresses
+  it.
+- **The call itself** — OpenAI carries arguments as a JSON **string**, Anthropic as
+  a JSON **object**. Crossing that boundary is a real conversion in both directions,
+  which is why `json.hpp` grew `append_escaped_string()` and `unescape_string()`.
+- **Tool results** — OpenAI `role:"tool"` + `tool_call_id` → an Anthropic **user**
+  turn containing `tool_result` blocks. Consecutive tool messages merge into one
+  turn: a parallel call is semantically one turn of results. (Measured, not assumed —
+  the live API accepts consecutive same-role turns and returns 200; an earlier code
+  comment claimed otherwise and was wrong.)
+- **Responses** — `tool_use` blocks → OpenAI `tool_calls[]`, with `content` set to
+  **`null` rather than `""`** on a pure tool call, because SDKs branch on null and an
+  empty string reads as "the model answered nothing".
+- `json.hpp`: `Value::sv` now carries the **raw span for objects and arrays**
+  (brackets included), which is what makes byte-for-byte schema forwarding possible.
+- **Guard: a streamed tool call fails the stream** rather than dropping the call.
+  Detected at `content_block_start` (so it triggers even for a zero-argument tool)
+  and at `input_json_delta`, then routed through the same sticky-failure path as a
+  cap overflow. Text-only streams are untouched.
+- `Stats::connect` histogram and `Connection::ts_wire_ready` stamp — see the
+  latency-profile fix below.
+- `bench/fastbackend --tools` — a mock serving an Anthropic response with two
+  `tool_use` blocks. Without it the regression sweep reports "no change" for edits
+  that only touch the tool path; a live check had already shown 19 µs for tool
+  responses against 15 µs for plain, a difference the benchmark could not see. Body
+  selection is now an `enum` rather than two bools, so `openai+tools` — a state that
+  does not exist — is unrepresentable.
+
+### Fixed: the self-reported latency profile counted the wrong things
+
+`Stats::req_path` ran from *request framed* to *bytes on the wire*, so the **TCP
+connect and TLS handshake sat inside it** — and inside `added-total`, the profile's
+headline. Harmless against a warm pooled mock, badly wrong against a cold real
+provider: a live single-request run reported `request-path p50 = 52.66 ms
+[overflow!]`, of which ~52.6 ms was the handshake and ~60 µs was the gateway.
+
+The stamps now give three intervals instead of two:
+
+```
+ts_req_recvd ──► ts_req_built ──► ts_wire_ready ──► ts_up_sent ──► ts_up_recvd ──► sent
+   request        framing +        socket ready      request        provider's
+   framed         translate +      (handshake done   fully          first byte
+                  auth mapping      if it was cold)  written
+```
+
+- `req_path` — framing, translation, auth mapping **plus the `write()` to the
+  upstream**
+- `connect` — the TCP + TLS handshake **alone**; exactly 0 on a pooled connection
+- `added-total` — `req_path` + `resp_path`, unchanged in meaning: everything the
+  gateway does
+
+**The first attempt at this split was wrong in the flattering direction, which is
+why it is written up.** It treated the whole `ts_req_built → ts_up_sent` interval as
+"connect" and excluded it. But a pooled connection performs no handshake, so that
+4.4 µs was the `write()` syscall — unambiguously our cost. Measured under identical
+warm-pool conditions:
+
+| | before | first (wrong) cut | correct |
+|---|---|---|---|
+| `added-total` p50 | — | 8,560 ns | **12,700 ns** |
+| `request-path` p50 | 1,920 ns | 1,920 ns | **6,140 ns** |
+| `connect` p50 | 4,420 ns | 4,420 ns | **20 ns** |
+
+`connect` at 20 ns is a stamp subtraction on a pooled connection — correctly zero.
+The rule that caught it: when a number improves, ask what else changed. It had
+improved because a real cost stopped being counted.
+
+**No published figure moves.** `BENCHMARKS.md`'s added-latency numbers come from
+`loadgen`'s client-observed measurement, not this histogram; the profile is a
+diagnostic printed at shutdown. The consequence is only that the profile previously
+overstated `added-total` on cold connections and was unaffected when warm — so a
+cold-start run quoted from the profile rather than the client measurement would have
+been too high.
+
+### Robustness
+
+Malformed tool pieces are **dropped, never guessed at**: a tool with no name, a call
+with no `function`, empty or absent `arguments` (→ `{}`). A half-formed tool would
+make the provider fail in a way the client cannot read.
+
+Escaping is handled properly rather than approximately: control bytes are
+`\u`-escaped (a raw control byte in a JSON string is invalid JSON that some parsers
+accept and others reject), `\uXXXX` decodes to UTF-8 including surrogate pairs, and
+a **lone surrogate becomes U+FFFD** rather than invalid UTF-8 that would make a
+provider reject the whole body.
+
+### Tests
+
+**47 new.** Translator (24): declaration shape, byte-for-byte schema forwarding, all
+five `tool_choice` cases, arguments-string ↔ input-object, parallel calls, text+call
+in one turn, tool-result turns, consecutive-result merging, the trailing-turn close
+(a malformed-JSON regression guard), malformed pieces dropped, `content:null`, no
+`tool_calls` key on a plain answer, and a **full round trip** — Anthropic `input` →
+OpenAI `arguments` → back to Anthropic `input` — through `"say \"hi\"\nnow"`,
+`a/b\c`, `-1.5e3` and `café`.
+
+JSON layer (7): raw spans include their brackets, whitespace and `1.50` preserved,
+escape round-trip, control bytes escaped, surrogate pairs, lone surrogate → U+FFFD,
+truncated escapes do not read past the end.
+
+Streaming guard (4): a streamed tool call aborts and **never emits
+`finish_reason:"tool_calls"` or `[DONE]`**; argument fragments alone also abort; the
+failure is sticky, so later well-formed text cannot resurrect the stream; and a
+plain text stream still completes normally.
+
+Gateway, both backends (12): round trip; upstream receives `input_schema` and never
+`parameters`; **tools and auth headers coexist** (both rebuild the request, so this
+catches one clobbering the other); tool-result turns forward with `input` as an
+object; **a streaming request with tools declared still streams**; a 60-property
+schema survives framing intact.
+
+Suites: **843/843** with TLS, **817/817** default.
+
+### Performance
+
+No regression on normal traffic: interleaved, temperature-gated A/B at 20k RPS
+against the pre-tool-calling build gave **identical p99 minimum and +5 µs median**,
+with the control holding 20,000 at 120 µs p99. A cold saturation sweep reached
+**87,933 RPS** at 90k offered — the top of the canonical 84–87k band.
+
+Tool-response translation itself costs about **+4 µs** (19 µs vs 15 µs for a plain
+response), measured live. The bench-harness A/B that would confirm it needs a cold
+box: the attempt ran with the machine at its 73 °C thermal floor and produced a
+4,540 µs outlier on a *plain* run, so no number is published from it.
 
 ## [0.6.0] — 2026-08-01
 
