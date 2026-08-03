@@ -141,13 +141,14 @@ namespace llmbridge::provider
         else if (type == "content_block_delta")
         {
             const json::Value* d = v.find("delta");
-            // A tool call streams its arguments as input_json_delta fragments. We
-            // cannot yet reassemble them into OpenAI tool_calls deltas, and the one
-            // thing we must NOT do is drop them and still report
-            // finish_reason:"tool_calls" — that hands an agent loop a tool call it
-            // was never given, which is worse than an error because it looks valid.
-            // Fail the stream instead; see _tool_unsupported.
-            if (d && d->str_or("type") == "input_json_delta") { _tool_unsupported = true; return; }
+            // A tool call streams its arguments as input_json_delta fragments,
+            // addressed by the block index they belong to.
+            if (d && d->str_or("type") == "input_json_delta")
+            {
+                const int ord = tool_ordinal_for(detail::to_ll(v.num_or("index", "-1")));
+                if (ord >= 0) emit_tool_args(out, ord, d->str_or("partial_json"));
+                return; // never falls through to the text path
+            }
             if (d && d->str_or("type") == "text_delta")
             {
                 if (!_role_emitted) // defensive: no message_start seen yet
@@ -195,24 +196,67 @@ namespace llmbridge::provider
         }
         else if (type == "content_block_start")
         {
-            // The block that announces a tool call. Same reasoning as
-            // input_json_delta above: detected here so the stream fails even if the
-            // provider sends no argument fragments (a zero-argument tool).
-            if (const json::Value* b = v.find("content_block"))
-                if (b->str_or("type") == "tool_use") _tool_unsupported = true;
+            const json::Value* b = v.find("content_block");
+            if (!b || b->str_or("type") != "tool_use") return; // text block: nothing to emit
+            const long long idx = detail::to_ll(v.num_or("index", "-1"));
+            if (idx < 0 || static_cast<size_t>(idx) >= kMaxBlocks) return; // refuse to grow
+            if (static_cast<size_t>(idx) >= _block_tool_ord.size())
+                _block_tool_ord.resize(static_cast<size_t>(idx) + 1, -1);
+            const int ord = _next_tool_ord++;
+            _block_tool_ord[static_cast<size_t>(idx)] = ord;
+            if (!_role_emitted) // a stream can open with a tool call and no text
+            {
+                emit_head(out);
+                out += R"("role":"assistant")";
+                emit_tail(out, nullptr);
+                _role_emitted = true;
+            }
+            emit_tool_open(out, ord, b->str_or("id"), b->str_or("name"));
         }
         // content_block_stop / ping / unknown: ignored for the text-only slice
         // (no OpenAI-side output).
     }
 
-    // A tool call was seen: tear the stream down. Kept next to the cap-failure
-    // path so both unfaithful-stream cases behave identically.
-    bool AnthropicToOpenAiSse::fail_tool_unsupported() noexcept
+    // Anthropic block index -> OpenAI tool_calls ordinal. Returns -1 for a block
+    // that is not a tool call, or one past the cap.
+    int AnthropicToOpenAiSse::tool_ordinal_for(long long block_index)
     {
-        _failed = true;
-        _pending.clear(); _pending.shrink_to_fit();
-        _cur_data.clear(); _cur_data.shrink_to_fit();
-        return false;
+        if (block_index < 0 || static_cast<size_t>(block_index) >= kMaxBlocks) return -1;
+        const size_t i = static_cast<size_t>(block_index);
+        return i < _block_tool_ord.size() ? _block_tool_ord[i] : -1;
+    }
+
+    // The FIRST chunk of a tool call: carries id, name and an empty arguments
+    // string. OpenAI clients key off `id` being present to start a new call, then
+    // concatenate `arguments` fragments from the chunks that follow.
+    void AnthropicToOpenAiSse::emit_tool_open(std::string& out, int ord, std::string_view id,
+                                              std::string_view name)
+    {
+        emit_head(out);
+        out += R"("tool_calls":[{"index":)";
+        out += std::to_string(ord);
+        out += R"(,"id":")";
+        detail::append_sanitized(out, id); // raw span; control bytes neutralised
+        out += R"(","type":"function","function":{"name":")";
+        detail::append_sanitized(out, name);
+        out += R"(","arguments":""}}])";
+        emit_tail(out, nullptr);
+    }
+
+    // A fragment of the arguments. Anthropic's `partial_json` and OpenAI's
+    // `arguments` are BOTH JSON strings whose contents are JSON text, escaped the
+    // same way — so the raw span forwards verbatim, with no decode/re-encode round
+    // trip that could alter a customer's argument bytes.
+    void AnthropicToOpenAiSse::emit_tool_args(std::string& out, int ord, std::string_view frag)
+    {
+        if (frag.empty()) return; // nothing to say; don't emit an empty chunk
+        emit_head(out);
+        out += R"("tool_calls":[{"index":)";
+        out += std::to_string(ord);
+        out += R"(,"function":{"arguments":")";
+        detail::append_sanitized(out, frag);
+        out += R"("}}])";
+        emit_tail(out, nullptr);
     }
 
     bool AnthropicToOpenAiSse::feed(std::string_view bytes, std::string& out)
@@ -242,10 +286,6 @@ namespace llmbridge::provider
             if (line.empty()) // blank line terminates an event
             {
                 if (_have_data) dispatch(_cur_data, out);
-                // dispatch() may have found a tool block; a stream we cannot render
-                // faithfully must abort rather than finish with a misleading
-                // finish_reason.
-                if (_tool_unsupported) return fail_tool_unsupported();
                 _cur_data.clear();
                 _have_data = false;
             }

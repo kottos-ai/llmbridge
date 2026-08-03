@@ -25,10 +25,10 @@
 - ✅ OpenAI ↔ Cohere
 - ✅ OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral, …) — passthrough, no body translation needed
 - ✅ Streaming (SSE, token-by-token) — OpenAI ↔ Anthropic, incl. `stream_options.include_usage`
-- ✅ **Tool calling** — declarations, `tool_choice`, parallel calls and `tool_result` round-trip (OpenAI ↔ Anthropic, **non-streaming**)
+- ✅ **Tool calling** — declarations, `tool_choice`, parallel calls and `tool_result` round-trip, **streaming and non-streaming** (OpenAI ↔ Anthropic)
 - ✅ **TLS to the provider** (`--upstream https://…`, opt-in build) and **credential passthrough** — enough to front `api.anthropic.com` directly
 - ✅ **Per-request timing headers** (`--timing-headers`) — what the gateway cost vs what the provider cost
-- 🚧 Tool-call *streaming* deltas, vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere, Anthropic-in mode — planned
+- 🚧 Vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere, Anthropic-in mode — planned
 
 ## Benchmarks
 
@@ -203,14 +203,13 @@ token-by-token, including the final usage chunk when the request sets
 `stream_options: {"include_usage": true}`. Both event-loop backends (epoll and
 io_uring) implement it, with back-pressure and an upstream idle timeout.
 
-**Tool calling** is supported **non-streaming**, OpenAI ⇄ Anthropic: `tools`
-declarations (the JSON Schema is forwarded byte-for-byte, never rebuilt), all
+**Tool calling** is supported **streaming and non-streaming**, OpenAI ⇄ Anthropic:
+`tools` declarations (the JSON Schema is forwarded byte-for-byte, never rebuilt), all
 `tool_choice` forms, parallel calls, and the `tool_result` round-trip — OpenAI's
 `role: "tool"` messages become an Anthropic user turn with `tool_result` blocks, and
-`tool_use` blocks come back as OpenAI `tool_calls`. A **streaming** request that
-declares tools streams normally; if the model actually *calls* a tool mid-stream the
-gateway **aborts the stream** rather than dropping the call while still reporting
-`finish_reason: "tool_calls"` — rendering streamed tool deltas is the next change.
+`tool_use` blocks come back as OpenAI `tool_calls`. Over SSE, Anthropic's
+`content_block_start` / `input_json_delta` events become OpenAI `tool_calls` deltas
+that a client concatenates into the call, so an agent loop works while streaming.
 
 **TLS and credentials.** Build with `-DLLMBRIDGE_TLS=ON` (OpenSSL ≥ 3.0; off by
 default so the standard build stays dependency-free) and `--upstream https://host`
@@ -235,7 +234,7 @@ against an OpenAI-compatible upstream — is planned, and is the harder directio
 Anthropic's streaming protocol is richer, so the events must be synthesised rather than
 discarded.
 
-**Planned:** tool-call **streaming deltas**, vision / image inputs, `cache_control`,
+**Planned:** vision / image inputs, `cache_control`,
 AWS Bedrock, streaming for the Gemini / Cohere dialects, Anthropic-in mode, and
 inbound TLS. Embeddings and audio (Whisper / TTS) are out of scope for now.
 

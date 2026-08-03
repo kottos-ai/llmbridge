@@ -638,77 +638,163 @@ TEST(SseReconstruction, DetectsContentMismatch)
     EXPECT_NE(a, b);
 }
 
-// ── Streamed tool calls: fail, never fake ───────────────────────────────────
-// The translator cannot yet render Anthropic tool_use / input_json_delta as
-// OpenAI tool_calls deltas. The one thing it must NOT do is drop the call and
-// still report finish_reason:"tool_calls" — that hands an agent loop a tool call
-// it never received, which is worse than an error because it looks valid.
+// ── Streamed tool calls ─────────────────────────────────────────────────────
+// Anthropic streams a call as content_block_start (id + name) followed by
+// input_json_delta fragments; OpenAI expects one opening tool_calls delta carrying
+// id/name, then arguments fragments under the same index. The indices are NOT the
+// same number, which is what most of these tests are about.
 
-TEST(SseTools, StreamedToolCallAbortsInsteadOfClaimingAToolCall)
+namespace
+{
+    // Build an Anthropic SSE event.
+    std::string ev(const std::string& type, const std::string& data)
+    {
+        return "event: " + type + "\ndata: " + data + "\n\n";
+    }
+    std::string blk_start_tool(int idx, const std::string& id, const std::string& name)
+    {
+        return ev("content_block_start",
+                  R"({"type":"content_block_start","index":)" + std::to_string(idx) +
+                      R"(,"content_block":{"type":"tool_use","id":")" + id + R"(","name":")" +
+                      name + R"(","input":{}}})");
+    }
+    std::string blk_args(int idx, const std::string& escaped_fragment)
+    {
+        return ev("content_block_delta",
+                  R"({"type":"content_block_delta","index":)" + std::to_string(idx) +
+                      R"(,"delta":{"type":"input_json_delta","partial_json":")" +
+                      escaped_fragment + R"("}})");
+    }
+    // Concatenate every arguments fragment for a given tool_calls index, exactly as
+    // an OpenAI client would when reassembling the call.
+    std::string reassemble(const std::string& out, int ord)
+    {
+        const std::string key = R"("index":)" + std::to_string(ord);
+        std::string args;
+        size_t p = 0;
+        while ((p = out.find(R"("tool_calls":[{)" + key, p)) != std::string::npos)
+        {
+            const size_t a = out.find(R"("arguments":")", p);
+            if (a == std::string::npos) break;
+            size_t s = a + 13;
+            // Find the CLOSING quote, skipping escaped ones: the arguments value is
+            // JSON-inside-JSON, so it is full of \" and a naive find('"') stops on
+            // the first one. (That bug made this test report "{\\" as the payload.)
+            size_t e = s;
+            while (e < out.size() && out[e] != '"')
+                e += (out[e] == '\\') ? 2 : 1;
+            args += out.substr(s, e - s);
+            p = e;
+        }
+        return args;
+    }
+} // namespace
+
+TEST(SseTools, OpeningChunkCarriesIdAndNameWithEmptyArguments)
 {
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
-    const bool ok = t.feed(
-        "event: message_start\n"
-        R"(data: {"type":"message_start","message":{"id":"m1","model":"c"}})" "\n\n"
-        "event: content_block_start\n"
-        R"(data: {"type":"content_block_start","index":0,"content_block":)"
-        R"({"type":"tool_use","id":"t1","name":"f","input":{}}})" "\n\n"
-        "event: message_delta\n"
-        R"(data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}})" "\n\n",
-        out);
-    EXPECT_FALSE(ok) << "a stream we cannot render faithfully must fail";
-    t.finish(out);
-    EXPECT_EQ(out.find(R"("finish_reason":"tool_calls")"), std::string::npos)
-        << "claimed a tool call it never delivered:\n" << out;
-    EXPECT_EQ(out.find("[DONE]"), std::string::npos)
-        << "an aborted stream must not end cleanly";
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "toolu_1", "get_weather"), out));
+    EXPECT_NE(out.find(R"("tool_calls":[{"index":0,"id":"toolu_1","type":"function")"),
+              std::string::npos) << out;
+    EXPECT_NE(out.find(R"("name":"get_weather","arguments":"")"), std::string::npos) << out;
+    // A client keys off the role chunk arriving first, even when the stream opens
+    // straight into a tool call with no text.
+    EXPECT_LT(out.find(R"("role":"assistant")"), out.find("tool_calls")) << out;
 }
 
-TEST(SseTools, ArgumentFragmentsAlsoAbort)
+TEST(SseTools, ArgumentFragmentsReassembleExactly)
 {
-    // Detected via input_json_delta even if content_block_start were missed.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
-    EXPECT_FALSE(t.feed(
-        "event: content_block_delta\n"
-        R"(data: {"type":"content_block_delta","index":0,"delta":)"
-        R"({"type":"input_json_delta","partial_json":"{\"city\":"}})" "\n\n",
-        out));
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f"), out));
+    ASSERT_TRUE(t.feed(blk_args(0, R"({\"city\":)"), out));
+    ASSERT_TRUE(t.feed(blk_args(0, R"(\"Paris\",\"n\":1.50})"), out));
+    // The fragments must concatenate to the original JSON, byte for byte —
+    // including the 1.50 a re-serialising implementation would normalise to 1.5.
+    EXPECT_EQ(reassemble(out, 0), R"({\"city\":\"Paris\",\"n\":1.50})");
 }
 
-TEST(SseTools, FailureIsStickyLikeACappedStream)
+TEST(SseTools, BlockIndexIsNotTheToolOrdinal)
 {
+    // THE bug this mapping exists to prevent: Anthropic indexes every content
+    // block, so a leading TEXT block pushes tool blocks to 1,2 — while OpenAI's
+    // tool_calls index must still start at 0. Emitting tool_calls[1] with no [0]
+    // breaks client-side reassembly.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
-    EXPECT_FALSE(t.feed(
-        "event: content_block_start\n"
-        R"(data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"f"}})"
-        "\n\n", out));
-    // Later well-formed text must not resurrect the stream.
-    EXPECT_FALSE(t.feed(
-        "event: content_block_delta\n"
-        R"(data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})"
-        "\n\n", out));
-    EXPECT_EQ(out.find("hi"), std::string::npos);
+    ASSERT_TRUE(t.feed(ev("content_block_start",
+                          R"({"type":"content_block_start","index":0,)"
+                          R"("content_block":{"type":"text","text":""}})"), out));
+    ASSERT_TRUE(t.feed(ev("content_block_delta",
+                          R"({"type":"content_block_delta","index":0,)"
+                          R"("delta":{"type":"text_delta","text":"hi"}})"), out));
+    ASSERT_TRUE(t.feed(blk_start_tool(1, "A", "fa"), out));
+    ASSERT_TRUE(t.feed(blk_start_tool(2, "B", "fb"), out));
+    EXPECT_NE(out.find(R"({"index":0,"id":"A")"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"({"index":1,"id":"B")"), std::string::npos) << out;
+    EXPECT_EQ(out.find(R"({"index":2,)"), std::string::npos)
+        << "leaked Anthropic's block index into tool_calls:\n" << out;
+}
+
+TEST(SseTools, FragmentsRouteToTheirOwnCall)
+{
+    // Interleaved fragments for two open calls must not cross-contaminate.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "A", "fa"), out));
+    ASSERT_TRUE(t.feed(blk_start_tool(1, "B", "fb"), out));
+    ASSERT_TRUE(t.feed(blk_args(0, "aa"), out));
+    ASSERT_TRUE(t.feed(blk_args(1, "bb"), out));
+    ASSERT_TRUE(t.feed(blk_args(0, "cc"), out));
+    EXPECT_EQ(reassemble(out, 0), "aacc");
+    EXPECT_EQ(reassemble(out, 1), "bb");
+}
+
+TEST(SseTools, FinishReasonToolCallsNowHasCallsBehindIt)
+{
+    // The regression this whole feature had to fix: reporting tool_calls with no
+    // tool_calls array. Now the claim must be backed.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f") + blk_args(0, "{}") +
+                       ev("message_delta", R"({"type":"message_delta","delta":{"stop_reason":"tool_use"}})") +
+                       ev("message_stop", R"({"type":"message_stop"})"), out));
+    EXPECT_NE(out.find(R"("finish_reason":"tool_calls")"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("tool_calls":[{"index":0,"id":"t1")"), std::string::npos) << out;
+    EXPECT_NE(out.find("[DONE]"), std::string::npos) << "a complete stream must end cleanly";
+}
+
+TEST(SseTools, FragmentForAnUnknownBlockIsIgnored)
+{
+    // A fragment whose content_block_start we never saw has no ordinal. Guessing
+    // one would attach a customer's arguments to the wrong call.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    EXPECT_TRUE(t.feed(blk_args(7, "orphan"), out));
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+}
+
+TEST(SseTools, AbsurdBlockIndexDoesNotAllocate)
+{
+    // A hostile index must not make us size a vector to it.
+    llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
+    std::string out;
+    EXPECT_TRUE(t.feed(blk_start_tool(100000000, "x", "f"), out));
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
 }
 
 TEST(SseTools, PlainTextStreamsAreUnaffected)
 {
-    // The guard must not cost the normal path anything.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
-    EXPECT_TRUE(t.feed(
-        "event: message_start\n"
-        R"(data: {"type":"message_start","message":{"id":"m1","model":"c"}})" "\n\n"
-        "event: content_block_delta\n"
-        R"(data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})" "\n\n"
-        "event: message_delta\n"
-        R"(data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}})" "\n\n"
-        "event: message_stop\n"
-        R"(data: {"type":"message_stop"})" "\n\n",
-        out));
+    ASSERT_TRUE(t.feed(
+        ev("message_start", R"({"type":"message_start","message":{"id":"m1","model":"c"}})") +
+        ev("content_block_delta",
+           R"({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})") +
+        ev("message_delta", R"({"type":"message_delta","delta":{"stop_reason":"end_turn"}})") +
+        ev("message_stop", R"({"type":"message_stop"})"), out));
     EXPECT_NE(out.find(R"("content":"hi")"), std::string::npos) << out;
     EXPECT_NE(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
-    EXPECT_NE(out.find("[DONE]"), std::string::npos) << out;
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
 }
