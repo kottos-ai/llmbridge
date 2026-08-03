@@ -25,7 +25,10 @@
 - ✅ OpenAI ↔ Cohere
 - ✅ OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral, …) — passthrough, no body translation needed
 - ✅ Streaming (SSE, token-by-token) — OpenAI ↔ Anthropic, incl. `stream_options.include_usage`
-- 🚧 Tool calling, vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere — planned (Phase B)
+- ✅ **Tool calling** — declarations, `tool_choice`, parallel calls and `tool_result` round-trip (OpenAI ↔ Anthropic, **non-streaming**)
+- ✅ **TLS to the provider** (`--upstream https://…`, opt-in build) and **credential passthrough** — enough to front `api.anthropic.com` directly
+- ✅ **Per-request timing headers** (`--timing-headers`) — what the gateway cost vs what the provider cost
+- 🚧 Tool-call *streaming* deltas, vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere, Anthropic-in mode — planned
 
 ## Benchmarks
 
@@ -108,7 +111,10 @@ BACKENDS=4 ./bench/saturate.sh 5 2 90000 130000                 # throughput cei
 
 `BACKENDS=4` is not optional: at the default of 1 the *mock backend* is the ceiling
 (~65k), not the gateway. Full methodology and fairness controls in
-[BENCHMARKS.md](./BENCHMARKS.md). Caveats: localhost mock (no TLS/WAN yet), single worker/thread each, dev-box co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
+[BENCHMARKS.md](./BENCHMARKS.md). Caveats: the benchmark runs against a **localhost mock over plain HTTP** — TLS and
+WAN latency are deliberately excluded so the figure isolates gateway overhead (the
+gateway itself *does* support TLS upstreams); single worker/thread each; dev-box
+co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
 ## Quick start
 
@@ -149,12 +155,25 @@ llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
 Clients POST OpenAI-shaped requests to `:8088`; `llmbridge` translates to the upstream
 dialect and back.
 
-> **What it talks to today.** The proxy translates and forwards to whatever you set
-> as `--upstream` — a mock, a local model server, or a gateway that already terminates
-> TLS and adds provider credentials (that's how the [benchmarks](#benchmarks) run).
-> Calling a hosted endpoint like `api.anthropic.com` *directly* needs outbound TLS plus
-> per-provider auth and routing, which are on the roadmap; until then, put it behind
-> your existing auth/TLS layer.
+**Against a real provider**, build with TLS and point it at the hosted endpoint:
+
+```sh
+cmake -B build -DLLMBRIDGE_TLS=ON        # OpenSSL ≥ 3.0; OFF by default so the
+cmake --build build -j                   # default build stays dependency-free
+
+llmbridge --upstream https://api.anthropic.com --translate anthropic --listen 8088
+```
+
+Your client keeps sending its own key as `Authorization: Bearer …`; the gateway maps it
+to the dialect the provider expects (`x-api-key` for Anthropic, `x-goog-api-key` for
+Gemini) and forwards **only** that — no other client header crosses into the rebuilt
+upstream request. Certificate and hostname verification are always on and cannot be
+disabled.
+
+> **Where the credential travels.** Client → gateway is **plain HTTP** (there is no
+> inbound TLS yet), so run `llmbridge` as a **loopback sidecar** next to your app. A
+> non-loopback plaintext upstream prints a startup warning, because a forwarded key
+> would cross the network in the clear.
 
 <!--
 ### Language bindings (planned)
@@ -184,6 +203,29 @@ token-by-token, including the final usage chunk when the request sets
 `stream_options: {"include_usage": true}`. Both event-loop backends (epoll and
 io_uring) implement it, with back-pressure and an upstream idle timeout.
 
+**Tool calling** is supported **non-streaming**, OpenAI ⇄ Anthropic: `tools`
+declarations (the JSON Schema is forwarded byte-for-byte, never rebuilt), all
+`tool_choice` forms, parallel calls, and the `tool_result` round-trip — OpenAI's
+`role: "tool"` messages become an Anthropic user turn with `tool_result` blocks, and
+`tool_use` blocks come back as OpenAI `tool_calls`. A **streaming** request that
+declares tools streams normally; if the model actually *calls* a tool mid-stream the
+gateway **aborts the stream** rather than dropping the call while still reporting
+`finish_reason: "tool_calls"` — rendering streamed tool deltas is the next change.
+
+**TLS and credentials.** Build with `-DLLMBRIDGE_TLS=ON` (OpenSSL ≥ 3.0; off by
+default so the standard build stays dependency-free) and `--upstream https://host`
+connects to a real provider with certificate *and* hostname verification, which cannot
+be disabled. The client's own key is mapped across the dialect boundary
+(`Authorization: Bearer` → `x-api-key` / `x-goog-api-key`) and forwarded on a strict
+whitelist — no other client header enters the rebuilt upstream request. Credentials are
+never logged, never placed in an error body, and pooled connection buffers are scrubbed
+on release. Client → gateway is **plaintext**, so deploy as a loopback sidecar.
+
+**Observability.** `--timing-headers` (opt-in) adds `x-llmbridge-*` response headers
+splitting a request into gateway compute, TCP+TLS connect, and provider time, plus an
+orderable arrival timestamp, a monotonic sequence number, and the provider's own token
+counts. Metadata only — no prompt or completion text.
+
 **Direction.** Today `llmbridge` runs in **OpenAI-in** mode: your code speaks the
 OpenAI API and the gateway fronts a provider. (Each request is translated in both
 directions — OpenAI → provider on the way out, provider → OpenAI on the way back — so
@@ -193,10 +235,9 @@ against an OpenAI-compatible upstream — is planned, and is the harder directio
 Anthropic's streaming protocol is richer, so the events must be synthesised rather than
 discarded.
 
-**Planned (Phase B):** tool calling (incl. streaming deltas), `tool_result`
-reconciliation, vision / image inputs, `cache_control`, AWS Bedrock, streaming for the
-Gemini / Cohere dialects, and Anthropic-in mode. Embeddings and audio (Whisper / TTS)
-are out of scope for now.
+**Planned:** tool-call **streaming deltas**, vision / image inputs, `cache_control`,
+AWS Bedrock, streaming for the Gemini / Cohere dialects, Anthropic-in mode, and
+inbound TLS. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
 ## Installation
 
