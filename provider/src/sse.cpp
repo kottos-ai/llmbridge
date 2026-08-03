@@ -141,6 +141,13 @@ namespace llmbridge::provider
         else if (type == "content_block_delta")
         {
             const json::Value* d = v.find("delta");
+            // A tool call streams its arguments as input_json_delta fragments. We
+            // cannot yet reassemble them into OpenAI tool_calls deltas, and the one
+            // thing we must NOT do is drop them and still report
+            // finish_reason:"tool_calls" — that hands an agent loop a tool call it
+            // was never given, which is worse than an error because it looks valid.
+            // Fail the stream instead; see _tool_unsupported.
+            if (d && d->str_or("type") == "input_json_delta") { _tool_unsupported = true; return; }
             if (d && d->str_or("type") == "text_delta")
             {
                 if (!_role_emitted) // defensive: no message_start seen yet
@@ -186,8 +193,26 @@ namespace llmbridge::provider
             }
             emit_done(out);
         }
-        // content_block_start / content_block_stop / ping / unknown: ignored for
-        // the text-only slice (no OpenAI-side output).
+        else if (type == "content_block_start")
+        {
+            // The block that announces a tool call. Same reasoning as
+            // input_json_delta above: detected here so the stream fails even if the
+            // provider sends no argument fragments (a zero-argument tool).
+            if (const json::Value* b = v.find("content_block"))
+                if (b->str_or("type") == "tool_use") _tool_unsupported = true;
+        }
+        // content_block_stop / ping / unknown: ignored for the text-only slice
+        // (no OpenAI-side output).
+    }
+
+    // A tool call was seen: tear the stream down. Kept next to the cap-failure
+    // path so both unfaithful-stream cases behave identically.
+    bool AnthropicToOpenAiSse::fail_tool_unsupported() noexcept
+    {
+        _failed = true;
+        _pending.clear(); _pending.shrink_to_fit();
+        _cur_data.clear(); _cur_data.shrink_to_fit();
+        return false;
     }
 
     bool AnthropicToOpenAiSse::feed(std::string_view bytes, std::string& out)
@@ -217,6 +242,10 @@ namespace llmbridge::provider
             if (line.empty()) // blank line terminates an event
             {
                 if (_have_data) dispatch(_cur_data, out);
+                // dispatch() may have found a tool block; a stream we cannot render
+                // faithfully must abort rather than finish with a misleading
+                // finish_reason.
+                if (_tool_unsupported) return fail_tool_unsupported();
                 _cur_data.clear();
                 _have_data = false;
             }
