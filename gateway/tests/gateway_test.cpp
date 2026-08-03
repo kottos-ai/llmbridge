@@ -1885,6 +1885,42 @@ namespace
                sse_chunk_encode(anthropic_sse_events(), chunk);
     }
 
+    // An Anthropic event stream that CALLS TOOLS: a text block first (so the
+    // Anthropic block index and the OpenAI tool ordinal diverge), then two tool
+    // blocks with fragmented arguments.
+    std::string anthropic_sse_tool_events()
+    {
+        return
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+            "{\"id\":\"msg_t\",\"model\":\"claude\",\"usage\":{\"input_tokens\":9}}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking.\"}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,"
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_A\",\"name\":\"get_weather\","
+            "\"input\":{}}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,"
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,"
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,"
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_B\",\"name\":\"get_time\","
+            "\"input\":{}}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,"
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+            "{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":14}}\n\n"
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    }
+
+    std::string sse_tool_response(size_t chunk)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(anthropic_sse_tool_events(), chunk);
+    }
+
     std::string openai_stream_request(const std::string& content)
     {
         return make_request("{\"model\":\"gpt-4o\",\"stream\":true,\"messages\":[{\"role\":\"user\","
@@ -2830,3 +2866,54 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyTools,
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
                          });
+
+// ── Streamed tool calls through the gateway ─────────────────────────────────
+// The translator tests prove the chunk shapes; these prove they survive the
+// gateway pump — chunked decode, back-pressure buffers, and both event loops.
+// Chunk sizes are varied because the tool events are LONGER than text events and
+// so more likely to straddle a chunk boundary mid-JSON.
+class ProxyToolStream
+    : public ProxyIT,
+      public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, size_t>>
+{
+};
+
+TEST_P(ProxyToolStream, ToolCallsStreamAndReassemble)
+{
+    const auto [backend, chunk] = GetParam();
+    _backend.set_response(sse_tool_response(chunk));
+    start(0, true, TranslateMode::Anthropic, backend);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string all = c.recv_all();
+
+    EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 200);
+    // Ordinals must be 0 and 1 even though Anthropic used blocks 1 and 2.
+    EXPECT_NE(all.find(R"("index":0,"id":"toolu_A")"), std::string::npos) << all;
+    EXPECT_NE(all.find(R"("index":1,"id":"toolu_B")"), std::string::npos) << all;
+    EXPECT_EQ(all.find(R"("index":2,"id":)"), std::string::npos)
+        << "Anthropic's block index leaked into tool_calls";
+    // Arguments reassemble across chunk boundaries.
+    std::string args;
+    size_t p = 0;
+    while ((p = all.find(R"("arguments":")", p)) != std::string::npos)
+    {
+        size_t s = p + 13, e = s;
+        while (e < all.size() && all[e] != '"') e += (all[e] == '\\') ? 2 : 1;
+        args += all.substr(s, e - s);
+        p = e;
+    }
+    EXPECT_NE(args.find(R"({\"city\":\"Paris\"})"), std::string::npos) << "args: " << args;
+    EXPECT_NE(all.find(R"("finish_reason":"tool_calls")"), std::string::npos) << all;
+    EXPECT_NE(all.find("[DONE]"), std::string::npos) << all;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Backends, ProxyToolStream,
+    ::testing::Combine(::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                       ::testing::Values(size_t{7}, size_t{64}, size_t{4096})),
+    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, size_t>>& i) {
+        return std::string(std::get<0>(i.param) == llmbridge::IoBackend::Epoll ? "epoll" : "uring") +
+               "_chunk" + std::to_string(std::get<1>(i.param));
+    });

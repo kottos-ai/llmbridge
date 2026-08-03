@@ -24,6 +24,7 @@
 // buffers; the gateway owns the sockets and back-pressure.
 
 #include <string>
+#include <vector>
 #include <string_view>
 
 namespace llmbridge::provider
@@ -71,7 +72,10 @@ namespace llmbridge::provider
         void ensure_created();                               // stamp _created once
         void emit_head(std::string& out);                    // up to `"delta":{`
         void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
-        bool fail_tool_unsupported() noexcept;                // abort: streamed tool call
+        void emit_tool_open(std::string& out, int ord, std::string_view id, std::string_view name);
+        void emit_tool_args(std::string& out, int ord, std::string_view frag);
+        int tool_ordinal_for(long long block_index);          // Anthropic index -> OpenAI ordinal
+        const char* default_finish() const noexcept;          // "tool_calls" once any call was emitted
         void emit_usage(std::string& out);                    // the final usage-only chunk
         void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
@@ -79,13 +83,22 @@ namespace llmbridge::provider
         std::string _cur_data;  // concatenated `data:` lines of the in-progress event
         bool _have_data = false;
         bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
-        // Set when the upstream streams a TOOL CALL, which this translator cannot
-        // yet render as OpenAI tool_calls deltas. It fails the stream rather than
-        // dropping the call, because dropping it while still reporting
-        // finish_reason:"tool_calls" hands the client a call it never received —
-        // a response that looks valid and is not. An aborted stream (no [DONE]) is
-        // the same signal this translator already uses for a corrupt body.
-        bool _tool_unsupported = false;
+        // ── Streamed tool calls ──────────────────────────────────────────────
+        // Anthropic indexes EVERY content block (text blocks included); OpenAI's
+        // tool_calls[].index counts only tool calls. The two diverge the moment a
+        // text block precedes a call, so a mapping is required — using Anthropic's
+        // index directly would emit tool_calls[1] with no tool_calls[0] and break
+        // client-side reassembly.
+        //
+        // Sparse and tiny: the vector is indexed by Anthropic block index, holds -1
+        // for "not a tool block", and is capped so a hostile index cannot make us
+        // allocate. Blocks beyond the cap are ignored rather than trusted.
+        static constexpr size_t kMaxBlocks = 256;
+        std::vector<int> _block_tool_ord;  // block index -> OpenAI ordinal, or -1
+        int _next_tool_ord = 0;
+        // A tool call was opened and the message has not reported a stop_reason.
+        // At EOF that means truncated arguments — see finish().
+        bool _tool_open = false;
 
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
