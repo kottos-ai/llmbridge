@@ -211,6 +211,7 @@ int main(int argc, char** argv)
         agg.upstream_reused += s.upstream_reused;
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
+        agg.connect.merge(s.connect);
         agg.resp_path.merge(s.resp_path);
     }
     std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile (%d worker%s) ===\n",
@@ -224,6 +225,7 @@ int main(int argc, char** argv)
                  (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries);
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
+    agg.connect.print(std::cerr, "  connect(TLS) ");
     agg.resp_path.print(std::cerr, "  response-path");
     return 0;
 }

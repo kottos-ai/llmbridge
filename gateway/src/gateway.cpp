@@ -1106,6 +1106,7 @@ namespace llmbridge
         u->peer = c;
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
+        if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
 
         // Optimistic send: if the pooled upstream is already connected (the common
         // case), write immediately and only arm EPOLLOUT if the socket buffer is
@@ -1156,6 +1157,7 @@ namespace llmbridge
                 return;
             }
             u->connected = true;
+            if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
 #ifdef LLMBRIDGE_HAVE_TLS
             if (u->tls && !u->tls->handshake_done())
                 u->tls->start_handshake(); // ClientHello lands in the write BIO
@@ -1358,9 +1360,17 @@ namespace llmbridge
             const int64_t ts_resp_sent = now_ns();
             if (ts_resp_sent - _t_start >= _warmup_ns)
             {
-                const int64_t req_ns = c->ts_up_sent - c->ts_req_recvd;
+                // req_path is OUR request-side work only; the wait for connect +
+                // TLS is its own histogram so it cannot inflate the added-latency
+                // claim. overhead = req_path + resp_path, connect excluded.
+                // Wire-ready falls back to built if a connect never happened.
+                const int64_t wire = c->ts_wire_ready ? c->ts_wire_ready : c->ts_req_built;
+                const int64_t conn_ns = wire - c->ts_req_built;              // handshake only
+                const int64_t req_ns = (c->ts_req_built - c->ts_req_recvd)   // our compute
+                                       + (c->ts_up_sent - wire);            // + the write()
                 const int64_t resp_ns = ts_resp_sent - c->ts_up_recvd;
                 if (req_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(req_ns));
+                if (conn_ns >= 0) _stats.connect.record(static_cast<uint64_t>(conn_ns));
                 if (resp_ns >= 0) _stats.resp_path.record(static_cast<uint64_t>(resp_ns));
                 if (req_ns >= 0 && resp_ns >= 0)
                     _stats.overhead.record(static_cast<uint64_t>(req_ns + resp_ns));
@@ -2107,6 +2117,7 @@ namespace llmbridge
         u->peer = c;
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
+        if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
 
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)
@@ -2132,6 +2143,7 @@ namespace llmbridge
             return;
         }
         u->connected = true;
+        if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
         u_arm_recv(u); // arm the multishot recv for this upstream's life
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
@@ -2270,9 +2282,17 @@ namespace llmbridge
             const int64_t ts = now_ns();
             if (ts - _t_start >= _warmup_ns)
             {
-                const int64_t req_ns = c->ts_up_sent - c->ts_req_recvd;
+                // req_path is OUR request-side work only; the wait for connect +
+                // TLS is its own histogram so it cannot inflate the added-latency
+                // claim. overhead = req_path + resp_path, connect excluded.
+                // Wire-ready falls back to built if a connect never happened.
+                const int64_t wire = c->ts_wire_ready ? c->ts_wire_ready : c->ts_req_built;
+                const int64_t conn_ns = wire - c->ts_req_built;              // handshake only
+                const int64_t req_ns = (c->ts_req_built - c->ts_req_recvd)   // our compute
+                                       + (c->ts_up_sent - wire);            // + the write()
                 const int64_t resp_ns = ts - c->ts_up_recvd;
                 if (req_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(req_ns));
+                if (conn_ns >= 0) _stats.connect.record(static_cast<uint64_t>(conn_ns));
                 if (resp_ns >= 0) _stats.resp_path.record(static_cast<uint64_t>(resp_ns));
                 if (req_ns >= 0 && resp_ns >= 0)
                     _stats.overhead.record(static_cast<uint64_t>(req_ns + resp_ns));
