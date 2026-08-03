@@ -500,3 +500,308 @@ TEST(RoundTrip, CohereRequestThenResponse)
     EXPECT_EQ(oai_resp.find("choices")->arr[0].find("message")->str_or("content"), "pong");
     EXPECT_EQ(oai_resp.find("usage")->num_or("total_tokens"), "6");
 }
+
+// ── Tool calling ────────────────────────────────────────────────────────────
+// The three genuine conversions (declaration shape, arguments string <-> input
+// object, tool result role) plus the failure modes. Every assertion re-parses the
+// output rather than string-matching, so a shape change cannot pass by accident.
+
+TEST(ToolReq, DeclarationBecomesAnthropicShape)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,
+      "messages":[{"role":"user","content":"hi"}],
+      "tools":[{"type":"function","function":{"name":"get_weather",
+        "description":"Get weather","parameters":{"type":"object",
+        "properties":{"city":{"type":"string"}},"required":["city"]}}}]})"));
+    const Value* tools = v.find("tools");
+    ASSERT_NE(tools, nullptr);
+    ASSERT_TRUE(tools->is_array());
+    ASSERT_EQ(tools->arr.size(), 1u);
+    EXPECT_EQ(tools->arr[0].str_or("name"), "get_weather");
+    EXPECT_EQ(tools->arr[0].str_or("description"), "Get weather");
+    // OpenAI's `parameters` becomes Anthropic's `input_schema`.
+    const Value* schema = tools->arr[0].find("input_schema");
+    ASSERT_NE(schema, nullptr);
+    EXPECT_EQ(schema->str_or("type"), "object");
+    EXPECT_EQ(v.find("tools")->arr[0].find("function"), nullptr) << "OpenAI wrapper leaked";
+}
+
+TEST(ToolReq, SchemaIsForwardedByteForByte)
+{
+    // A customer's JSON Schema is arbitrary. Rebuilding it from the DOM could change
+    // number formatting, escapes or key order, so it must pass through verbatim.
+    const std::string schema =
+        R"({"type":"object","properties":{"n":{"type":"number","default":1.50},)"
+        R"("s":{"type":"string","pattern":"^a\\/b$"},"e":{"enum":[1,"two",null]}},)"
+        R"("required":["n"],"additionalProperties":false})";
+    const std::string out = openai_to_anthropic_request(
+        R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],)"
+        R"("tools":[{"type":"function","function":{"name":"f","parameters":)" + schema + "}}]}");
+    EXPECT_NE(out.find(schema), std::string::npos)
+        << "schema was rewritten rather than forwarded:\n" << out;
+}
+
+TEST(ToolReq, ToolChoiceMapping)
+{
+    const auto choice = [](const char* tc) {
+        std::string body = R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],)"
+                           R"("tools":[{"type":"function","function":{"name":"f","parameters":{}}}])";
+        if (tc && *tc) { body += ",\"tool_choice\":"; body += tc; }
+        body += "}";
+        return openai_to_anthropic_request(body);
+    };
+    EXPECT_NE(choice(R"("auto")").find(R"("tool_choice":{"type":"auto"})"), std::string::npos);
+    EXPECT_NE(choice(R"("required")").find(R"("tool_choice":{"type":"any"})"), std::string::npos);
+    EXPECT_NE(choice(R"({"type":"function","function":{"name":"f"}})")
+                  .find(R"("tool_choice":{"type":"tool","name":"f"})"), std::string::npos);
+    // "none" means do not call tools; Anthropic expresses that by having none.
+    const std::string none = choice(R"("none")");
+    EXPECT_EQ(none.find("\"tools\""), std::string::npos) << none;
+    // Absent tool_choice: tools present, no choice emitted (provider default).
+    const std::string absent = choice("");
+    EXPECT_NE(absent.find("\"tools\""), std::string::npos);
+    EXPECT_EQ(absent.find("tool_choice"), std::string::npos);
+}
+
+TEST(ToolReq, AssistantCallBecomesToolUseWithObjectInput)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"user","content":"weather?"},
+      {"role":"assistant","content":null,"tool_calls":[
+        {"id":"call_1","type":"function","function":{"name":"get_weather",
+         "arguments":"{\"city\":\"Paris\",\"units\":\"c\"}"}}]}]})"));
+    const Value* msgs = v.find("messages");
+    ASSERT_NE(msgs, nullptr);
+    ASSERT_EQ(msgs->arr.size(), 2u);
+    const Value& asst = msgs->arr[1];
+    EXPECT_EQ(asst.str_or("role"), "assistant");
+    const Value* content = asst.find("content");
+    ASSERT_TRUE(content && content->is_array());
+    ASSERT_EQ(content->arr.size(), 1u);
+    EXPECT_EQ(content->arr[0].str_or("type"), "tool_use");
+    EXPECT_EQ(content->arr[0].str_or("id"), "call_1");
+    EXPECT_EQ(content->arr[0].str_or("name"), "get_weather");
+    // The crux: OpenAI's arguments STRING became a real object.
+    const Value* input = content->arr[0].find("input");
+    ASSERT_NE(input, nullptr);
+    ASSERT_TRUE(input->is_object()) << "arguments string was not decoded to an object";
+    EXPECT_EQ(input->str_or("city"), "Paris");
+    EXPECT_EQ(input->str_or("units"), "c");
+}
+
+TEST(ToolReq, ParallelCallsAllSurvive)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"assistant","content":null,"tool_calls":[
+        {"id":"a","type":"function","function":{"name":"f","arguments":"{\"x\":1}"}},
+        {"id":"b","type":"function","function":{"name":"g","arguments":"{\"y\":2}"}},
+        {"id":"c","type":"function","function":{"name":"h","arguments":"{}"}}]}]})"));
+    const Value* content = v.find("messages")->arr[0].find("content");
+    ASSERT_TRUE(content && content->is_array());
+    ASSERT_EQ(content->arr.size(), 3u);
+    EXPECT_EQ(content->arr[0].str_or("id"), "a");
+    EXPECT_EQ(content->arr[2].str_or("id"), "c");
+}
+
+TEST(ToolReq, TextAndCallInOneAssistantTurn)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"assistant","content":"Let me look that up.","tool_calls":[
+        {"id":"a","type":"function","function":{"name":"f","arguments":"{}"}}]}]})"));
+    const Value* content = v.find("messages")->arr[0].find("content");
+    ASSERT_TRUE(content && content->is_array());
+    ASSERT_EQ(content->arr.size(), 2u);
+    EXPECT_EQ(content->arr[0].str_or("type"), "text");
+    EXPECT_EQ(content->arr[0].str_or("text"), "Let me look that up.");
+    EXPECT_EQ(content->arr[1].str_or("type"), "tool_use");
+}
+
+TEST(ToolReq, ToolResultBecomesUserTurn)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"tool","tool_call_id":"call_1","content":"18C"}]})"));
+    const Value& m = v.find("messages")->arr[0];
+    EXPECT_EQ(m.str_or("role"), "user") << "tool results must ride a USER turn";
+    const Value* content = m.find("content");
+    ASSERT_TRUE(content && content->is_array());
+    EXPECT_EQ(content->arr[0].str_or("type"), "tool_result");
+    EXPECT_EQ(content->arr[0].str_or("tool_use_id"), "call_1");
+    EXPECT_EQ(content->arr[0].str_or("content"), "18C");
+}
+
+TEST(ToolReq, ConsecutiveToolResultsMergeIntoOneTurn)
+{
+    // A parallel tool call yields several OpenAI tool messages that are semantically
+    // ONE turn of results. (Anthropic tolerates consecutive user turns — measured —
+    // so this is about emitting the canonical shape, not about avoiding an error.)
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"tool","tool_call_id":"a","content":"1"},
+      {"role":"tool","tool_call_id":"b","content":"2"},
+      {"role":"tool","tool_call_id":"c","content":"3"},
+      {"role":"user","content":"thanks"}]})"));
+    const Value* msgs = v.find("messages");
+    ASSERT_EQ(msgs->arr.size(), 2u) << "results did not merge into a single turn";
+    EXPECT_EQ(msgs->arr[0].find("content")->arr.size(), 3u);
+    EXPECT_EQ(msgs->arr[1].str_or("content"), "thanks"); // the trailing turn is intact
+}
+
+TEST(ToolReq, ToolResultTurnIsClosedBeforeAFollowingAssistantTurn)
+{
+    // Regression guard: the open "[" of a merged tool_result turn must be closed
+    // when a non-tool message follows, or the JSON is malformed.
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"tool","tool_call_id":"a","content":"1"},
+      {"role":"assistant","content":"done"}]})"));
+    ASSERT_EQ(v.find("messages")->arr.size(), 2u);
+    EXPECT_EQ(v.find("messages")->arr[1].str_or("role"), "assistant");
+}
+
+TEST(ToolReq, MalformedToolPiecesAreDroppedNotGuessed)
+{
+    // A tool with no name, and a call with no function, are unusable. Emitting a
+    // half-formed tool would make the provider fail in a way the client cannot read.
+    const std::string out = openai_to_anthropic_request(R"({"model":"m","max_tokens":8,
+      "messages":[{"role":"assistant","content":null,"tool_calls":[
+        {"id":"x","type":"function"},
+        {"id":"y","type":"function","function":{"name":"ok","arguments":"{}"}}]}],
+      "tools":[{"type":"function","function":{"description":"no name here"}},
+               {"type":"function","function":{"name":"good","parameters":{}}}]})");
+    const Value v = P(out);
+    ASSERT_EQ(v.find("tools")->arr.size(), 1u);
+    EXPECT_EQ(v.find("tools")->arr[0].str_or("name"), "good");
+    const Value* content = v.find("messages")->arr[0].find("content");
+    ASSERT_EQ(content->arr.size(), 1u);
+    EXPECT_EQ(content->arr[0].str_or("name"), "ok");
+}
+
+TEST(ToolReq, EmptyAndAbsentArgumentsBecomeEmptyObject)
+{
+    const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
+      {"role":"assistant","content":null,"tool_calls":[
+        {"id":"a","type":"function","function":{"name":"f","arguments":""}},
+        {"id":"b","type":"function","function":{"name":"g"}}]}]})"));
+    const Value* content = v.find("messages")->arr[0].find("content");
+    ASSERT_EQ(content->arr.size(), 2u);
+    for (const auto& blk : content->arr)
+    {
+        const Value* in = blk.find("input");
+        ASSERT_NE(in, nullptr);
+        EXPECT_TRUE(in->is_object()) << "must be {}, never a bare string or null";
+        EXPECT_TRUE(in->obj.empty());
+    }
+}
+
+TEST(ToolReq, NoToolsKeyWhenNoneDeclared)
+{
+    const std::string out = openai_to_anthropic_request(
+        R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})");
+    EXPECT_EQ(out.find("\"tools\""), std::string::npos) << out;
+    EXPECT_EQ(out.find("tool_choice"), std::string::npos) << out;
+}
+
+TEST(ToolReq, EmptyToolsArrayEmitsNothing)
+{
+    const std::string out = openai_to_anthropic_request(
+        R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}],"tools":[]})");
+    EXPECT_EQ(out.find("\"tools\""), std::string::npos) << out;
+}
+
+// ── response: Anthropic -> OpenAI ───────────────────────────────────────────
+
+TEST(ToolResp, ToolUseBecomesToolCallsWithStringArguments)
+{
+    const Value v = P(anthropic_to_openai_response(R"({"id":"msg_1","model":"claude",
+      "stop_reason":"tool_use","content":[
+        {"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Paris"}}],
+      "usage":{"input_tokens":10,"output_tokens":20}})"));
+    const Value& msg = *v.find("choices")->arr[0].find("message");
+    const Value* calls = msg.find("tool_calls");
+    ASSERT_NE(calls, nullptr);
+    ASSERT_EQ(calls->arr.size(), 1u);
+    EXPECT_EQ(calls->arr[0].str_or("id"), "toolu_1");
+    EXPECT_EQ(calls->arr[0].str_or("type"), "function");
+    const Value* fn = calls->arr[0].find("function");
+    ASSERT_NE(fn, nullptr);
+    EXPECT_EQ(fn->str_or("name"), "get_weather");
+    // arguments is a STRING containing JSON — decoding it must yield the input.
+    const Value* args = fn->find("arguments");
+    ASSERT_NE(args, nullptr);
+    ASSERT_TRUE(args->is_string()) << "arguments must be a string, not an object";
+    const std::string decoded = llmbridge::json::unescape_string(args->sv);
+    EXPECT_EQ(decoded, R"({"city":"Paris"})");
+    EXPECT_EQ(v.find("choices")->arr[0].str_or("finish_reason"), "tool_calls");
+}
+
+TEST(ToolResp, ContentIsNullNotEmptyStringOnPureToolCall)
+{
+    // OpenAI SDKs branch on content === null. An empty string reads as "the model
+    // answered nothing" instead of "the model called a tool".
+    const std::string out = anthropic_to_openai_response(R"({"id":"m","model":"c",
+      "stop_reason":"tool_use","content":[{"type":"tool_use","id":"t","name":"f","input":{}}],
+      "usage":{"input_tokens":1,"output_tokens":1}})");
+    EXPECT_NE(out.find(R"("content":null)"), std::string::npos) << out;
+    EXPECT_EQ(out.find(R"("content":"")"), std::string::npos) << out;
+}
+
+TEST(ToolResp, TextAndToolCallCoexist)
+{
+    const Value v = P(anthropic_to_openai_response(R"({"id":"m","model":"c",
+      "stop_reason":"tool_use","content":[
+        {"type":"text","text":"Checking."},
+        {"type":"tool_use","id":"t1","name":"f","input":{"a":1}}],
+      "usage":{"input_tokens":1,"output_tokens":2}})"));
+    const Value& msg = *v.find("choices")->arr[0].find("message");
+    EXPECT_EQ(msg.str_or("content"), "Checking.");
+    ASSERT_NE(msg.find("tool_calls"), nullptr);
+    EXPECT_EQ(msg.find("tool_calls")->arr.size(), 1u);
+}
+
+TEST(ToolResp, NoToolCallsKeyOnAPlainAnswer)
+{
+    const std::string out = anthropic_to_openai_response(R"({"id":"m","model":"c",
+      "stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],
+      "usage":{"input_tokens":1,"output_tokens":1}})");
+    EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("content":"hello")"), std::string::npos) << out;
+}
+
+TEST(ToolResp, ParallelToolUseBlocks)
+{
+    const Value v = P(anthropic_to_openai_response(R"({"id":"m","model":"c",
+      "stop_reason":"tool_use","content":[
+        {"type":"tool_use","id":"t1","name":"f","input":{"a":1}},
+        {"type":"tool_use","id":"t2","name":"g","input":{"b":2}}],
+      "usage":{"input_tokens":1,"output_tokens":2}})"));
+    const Value* calls = v.find("choices")->arr[0].find("message")->find("tool_calls");
+    ASSERT_EQ(calls->arr.size(), 2u);
+    EXPECT_EQ(calls->arr[1].str_or("id"), "t2");
+    EXPECT_EQ(calls->arr[1].find("function")->str_or("name"), "g");
+}
+
+TEST(ToolRoundTrip, ArgumentsSurviveBothDirections)
+{
+    // The round trip that matters in an agent loop: Anthropic emits input (object),
+    // we hand the client arguments (string), the client sends it back, and it must
+    // arrive at Anthropic as the SAME object. Includes escaping hazards.
+    const std::string anth = R"({"id":"m","model":"c","stop_reason":"tool_use","content":[
+      {"type":"tool_use","id":"t1","name":"f","input":{"q":"say \"hi\"\nnow","path":"a/b\\c","n":-1.5e3,"u":"café"}}],
+      "usage":{"input_tokens":1,"output_tokens":1}})";
+    const Value resp = P(anthropic_to_openai_response(anth));
+    const Value* args =
+        resp.find("choices")->arr[0].find("message")->find("tool_calls")->arr[0].find("function")->find("arguments");
+    ASSERT_NE(args, nullptr);
+
+    // Feed those exact arguments back through the request path.
+    std::string back = R"({"model":"m","max_tokens":8,"messages":[{"role":"assistant","content":null,)"
+                       R"("tool_calls":[{"id":"t1","type":"function","function":{"name":"f","arguments":")";
+    back.append(args->sv); // still-escaped span, exactly as a client would echo it
+    back += R"("}}]}]})";
+    const Value req = P(openai_to_anthropic_request(back));
+    const Value* input = req.find("messages")->arr[0].find("content")->arr[0].find("input");
+    ASSERT_NE(input, nullptr);
+    ASSERT_TRUE(input->is_object());
+    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("q")), "say \"hi\"\nnow");
+    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("path")), "a/b\\c");
+    EXPECT_EQ(input->num_or("n"), "-1.5e3");
+    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("u")), "café");
+}
