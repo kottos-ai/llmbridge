@@ -79,9 +79,18 @@ namespace
             if (crt) X509_free(crt);
             if (key) EVP_PKEY_free(key);
         }
+        // The CA path must be unique per process AND per call. ctest runs this
+        // binary many times in parallel (-j), and a fixed name meant one process
+        // truncated the file another was mid-way through loading — surfacing as a
+        // spurious "no certificate or crl found" in whichever test lost the race.
+        // A flaky security suite is a suite people learn to ignore, so this is
+        // worth the two lines.
         std::string write_pem() const
         {
-            std::string path = std::string(::testing::TempDir()) + "llmbridge_gw_tls_ca.pem";
+            static std::atomic<unsigned> seq{0};
+            std::string path = std::string(::testing::TempDir()) + "llmbridge_gw_tls_ca_" +
+                               std::to_string(static_cast<long>(::getpid())) + "_" +
+                               std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".pem";
             FILE* f = std::fopen(path.c_str(), "wb");
             EXPECT_NE(f, nullptr);
             PEM_write_X509(f, crt);

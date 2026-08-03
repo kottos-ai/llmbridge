@@ -15,8 +15,12 @@
 //   - Error     : non-numeric / signed / empty Content-Length, oversize header,
 //                 Transfer-Encoding, conflicting duplicate CL, over-cap body.
 //   - Pipeline  : concatenated messages -> first is framed, total_len = first.
-//   - Lenient   : documented parser quirks (trailing garbage after CL, dup CL,
-//                 "closed" prefix-matching "close").
+//   - Lenient   : documented parser quirks (identical dup CL collapses, "closed"
+//                 prefix-matching "close"). NOTE: "trailing garbage after CL is
+//                 accepted" used to live here as a quirk. It was a smuggling
+//                 primitive, not a quirk — see the HttpDesync suite, which now
+//                 asserts the rejection.
+//   - HttpDesync: framing-desync regressions from the 2026-08-03 security sweep.
 //   - Incremental: byte-by-byte arrival property — every proper prefix is
 //                 NeedMore and never a false Complete/Error.
 
@@ -25,6 +29,8 @@
 #include <gtest/gtest.h>
 
 #include <cctype>
+#include <chrono>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -255,11 +261,106 @@ INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_increm
                          [](const testing::TestParamInfo<IncCase>& i) { return i.param.name; });
 
 // ── Lenient / documented quirks ─────────────────────────────────────────────
-TEST(HttpQuirk, TrailingGarbageAfterClNumberIsAccepted)
+// --- Framing-desync regressions (security sweep, 2026-08-03) ------------------
+//
+// Every case below was MEASURED against the pre-fix framer. Six of the seven had
+// the identical signature: parse() returned Complete with body_len == 0 while the
+// body sat unconsumed in the buffer. In passthrough mode the gateway then forwards
+// the header block verbatim — malformed header included — so an upstream that
+// reads the length we could not becomes a desync, and because the upstream pool is
+// SHARED, that desync crosses clients. Hence: refuse, never re-interpret.
+//
+// The first of these replaces a test that asserted the opposite ("trailing garbage
+// after the CL number is accepted"). It was written as a documented quirk; it was
+// a smuggling primitive.
+
+namespace
 {
+    // Each input carries a 5-byte body the framer must NOT silently frame as empty.
+    void expect_rejected(const std::string& raw, const char* why)
+    {
+        Message m;
+        EXPECT_EQ(parse(raw, m), ParseStatus::Error) << why;
+    }
+} // namespace
+
+TEST(HttpDesync, NonNumericContentLengthIsRejected)
+{
+    // std::from_chars stops at the first non-digit and still reports success, so
+    // "5x" parsed as 5 and "0x1b" as 0 — the latter framing a 27-byte body empty.
+    expect_rejected(build("POST", {"Content-Length: 5x"}, "hello"), "trailing garbage");
+    expect_rejected(build("POST", {"Content-Length: 0x5"}, "hello"), "hex-looking");
+    expect_rejected(build("POST", {"Content-Length: +5"}, "hello"), "leading plus");
+    expect_rejected(build("POST", {"Content-Length: "}, "hello"), "empty value");
+    expect_rejected(build("POST", {"Content-Length: 5 5"}, "hello"), "embedded space");
+}
+
+TEST(HttpDesync, WhitespaceBeforeColonIsRejected)
+{
+    // "Content-Length : 5" matches no `name:` prefix test in the framer, so the
+    // length went unseen; RFC 9112 §5.1 forbids it for exactly this reason.
+    expect_rejected(build("POST", {"Content-Length : 5"}, "hello"), "space before colon");
+    expect_rejected(build("POST", {"Content-Length\t: 5"}, "hello"), "tab before colon");
+}
+
+TEST(HttpDesync, BareCrOrLfInHeaderBlockIsRejected)
+{
+    // A parser that treats a bare CR/LF as a line terminator sees a Content-Length
+    // we never saw. Measured reaching an upstream.
+    expect_rejected(build("POST", {"X-A: 1\rContent-Length: 5"}, "hello"), "bare CR");
+    expect_rejected(build("POST", {"X-A: 1\nContent-Length: 5"}, "hello"), "bare LF");
+}
+
+TEST(HttpDesync, ObsFoldContinuationIsRejected)
+{
+    // A folded Content-Length is invisible to a prefix matcher, honoured by a
+    // folding upstream. RFC 9112 §5.2 requires rejection on receipt.
+    expect_rejected(build("POST", {"X-A: 1", " Content-Length: 5"}, "hello"), "obs-fold SP");
+    expect_rejected(build("POST", {"X-A: 1", "\tContent-Length: 5"}, "hello"), "obs-fold HTAB");
+}
+
+TEST(HttpDesync, HeaderLineWithoutColonIsRejected)
+{
+    expect_rejected(build("POST", {"NotAHeader"}, "hello"), "no colon");
+    expect_rejected(build("POST", {": novalue"}, "hello"), "empty field name");
+}
+
+TEST(HttpDesync, LegalContentLengthFormsStillAccepted)
+{
+    // The fix must not over-reject: trailing OWS is legal (RFC 9110 trims it), and
+    // a plain length obviously is. A framer that rejects these breaks real clients.
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 5x"}, "hello"), m), ParseStatus::Complete);
+    ASSERT_EQ(parse(build("POST", {"Content-Length: 5 "}, "hello"), m), ParseStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
+    ASSERT_EQ(parse(build("POST", {"Content-Length:5"}, "hello"), m), ParseStatus::Complete);
+    EXPECT_EQ(m.body_len, 5u);
+}
+
+TEST(HttpDesync, ResponseWithBothChunkedAndContentLengthIsRejected)
+{
+    // The two framings disagree about where the body ends. Whichever we pick, the
+    // other is what some intermediary picked — and a mis-framed response leaves
+    // stray bytes on the POOLED connection, i.e. in the next client's response.
+    const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    llmbridge::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::http::parse_response_head(raw, h), llmbridge::http::HeadStatus::Error);
+}
+
+TEST(HttpDesync, ResponseConflictingDuplicateContentLengthIsRejected)
+{
+    const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhello";
+    llmbridge::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::http::parse_response_head(raw, h), llmbridge::http::HeadStatus::Error);
+}
+
+TEST(HttpDesync, ResponseBareCrAndBadLengthAreRejected)
+{
+    llmbridge::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::http::parse_response_head("HTTP/1.1 200 OK\r\nX-A: 1\rContent-Length: 5\r\n\r\nhello", h),
+              llmbridge::http::HeadStatus::Error);
+    EXPECT_EQ(llmbridge::http::parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello", h),
+              llmbridge::http::HeadStatus::Error);
 }
 TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 {
@@ -357,4 +458,105 @@ TEST(FindHeader, BareCrSurvivesInsideValueSoCallersMustValidate)
     const auto v = llmbridge::http::find_header(h, "x-api-key:");
     EXPECT_NE(v.find('\r'), std::string_view::npos)
         << "if this ever passes, find_header changed and gateway validation may be stale";
+}
+
+// --- Non-streaming chunked decode: correctness + cost (security sweep) --------
+//
+// The chunked response path is re-entered on every read. It used to build a fresh
+// ChunkDecoder and re-decode from byte zero, making an N-read body cost O(N*body):
+// 8 MB took 79 ms of straight-line CPU on the single-threaded loop, which is
+// head-of-line blocking for every other client on that worker.
+
+namespace
+{
+    std::string make_chunked_response(size_t total, size_t chunk)
+    {
+        std::string s = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (size_t o = 0; o < total; o += chunk)
+        {
+            const size_t n = std::min(chunk, total - o);
+            char hdr[32];
+            std::snprintf(hdr, sizeof hdr, "%zx\r\n", n);
+            s += hdr;
+            s.append(n, 'x');
+            s += "\r\n";
+        }
+        return s + "0\r\n\r\n";
+    }
+
+    // Drive parse_response the way the gateway does: append a read, re-parse.
+    llmbridge::http::ParsedResponse drive(const std::string& wire, size_t read_size,
+                                          llmbridge::http::ResponseDecoder& st,
+                                          std::string& rbuf)
+    {
+        llmbridge::http::ParsedResponse r;
+        for (size_t off = 0; off < wire.size(); off += read_size)
+        {
+            rbuf.append(wire, off, std::min(read_size, wire.size() - off));
+            r = llmbridge::http::parse_response(rbuf, st);
+            if (r.status == llmbridge::http::RespStatus::Error) return r;
+        }
+        return r;
+    }
+} // namespace
+
+TEST(HttpChunkedResponse, IncrementalArrivalDecodesExactlyOnce)
+{
+    const size_t body = 512 * 1024;
+    const std::string wire = make_chunked_response(body, 16 * 1024);
+    llmbridge::http::ResponseDecoder st;
+    std::string rbuf;
+    const auto r = drive(wire, 64 * 1024, st, rbuf);
+
+    ASSERT_EQ(r.status, llmbridge::http::RespStatus::Complete);
+    EXPECT_EQ(r.body.size(), body);
+    EXPECT_EQ(r.body.find_first_not_of('x'), std::string::npos);
+    EXPECT_EQ(r.total_len, wire.size());
+    // Every post-header byte handed to the decoder exactly once.
+    EXPECT_EQ(st.dec.consumed(), wire.size() - r.head.header_len);
+}
+
+TEST(HttpChunkedResponse, ResetAllowsReuseOnAPooledConnection)
+{
+    // A pooled upstream serves many responses. Without reset() the second decode
+    // would resume mid-stream and mis-frame — i.e. serve one client another's bytes.
+    llmbridge::http::ResponseDecoder st;
+    for (int i = 0; i < 3; ++i)
+    {
+        const std::string wire = make_chunked_response(1024 * (i + 1), 256);
+        std::string rbuf;
+        const auto r = drive(wire, 300, st, rbuf);
+        ASSERT_EQ(r.status, llmbridge::http::RespStatus::Complete) << "iteration " << i;
+        EXPECT_EQ(r.body.size(), size_t(1024 * (i + 1)));
+        st.reset();
+    }
+}
+
+TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
+{
+    // The deterministic form of "not quadratic". A timing assertion was tried
+    // first and flaked on allocator warmth, which is exactly the kind of test
+    // people learn to ignore — so assert the invariant that actually matters:
+    // across the whole incremental arrival, the decoder's consumed count only
+    // ever moves FORWARD, and each step is bounded by the bytes that just
+    // arrived. Re-decoding from byte zero violates both.
+    const size_t body = 1024 * 1024, read_size = 64 * 1024;
+    const std::string wire = make_chunked_response(body, 16 * 1024);
+
+    llmbridge::http::ResponseDecoder st;
+    std::string rbuf;
+    size_t prev = 0, total_steps = 0;
+    for (size_t off = 0; off < wire.size(); off += read_size)
+    {
+        rbuf.append(wire, off, std::min(read_size, wire.size() - off));
+        const auto r = llmbridge::http::parse_response(rbuf, st);
+        ASSERT_NE(r.status, llmbridge::http::RespStatus::Error);
+        const size_t now = st.dec.consumed();
+        EXPECT_GE(now, prev) << "decoder went backwards — re-decoding from the start";
+        EXPECT_LE(now - prev, read_size) << "consumed more than just arrived — re-fed old bytes";
+        total_steps += now - prev;
+        prev = now;
+    }
+    // Total decode work equals the payload exactly: no byte seen twice.
+    EXPECT_EQ(total_steps, wire.size() - sizeof("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n") + 1);
 }

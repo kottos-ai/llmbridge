@@ -13,6 +13,115 @@ Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting a
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
 
+## [0.8.1] — 2026-08-03
+
+A security sweep of the public HTTP surface. **Fixes only — no new functionality**,
+hence a PATCH. No public API change: the one signature that moved
+(`http::parse_response`) lives in `net/`, which is internal to the reference gateway
+and is not among the installed headers (only `provider/` is).
+
+### Compatibility note
+
+This release **rejects requests that previous versions accepted**, deliberately.
+A request whose header block contains a bare CR or LF, an obs-fold continuation
+line, whitespace before a colon, a header line with no colon, or a non-numeric
+`Content-Length` (`0x1b`, `27abc`) now gets a `400` and is not forwarded. Each of
+those was a framing-desync primitive — see below. Well-formed HTTP/1.1 is
+unaffected, including the legal trailing whitespace in `Content-Length: 27 `.
+
+### Security — HTTP framing sweep
+
+A systematic sweep of the public request/response surface, done by probing rather
+than reading. Eight defects, seven of them in the framer and all with the same
+signature: **a malformed header became an invisible header instead of a rejection.**
+`parse()` returned `Complete` with `body_len == 0` while the body sat unconsumed.
+
+That is a request-smuggling desync. In passthrough mode (`--translate none`) the
+gateway forwards the client's header block verbatim, so an upstream that reads a
+length we could not frames a body we never sent — and because the upstream pool is
+**shared between clients**, the leftover bytes become the head of another client's
+request. Each fix refuses the message; none sanitises and forwards.
+
+Fixed in `parse()` (requests) and `parse_response_head()` (responses):
+
+- **Non-numeric `Content-Length` accepted.** `std::from_chars` stops at the first
+  non-digit and still reports success, so `0x1b` parsed as **0** and `27abc` as
+  **27**. Now `1*DIGIT` only, per RFC 9112 §8.6. Legal trailing OWS (`"27 "`) is
+  still accepted — the fix must not over-reject.
+- **Whitespace before the colon.** `Content-Length : 27` matched no `name:` prefix
+  test, so the length went unseen. RFC 9112 §5.1 forbids it for this exact reason.
+- **Bare CR / bare LF in the header block.** We split on CRLF; a parser that splits
+  on a bare CR sees headers we never saw. Measured reaching an upstream.
+- **obs-fold continuation lines** (`\r\n Content-Length: 27`) — invisible to a prefix
+  matcher, honoured by a folding upstream. RFC 9112 §5.2 requires rejection.
+- **Header lines with no colon, or an empty field name.**
+- **Responses carrying both `Content-Length` and `Transfer-Encoding: chunked`**, and
+  **conflicting duplicate `Content-Length` in a response** — neither was rejected.
+  A mis-framed *response* on a pooled connection hands one client another's bytes,
+  so response framing is now as strict as request framing.
+
+A test that asserted the first of these as a documented parser quirk
+(`TrailingGarbageAfterClNumberIsAccepted`) has been **replaced by one asserting the
+rejection**. It was a smuggling primitive, not a quirk. The new `HttpDesync` suite
+covers every case above and asserts end-to-end that a refused request reaches the
+upstream as **zero bytes** — fail closed, verified at the wire, not merely at the
+parser.
+
+### Fixed — quadratic cost on the non-streaming chunked path (availability)
+
+`parse_response()` built a fresh `ChunkDecoder` and re-decoded from byte zero on
+every call, and it is called on every read. A body arriving in N reads therefore cost
+O(N × body). This is the non-streaming response path for **both backends, TLS or
+plaintext** — not a TLS-specific path. Measured on one connection with 64 KiB reads:
+
+| body | before | after |
+|---|---|---|
+| 1 MB | 1.6 ms | 1.3 ms |
+| 2 MB | 4.3 ms | 3.1 ms |
+| 4 MB | 13.9 ms | 6.5 ms |
+| 8 MB | **79.0 ms** | **14.1 ms** |
+
+**Scope, stated precisely.** A typical 1 KB reply — and an 8 KB one — arrives in a
+single read, so the re-decode loop never runs: 0.4 µs before and after. The defect
+needs a body spanning several 64 KiB reads, so it does not appear below ~128 KB and
+does not cost a millisecond until roughly 500 KB–1 MB. Normal traffic was never
+affected, and this was never a regression against the p99 < 1 ms added-latency
+target, which is measured at ~1 KB payloads.
+
+The harm is **head-of-line blocking**, not the latency of the request that triggers
+it. The loop is single-threaded, so a 79 ms decode delays *every other client on
+that worker* by up to 79 ms — one oversized response degrades everyone else's p99.
+An unusually large legitimate completion can trigger it; a hostile or compromised
+upstream can do it deliberately, at will, up to `kMaxBodyLen` (16 MiB), which is the
+threat that justifies the fix. Decode state now lives per connection
+(`http::ResponseDecoder`) and is fed only newly-arrived bytes, and is reset between
+responses on a pooled connection. The regression test asserts the invariant
+deterministically — the decoder's consumed count only moves forward, and never by
+more than the bytes that just arrived — rather than timing it, because a timing
+assertion flaked on allocator warmth and a flaky security test is one people ignore.
+
+### Fixed — flaky TLS test fixture
+
+The TLS test CA was written to a fixed path in the shared temp dir, so parallel
+`ctest -j` processes truncated each other's file, surfacing as a spurious
+"no certificate or crl found" in whichever test lost the race. Now unique per
+process and per call.
+
+### Verified clean (probed, not assumed)
+
+- **Credentials and the shared pool.** A key never inherited by a client that sent
+  none, never trailing a shorter reused request, never echoed as `Authorization`
+  upstream, never in an error body or the gateway log.
+- **TLS.** No bypass path exists — verification is unconditional, with tests for an
+  untrusted chain, a hostname mismatch, and explicitly no plaintext fallback.
+- **Availability.** Survives 300 slow-loris connections, 100k-deep nested JSON
+  (depth capped at 64), an over-cap `Content-Length` and an over-cap header block —
+  all refused with 400, process alive and still serving throughout.
+
+Known gaps are stated in `SECURITY.md`, which now also documents the **inbound
+plaintext leg** (client → gateway is HTTP, so the OSS gateway is a loopback sidecar,
+not a remote endpoint) and the **absence of a client-side idle timeout**.
+
 ## [0.8.0] — 2026-08-03
 
 Streamed tool calls. A `"stream": true` request whose model calls a tool now produces
@@ -812,7 +921,15 @@ Initial release: the C++20 translator (OpenAI ⇄ Anthropic / Gemini / Cohere,
 non-streaming chat completions), the reference gateway proxy (epoll and io_uring),
 the benchmark harness, and the test suite.
 
-[Unreleased]: https://github.com/kottosai/llmbridge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kottosai/llmbridge/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/kottosai/llmbridge/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/kottosai/llmbridge/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/kottosai/llmbridge/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/kottosai/llmbridge/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/kottosai/llmbridge/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/kottosai/llmbridge/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/kottosai/llmbridge/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/kottosai/llmbridge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/kottosai/llmbridge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kottosai/llmbridge/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/kottosai/llmbridge/compare/v0.1.0...v0.1.1

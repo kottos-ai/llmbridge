@@ -67,6 +67,73 @@ namespace llmbridge::http
             while (i < v.size() && (v[i] == ' ' || v[i] == '\t')) ++i;
             return v.substr(i);
         }
+
+        // Trim optional whitespace (RFC 9110 OWS = SP / HTAB) from both ends of a
+        // field value. Trailing OWS is legal and must be stripped BEFORE a strict
+        // numeric test, or "Content-Length: 27 " would be rejected as non-numeric.
+        inline std::string_view trim_ows(std::string_view v) noexcept
+        {
+            size_t b = 0, e = v.size();
+            while (b < e && (v[b] == ' ' || v[b] == '\t')) ++b;
+            while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t')) --e;
+            return v.substr(b, e - b);
+        }
+
+        // Strict Content-Length: RFC 9112 §8.6 is 1*DIGIT, nothing else. Plain
+        // std::from_chars is NOT enough — it stops at the first non-digit and
+        // still reports success, so "0x1b" parses as 0 and "27abc" as 27. Both
+        // were measured: the first framed a 27-byte body as empty. A length we
+        // read differently from the upstream is a desync, so anything that is not
+        // pure digits is refused outright.
+        inline bool parse_strict_length(std::string_view v, size_t& out) noexcept
+        {
+            v = trim_ows(v);
+            if (v.empty()) return false;
+            for (const char c : v)
+                if (c < '0' || c > '9') return false;
+            size_t n = 0;
+            const auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
+            if (ec != std::errc{} || p != v.data() + v.size()) return false; // overflow
+            out = n;
+            return true;
+        }
+
+        // Reject a header block containing a BARE CR or BARE LF.
+        //
+        // We split lines on CRLF. A parser that splits on a bare CR (or bare LF)
+        // instead sees a different set of headers than we do — it may see a
+        // Content-Length we never saw. Measured: "X-A: 1\rContent-Length: 27"
+        // made the length invisible to this framer while a lenient upstream
+        // honoured it, framing 27 bytes we never sent. On a POOLED upstream that
+        // disagreement is a cross-client desync, so this is a refusal and never a
+        // sanitise-and-forward.
+        inline bool block_line_endings_ok(std::string_view h) noexcept
+        {
+            for (size_t i = 0; i < h.size(); ++i)
+            {
+                if (h[i] == '\r' && (i + 1 >= h.size() || h[i + 1] != '\n')) return false;
+                if (h[i] == '\n' && (i == 0 || h[i - 1] != '\r')) return false;
+            }
+            return true;
+        }
+
+        // Validate one header line and locate its colon.
+        //
+        // Two refusals beyond "must have a colon", both of which otherwise make a
+        // header INVISIBLE to every `name:` prefix test in this file while a more
+        // lenient upstream still honours it:
+        //   * obs-fold — a line starting with SP/HTAB is a continuation of the
+        //     previous header (RFC 9112 §5.2, deprecated, MUST-reject on receipt).
+        //   * whitespace before the colon — "Content-Length : 27" (RFC 9112 §5.1
+        //     forbids it precisely because it is a smuggling primitive).
+        inline bool line_ok(std::string_view line, size_t& colon) noexcept
+        {
+            if (line.empty()) return false;
+            if (line[0] == ' ' || line[0] == '\t') return false; // obs-fold
+            colon = line.find(':');
+            if (colon == std::string_view::npos || colon == 0) return false;
+            return !(line[colon - 1] == ' ' || line[colon - 1] == '\t');
+        }
     } // namespace detail
 
     // Case-insensitive single-header lookup over a raw header block (the bytes
@@ -138,6 +205,9 @@ namespace llmbridge::http
         bool have_cl = false; // to detect a conflicting duplicate Content-Length
         std::string_view headers = buf.substr(0, hdr_end);
 
+        // Fail closed on a header block we and an upstream would split differently.
+        if (!detail::block_line_endings_ok(headers)) return ParseStatus::Error;
+
         size_t pos = headers.find("\r\n");
         if (pos == std::string_view::npos) pos = headers.size(); // no headers
         while (pos < headers.size())
@@ -147,12 +217,16 @@ namespace llmbridge::http
             if (eol == std::string_view::npos) eol = headers.size();
             std::string_view line = headers.substr(start, eol - start);
 
+            // A line we cannot unambiguously read is a line the upstream might
+            // read anyway — refuse the message rather than skip the header.
+            size_t colon = 0;
+            if (!detail::line_ok(line, colon)) return ParseStatus::Error;
+            const std::string_view value = line.substr(colon + 1);
+
             if (detail::line_is(line, "content-length:"))
             {
-                std::string_view v = detail::ltrim(line.substr(15));
                 size_t n = 0;
-                auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
-                if (ec != std::errc{}) return ParseStatus::Error;
+                if (!detail::parse_strict_length(value, n)) return ParseStatus::Error;
                 // Conflicting duplicate Content-Length → reject (smuggling vector,
                 // RFC 9112 §6.3). An identical repeat is harmless; collapse it.
                 if (have_cl && n != out.body_len) return ParseStatus::Error;
@@ -167,7 +241,7 @@ namespace llmbridge::http
             }
             else if (detail::line_is(line, "connection:"))
             {
-                std::string_view v = detail::ltrim(line.substr(11));
+                std::string_view v = detail::ltrim(value);
                 // Only "close" flips the default; "keep-alive" is the default.
                 if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
             }
@@ -248,6 +322,13 @@ namespace llmbridge::http
             if (k == 3) out.status = code;
         }
 
+        // Same strictness as the request framer, and for a sharper reason: a
+        // mis-framed RESPONSE leaves stray bytes on a POOLED upstream connection,
+        // where they become the head of the NEXT client's response. A framing
+        // disagreement here hands one client another client's bytes, so a
+        // malformed response is refused rather than salvaged.
+        if (!detail::block_line_endings_ok(headers)) return HeadStatus::Error;
+
         size_t pos = headers.find("\r\n");
         if (pos == std::string_view::npos) pos = headers.size();
         while (pos < headers.size())
@@ -257,28 +338,38 @@ namespace llmbridge::http
             if (eol == std::string_view::npos) eol = headers.size();
             std::string_view line = headers.substr(start, eol - start);
 
+            size_t colon = 0;
+            if (!detail::line_ok(line, colon)) return HeadStatus::Error;
+            const std::string_view value = line.substr(colon + 1);
+
             if (detail::line_is(line, "content-length:"))
             {
-                std::string_view v = detail::ltrim(line.substr(15));
                 size_t n = 0;
-                auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
-                if (ec == std::errc{}) { out.content_length = n; out.has_content_length = true; }
+                if (!detail::parse_strict_length(value, n)) return HeadStatus::Error;
+                // Conflicting duplicate → reject, as on the request path.
+                if (out.has_content_length && n != out.content_length) return HeadStatus::Error;
+                out.content_length = n;
+                out.has_content_length = true;
             }
             else if (detail::line_is(line, "transfer-encoding:"))
             {
-                if (detail::contains_ci(line.substr(18), "chunked")) out.chunked = true;
+                if (detail::contains_ci(value, "chunked")) out.chunked = true;
             }
             else if (detail::line_is(line, "content-type:"))
             {
-                if (detail::contains_ci(line.substr(13), "text/event-stream")) out.event_stream = true;
+                if (detail::contains_ci(value, "text/event-stream")) out.event_stream = true;
             }
             else if (detail::line_is(line, "connection:"))
             {
-                std::string_view v = detail::ltrim(line.substr(11));
+                std::string_view v = detail::ltrim(value);
                 if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
             }
             pos = eol;
         }
+        // Both framings present (RFC 9112 §6.3): the two disagree about where the
+        // body ends, and whichever we pick, the other is what some intermediary
+        // picked. Refuse instead of preferring one.
+        if (out.chunked && out.has_content_length) return HeadStatus::Error;
         if (out.has_content_length && out.content_length > kMaxBodyLen) return HeadStatus::Error;
         return HeadStatus::Ok;
     }
@@ -441,8 +532,45 @@ namespace llmbridge::http
         [[nodiscard]] bool failed() const noexcept { return status == RespStatus::Error; }
     };
 
+    // Per-connection decode state for non-streaming responses.
+    //
+    // This exists to keep the chunked path LINEAR. An earlier revision built a
+    // fresh ChunkDecoder on every call and re-decoded the whole buffer from byte
+    // zero, which is O(n^2) as bytes trickle in — measured on a single upstream
+    // connection, decoding a body arriving in 64 KiB reads:
+    //
+    //     1 MB ->  1.6 ms      4 MB -> 13.9 ms
+    //     2 MB ->  4.3 ms      8 MB -> 79.0 ms   (65x the body re-decoded)
+    //
+    // Scope, so nobody over-reads the table: a typical 1 KB reply arrives in ONE
+    // read, so this loop never runs and the cost is ~0.4 us either way. It takes a
+    // body spanning several reads to matter at all (~128 KB), and ~500 KB before it
+    // costs a millisecond. Normal traffic was never affected.
+    //
+    // What makes it worth fixing is not the latency of the request that triggers it
+    // but HEAD-OF-LINE BLOCKING: the loop is single-threaded, so a 79 ms decode
+    // delays every other client on that worker by up to 79 ms. An unusually large
+    // completion can trigger it; a hostile upstream can do it at will up to
+    // kMaxBodyLen. Feeding only the newly-arrived bytes makes the cost linear and
+    // the buffer reusable.
+    struct ResponseDecoder
+    {
+        ChunkDecoder dec;
+        std::string body; // decoded payload, accumulated across feeds
+        size_t fed = 0;   // post-header bytes already handed to `dec`
+
+        // Call between responses on a pooled connection. clear() keeps capacity,
+        // so a warm connection does no per-request allocation.
+        void reset() noexcept
+        {
+            dec = ChunkDecoder{};
+            body.clear();
+            fed = 0;
+        }
+    };
+
     [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf,
-                                                       std::string& scratch) noexcept
+                                                       ResponseDecoder& st) noexcept
     {
         ParsedResponse r;
         const HeadStatus hs = parse_response_head(buf, r.head);
@@ -464,18 +592,22 @@ namespace llmbridge::http
             return r;
         }
 
-        // Chunked: decode from scratch each call. A fresh decoder per attempt keeps
-        // this function stateless and idempotent, matching parse()'s contract; the
-        // cost is re-decoding the bytes buffered so far, which is bounded by
-        // kMaxBodyLen and only paid on the non-streaming path (the streaming pump
-        // uses a persistent decoder precisely to avoid that).
-        ChunkDecoder dec;
-        scratch.clear(); // keeps capacity: no per-request allocation after warm-up
-        if (!dec.feed(buf.substr(r.head.header_len), scratch)) { r.status = RespStatus::Error; return r; }
-        if (scratch.size() > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
-        if (!dec.done()) return r; // NeedMore
-        r.body = scratch;
-        r.total_len = r.head.header_len + dec.consumed();
+        // Chunked: feed ONLY the bytes that arrived since the last call. The
+        // decoder and the decoded body persist in `st` across calls, so a body
+        // delivered in N reads costs O(body) rather than O(N * body). Still
+        // idempotent: re-calling with an unchanged buffer feeds nothing and
+        // re-reports the same result. `st` MUST be reset between responses on a
+        // pooled connection (see ResponseDecoder::reset).
+        const std::string_view after = buf.substr(r.head.header_len);
+        if (!st.dec.done() && st.fed < after.size())
+        {
+            if (!st.dec.feed(after.substr(st.fed), st.body)) { r.status = RespStatus::Error; return r; }
+            st.fed = st.dec.consumed();
+        }
+        if (st.body.size() > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
+        if (!st.dec.done()) return r; // NeedMore
+        r.body = st.body;
+        r.total_len = r.head.header_len + st.dec.consumed();
         r.status = RespStatus::Complete;
         return r;
     }

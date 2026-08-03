@@ -104,6 +104,11 @@ namespace llmbridge
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
 
+        // Non-streaming chunked decode state, PER CONNECTION rather than shared:
+        // it must persist across reads so the decoder is fed only new bytes
+        // (see http::ResponseDecoder — the shared-scratch form was quadratic).
+        http::ResponseDecoder rdec;
+
         std::string rbuf;
         std::string wbuf;
         size_t woff = 0;
@@ -416,7 +421,6 @@ namespace llmbridge
         // response is framed and consumed entirely within one event, so there is no
         // overlap. Reused across requests so the chunked path — which is the REAL
         // provider path, not an edge case — does not allocate per response.
-        std::string _resp_scratch;
 #ifdef LLMBRIDGE_HAVE_TLS
         net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
         bool _tls_ctx_ok = false;

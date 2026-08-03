@@ -116,6 +116,12 @@ is yours to enforce.
 - **Buffer scrubbing is targeted, not exhaustive** — the pooled request buffer is
   scrubbed because it can outlive its request; transient buffers are not, because they
   are overwritten within microseconds and doing so would put a `memset` on the hot path.
+- **No client-side idle or header timeout.** The idle sweep aborts requests whose
+  *upstream* has gone silent, but a client that opens a connection and sends a partial
+  header is held until it disconnects. Each such connection is bounded in memory (32 KiB
+  header cap) but not in time, so a slow-loris client can occupy file descriptors. This
+  is tolerable for a loopback sidecar serving trusted local callers and is a third reason
+  not to expose the listener; it is a real gap for any other deployment.
 
 ## Security best practices for users
 

@@ -960,6 +960,7 @@ namespace llmbridge
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { close_upstream(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
+        u->rdec.reset();
         // wbuf held the REBUILT REQUEST, including the client's credential, and this
         // connection may now idle for 30 s. Scrub rather than clear.
         secure_clear(u->wbuf);
@@ -1258,7 +1259,7 @@ namespace llmbridge
         // chunked over HTTP/1.1, which parse() rejects by design (see http.hpp).
         // `r.body` aliases rbuf (Content-Length) or _resp_scratch (chunked); it is
         // dead before rbuf is erased or the upstream released, below.
-        const auto r = http::parse_response(u->rbuf, _resp_scratch);
+        const auto r = http::parse_response(u->rbuf, u->rdec);
         if (r.failed()) { error_respond(client, 502); return; }
         if (!r.complete()) return;
         const http::ResponseHead& h = r.head;
@@ -1329,6 +1330,7 @@ namespace llmbridge
         // Drop the framed message so a pipelined next response is not mis-read as
         // part of this one; anything left is the start of the next message.
         u->rbuf.erase(0, total_len);
+        u->rdec.reset(); // next response on this conn decodes from a clean state
         if (pool_upstream) release_upstream(u);
         else close_upstream(u);
         respond(client);
@@ -1852,6 +1854,7 @@ namespace llmbridge
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { u_close(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
+        u->rdec.reset();
         secure_clear(u->wbuf); // see release_upstream: credential must not idle in the pool
         u->woff = 0;
         u->msg = http::Message{};
@@ -2064,7 +2067,7 @@ namespace llmbridge
 
             // parse_response, NOT parse: providers return non-streaming bodies
             // chunked over HTTP/1.1 and parse() rejects that by design (http.hpp).
-            const auto r = http::parse_response(c->rbuf, _resp_scratch);
+            const auto r = http::parse_response(c->rbuf, c->rdec);
             if (r.failed()) { u_error_respond(c->peer, 502); return; }
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
@@ -2218,6 +2221,7 @@ namespace llmbridge
         client->peer = nullptr;
         // Drop the framed message; anything left is the next pipelined response.
         u->rbuf.erase(0, total_len);
+        u->rdec.reset(); // see the epoll mirror
         if (pool_upstream) u_release_upstream(u);
         else u_close(u);
         u_submit_send(client);
