@@ -25,7 +25,7 @@
 #include <string>
 #include <string_view>
 
-namespace llmbridge::http
+namespace llmbridge::net::http
 {
     struct Message
     {
@@ -35,11 +35,17 @@ namespace llmbridge::http
         bool keep_alive = true;
     };
 
-    enum class ParseStatus
+    // The framing tri-state, shared by every parse entry point in this header.
+    //
+    // There used to be three of these, one per function, for one concept:
+    // `ParseStatus` and `RespStatus` were character-for-character identical, and
+    // `HeadStatus` differed only in spelling Complete as "Ok". A reader had to
+    // learn which enum belonged to which call before reading either.
+    enum class FrameStatus
     {
-        NeedMore, // headers not fully buffered, or body still arriving
-        Complete, // a full message is present in buf[0, total_len)
-        Error     // malformed (header too large, bad Content-Length)
+        NeedMore, // not fully buffered yet — feed more bytes and re-run
+        Complete, // the thing this call frames is fully present
+        Error     // malformed; refuse the message (see the fail-closed policy)
     };
 
     namespace detail
@@ -186,17 +192,17 @@ namespace llmbridge::http
 
     // Parse framing info out of `buf`. Idempotent and cheap to re-run as more
     // bytes arrive: returns NeedMore until the full message is buffered.
-    inline ParseStatus parse(std::string_view buf, Message& out) noexcept
+    inline FrameStatus parse_request(std::string_view buf, Message& out) noexcept
     {
         // Locate end of header block (CRLF CRLF).
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
         {
-            if (buf.size() > kMaxHeaderLen) return ParseStatus::Error;
-            return ParseStatus::NeedMore;
+            if (buf.size() > kMaxHeaderLen) return FrameStatus::Error;
+            return FrameStatus::NeedMore;
         }
         out.header_len = hdr_end + 4;
-        if (out.header_len > kMaxHeaderLen) return ParseStatus::Error;
+        if (out.header_len > kMaxHeaderLen) return FrameStatus::Error;
 
         // Walk header lines after the request/status line, pulling the two
         // headers we care about. Default keep-alive for HTTP/1.1.
@@ -206,7 +212,7 @@ namespace llmbridge::http
         std::string_view headers = buf.substr(0, hdr_end);
 
         // Fail closed on a header block we and an upstream would split differently.
-        if (!detail::block_line_endings_ok(headers)) return ParseStatus::Error;
+        if (!detail::block_line_endings_ok(headers)) return FrameStatus::Error;
 
         size_t pos = headers.find("\r\n");
         if (pos == std::string_view::npos) pos = headers.size(); // no headers
@@ -220,16 +226,16 @@ namespace llmbridge::http
             // A line we cannot unambiguously read is a line the upstream might
             // read anyway — refuse the message rather than skip the header.
             size_t colon = 0;
-            if (!detail::line_ok(line, colon)) return ParseStatus::Error;
+            if (!detail::line_ok(line, colon)) return FrameStatus::Error;
             const std::string_view value = line.substr(colon + 1);
 
             if (detail::line_is(line, "content-length:"))
             {
                 size_t n = 0;
-                if (!detail::parse_strict_length(value, n)) return ParseStatus::Error;
+                if (!detail::parse_strict_length(value, n)) return FrameStatus::Error;
                 // Conflicting duplicate Content-Length → reject (smuggling vector,
                 // RFC 9112 §6.3). An identical repeat is harmless; collapse it.
-                if (have_cl && n != out.body_len) return ParseStatus::Error;
+                if (have_cl && n != out.body_len) return FrameStatus::Error;
                 out.body_len = n;
                 have_cl = true;
             }
@@ -237,7 +243,7 @@ namespace llmbridge::http
             {
                 // We frame by Content-Length only; refuse TE outright rather than
                 // risk a TE/CL desync against a TE-honouring upstream.
-                return ParseStatus::Error;
+                return FrameStatus::Error;
             }
             else if (detail::line_is(line, "connection:"))
             {
@@ -249,11 +255,11 @@ namespace llmbridge::http
         }
 
         // Reject a hostile / absurd body length before we ever buffer toward it.
-        if (out.body_len > kMaxBodyLen) return ParseStatus::Error;
+        if (out.body_len > kMaxBodyLen) return FrameStatus::Error;
 
         out.total_len = out.header_len + out.body_len;
-        if (buf.size() < out.total_len) return ParseStatus::NeedMore;
-        return ParseStatus::Complete;
+        if (buf.size() < out.total_len) return FrameStatus::NeedMore;
+        return FrameStatus::Complete;
     }
 
     // ── Streaming response support (Phase B) ────────────────────────────────
@@ -277,7 +283,6 @@ namespace llmbridge::http
         size_t content_length = 0;
     };
 
-    enum class HeadStatus { NeedMore, Ok, Error };
 
     namespace detail
     {
@@ -300,13 +305,13 @@ namespace llmbridge::http
     // transfer-encoding (needed for SSE) and reports how the body is framed so the
     // caller can choose whole-body vs streaming handling. Returns NeedMore until
     // the CRLFCRLF is buffered.
-    inline HeadStatus parse_response_head(std::string_view buf, ResponseHead& out) noexcept
+    inline FrameStatus parse_response_head(std::string_view buf, ResponseHead& out) noexcept
     {
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
-            return buf.size() > kMaxHeaderLen ? HeadStatus::Error : HeadStatus::NeedMore;
+            return buf.size() > kMaxHeaderLen ? FrameStatus::Error : FrameStatus::NeedMore;
         out.header_len = hdr_end + 4;
-        if (out.header_len > kMaxHeaderLen) return HeadStatus::Error;
+        if (out.header_len > kMaxHeaderLen) return FrameStatus::Error;
 
         std::string_view headers = buf.substr(0, hdr_end);
 
@@ -327,7 +332,7 @@ namespace llmbridge::http
         // where they become the head of the NEXT client's response. A framing
         // disagreement here hands one client another client's bytes, so a
         // malformed response is refused rather than salvaged.
-        if (!detail::block_line_endings_ok(headers)) return HeadStatus::Error;
+        if (!detail::block_line_endings_ok(headers)) return FrameStatus::Error;
 
         size_t pos = headers.find("\r\n");
         if (pos == std::string_view::npos) pos = headers.size();
@@ -339,15 +344,15 @@ namespace llmbridge::http
             std::string_view line = headers.substr(start, eol - start);
 
             size_t colon = 0;
-            if (!detail::line_ok(line, colon)) return HeadStatus::Error;
+            if (!detail::line_ok(line, colon)) return FrameStatus::Error;
             const std::string_view value = line.substr(colon + 1);
 
             if (detail::line_is(line, "content-length:"))
             {
                 size_t n = 0;
-                if (!detail::parse_strict_length(value, n)) return HeadStatus::Error;
+                if (!detail::parse_strict_length(value, n)) return FrameStatus::Error;
                 // Conflicting duplicate → reject, as on the request path.
-                if (out.has_content_length && n != out.content_length) return HeadStatus::Error;
+                if (out.has_content_length && n != out.content_length) return FrameStatus::Error;
                 out.content_length = n;
                 out.has_content_length = true;
             }
@@ -369,9 +374,9 @@ namespace llmbridge::http
         // Both framings present (RFC 9112 §6.3): the two disagree about where the
         // body ends, and whichever we pick, the other is what some intermediary
         // picked. Refuse instead of preferring one.
-        if (out.chunked && out.has_content_length) return HeadStatus::Error;
-        if (out.has_content_length && out.content_length > kMaxBodyLen) return HeadStatus::Error;
-        return HeadStatus::Ok;
+        if (out.chunked && out.has_content_length) return FrameStatus::Error;
+        if (out.has_content_length && out.content_length > kMaxBodyLen) return FrameStatus::Error;
+        return FrameStatus::Complete;
     }
 
     // Incremental HTTP/1.1 chunked-transfer decoder. Feed body bytes as they
@@ -519,17 +524,16 @@ namespace llmbridge::http
     // case. `body` is valid only while both `buf` and `scratch` outlive it, and
     // only until either is modified — in the gateway that means before rbuf is
     // erased or the upstream is released.
-    enum class RespStatus { NeedMore, Complete, Error };
 
     struct ParsedResponse
     {
-        RespStatus status = RespStatus::NeedMore;
+        FrameStatus status = FrameStatus::NeedMore;
         ResponseHead head{};
         std::string_view body{}; // valid only when status == Complete
         size_t total_len = 0;    // bytes of `buf` this message occupies
 
-        [[nodiscard]] bool complete() const noexcept { return status == RespStatus::Complete; }
-        [[nodiscard]] bool failed() const noexcept { return status == RespStatus::Error; }
+        [[nodiscard]] bool complete() const noexcept { return status == FrameStatus::Complete; }
+        [[nodiscard]] bool failed() const noexcept { return status == FrameStatus::Error; }
     };
 
     // Per-connection decode state for non-streaming responses.
@@ -573,22 +577,22 @@ namespace llmbridge::http
                                                        ResponseDecoder& st) noexcept
     {
         ParsedResponse r;
-        const HeadStatus hs = parse_response_head(buf, r.head);
-        if (hs == HeadStatus::NeedMore) return r; // status stays NeedMore
-        if (hs == HeadStatus::Error) { r.status = RespStatus::Error; return r; }
+        const FrameStatus hs = parse_response_head(buf, r.head);
+        if (hs == FrameStatus::NeedMore) return r; // status stays NeedMore
+        if (hs == FrameStatus::Error) { r.status = FrameStatus::Error; return r; }
 
         // Both framings present is a smuggling signal even from a trusted origin
         // (a compromised or buggy middlebox), so refuse rather than pick a winner.
-        if (r.head.chunked && r.head.has_content_length) { r.status = RespStatus::Error; return r; }
+        if (r.head.chunked && r.head.has_content_length) { r.status = FrameStatus::Error; return r; }
 
         if (!r.head.chunked)
         {
-            if (r.head.content_length > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
+            if (r.head.content_length > kMaxBodyLen) { r.status = FrameStatus::Error; return r; }
             const size_t need = r.head.header_len + r.head.content_length;
             if (buf.size() < need) return r; // NeedMore
             r.body = buf.substr(r.head.header_len, r.head.content_length); // no copy
             r.total_len = need;
-            r.status = RespStatus::Complete;
+            r.status = FrameStatus::Complete;
             return r;
         }
 
@@ -601,14 +605,14 @@ namespace llmbridge::http
         const std::string_view after = buf.substr(r.head.header_len);
         if (!st.dec.done() && st.fed < after.size())
         {
-            if (!st.dec.feed(after.substr(st.fed), st.body)) { r.status = RespStatus::Error; return r; }
+            if (!st.dec.feed(after.substr(st.fed), st.body)) { r.status = FrameStatus::Error; return r; }
             st.fed = st.dec.consumed();
         }
-        if (st.body.size() > kMaxBodyLen) { r.status = RespStatus::Error; return r; }
+        if (st.body.size() > kMaxBodyLen) { r.status = FrameStatus::Error; return r; }
         if (!st.dec.done()) return r; // NeedMore
         r.body = st.body;
         r.total_len = r.head.header_len + st.dec.consumed();
-        r.status = RespStatus::Complete;
+        r.status = FrameStatus::Complete;
         return r;
     }
-} // namespace llmbridge::http
+} // namespace llmbridge::net::http

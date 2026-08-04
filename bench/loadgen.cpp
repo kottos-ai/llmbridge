@@ -51,8 +51,8 @@
 #include "net/http.hpp"
 #include "net/socket_util.hpp"
 
-using llmbridge::http::Message;
-using llmbridge::http::ParseStatus;
+using llmbridge::net::http::Message;
+using llmbridge::net::http::FrameStatus;
 
 namespace
 {
@@ -323,9 +323,9 @@ int main(int argc, char** argv)
             if (dead) { ++errors; reconnect(c); continue; } // recycle the socket back into the pool
 
             Message m;
-            ParseStatus st = llmbridge::http::parse(c->rbuf, m);
-            if (st == ParseStatus::NeedMore) continue;
-            if (st == ParseStatus::Error) { ++errors; reconnect(c); continue; }
+            FrameStatus st = llmbridge::net::http::parse_request(c->rbuf, m);
+            if (st == FrameStatus::NeedMore) continue;
+            if (st == FrameStatus::Error) { ++errors; reconnect(c); continue; }
 
             // Full response. Record CO-corrected latency, recycle the conn.
             int64_t lat = llmbridge::now_ns() - c->scheduled_ns;

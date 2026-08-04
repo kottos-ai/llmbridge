@@ -382,10 +382,18 @@ namespace llmbridge::provider
             if (message.empty()) message = v.str_or("message");
         }
 
-        // Both spans come from an UNTRUSTED upstream body and our parser is
-        // lenient about control bytes, so sanitize on the way out — same rule the
-        // SSE passthrough follows. Otherwise a provider could make our own error
-        // envelope unparseable to a strict client.
+        // Both spans come from an UNTRUSTED upstream body, so sanitize on the way
+        // out — same rule the SSE passthrough follows. Otherwise a provider could
+        // make our own error envelope unparseable to a strict client.
+        //
+        // This is now DEFENCE IN DEPTH rather than the primary mitigation: the
+        // parser rejects raw control bytes in strings outright (RFC 8259 §7), so a
+        // body carrying one no longer parses and `message`/`type` come back empty,
+        // yielding the generic envelope below. An earlier version of this comment
+        // said "our parser is lenient about control bytes" — that was true when it
+        // was written and is not any more. Kept because it costs nothing on an
+        // error path and the invariant it guards (no raw control byte in an
+        // envelope we emit) is the one that must not regress.
         std::string out = "{\"error\":{\"message\":\"";
         if (message.empty()) out += "upstream provider error";
         else detail::append_sanitized(out, message);

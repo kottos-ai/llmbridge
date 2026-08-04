@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace llmbridge::json
+namespace llmbridge::provider::json
 {
     class Value
     {
@@ -114,21 +114,62 @@ namespace llmbridge::json
                 while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
             }
 
+            // The complete set RFC 8259 §7 permits after a backslash.
+            static constexpr bool is_escape_char(char c) noexcept
+            {
+                return c == '"' || c == '\\' || c == '/' || c == 'b' || c == 'f' ||
+                       c == 'n' || c == 'r' || c == 't' || c == 'u';
+            }
+            static constexpr bool is_hex(char c) noexcept
+            {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            }
+
             // Return the RAW span between the quotes (assumes s[i]=='"'), still
             // JSON-escaped, as a view into the input — never decoded, never copied.
             // We scan only for the real closing quote, skipping escape pairs (\X).
+            //
+            // STRICTNESS IS LOAD-BEARING HERE. This span is re-emitted VERBATIM on the
+            // passthrough path (see the comment on Value::sv), so whatever this scanner
+            // accepts ends up in the bytes we hand the client. An earlier revision
+            // skipped both checks below, and the measured result was: a provider string
+            // containing a raw newline was copied straight through, and the client got
+            // a 200 OK whose body Python's json.loads — and therefore the OpenAI SDK —
+            // rejects with "Invalid control character". We laundered malformed provider
+            // output into a malformed client response and called it success.
+            //
+            // So refuse, per the fail-closed policy, rather than sanitise-and-forward:
+            // a caller that cannot re-serialise its input unchanged has no business
+            // passing it on.
             std::string_view parse_string()
             {
                 ++i; // opening quote
                 const size_t start = i;
                 while (i < s.size())
                 {
-                    const char c = s[i];
+                    const unsigned char c = static_cast<unsigned char>(s[i]);
                     if (c == '"') { std::string_view sv = s.substr(start, i - start); ++i; return sv; }
-                    if (c == '\\') { i += 2; continue; } // skip the escaped char
+                    if (c < 0x20) break; // raw control character — RFC 8259 §7 forbids it
+                    if (c == '\\')
+                    {
+                        if (i + 1 >= s.size()) break;
+                        const char e = s[i + 1];
+                        if (!is_escape_char(e)) break; // e.g. "\q" — would re-emit invalid
+                        if (e == 'u')
+                        {
+                            if (i + 5 >= s.size()) break;
+                            if (!is_hex(s[i + 2]) || !is_hex(s[i + 3]) ||
+                                !is_hex(s[i + 4]) || !is_hex(s[i + 5]))
+                                break; // "\uZZZZ" — same problem, one level down
+                            i += 6;
+                            continue;
+                        }
+                        i += 2;
+                        continue;
+                    }
                     ++i;
                 }
-                ok = false; // unterminated string
+                ok = false; // unterminated, raw control character, or bad escape
                 return s.substr(start);
             }
 
@@ -401,4 +442,4 @@ namespace llmbridge::json
         out.append(raw.data() + start, n - start); // trailing plain run
         out += '"';
     }
-} // namespace llmbridge::json
+} // namespace llmbridge::provider::json

@@ -18,6 +18,10 @@
 #ifdef LLMBRIDGE_HAVE_TLS
 
 #include <gtest/gtest.h>
+
+#include <unistd.h>
+
+#include <atomic>
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -74,7 +78,20 @@ namespace
         /// Write the cert to a temp PEM so the client Context can trust it as a CA.
         std::string write_pem() const
         {
-            std::string path = std::string(::testing::TempDir()) + "llmbridge_tls_test_ca.pem";
+            // Unique per process AND per call. ctest gives each gtest case its own
+            // process and runs them with -j, so a fixed name meant one process
+            // truncated the file another was mid-way through loading, surfacing as a
+            // spurious TLS failure in whichever lost the race.
+            //
+            // This is the SAME bug, in the SAME copy-pasted SelfSigned helper, as the
+            // one fixed in gateway/tests/gateway_tls_test.cpp — and it was left behind
+            // when that one was fixed. Duplicated code, one-sided fix: exactly the
+            // failure mode the ep_/ur_ audit was about. If a third copy ever appears,
+            // hoist this helper into a shared test header instead.
+            static std::atomic<unsigned> seq{0};
+            std::string path = std::string(::testing::TempDir()) + "llmbridge_tls_test_ca_" +
+                               std::to_string(static_cast<long>(::getpid())) + "_" +
+                               std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".pem";
             FILE* f = std::fopen(path.c_str(), "wb");
             EXPECT_NE(f, nullptr);
             PEM_write_X509(f, crt);

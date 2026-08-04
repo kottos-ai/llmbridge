@@ -22,8 +22,8 @@
 #include "provider/json.hpp"
 
 using llmbridge::provider::AnthropicToOpenAiSse;
-using llmbridge::json::parse;
-using llmbridge::json::Value;
+using llmbridge::provider::json::parse;
+using llmbridge::provider::json::Value;
 
 namespace
 {
@@ -837,7 +837,7 @@ c)"};
             p = e;
             if (line == "[DONE]") continue;
             bool ok = false;
-            llmbridge::json::parse(line, ok);
+            llmbridge::provider::json::parse(line, ok);
             EXPECT_TRUE(ok) << "fragment " << f << " produced invalid JSON:\n" << line;
             ++checked;
         }

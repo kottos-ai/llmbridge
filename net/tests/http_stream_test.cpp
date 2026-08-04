@@ -18,10 +18,10 @@
 #include <string>
 #include <string_view>
 
-using llmbridge::http::ChunkDecoder;
-using llmbridge::http::HeadStatus;
-using llmbridge::http::parse_response_head;
-using llmbridge::http::ResponseHead;
+using llmbridge::net::http::ChunkDecoder;
+using llmbridge::net::http::FrameStatus;
+using llmbridge::net::http::parse_response_head;
+using llmbridge::net::http::ResponseHead;
 
 namespace
 {
@@ -73,7 +73,7 @@ TEST(RespHead, DetectsEventStreamAndChunked)
     ResponseHead h;
     auto st = parse_response_head(
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n", h);
-    EXPECT_EQ(st, HeadStatus::Ok);
+    EXPECT_EQ(st, FrameStatus::Complete);
     EXPECT_EQ(h.status, 200);
     EXPECT_TRUE(h.event_stream);
     EXPECT_TRUE(h.chunked);
@@ -93,7 +93,7 @@ TEST(RespHead, PlainJsonResponseIsNotStreaming)
     ResponseHead h;
     auto st = parse_response_head(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n", h);
-    EXPECT_EQ(st, HeadStatus::Ok);
+    EXPECT_EQ(st, FrameStatus::Complete);
     EXPECT_FALSE(h.event_stream);
     EXPECT_FALSE(h.chunked);
     EXPECT_TRUE(h.has_content_length);
@@ -110,8 +110,8 @@ TEST(RespHead, ConnectionCloseFlipsKeepAlive)
 TEST(RespHead, NeedMoreUntilHeadersComplete)
 {
     ResponseHead h;
-    EXPECT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nContent-Type: text/event-str", h), HeadStatus::NeedMore);
-    EXPECT_EQ(parse_response_head("", h), HeadStatus::NeedMore);
+    EXPECT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nContent-Type: text/event-str", h), FrameStatus::NeedMore);
+    EXPECT_EQ(parse_response_head("", h), FrameStatus::NeedMore);
 }
 
 // ── ChunkDecoder ────────────────────────────────────────────────────────────

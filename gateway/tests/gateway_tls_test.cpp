@@ -189,8 +189,8 @@ namespace
                 for (;;)
                 {
                     // Frame one request off the decrypted byte stream.
-                    llmbridge::http::Message m;
-                    while (llmbridge::http::parse(buf, m) != llmbridge::http::ParseStatus::Complete)
+                    llmbridge::net::http::Message m;
+                    while (llmbridge::net::http::parse_request(buf, m) != llmbridge::net::http::FrameStatus::Complete)
                     {
                         const int n = SSL_read(ssl, tmp, sizeof tmp);
                         if (n <= 0) goto done;
@@ -329,8 +329,8 @@ namespace
             char tmp[8192];
             for (;;)
             {
-                llmbridge::http::Message m;
-                if (llmbridge::http::parse(_buf, m) == llmbridge::http::ParseStatus::Complete)
+                llmbridge::net::http::Message m;
+                if (llmbridge::net::http::parse_request(_buf, m) == llmbridge::net::http::FrameStatus::Complete)
                 {
                     std::string out = _buf.substr(0, m.total_len);
                     _buf.erase(0, m.total_len);

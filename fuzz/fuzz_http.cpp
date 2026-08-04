@@ -21,15 +21,15 @@
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
-    llmbridge::http::Message m;
+    llmbridge::net::http::Message m;
     const auto st =
-        llmbridge::http::parse(std::string_view(reinterpret_cast<const char*>(data), size), m);
+        llmbridge::net::http::parse_request(std::string_view(reinterpret_cast<const char*>(data), size), m);
 
     // Structural invariants the framer must uphold for any input.
-    if (st == llmbridge::http::ParseStatus::Complete)
+    if (st == llmbridge::net::http::FrameStatus::Complete)
     {
         assert(m.total_len == m.header_len + m.body_len);
-        assert(m.body_len <= llmbridge::http::kMaxBodyLen);
+        assert(m.body_len <= llmbridge::net::http::kMaxBodyLen);
         assert(m.total_len <= size);
     }
     return 0;

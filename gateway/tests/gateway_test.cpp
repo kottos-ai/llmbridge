@@ -249,8 +249,8 @@ namespace
             char tmp[16384];
             while (!_stop)
             {
-                llmbridge::http::Message m;
-                while (llmbridge::http::parse(buf, m) != llmbridge::http::ParseStatus::Complete)
+                llmbridge::net::http::Message m;
+                while (llmbridge::net::http::parse_request(buf, m) != llmbridge::net::http::FrameStatus::Complete)
                 {
                     ssize_t n = ::read(c, tmp, sizeof(tmp));
                     if (n <= 0) { ::close(c); return; }
@@ -374,8 +374,8 @@ namespace
             char tmp[8192];
             for (;;)
             {
-                llmbridge::http::Message m;
-                if (llmbridge::http::parse(_buf, m) == llmbridge::http::ParseStatus::Complete)
+                llmbridge::net::http::Message m;
+                if (llmbridge::net::http::parse_request(_buf, m) == llmbridge::net::http::FrameStatus::Complete)
                 {
                     std::string out = _buf.substr(0, m.total_len);
                     _buf.erase(0, m.total_len);
@@ -496,8 +496,8 @@ TEST_F(ProxyIT, ResponseBodyIntegrity)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
     std::string resp = c.recv_response();
-    llmbridge::http::Message m;
-    ASSERT_EQ(llmbridge::http::parse(resp, m), llmbridge::http::ParseStatus::Complete);
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(resp, m), llmbridge::net::http::FrameStatus::Complete);
     EXPECT_EQ(resp.substr(m.header_len), kRespBody);
 }
 
@@ -648,8 +648,8 @@ namespace
 
     std::string body_of(const std::string& resp)
     {
-        llmbridge::http::Message m;
-        if (llmbridge::http::parse(resp, m) != llmbridge::http::ParseStatus::Complete) return {};
+        llmbridge::net::http::Message m;
+        if (llmbridge::net::http::parse_request(resp, m) != llmbridge::net::http::FrameStatus::Complete) return {};
         return resp.substr(m.header_len, m.body_len);
     }
 } // namespace
@@ -691,9 +691,18 @@ TEST_P(ProxyTranslateMode, ForwardsTranslatedRequestUpstream)
 
     // Upstream saw the provider-shaped, content-preserving request.
     EXPECT_NE(upstream.find("unique-marker-content"), std::string::npos) << upstream;
-    if (mode == TranslateMode::Anthropic) EXPECT_NE(upstream.find("/v1/messages"), std::string::npos);
-    if (mode == TranslateMode::Gemini) EXPECT_NE(upstream.find("generateContent"), std::string::npos);
-    if (mode == TranslateMode::Cohere) EXPECT_NE(upstream.find("/v2/chat"), std::string::npos);
+    if (mode == TranslateMode::Anthropic)
+    {
+        EXPECT_NE(upstream.find("/v1/messages"), std::string::npos);
+    }
+    if (mode == TranslateMode::Gemini)
+    {
+        EXPECT_NE(upstream.find("generateContent"), std::string::npos);
+    }
+    if (mode == TranslateMode::Cohere)
+    {
+        EXPECT_NE(upstream.find("/v2/chat"), std::string::npos);
+    }
     c.close();
     shutdown();
 }
@@ -842,7 +851,10 @@ TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
     (void)c.recv_response();
     const std::string up = _backend.last_request();
     EXPECT_EQ(up.find("X-S:"), std::string::npos) << up;
-    if (!up.empty()) EXPECT_NE(up.find("x-api-key: clean"), std::string::npos) << up;
+    if (!up.empty())
+    {
+        EXPECT_NE(up.find("x-api-key: clean"), std::string::npos) << up;
+    }
 }
 
 // An oversized credential is refused rather than forwarded (bounded work, and a
@@ -1156,7 +1168,7 @@ TEST_F(ProxyIT, MalformedRequestClosedAndGatewaySurvives)
     {
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
-        // Valid framing, invalid Content-Length -> http::parse Error.
+        // Valid framing, invalid Content-Length -> net::http::parse Error.
         ASSERT_TRUE(bad.send("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n"));
         EXPECT_EQ(bad.recv_status(), 400); // malformed framing -> 400 Bad Request
         EXPECT_TRUE(bad.wait_closed());
@@ -1698,7 +1710,9 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
     // armed recv may instead evict the dead conn first (a completion-order race), so
     // we assert the retry path only where it's deterministic.
     if (GetParam() == llmbridge::IoBackend::Epoll)
-        EXPECT_GT(_gw->stats().upstream_retries, 0u) << "epoll inline pipelined reuse must retry";
+    {
+            EXPECT_GT(_gw->stats().upstream_retries, 0u) << "epoll inline pipelined reuse must retry";
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,
@@ -1947,12 +1961,12 @@ namespace
             const std::string pay = line.substr(6);
             if (pay == "[DONE]") { s.done = true; continue; }
             bool ok = false;
-            llmbridge::json::Value v = llmbridge::json::parse(pay, ok);
+            llmbridge::provider::json::Value v = llmbridge::provider::json::parse(pay, ok);
             if (!ok) continue;
-            const llmbridge::json::Value* ch = v.find("choices");
+            const llmbridge::provider::json::Value* ch = v.find("choices");
             if (!ch || !ch->is_array() || ch->arr.empty()) continue;
-            const llmbridge::json::Value& c0 = ch->arr[0];
-            if (const llmbridge::json::Value* d = c0.find("delta"))
+            const llmbridge::provider::json::Value& c0 = ch->arr[0];
+            if (const llmbridge::provider::json::Value* d = c0.find("delta"))
             {
                 if (!d->str_or("role").empty()) s.role = true;
                 s.content += std::string(d->str_or("content"));
@@ -2318,7 +2332,9 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     // epoll implements backpressure by pausing upstream reads; io_uring instead
     // bounds the buffer (kStreamBufCap), so only assert the counter on epoll.
     if (GetParam() == llmbridge::IoBackend::Epoll)
-        EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
+    {
+            EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
@@ -2528,7 +2544,7 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
     // The point of the test. If this fires, the pool never actually ran dry and the
     // assertions above passed without touching the recovery path — so either the
     // hook stopped working or the kernel no longer reports -ENOBUFS here, and the
-    // recovery branch in u_on_recv is dead code that needs re-examining.
+    // recovery branch in ur_on_recv is dead code that needs re-examining.
     EXPECT_GT(enobufs, 0u)
         << "pool of 1 buffer across " << kClients
         << " streams did not produce -ENOBUFS; this test is not exercising what it claims";

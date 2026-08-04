@@ -14,9 +14,9 @@
 #include <deque>
 #include <string>
 
-using llmbridge::json::Value;
-using llmbridge::json::parse;
-using llmbridge::json::append_escaped;
+using llmbridge::provider::json::Value;
+using llmbridge::provider::json::parse;
+using llmbridge::provider::json::append_escaped;
 
 namespace
 {
@@ -214,7 +214,7 @@ TEST(RawSpan, ObjectAndArraySpansIncludeTheirBrackets)
     // including delimiters — anything else corrupts a customer's JSON Schema.
     const std::string src = R"({"o":{"a":[1,2,{"b":null}]},"arr":[{"x":1}],"s":"str"})";
     bool ok = false;
-    const auto v = llmbridge::json::parse(src, ok);
+    const auto v = llmbridge::provider::json::parse(src, ok);
     ASSERT_TRUE(ok);
     EXPECT_EQ(v.find("o")->sv, R"({"a":[1,2,{"b":null}]})");
     EXPECT_EQ(v.find("arr")->sv, R"([{"x":1}])");
@@ -227,7 +227,7 @@ TEST(RawSpan, PreservesWhitespaceAndNumberFormatting)
     // forwarding must not.
     const std::string src = "{\"p\": { \"n\" : 1.50 , \"e\":1e+3 }}";
     bool ok = false;
-    const auto v = llmbridge::json::parse(src, ok);
+    const auto v = llmbridge::provider::json::parse(src, ok);
     ASSERT_TRUE(ok);
     EXPECT_EQ(v.find("p")->sv, "{ \"n\" : 1.50 , \"e\":1e+3 }");
 }
@@ -236,18 +236,18 @@ TEST(EscapeRoundTrip, JsonBecomesAStringAndBack)
 {
     const std::string original = R"({"city":"Paris","q":"say \"hi\"","n":-1.5})";
     std::string escaped;
-    llmbridge::json::append_escaped_string(escaped, original);
+    llmbridge::provider::json::append_escaped_string(escaped, original);
     bool ok = false;
-    const auto v = llmbridge::json::parse(escaped, ok);
+    const auto v = llmbridge::provider::json::parse(escaped, ok);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(v.is_string());
-    EXPECT_EQ(llmbridge::json::unescape_string(v.sv), original);
+    EXPECT_EQ(llmbridge::provider::json::unescape_string(v.sv), original);
 }
 
 TEST(EscapeRoundTrip, ControlCharactersAreEscapedNotEmittedRaw)
 {
     std::string out;
-    llmbridge::json::append_escaped_string(out, std::string("a\tb\nc\x01""d"));
+    llmbridge::provider::json::append_escaped_string(out, std::string("a\tb\nc\x01""d"));
     // A raw control byte inside a JSON string is invalid JSON that some parsers
     // accept and others reject — exactly the ambiguity to avoid on a provider wire.
     EXPECT_EQ(out.find('\x01'), std::string::npos);
@@ -255,29 +255,86 @@ TEST(EscapeRoundTrip, ControlCharactersAreEscapedNotEmittedRaw)
     EXPECT_NE(out.find("\\t"), std::string::npos);
     EXPECT_NE(out.find("\\n"), std::string::npos);
     bool ok = false;
-    llmbridge::json::parse(out, ok);
+    llmbridge::provider::json::parse(out, ok);
     EXPECT_TRUE(ok) << "escaper produced invalid JSON: " << out;
 }
 
 TEST(Unescape, DecodesUnicodeIncludingSurrogatePairs)
 {
-    EXPECT_EQ(llmbridge::json::unescape_string("caf\\u00e9"), "café");
-    EXPECT_EQ(llmbridge::json::unescape_string("\\ud83d\\ude00"), "😀"); // U+1F600
-    EXPECT_EQ(llmbridge::json::unescape_string("a\\/b"), "a/b");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string("caf\\u00e9"), "café");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string("\\ud83d\\ude00"), "😀"); // U+1F600
+    EXPECT_EQ(llmbridge::provider::json::unescape_string("a\\/b"), "a/b");
 }
 
 TEST(Unescape, LoneSurrogateBecomesReplacementNotInvalidUtf8)
 {
     // Emitting a lone surrogate as UTF-8 would be malformed and the provider would
     // reject the whole body; U+FFFD keeps the request valid and the failure local.
-    const std::string out = llmbridge::json::unescape_string("\\ud800");
+    const std::string out = llmbridge::provider::json::unescape_string("\\ud800");
     EXPECT_EQ(out, "\xEF\xBF\xBD");
 }
 
 TEST(Unescape, TruncatedEscapesDoNotReadPastTheEnd)
 {
     // Malformed input must terminate, not scan off the end.
-    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("abc\\"));
-    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("\\u12"));
-    EXPECT_NO_THROW((void)llmbridge::json::unescape_string("\\ud83d\\u"));
+    EXPECT_NO_THROW((void)llmbridge::provider::json::unescape_string("abc\\"));
+    EXPECT_NO_THROW((void)llmbridge::provider::json::unescape_string("\\u12"));
+    EXPECT_NO_THROW((void)llmbridge::provider::json::unescape_string("\\ud83d\\u"));
+}
+
+// --- RFC 8259 §7 string strictness (found by the corpus concurrency test) -----
+//
+// The parser's string span is re-emitted VERBATIM on the passthrough path, so
+// anything accepted here reaches the client's bytes. Accepting an illegal string
+// therefore does not produce a lenient parse — it produces a 200 OK whose body a
+// strict parser rejects. Measured before the fix: a provider answer containing a
+// raw newline arrived at the client as `"content":"line1<LF>line2"`, which
+// Python's json.loads (and so the OpenAI SDK) refuses with "Invalid control
+// character". Refuse at the parse instead.
+
+namespace
+{
+    bool parses(std::string_view doc)
+    {
+        bool ok = false;
+        (void)llmbridge::provider::json::parse(doc, ok);
+        return ok;
+    }
+} // namespace
+
+TEST(JsonStrictness, RawControlCharactersInStringsAreRejected)
+{
+    EXPECT_FALSE(parses("{\"t\":\"a\nb\"}")) << "raw newline";
+    EXPECT_FALSE(parses("{\"t\":\"a\tb\"}")) << "raw tab";
+    EXPECT_FALSE(parses("{\"t\":\"a\rb\"}")) << "raw carriage return";
+    EXPECT_FALSE(parses(std::string("{\"t\":\"a\x01" "b\"}"))) << "raw 0x01";
+    EXPECT_FALSE(parses(std::string("{\"t\":\"a\x1f" "b\"}"))) << "raw 0x1f";
+    // The boundary: 0x20 is a space and perfectly legal.
+    EXPECT_TRUE(parses("{\"t\":\"a b\"}"));
+}
+
+TEST(JsonStrictness, InvalidEscapesAreRejected)
+{
+    EXPECT_FALSE(parses(R"({"t":"a\qb"})")) << "\\q is not an escape";
+    EXPECT_FALSE(parses(R"({"t":"a\xb"})")) << "\\x is not JSON";
+    EXPECT_FALSE(parses(R"({"t":"a\"})")) << "trailing backslash";
+    EXPECT_FALSE(parses(R"({"t":"\uZZZZ"})")) << "non-hex \\u";
+    EXPECT_FALSE(parses(R"({"t":"\u12"})")) << "truncated \\u";
+}
+
+TEST(JsonStrictness, EveryLegalEscapeStillParses)
+{
+    // The fix must not over-reject: this is the complete RFC 8259 escape set,
+    // plus raw UTF-8, which is legal and must stay zero-copy.
+    EXPECT_TRUE(parses(R"({"t":"\" \\ \/ \b \f \n \r \t"})"));
+    EXPECT_TRUE(parses(R"({"t":"é 中 😀"})"));
+    EXPECT_TRUE(parses("{\"t\":\"caf\xc3\xa9 \xe6\x9d\xb1\xe4\xba\xac \xF0\x9F\x98\x80\"}"));
+    EXPECT_TRUE(parses(R"({"t":"nothing special at all"})"));
+}
+
+TEST(JsonStrictness, IllegalStringInAKeyIsAlsoRejected)
+{
+    // Keys go through the same scanner and are re-emitted the same way.
+    EXPECT_FALSE(parses("{\"a\nb\":1}"));
+    EXPECT_FALSE(parses(R"({"a\qb":1})"));
 }

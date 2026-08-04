@@ -124,8 +124,8 @@ machine (the machine is ~95% idle throughout — see above).
 | fd lookup per op (`fget`, `sock_from_file`) | 3.2% |
 | io_uring core | 2.8% |
 
-Our hottest functions are `u_on_cqe` (1.54%), `http::parse` (1.29%), `u_on_recv`
-(1.03%). **Optimising llmbridge's code caps out at roughly 7% more throughput** — the
+Our hottest functions are `ur_on_cqe` (1.54%), `http::parse_request` (1.29%),
+`ur_on_recv` (1.03%). **Optimising llmbridge's code caps out at roughly 7% more throughput** — the
 ceiling is the kernel's TCP path, which is the irreducible price of being a TCP proxy.
 The levers that actually matter are, in order: clock speed (throughput tracks it nearly
 linearly — the same build measures ~78k at a throttled 4.0 GHz and ~88k at 4.5 GHz),
@@ -174,10 +174,14 @@ Both gateways translate the **same Anthropic SSE stream** from the **same provid
 into OpenAI `chat.completion.chunk`s. Every number is taken by the **same client-side
 instrument** — neither gateway self-reports.
 
-> Charts regenerated from this run (`bench/make_stream_chart.py`). Note the source CSV
-> is append-only across runs and the chart takes a median over it, so it must be reset
-> to a single run's rows before charting — otherwise it silently blends incompatible
-> configurations.
+> Charts regenerated from these runs (`bench/make_stream_chart.py`). The source CSV is
+> append-only and the chart takes a median over it, so reset it whenever the
+> CONFIGURATION changes — otherwise it silently blends incompatible runs. Repeating the
+> SAME configuration is the intended use and is what the median is for: these figures
+> are the median of **three** runs, measured on **v0.8.1 plus the unreleased 0.9.x
+> working tree** (not a tagged release — re-run and re-chart when 0.9.x ships). (An earlier revision of this note said to reset to a
+> single run's rows, which was true when only one run existed and would now silently
+> discard the repetitions.)
 
 ### Results — llmbridge vs LiteLLM (50 tok/s per stream, one worker each)
 
@@ -188,10 +192,10 @@ percentile (see Known limitations).
 
 | Concurrent streams | direct (floor) p50 / p99 | **llmbridge** p50 / p99 | LiteLLM p50 / p99 | TTFT: floor / **llmbridge** / LiteLLM | Tokens delivered: **llmbridge** / LiteLLM |
 |---|---|---|---|---|---|
-| 16  | 58 / 121 us | **108 / 189 us** | 1.65 ms / 230 ms | 30.8 / **30.3** / 84.3 ms | **100%** / 94% |
-| 64  | 53 / 113 us | **109 / 195 us** | 213 ms / 704 ms | 30.8 / **30.8** / 2,206 ms | **100%** / 37% |
-| 256 | 53 / 154 us | **124 / 265 us** | > 2 s † | 30.7 / **30.7** / 9,703 ms | **99.9%** / 9% |
-| 512 | 54 / 234 us | **172 / 340 us** | > 2 s † | 30.7 / **30.8** / 13,130 ms | **99.9%** / 3% |
+| 16  | 54 / 105 us | **111 / 169 us** | 1.51 ms / 184 ms | 30.6 / **30.7** / 78 ms | **100%** / 95% |
+| 64  | 53 / 110 us | **109 / 185 us** | 201 ms / 641 ms | 30.7 / **30.7** / 2,122 ms | **100%** / 38% |
+| 256 | 54 / 151 us | **128 / 237 us** | > 2 s † | 30.7 / **30.8** / 10,872 ms | **100%** / 10% |
+| 512 | 54 / 236 us | **175 / 281 us** | > 2 s † | 30.7 / **30.8** / 13,363 ms | **100%** / 3% |
 
 † Beyond the load generator's 2 s histogram range, so not a percentile — past the tracked
 range the percentile function returns the maximum. The generator prints an explicit
@@ -200,13 +204,13 @@ nor the direct baseline at any level**, so every number in those columns is a re
 percentile.
 
 **How to read this.** llmbridge's time to first token sits **on the no-gateway floor**
-(30.3-30.8 ms vs the floor's 30.7-30.8 ms) at every concurrency, and it delivers
-essentially every token the provider emits. Its own per-token cost is **~50-120 us**
-against a 20 ms inter-token interval — under 1% of the token budget.
+(30.7-30.8 ms against the floor's 30.6-30.7 ms) at every concurrency, and it delivers
+every token the provider emits. Its own per-token cost is **~56-121 us** against a 20 ms
+inter-token interval — under 1% of the token budget.
 
-LiteLLM tracks well at 16 streams (94% delivered) and then queues: by 64 streams it
-delivers 37% and first-token latency is 2.2 s; by 512 streams it delivers **3%** with a
-**13 s** TTFT. Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
+LiteLLM tracks well at 16 streams (95% delivered) and then queues: by 64 streams it
+delivers 38% and first-token latency is 2.1 s; by 512 streams it delivers **3%** with a
+**13.4 s** TTFT. Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
 offered load.
 
 **Measurement conditions.** Cold-booted host, `performance` governor, **stock idle

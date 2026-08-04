@@ -11,26 +11,73 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Runs first and finishes in under a second: it needs no compiler and no build.
+  # Guards the ep_/ur_ backend split, which is what stops a call landing in the
+  # wrong event loop — the two backends' teardown and I/O are not interchangeable,
+  # and one such crossing shipped undetected before this existed.
+  conventions:
+    name: naming conventions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check backend prefixes and namespaces
+        run: python3 scripts/check_conventions.py
+      # Cheap last line of defence, not a gitleaks replacement. `private/` (live-key
+      # demo scripts, price observatory) shares this working tree with the public
+      # repo, separated only by .gitignore — one mis-added file is unrecoverable
+      # once pushed.
+      - name: Check no credentials are tracked
+        run: python3 scripts/check_no_secrets.py
+
+  # Pinned compiler versions, not bare `gcc`/`clang`. DESIGN.md and the README state a
+  # GCC 13+ / Clang 16+ floor; testing whatever the runner image happens to ship proves
+  # only that one version works, and silently drifts as the image updates. These are the
+  # versions we claim, so these are the versions CI builds.
   build-test:
-    name: build & test · ${{ matrix.cc }}
+    name: build & test · ${{ matrix.cxx }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { cc: gcc,   cxx: g++ }
-          - { cc: clang, cxx: clang++ }
+          - { pkg: g++-13,      cc: gcc-13,   cxx: g++-13 }
+          - { pkg: g++-14,      cc: gcc-14,   cxx: g++-14 }
+          - { pkg: clang-16,    cc: clang-16, cxx: clang++-16 }
+          - { pkg: clang-17,    cc: clang-17, cxx: clang++-17 }
+          - { pkg: clang-18,    cc: clang-18, cxx: clang++-18 }
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install ${{ matrix.pkg }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg }}
       - name: Configure (Release, tests on)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=ON -DLLMBRIDGE_WERROR=ON
       - name: Build
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # macOS builds the EMBEDDABLE LIBRARY only, which is the portable half and the whole
+  # "drop it into your binary" story. The gateway is Linux-only by design (epoll and
+  # io_uring), so this job deliberately does not build it — that is the supported
+  # boundary, not a gap. Configure succeeds because net/ feature-detects io_uring
+  # rather than assuming it.
+  macos-library:
+    name: library · macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=ON -DLLMBRIDGE_WERROR=ON
+      - name: Build the translator library and its tests
+        run: |
+          cmake --build build --target provider -j
+          cmake --build build --target provider_json_test provider_translate_test \
+                                 provider_sse_test provider_bijection_test -j
+      - name: Test
+        run: ctest --test-dir build -R "Json|Translate|Sse|Bijection" --output-on-failure
 
   sanitizers:
     name: tests · ASan+UBSan
@@ -74,3 +121,28 @@ jobs:
         # -max_len bounds input: fuzz_sse translates each input twice (whole +
         # chunked) to assert fragmentation-invariance, so keep units modest.
         run: ./build-fuzz/bin/fuzz_sse -max_total_time=60 -max_len=8192 -print_final_stats=1 fuzz/corpus/sse
+
+  # Builds a downstream project against an INSTALLED llmbridge, exactly as the README
+  # tells a user to. Nothing else here touches the install tree — the suite builds
+  # in-tree — so a broken export, a header that does not stand alone, or a renamed
+  # public namespace would pass every other job and break only for the consumer.
+  # v0.9.0 moved `llmbridge::json` inside an installed header; this is what would
+  # have caught it.
+  install-consumer:
+    name: consumer · find_package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and install llmbridge
+        run: |
+          cmake -B build-inst -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=OFF \
+                -DLLMBRIDGE_WERROR=ON -DCMAKE_INSTALL_PREFIX="$PWD/_install"
+          cmake --build build-inst -j
+          cmake --install build-inst
+      - name: Build a consumer against the install tree
+        run: |
+          cmake -S ci/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$PWD/_install"
+          cmake --build build-consumer -j
+      - name: Run it
+        run: ./build-consumer/consumer
+
