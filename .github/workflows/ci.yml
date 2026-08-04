@@ -113,14 +113,36 @@ jobs:
           cmake -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ \
             -DLLMBRIDGE_BUILD_FUZZERS=ON -DLLMBRIDGE_BUILD_TESTS=OFF
           cmake --build build-fuzz -j
+      # -artifact_prefix sends crash/timeout/OOM reproducers to one directory so the
+      # upload step below can collect them. libFuzzer requires the trailing slash and
+      # the directory to exist. Without this the reproducer is written to the runner's
+      # CWD and discarded when the job ends — leaving a red X and no way to reproduce
+      # it, which for a randomised fuzzer means the finding is simply lost.
+      - name: Prepare artifact directory
+        run: mkdir -p fuzz-artifacts
       - name: Fuzz the JSON parser (60s, seeded)
-        run: ./build-fuzz/bin/fuzz_json -max_total_time=60 -print_final_stats=1 fuzz/corpus/json
+        run: ./build-fuzz/bin/fuzz_json -max_total_time=60 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/json
       - name: Fuzz the HTTP framer (60s, seeded)
-        run: ./build-fuzz/bin/fuzz_http -max_total_time=60 -print_final_stats=1 fuzz/corpus/http
+        run: ./build-fuzz/bin/fuzz_http -max_total_time=60 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/http
       - name: Fuzz the SSE translator (60s, seeded)
         # -max_len bounds input: fuzz_sse translates each input twice (whole +
         # chunked) to assert fragmentation-invariance, so keep units modest.
-        run: ./build-fuzz/bin/fuzz_sse -max_total_time=60 -max_len=8192 -print_final_stats=1 fuzz/corpus/sse
+        run: ./build-fuzz/bin/fuzz_sse -max_total_time=60 -max_len=8192 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/sse
+
+      # if: failure() — runs only when a fuzz step above failed, and still runs even
+      # though that failure aborts the rest of the job. Reproduce locally with:
+      #   ./build-fuzz/bin/fuzz_json <downloaded-crash-file>
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-reproducers-${{ github.run_id }}
+          path: fuzz-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
 
   # Builds a downstream project against an INSTALLED llmbridge, exactly as the README
   # tells a user to. Nothing else here touches the install tree — the suite builds
