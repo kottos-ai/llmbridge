@@ -71,11 +71,12 @@ configurations are documented in
 
 ![Throughput saturation — offered vs achieved RPS](bench/results/saturation.svg)
 
-Single-thread ceiling is **~84k RPS** — mean of three cold-boot runs; best single run
-86,982, reproducing an earlier 87.6k measurement on the same code. Requires `BACKENDS=4`,
-or the mock is the limit (at the default of 1 the mock caps it at ~65k). The conservative
-mean is quoted rather than the best run, because the best run is only achievable on a
-cold machine.
+Single-thread ceiling is **~84k RPS** — median of three cold-boot runs (84,928; the
+mean, 84,763, rounds to the same claim); best single run 86,982, reproducing an earlier
+87.6k measurement on the same code. Requires `BACKENDS=4`, or the mock is the limit (at
+the default of 1 the mock caps it at ~65k). The middle run is quoted rather than the
+best, because the best run is only achievable on a cold machine — and median-of-3 is
+the summary statistic used throughout this document.
 
 Throughput is strongly thermally dependent on this laptop, so the number degrades within
 a session: three consecutive runs measured **86,982 → 84,928 → 82,380** as the package
