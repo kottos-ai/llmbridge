@@ -27,8 +27,8 @@
 #include <string>
 #include <vector>
 
-using llmbridge::json::Value;
-using llmbridge::json::parse;
+using llmbridge::provider::json::Value;
+using llmbridge::provider::json::parse;
 using llmbridge::provider::openai_to_anthropic_request;
 using llmbridge::provider::openai_to_gemini_request;
 using llmbridge::provider::openai_to_cohere_request;

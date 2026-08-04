@@ -23,8 +23,8 @@ using llmbridge::provider::openai_to_gemini_request;
 using llmbridge::provider::gemini_to_openai_response;
 using llmbridge::provider::openai_to_cohere_request;
 using llmbridge::provider::cohere_to_openai_response;
-using llmbridge::json::Value;
-using llmbridge::json::parse;
+using llmbridge::provider::json::Value;
+using llmbridge::provider::json::parse;
 
 namespace
 {
@@ -200,11 +200,15 @@ TEST(UpstreamError, UnparseableBodyStillYieldsValidEnvelope)
     }
 }
 
-TEST(UpstreamError, SanitizesControlBytesFromUpstream)
+TEST(UpstreamError, RawControlBytesFromUpstreamNeverReachTheEnvelope)
 {
-    // A hostile/broken provider can put a RAW control byte inside its error
-    // message (our parser is lenient); relaying it verbatim would make OUR error
-    // envelope invalid JSON for a strict client.
+    // A hostile/broken provider puts a RAW control byte in its error message.
+    // Relaying it verbatim would make OUR error envelope invalid JSON for a strict
+    // client. Since the parser was tightened (RFC 8259 §7) such a body does not
+    // parse at all, so we emit the generic envelope rather than guessing at a
+    // message inside malformed JSON — refusing to interpret beats sanitising and
+    // forwarding. The invariant under test is unchanged and is the one that
+    // matters: no raw control byte, and the envelope always parses.
     std::string body = "{\"error\":{\"type\":\"api_err\",\"message\":\"boom";
     body += char(0x0A);
     body += "next";
@@ -212,10 +216,38 @@ TEST(UpstreamError, SanitizesControlBytesFromUpstream)
     body += "\"}}";
     const std::string out = llmbridge::provider::upstream_error_to_openai(body, "upstream_error");
     for (unsigned char c : out) EXPECT_GE(c, 0x20) << "raw control byte leaked into the envelope";
-    EXPECT_NE(out.find("\\u000a"), std::string::npos);
-    EXPECT_NE(out.find("\\u0001"), std::string::npos);
-    Value v = P(out); // and it still parses
-    EXPECT_EQ(v.find("error")->str_or("type"), "api_err");
+    Value v = P(out);
+    ASSERT_NE(v.find("error"), nullptr) << "envelope must still be valid JSON";
+    EXPECT_EQ(v.find("error")->str_or("type"), "upstream_error");
+    EXPECT_EQ(v.find("error")->str_or("message"), "upstream provider error");
+}
+
+TEST(UpstreamError, WellFormedProviderErrorStillRelaysItsOwnMessage)
+{
+    // The case that actually happens: real providers emit valid JSON, and the
+    // stricter parser must not cost us the provider's own type and message —
+    // that is the whole point of relaying a 429 rather than laundering it to 502.
+    const std::string body =
+        R"({"error":{"type":"rate_limit_error","message":"Number of requests has exceeded your rate limit"}})";
+    const std::string out = llmbridge::provider::upstream_error_to_openai(body, "upstream_error");
+    Value v = P(out);
+    ASSERT_NE(v.find("error"), nullptr);
+    EXPECT_EQ(v.find("error")->str_or("type"), "rate_limit_error");
+    EXPECT_EQ(v.find("error")->str_or("message"),
+              "Number of requests has exceeded your rate limit");
+}
+
+TEST(UpstreamError, EscapedControlCharsRelayAsEscaped)
+{
+    // Legal input: the control character is already escaped, so the body parses and
+    // the span is forwarded still-escaped. Valid JSON in, valid JSON out.
+    const std::string body =
+        "{\"error\":{\"type\":\"t\",\"message\":\"line1\\nline2\"}}";
+    const std::string out = llmbridge::provider::upstream_error_to_openai(body, "upstream_error");
+    for (unsigned char c : out) EXPECT_GE(c, 0x20);
+    Value v = P(out);
+    ASSERT_NE(v.find("error"), nullptr);
+    EXPECT_EQ(v.find("error")->str_or("type"), "t");
 }
 
 TEST(UpstreamError, PreservesEscapingInMessage)
@@ -727,7 +759,7 @@ TEST(ToolResp, ToolUseBecomesToolCallsWithStringArguments)
     const Value* args = fn->find("arguments");
     ASSERT_NE(args, nullptr);
     ASSERT_TRUE(args->is_string()) << "arguments must be a string, not an object";
-    const std::string decoded = llmbridge::json::unescape_string(args->sv);
+    const std::string decoded = llmbridge::provider::json::unescape_string(args->sv);
     EXPECT_EQ(decoded, R"({"city":"Paris"})");
     EXPECT_EQ(v.find("choices")->arr[0].str_or("finish_reason"), "tool_calls");
 }
@@ -800,8 +832,8 @@ TEST(ToolRoundTrip, ArgumentsSurviveBothDirections)
     const Value* input = req.find("messages")->arr[0].find("content")->arr[0].find("input");
     ASSERT_NE(input, nullptr);
     ASSERT_TRUE(input->is_object());
-    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("q")), "say \"hi\"\nnow");
-    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("path")), "a/b\\c");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string(input->str_or("q")), "say \"hi\"\nnow");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string(input->str_or("path")), "a/b\\c");
     EXPECT_EQ(input->num_or("n"), "-1.5e3");
-    EXPECT_EQ(llmbridge::json::unescape_string(input->str_or("u")), "café");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string(input->str_or("u")), "café");
 }

@@ -33,6 +33,49 @@ app/        the CLI daemon (llmbridge --listen … --upstream … --translate �
 "use it as a library" story. `net/http.hpp` is header-only so the framer inlines
 into the loop. Nothing above `net/` has a third-party dependency.
 
+### Naming conventions (enforced)
+
+Namespaces mirror the directory, with no exceptions:
+`net/…` → `llmbridge::net[::http|::tls|::uring]`, `provider/…` →
+`llmbridge::provider[::json]`, `gateway/…` → `llmbridge`.
+
+**Inside `Gateway`, the backend a function belongs to is part of its name:**
+
+| prefix | meaning |
+|---|---|
+| `ep_` | epoll-only — reachable solely from `run_epoll()` |
+| `ur_` | io_uring-only — reachable solely from `run_uring()` |
+| *(none)* | genuinely shared by both loops (`sweep_idle`, the `tls_*` pump helpers) |
+
+Two rules make this worth the verbosity:
+
+1. **A call crossing the prefixes is a bug, and `grep 'ur_[a-z_]*(' | grep ep_`
+   finds it.** Neither backend's teardown, write-arming or completion handling is
+   valid in the other. Exactly one such crossing existed when the convention was
+   introduced — `ur_forward()` calling the *epoll* error responder — and it had
+   been invisible for as long as the epoll half was unprefixed.
+2. **Twins share a verb.** `ep_stream_flush` / `ur_stream_flush`,
+   `ep_finish_client` / `ur_finish_client`. Before this, the same role was called
+   `stream_flush` on one side and `u_stream_kick` on the other, so a grep for the
+   counterpart returned nothing and the pairing had to be rediscovered by reading.
+
+The uring prefix is `ur_`, not `u_`, because `u` is the conventional parameter name
+for an *upstream* connection — `void u_tls_kick_send(Connection* u)` used both
+meanings of `u` in one signature.
+
+**This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
+first CI job (no compiler, ~90 ms) and fails the build on three things: a call crossing
+the prefixes; an **unprefixed** method reachable from only one backend; and a header
+whose namespace does not mirror its directory. The middle check is the one that earns
+its keep — a crossing grep cannot catch a mislabelled method, because the offending name
+has no prefix to grep for. That is exactly how `abort_pair` survived the rename that
+introduced this convention. Each check is verified against a deliberately reintroduced
+instance of the defect it exists to catch.
+
+Elsewhere: `kPascalCase` constants, `_member` privates, `PascalCase` types and enum
+values, `snake_case` functions, `ts_*` for timestamps, and `X_to_Y_request` /
+`X_to_Y_response` for the translation entry points.
+
 ## Threading & I/O model
 
 - **Shared-nothing workers.** Each worker is a single thread owning one event loop

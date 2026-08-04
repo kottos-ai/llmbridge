@@ -22,8 +22,8 @@
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     bool ok = false;
-    llmbridge::json::Value v =
-        llmbridge::json::parse(std::string_view(reinterpret_cast<const char*>(data), size), ok);
+    llmbridge::provider::json::Value v =
+        llmbridge::provider::json::parse(std::string_view(reinterpret_cast<const char*>(data), size), ok);
     // Touch the result so nothing is optimised away; no assertion — the invariant
     // is simply "does not crash / ASAN-clean on any input".
     if (ok && v.is_object()) (void)v.find("model");

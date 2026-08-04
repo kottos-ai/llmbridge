@@ -96,7 +96,7 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
-        bool write_armed = false;     // EPOLLOUT currently registered
+        bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
         bool doomed = false;          // closed this epoll batch; deleted after the batch
@@ -106,15 +106,15 @@ namespace llmbridge
 
         // Non-streaming chunked decode state, PER CONNECTION rather than shared:
         // it must persist across reads so the decoder is fed only new bytes
-        // (see http::ResponseDecoder — the shared-scratch form was quadratic).
-        http::ResponseDecoder rdec;
+        // (see net::http::ResponseDecoder — the shared-scratch form was quadratic).
+        net::http::ResponseDecoder rdec;
 
         std::string rbuf;
         std::string wbuf;
         size_t woff = 0;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
-        http::Message msg{};
+        net::http::Message msg{};
 
         // Latency stamps (ns), held on the CLIENT conn for the active request.
         int64_t ts_req_recvd = 0;
@@ -156,10 +156,12 @@ namespace llmbridge
         bool streaming = false;
         bool stream_chunked = false; // upstream body uses chunked transfer-encoding
         bool stream_ended = false;   // final [DONE] emitted; close once the client drains
-        bool read_paused = false;    // upstream EPOLLIN paused (client-write backpressure)
+        bool read_paused = false;    // epoll backend only: upstream EPOLLIN paused
+                                     // (client-write backpressure; the uring pump
+                                     // bounds wpending with kStreamBufCap instead)
         bool wants_usage = false;    // client set stream_options.include_usage
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
-        http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
+        net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`
         // while a client SEND SQE is in flight, so `wbuf` (the SEND's buffer) is
         // never reallocated under the kernel's feet. `send_inflight` serializes
@@ -274,31 +276,48 @@ namespace llmbridge
         void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
 
     private:
+        // NAMING — the backend a method belongs to is part of its name:
+        //   ep_*   epoll-only    (reachable only from run_epoll)
+        //   ur_*   io_uring-only (reachable only from run_uring)
+        //   plain  shared by both loops — sweep_idle, the tls_* pump helpers
+        //
+        // A call that crosses the prefixes is a bug: neither backend's teardown,
+        // write-arming or completion handling is valid in the other. The payoff is
+        // that the check is a grep rather than a call-graph walk —
+        //   grep -n 'ur_[a-z_]*(' gateway.cpp | grep ep_
+        // Exactly one crossing existed when this convention was introduced
+        // (ur_forward calling the epoll error responder); it had been invisible for
+        // as long as the epoll half of the class was unprefixed. Twins share a verb
+        // so the counterpart is greppable: ep_stream_flush / ur_stream_flush.
+        //
+        // The uring prefix is ur_, not u_, because `u` is the parameter name for an
+        // upstream connection and `void u_tls_kick_send(Connection* u)` used both
+        // meanings at once. See DESIGN.md "Naming conventions".
         void ep_add_read(Connection* c) noexcept;
         void ep_arm_write(Connection* c) noexcept;
         void ep_disarm_write(Connection* c) noexcept;
 
-        void on_accept() noexcept;
-        void on_client_readable(Connection* c) noexcept;
-        void on_client_writable(Connection* c) noexcept;
-        void on_upstream_writable(Connection* c) noexcept;
-        void on_upstream_readable(Connection* c) noexcept;
+        void ep_on_accept() noexcept;
+        void ep_on_client_readable(Connection* c) noexcept;
+        void ep_on_client_writable(Connection* c) noexcept;
+        void ep_on_upstream_writable(Connection* c) noexcept;
+        void ep_on_upstream_readable(Connection* c) noexcept;
 
         // Forward the client's buffered (and optionally translated) request to an
         // upstream connection. Called inline once a full request is framed.
-        void forward(Connection* client) noexcept;
+        void ep_forward(Connection* client) noexcept;
         // Write the buffered response to the client; close out accounting.
-        void respond(Connection* client) noexcept;
-        void finish_client_response(Connection* c) noexcept;
+        void ep_respond(Connection* client) noexcept;
+        void ep_finish_client(Connection* c) noexcept;
 
         // ── Streaming pump (epoll) ──────────────────────────────────────────
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
         void ep_resume_read(Connection* c) noexcept;  // restore EPOLLIN
-        void begin_stream(Connection* u, const http::ResponseHead& h) noexcept; // enter streaming
-        void stream_pump(Connection* u) noexcept;      // decode+translate new upstream body bytes
-        void stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
-        void stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
-        void finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
+        void ep_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept; // enter streaming
+        void ep_stream_pump(Connection* u) noexcept;      // decode+translate new upstream body bytes
+        void ep_stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
+        void ep_stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
+        void ep_finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
 
         // Abort any request whose upstream has been silent for longer than
         // _upstream_idle_ns. Runs on the loop's existing periodic tick (epoll's
@@ -306,21 +325,21 @@ namespace llmbridge
         // `uring` selects the matching teardown primitives.
         void sweep_idle(bool uring) noexcept;
 
-        Connection* acquire_upstream() noexcept;
-        void release_upstream(Connection* u) noexcept;
+        Connection* ep_acquire_upstream() noexcept;
+        void ep_release_upstream(Connection* u) noexcept;
         // Epoll: a pooled upstream failed before any response (provider dropped the
         // idle keep-alive). Resend the request once on a fresh connection.
-        bool retry_upstream(Connection* u) noexcept;
-        void close_client(Connection* c) noexcept;
-        void close_upstream(Connection* u) noexcept;
-        void abort_pair(Connection* client) noexcept;
+        bool ep_retry_upstream(Connection* u) noexcept;
+        void ep_close_client(Connection* c) noexcept;
+        void ep_close_upstream(Connection* u) noexcept;
+        void ep_abort_pair(Connection* client) noexcept;
         // Reply to the client with a structured HTTP error (400 malformed request /
         // 502 upstream failure) and close, instead of a bare TCP reset. Tears down
         // any in-flight upstream peer.
-        void error_respond(Connection* client, int code) noexcept;
+        void ep_error_respond(Connection* client, int code) noexcept;
 
-        bool drain_read(Connection* c) noexcept;
-        bool pump_write(Connection* c, bool* done) noexcept;
+        bool ep_drain_read(Connection* c) noexcept;
+        bool ep_pump_write(Connection* c, bool* done) noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         // ── TLS plumbing (upstream side only; every helper is a no-op-safe
@@ -337,21 +356,21 @@ namespace llmbridge
         // Push un-fed request plaintext (wbuf[woff..]) into the Session.
         void tls_push_request(Connection* u) noexcept;
         // True when the request is fully on the wire: all plaintext fed AND all
-        // ciphertext flushed. This is the TLS analogue of pump_write's `done`,
+        // ciphertext flushed. This is the TLS analogue of ep_pump_write's `done`,
         // and the point where ts_up_sent is stamped.
         bool tls_request_flushed(const Connection* u) const noexcept;
 
         // Epoll only: write tls_out to the socket (non-blocking), arming EPOLLOUT
         // on a partial write. False = socket error.
-        bool tls_flush_epoll(Connection* u, bool* done) noexcept;
-        // Epoll only: TLS-aware replacement for drain_read on upstream conns.
-        bool tls_drain_read_epoll(Connection* u) noexcept;
+        bool ep_tls_flush(Connection* u, bool* done) noexcept;
+        // Epoll only: TLS-aware replacement for ep_drain_read on upstream conns.
+        bool ep_tls_drain_read(Connection* u) noexcept;
 
 #ifdef LLMBRIDGE_HAVE_URING
         // io_uring only: submit a SEND for tls_out if non-empty and none in
         // flight (send_inflight serializes; handshake flights and request bytes
         // must not interleave on the wire).
-        void u_tls_kick_send(Connection* u) noexcept;
+        void ur_tls_flush(Connection* u) noexcept;
 #endif
 #endif
 
@@ -363,40 +382,40 @@ namespace llmbridge
         // machine, sharing the Connection struct + translate/framing helpers. A
         // conn is freed only when its `inflight` SQEs all complete.
         int run_uring();
-        bool u_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
-        void u_submit_accept() noexcept;
-        void u_submit_timer() noexcept;
-        bool u_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
-        bool u_submit_send(Connection* c) noexcept;
-        bool u_submit_connect(Connection* u) noexcept;
-        void u_submit_cancel(int fd) noexcept; // cancel all in-flight ops on a fd
-        void u_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
-        void u_on_accept(int res, uint32_t flags) noexcept;
-        void u_on_recv(Connection* c, int res, uint32_t flags) noexcept;
-        void u_on_send(Connection* c, int res) noexcept;
-        void u_on_connect(Connection* u, int res) noexcept;
-        void u_forward(Connection* c) noexcept;
-        void u_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
-        void u_on_response(Connection* u, const http::ResponseHead& h,
+        bool ur_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
+        void ur_submit_accept() noexcept;
+        void ur_submit_timer() noexcept;
+        bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
+        bool ur_submit_send(Connection* c) noexcept;
+        bool ur_submit_connect(Connection* u) noexcept;
+        void ur_submit_cancel(int fd) noexcept; // cancel all in-flight ops on a fd
+        void ur_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
+        void ur_on_accept(int res, uint32_t flags) noexcept;
+        void ur_on_recv(Connection* c, int res, uint32_t flags) noexcept;
+        void ur_on_send(Connection* c, int res) noexcept;
+        void ur_on_connect(Connection* u, int res) noexcept;
+        void ur_forward(Connection* c) noexcept;
+        void ur_try_forward_buffered(Connection* c) noexcept; // forward a framed request if idle
+        void ur_on_response(Connection* u, const net::http::ResponseHead& h,
                            std::string_view body_buf, size_t total_len) noexcept;
-        void u_finish_client(Connection* c) noexcept;
+        void ur_finish_client(Connection* c) noexcept;
         // io_uring streaming pump — completion-driven mirror of the epoll pump,
         // with serialized sends (one SEND SQE in flight) and a bounded buffer.
-        void u_begin_stream(Connection* u, const http::ResponseHead& h) noexcept;
-        void u_stream_pump(Connection* u) noexcept;
-        void u_stream_on_eof(Connection* u) noexcept;
-        void u_stream_kick(Connection* client) noexcept; // send pending bytes, or finalize
-        void u_finalize_stream(Connection* client) noexcept;
-        Connection* u_acquire_upstream() noexcept;
-        void u_release_upstream(Connection* u) noexcept;
+        void ur_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept;
+        void ur_stream_pump(Connection* u) noexcept;
+        void ur_stream_on_upstream_eof(Connection* u) noexcept;
+        void ur_stream_flush(Connection* client) noexcept; // send pending bytes, or finalize
+        void ur_finalize_stream(Connection* client) noexcept;
+        Connection* ur_acquire_upstream() noexcept;
+        void ur_release_upstream(Connection* u) noexcept;
         // A pooled upstream failed before sending any response (it was almost
         // certainly closed idle by the provider). Resend the request once on a
         // fresh connection. Returns true if a retry was issued.
-        bool u_retry_upstream(Connection* u) noexcept;
-        void u_close(Connection* c) noexcept;
-        void u_abort_pair(Connection* client) noexcept;
-        void u_error_respond(Connection* client, int code) noexcept; // uring mirror of error_respond
-        void u_maybe_free(Connection* c) noexcept;
+        bool ur_retry_upstream(Connection* u) noexcept;
+        void ur_close(Connection* c) noexcept;
+        void ur_abort_pair(Connection* client) noexcept;
+        void ur_error_respond(Connection* client, int code) noexcept; // uring mirror of ep_error_respond
+        void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;
         net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
@@ -416,7 +435,7 @@ namespace llmbridge
         TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
         bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
-        // Decode buffer for CHUNKED upstream responses (see http::parse_response).
+        // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a
         // response is framed and consumed entirely within one event, so there is no
         // overlap. Reused across requests so the chunked path — which is the REAL

@@ -35,10 +35,10 @@
 #include <utility>
 #include <vector>
 
-using llmbridge::http::Message;
-using llmbridge::http::ParseStatus;
-using llmbridge::http::parse;
-using llmbridge::http::kMaxHeaderLen;
+using llmbridge::net::http::Message;
+using llmbridge::net::http::FrameStatus;
+using llmbridge::net::http::parse_request;
+using llmbridge::net::http::kMaxHeaderLen;
 
 namespace
 {
@@ -190,7 +190,7 @@ TEST_P(HttpComplete, FramesExactly)
 {
     const auto& c = GetParam();
     Message m;
-    ASSERT_EQ(parse(c.raw, m), ParseStatus::Complete) << c.name;
+    ASSERT_EQ(parse_request(c.raw, m), FrameStatus::Complete) << c.name;
     const size_t hdr = c.raw.find("\r\n\r\n") + 4;
     EXPECT_EQ(m.header_len, hdr) << c.name;
     EXPECT_EQ(m.body_len, c.body_len) << c.name;
@@ -205,7 +205,7 @@ class HttpNeedMore : public ::testing::TestWithParam<RawCase> {};
 TEST_P(HttpNeedMore, ReturnsNeedMore)
 {
     Message m;
-    EXPECT_EQ(parse(GetParam().raw, m), ParseStatus::NeedMore) << GetParam().name;
+    EXPECT_EQ(parse_request(GetParam().raw, m), FrameStatus::NeedMore) << GetParam().name;
 }
 INSTANTIATE_TEST_SUITE_P(Cases, HttpNeedMore, ::testing::ValuesIn(make_needmore_cases()),
                          [](const testing::TestParamInfo<RawCase>& i) { return i.param.name; });
@@ -214,7 +214,7 @@ class HttpError : public ::testing::TestWithParam<RawCase> {};
 TEST_P(HttpError, ReturnsError)
 {
     Message m;
-    EXPECT_EQ(parse(GetParam().raw, m), ParseStatus::Error) << GetParam().name;
+    EXPECT_EQ(parse_request(GetParam().raw, m), FrameStatus::Error) << GetParam().name;
 }
 INSTANTIATE_TEST_SUITE_P(Cases, HttpError, ::testing::ValuesIn(make_error_cases()),
                          [](const testing::TestParamInfo<RawCase>& i) { return i.param.name; });
@@ -224,7 +224,7 @@ TEST_P(HttpPipeline, FramesOnlyFirstMessage)
 {
     const auto& c = GetParam();
     Message m;
-    ASSERT_EQ(parse(c.raw, m), ParseStatus::Complete) << c.name;
+    ASSERT_EQ(parse_request(c.raw, m), FrameStatus::Complete) << c.name;
     EXPECT_EQ(m.total_len, c.first_total) << c.name;
     EXPECT_LT(m.total_len, c.raw.size()) << c.name;
 }
@@ -251,11 +251,11 @@ TEST_P(HttpIncremental, EveryProperPrefixIsNeedMore)
 {
     const auto& c = GetParam();
     Message m;
-    auto st = parse(std::string_view(c.raw).substr(0, c.prefix), m);
+    auto st = parse_request(std::string_view(c.raw).substr(0, c.prefix), m);
     if (c.prefix < c.raw.size())
-        EXPECT_EQ(st, ParseStatus::NeedMore) << c.name;
+        EXPECT_EQ(st, FrameStatus::NeedMore) << c.name;
     else
-        EXPECT_EQ(st, ParseStatus::Complete) << c.name;
+        EXPECT_EQ(st, FrameStatus::Complete) << c.name;
 }
 INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_incremental_cases()),
                          [](const testing::TestParamInfo<IncCase>& i) { return i.param.name; });
@@ -264,7 +264,7 @@ INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_increm
 // --- Framing-desync regressions (security sweep, 2026-08-03) ------------------
 //
 // Every case below was MEASURED against the pre-fix framer. Six of the seven had
-// the identical signature: parse() returned Complete with body_len == 0 while the
+// the identical signature: parse_request() returned Complete with body_len == 0 while the
 // body sat unconsumed in the buffer. In passthrough mode the gateway then forwards
 // the header block verbatim — malformed header included — so an upstream that
 // reads the length we could not becomes a desync, and because the upstream pool is
@@ -280,7 +280,7 @@ namespace
     void expect_rejected(const std::string& raw, const char* why)
     {
         Message m;
-        EXPECT_EQ(parse(raw, m), ParseStatus::Error) << why;
+        EXPECT_EQ(parse_request(raw, m), FrameStatus::Error) << why;
     }
 } // namespace
 
@@ -330,9 +330,9 @@ TEST(HttpDesync, LegalContentLengthFormsStillAccepted)
     // The fix must not over-reject: trailing OWS is legal (RFC 9110 trims it), and
     // a plain length obviously is. A framer that rejects these breaks real clients.
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 5 "}, "hello"), m), ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Content-Length: 5 "}, "hello"), m), FrameStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
-    ASSERT_EQ(parse(build("POST", {"Content-Length:5"}, "hello"), m), ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Content-Length:5"}, "hello"), m), FrameStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
 }
 
@@ -343,29 +343,29 @@ TEST(HttpDesync, ResponseWithBothChunkedAndContentLengthIsRejected)
     // stray bytes on the POOLED connection, i.e. in the next client's response.
     const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
                             "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-    llmbridge::http::ResponseHead h;
-    EXPECT_EQ(llmbridge::http::parse_response_head(raw, h), llmbridge::http::HeadStatus::Error);
+    llmbridge::net::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::net::http::parse_response_head(raw, h), llmbridge::net::http::FrameStatus::Error);
 }
 
 TEST(HttpDesync, ResponseConflictingDuplicateContentLengthIsRejected)
 {
     const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhello";
-    llmbridge::http::ResponseHead h;
-    EXPECT_EQ(llmbridge::http::parse_response_head(raw, h), llmbridge::http::HeadStatus::Error);
+    llmbridge::net::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::net::http::parse_response_head(raw, h), llmbridge::net::http::FrameStatus::Error);
 }
 
 TEST(HttpDesync, ResponseBareCrAndBadLengthAreRejected)
 {
-    llmbridge::http::ResponseHead h;
-    EXPECT_EQ(llmbridge::http::parse_response_head("HTTP/1.1 200 OK\r\nX-A: 1\rContent-Length: 5\r\n\r\nhello", h),
-              llmbridge::http::HeadStatus::Error);
-    EXPECT_EQ(llmbridge::http::parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello", h),
-              llmbridge::http::HeadStatus::Error);
+    llmbridge::net::http::ResponseHead h;
+    EXPECT_EQ(llmbridge::net::http::parse_response_head("HTTP/1.1 200 OK\r\nX-A: 1\rContent-Length: 5\r\n\r\nhello", h),
+              llmbridge::net::http::FrameStatus::Error);
+    EXPECT_EQ(llmbridge::net::http::parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello", h),
+              llmbridge::net::http::FrameStatus::Error);
 }
 TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 {
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 5 "}, "hello"), m), ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Content-Length: 5 "}, "hello"), m), FrameStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
 }
 TEST(HttpQuirk, DuplicateContentLengthIdenticalIsAccepted)
@@ -373,8 +373,8 @@ TEST(HttpQuirk, DuplicateContentLengthIdenticalIsAccepted)
     // Identical repeats are harmless and collapse to one (a conflicting duplicate
     // is rejected — see the HttpError `dup_content_length_conflict` case).
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 5", "Content-Length: 5"}, "hello"), m),
-              ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Content-Length: 5", "Content-Length: 5"}, "hello"), m),
+              FrameStatus::Complete);
     EXPECT_EQ(m.body_len, 5u);
 }
 TEST(HttpQuirk, BodyLengthAtCapIsNotError)
@@ -383,21 +383,21 @@ TEST(HttpQuirk, BodyLengthAtCapIsNotError)
     // proving the guard is a true upper bound, not off-by-one strict.
     Message m;
     const std::string raw =
-        "POST / HTTP/1.1\r\nContent-Length: " + std::to_string(llmbridge::http::kMaxBodyLen) + "\r\n\r\n";
-    EXPECT_NE(parse(raw, m), ParseStatus::Error);
+        "POST / HTTP/1.1\r\nContent-Length: " + std::to_string(llmbridge::net::http::kMaxBodyLen) + "\r\n\r\n";
+    EXPECT_NE(parse_request(raw, m), FrameStatus::Error);
 }
 TEST(HttpQuirk, ConnectionClosedPrefixMatchesClose)
 {
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Connection: closed", "Content-Length: 1"}, "x"), m),
-              ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Connection: closed", "Content-Length: 1"}, "x"), m),
+              FrameStatus::Complete);
     EXPECT_FALSE(m.keep_alive);
 }
 TEST(HttpQuirk, IdempotentReparseGivesSameResult)
 {
     std::string raw = build("POST", {"Content-Length: 4"}, "abcd");
     Message m1, m2;
-    EXPECT_EQ(parse(raw, m1), parse(raw, m2));
+    EXPECT_EQ(parse_request(raw, m1), parse_request(raw, m2));
     EXPECT_EQ(m1.total_len, m2.total_len);
     EXPECT_EQ(m1.body_len, m2.body_len);
     EXPECT_EQ(m1.keep_alive, m2.keep_alive);
@@ -405,14 +405,14 @@ TEST(HttpQuirk, IdempotentReparseGivesSameResult)
 TEST(HttpQuirk, ZeroLengthBodyFramesAtHeaderEnd)
 {
     Message m;
-    ASSERT_EQ(parse(build("POST", {"Content-Length: 0"}, ""), m), ParseStatus::Complete);
+    ASSERT_EQ(parse_request(build("POST", {"Content-Length: 0"}, ""), m), FrameStatus::Complete);
     EXPECT_EQ(m.body_len, 0u);
     EXPECT_EQ(m.total_len, m.header_len);
 }
 TEST(HttpQuirk, LargePaddingHeaderUnderCapIsNotError)
 {
     Message m;
-    EXPECT_NE(parse(build("GET", {"X-Pad: " + std::string(1024, 'p')}, ""), m), ParseStatus::Error);
+    EXPECT_NE(parse_request(build("GET", {"X-Pad: " + std::string(1024, 'p')}, ""), m), FrameStatus::Error);
 }
 
 // ── find_header ──────────────────────────────────────────────────────────────
@@ -420,33 +420,33 @@ TEST(HttpQuirk, LargePaddingHeaderUnderCapIsNotError)
 TEST(FindHeader, CaseInsensitiveNameLookupTrimsValue)
 {
     const std::string_view h = "Host: x\r\nX-API-Key:   sk-123\r\nContent-Length: 4\r\n";
-    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "sk-123");
-    EXPECT_EQ(llmbridge::http::find_header(h, "host:"), "x");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "sk-123");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "host:"), "x");
 }
 
 TEST(FindHeader, MissingHeaderIsEmpty)
 {
-    EXPECT_TRUE(llmbridge::http::find_header("Host: x\r\n", "authorization:").empty());
-    EXPECT_TRUE(llmbridge::http::find_header("", "authorization:").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("Host: x\r\n", "authorization:").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("", "authorization:").empty());
 }
 
 TEST(FindHeader, FirstOccurrenceWinsOnDuplicates)
 {
     // Anti-smuggling: duplicated credentials must resolve deterministically.
     const std::string_view h = "x-api-key: first\r\nx-api-key: second\r\n";
-    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "first");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "first");
 }
 
 TEST(FindHeader, ColonInNameStopsPrefixConfusion)
 {
     const std::string_view h = "x-api-key-2: wrong\r\nx-api-key: right\r\n";
-    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "right");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "right");
 }
 
 TEST(FindHeader, CrlfEndsTheValue)
 {
     const std::string_view h = "x-api-key: k\r\nX-Evil: 1\r\n";
-    EXPECT_EQ(llmbridge::http::find_header(h, "x-api-key:"), "k");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "k");
 }
 
 // Documents the SHARP EDGE deliberately: a bare CR does NOT terminate a line, so
@@ -455,7 +455,7 @@ TEST(FindHeader, CrlfEndsTheValue)
 TEST(FindHeader, BareCrSurvivesInsideValueSoCallersMustValidate)
 {
     const std::string_view h = "x-api-key: k\rX-Smuggled: 1\r\nHost: a\r\n";
-    const auto v = llmbridge::http::find_header(h, "x-api-key:");
+    const auto v = llmbridge::net::http::find_header(h, "x-api-key:");
     EXPECT_NE(v.find('\r'), std::string_view::npos)
         << "if this ever passes, find_header changed and gateway validation may be stale";
 }
@@ -485,16 +485,16 @@ namespace
     }
 
     // Drive parse_response the way the gateway does: append a read, re-parse.
-    llmbridge::http::ParsedResponse drive(const std::string& wire, size_t read_size,
-                                          llmbridge::http::ResponseDecoder& st,
+    llmbridge::net::http::ParsedResponse drive(const std::string& wire, size_t read_size,
+                                          llmbridge::net::http::ResponseDecoder& st,
                                           std::string& rbuf)
     {
-        llmbridge::http::ParsedResponse r;
+        llmbridge::net::http::ParsedResponse r;
         for (size_t off = 0; off < wire.size(); off += read_size)
         {
             rbuf.append(wire, off, std::min(read_size, wire.size() - off));
-            r = llmbridge::http::parse_response(rbuf, st);
-            if (r.status == llmbridge::http::RespStatus::Error) return r;
+            r = llmbridge::net::http::parse_response(rbuf, st);
+            if (r.status == llmbridge::net::http::FrameStatus::Error) return r;
         }
         return r;
     }
@@ -504,11 +504,11 @@ TEST(HttpChunkedResponse, IncrementalArrivalDecodesExactlyOnce)
 {
     const size_t body = 512 * 1024;
     const std::string wire = make_chunked_response(body, 16 * 1024);
-    llmbridge::http::ResponseDecoder st;
+    llmbridge::net::http::ResponseDecoder st;
     std::string rbuf;
     const auto r = drive(wire, 64 * 1024, st, rbuf);
 
-    ASSERT_EQ(r.status, llmbridge::http::RespStatus::Complete);
+    ASSERT_EQ(r.status, llmbridge::net::http::FrameStatus::Complete);
     EXPECT_EQ(r.body.size(), body);
     EXPECT_EQ(r.body.find_first_not_of('x'), std::string::npos);
     EXPECT_EQ(r.total_len, wire.size());
@@ -520,13 +520,13 @@ TEST(HttpChunkedResponse, ResetAllowsReuseOnAPooledConnection)
 {
     // A pooled upstream serves many responses. Without reset() the second decode
     // would resume mid-stream and mis-frame — i.e. serve one client another's bytes.
-    llmbridge::http::ResponseDecoder st;
+    llmbridge::net::http::ResponseDecoder st;
     for (int i = 0; i < 3; ++i)
     {
         const std::string wire = make_chunked_response(1024 * (i + 1), 256);
         std::string rbuf;
         const auto r = drive(wire, 300, st, rbuf);
-        ASSERT_EQ(r.status, llmbridge::http::RespStatus::Complete) << "iteration " << i;
+        ASSERT_EQ(r.status, llmbridge::net::http::FrameStatus::Complete) << "iteration " << i;
         EXPECT_EQ(r.body.size(), size_t(1024 * (i + 1)));
         st.reset();
     }
@@ -543,14 +543,14 @@ TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
     const size_t body = 1024 * 1024, read_size = 64 * 1024;
     const std::string wire = make_chunked_response(body, 16 * 1024);
 
-    llmbridge::http::ResponseDecoder st;
+    llmbridge::net::http::ResponseDecoder st;
     std::string rbuf;
     size_t prev = 0, total_steps = 0;
     for (size_t off = 0; off < wire.size(); off += read_size)
     {
         rbuf.append(wire, off, std::min(read_size, wire.size() - off));
-        const auto r = llmbridge::http::parse_response(rbuf, st);
-        ASSERT_NE(r.status, llmbridge::http::RespStatus::Error);
+        const auto r = llmbridge::net::http::parse_response(rbuf, st);
+        ASSERT_NE(r.status, llmbridge::net::http::FrameStatus::Error);
         const size_t now = st.dec.consumed();
         EXPECT_GE(now, prev) << "decoder went backwards — re-decoding from the start";
         EXPECT_LE(now - prev, read_size) << "consumed more than just arrived — re-fed old bytes";

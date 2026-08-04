@@ -226,9 +226,9 @@ int main(int argc, char** argv)
             // Drain all complete requests in the buffer, respond to each.
             for (;;)
             {
-                llmbridge::http::Message m;
-                auto st = llmbridge::http::parse(c->rbuf, m);
-                if (st != llmbridge::http::ParseStatus::Complete) break;
+                llmbridge::net::http::Message m;
+                auto st = llmbridge::net::http::parse_request(c->rbuf, m);
+                if (st != llmbridge::net::http::FrameStatus::Complete) break;
                 c->rbuf.erase(0, m.total_len);
                 if (latency_us > 0) { struct timespec t{latency_us / 1000000, (latency_us % 1000000) * 1000}; nanosleep(&t, nullptr); }
                 c->wbuf.append(g_resp);

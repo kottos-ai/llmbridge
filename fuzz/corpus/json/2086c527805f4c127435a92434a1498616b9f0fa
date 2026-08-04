@@ -1,0 +1,1 @@
+{"ii":"msg_1",&type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":1}}

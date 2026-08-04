@@ -18,6 +18,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ── Warnings ────────────────────────────────────────────────────────────────
+# On by default; there were none at all before 0.9.0, which is a strange gap for a
+# codebase whose pitch is systems rigour. -Werror is CI-only (LLMBRIDGE_WERROR=ON)
+# so a warning never blocks a local edit-compile loop, but also never reaches main.
+# Scoped to our own targets via add_compile_options AFTER FetchContent, so
+# GoogleTest's warnings are not our problem.
+option(LLMBRIDGE_WERROR "Treat warnings as errors (CI)" OFF)
+
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif ()
@@ -68,6 +76,15 @@ if (LLMBRIDGE_TLS)
 endif ()
 
 add_subdirectory(net)
+# Applied here, after FetchContent has configured GoogleTest, so these apply to our
+# targets and not to fetched third-party code.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wall -Wextra)
+    if (LLMBRIDGE_WERROR)
+        add_compile_options(-Werror)
+    endif ()
+endif ()
+
 add_subdirectory(provider)
 add_subdirectory(gateway)
 add_subdirectory(app)

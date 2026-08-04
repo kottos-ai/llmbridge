@@ -13,6 +13,87 @@ Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting a
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
 
+## [0.9.0] — 2026-08-04
+
+A naming audit, a JSON strictness fix, and the test suite that found it. MINOR because
+two things break: an installed header moves namespace, and input earlier versions
+accepted is now refused.
+
+### ⚠ Breaking
+
+- **`llmbridge::json` → `llmbridge::provider::json`.** The only public break — `provider/`
+  is the installed header set. Add `provider::`, or alias it in one line.
+  (`llmbridge::http` → `llmbridge::net::http` likewise, but `net/` is not installed.)
+- **Malformed JSON is now refused, not forwarded.** A string containing a raw control
+  character (`U+0000`–`U+001F`) or an invalid escape (`\q`, `\uZZZZ`) fails the parse.
+  Well-formed JSON is unaffected, including every RFC 8259 escape, `\u` sequences,
+  surrogate pairs and raw UTF-8.
+
+### Fixed
+
+- **The gateway could return `200 OK` with a body no strict JSON parser accepts.** The
+  DOM keeps raw string spans for zero-copy passthrough, so control bytes the parser
+  accepted were copied verbatim into the client's response. Measured: a provider answer
+  containing a raw newline reached the client inside a 200 that Python's `json.loads` —
+  and so the OpenAI SDK — rejects. Now a `502` with a valid error envelope. A test that
+  asserted the old behaviour has been rewritten; the comment claiming "our parser is
+  lenient" was true when written and is not now.
+- **A cross-backend call the old naming hid.** `ur_forward()` called the *epoll* error
+  responder on the malformed-credential path. Harmless in practice, but only by three
+  accidents (`peer` still null, a small body completing inline, an already-deferred
+  close) — any of which a future change could remove.
+- **Flaky TLS test fixtures, both copies.** The test CA was written to a fixed temp path,
+  so parallel `ctest -j` processes truncated each other's file. The same copy-pasted bug
+  existed in `gateway_tls_test.cpp` and `net/tests/tls_test.cpp`, and the first fix landed
+  on only one — the exact failure mode this release's audit was about.
+
+### Changed — naming, and it is enforced now
+
+`Gateway` implements the whole request lifecycle twice, at 60–81% similarity for the ten
+largest of fourteen twin pairs. The io_uring half was prefixed `u_`; the epoll half was
+unprefixed, so the epoll implementation silently occupied the namespace that should mean
+"shared". Now `ep_*` / `ur_*` / unprefixed-means-shared, with twins sharing a verb so the
+counterpart is greppable. `parse()` → `parse_request()`, and three identical status enums
+collapse into one `FrameStatus`.
+
+`scripts/check_conventions.py` runs as the first CI job (~90 ms, no compiler) and fails on
+a call crossing the prefixes, an *unprefixed* method reachable from only one backend, or a
+namespace not mirroring its directory. The middle check earns its keep: a crossing grep
+cannot catch a mislabelled method, which is how `abort_pair` survived the rename that
+introduced the convention. Each check is verified by reintroducing the defect it catches.
+
+Diffing all fourteen twins found no unintentional one-sided logic. One divergence is
+deliberate and worth knowing: under a slow client epoll applies back-pressure while
+io_uring drops the stream past an 8 MiB cap.
+
+### Added — `gateway_corpus_test`
+
+1000 requests over 100 clients, streamed and non-streaming, on both backends. Every
+request carries a different question and the mock provider answers by **looking it up**,
+so a pooled-connection desync handing client A client B's bytes fails the test by name —
+a canned-response test is structurally blind to that.
+
+The corpus is 1000 recorded Claude answers (`scripts/gen_qa_corpus.py`; the test itself
+never touches the network), typed by what each stresses and curated from 2000 so every
+rare character class survives at 100%. It carries real newlines, quotes, backslashes,
+astral-plane characters and answers large enough to cross the io_uring provided-buffer
+boundary. Negative controls deliberately break each property and assert the harness
+notices — that is what exposed the control-character defect above.
+
+### Known — self-reported added latency is not comparable across backends under load
+
+`Histogram::percentile()` returns the running max once the target falls past its 2.62 ms
+range, and the io_uring stamps bracket a *submitted* send and its completion, so they also
+contain queueing. Across a 1→500 client sweep io_uring's reported median climbs
+(43 µs → 1689 µs → unresolvable) while epoll's stays flat (45 → 79 µs). The honest
+per-request figure on both is ~45–80 µs, and it does not degrade with concurrency. This
+does not affect the published ~80 µs claim, measured at 100 RPS where nothing queues.
+
+### Note on older entries
+
+Entries below refer to the **old** names (`http::parse`, `u_on_recv`, `llmbridge::json`).
+They record what the code was called at the time, not a current API reference.
+
 ## [0.8.1] — 2026-08-03
 
 A security sweep of the public HTTP surface. **Fixes only — no new functionality**,
@@ -921,7 +1002,8 @@ Initial release: the C++20 translator (OpenAI ⇄ Anthropic / Gemini / Cohere,
 non-streaming chat completions), the reference gateway proxy (epoll and io_uring),
 the benchmark harness, and the test suite.
 
-[Unreleased]: https://github.com/kottosai/llmbridge/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/kottosai/llmbridge/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kottosai/llmbridge/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/kottosai/llmbridge/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/kottosai/llmbridge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/kottosai/llmbridge/compare/v0.6.0...v0.7.0
