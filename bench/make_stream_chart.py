@@ -193,7 +193,10 @@ for i, s in enumerate(LEVELS):
         bx = x0 + bw * 0.18 + j * (barw + 8)
         y = MT + PH - (min(val, 100.0) / 100.0) * PH
         svg.append(f'<rect x="{bx:.1f}" y="{y:.1f}" width="{barw:.1f}" height="{MT + PH - y:.1f}" fill="{colour}" rx="3"/>')
-        svg.append(f'<text x="{bx + barw/2:.1f}" y="{y - 8:.1f}" font-size="{F_VAL}" font-weight="600" '
+        # clamp the value label for full-height bars: at 100% the bar top is MT,
+        # and y-8 would push the label into the subtitle block above the plot
+        lbl_y = max(y - 8, MT - 4)
+        svg.append(f'<text x="{bx + barw/2:.1f}" y="{lbl_y:.1f}" font-size="{F_VAL}" font-weight="600" '
                    f'fill="{colour}" text-anchor="middle">{val:.0f}%</text>')
     svg.append(f'<text x="{x0 + bw/2:.1f}" y="{MT + PH + 30:.1f}" font-size="{F_XLBL}" fill="{INK}" '
                f'text-anchor="middle">{s}</text>')

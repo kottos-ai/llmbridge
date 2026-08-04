@@ -130,9 +130,19 @@ for i, r in enumerate(rows):
     # x label
     svg.append(
         f'<text x="{gx:.1f}" y="{axis_y + 26:.1f}" font-size="{F_XLBL}" fill="{INK}" text-anchor="middle" font-weight="600">{r["rps"]} RPS</text>')
-    if r["litellm_sat"]:
-        svg.append(
-            f'<text x="{gx:.1f}" y="{axis_y + 45:.1f}" font-size="12" fill="{LITELLM}" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>')
+
+# ONE spanning "saturated" annotation, not one per group: the 12px label is wider
+# than the group spacing, so per-group copies overlapped into an unreadable smear.
+# A thin rule marks the saturated span; the label sits between the x labels and
+# the legend (axis_y+47 clears the x-label descenders and the legend's top).
+sat = [i for i, r in enumerate(rows) if r["litellm_sat"]]
+if sat:
+    x0 = ML + sat[0] * group_w + group_w / 2 - 55
+    x1 = ML + sat[-1] * group_w + group_w / 2 + 55
+    svg.append(
+        f'<line x1="{x0:.1f}" y1="{axis_y + 34:.1f}" x2="{x1:.1f}" y2="{axis_y + 34:.1f}" stroke="{LITELLM}" stroke-width="1" opacity=".55"/>')
+    svg.append(
+        f'<text x="{(x0 + x1) / 2:.1f}" y="{axis_y + 47:.1f}" font-size="12" fill="{LITELLM}" text-anchor="middle">LiteLLM saturated across this range (~250 RPS cap)</text>')
 
 # x axis line
 svg.append(f'<line x1="{ML}" y1="{axis_y:.1f}" x2="{ML + PW}" y2="{axis_y:.1f}" stroke="{INK}" stroke-width="1.5"/>')
