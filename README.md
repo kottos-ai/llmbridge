@@ -221,9 +221,12 @@ never logged, never placed in an error body, and pooled connection buffers are s
 on release. Client → gateway is **plaintext**, so deploy as a loopback sidecar.
 
 **Observability.** `--timing-headers` (opt-in) adds `x-llmbridge-*` response headers
-splitting a request into gateway compute, TCP+TLS connect, and provider time, plus an
-orderable arrival timestamp, a monotonic sequence number, and the provider's own token
-counts. Metadata only — no prompt or completion text.
+splitting a request into four disjoint spans — gateway compute, the TCP+TLS handshake
+(exactly `0` on a pooled connection), the upstream `write()`, and provider time — plus
+an orderable arrival timestamp, a monotonic sequence number, and the provider's own
+token counts. Metadata only — no prompt or completion text. Every one of those numbers
+is defined precisely in **[LATENCY.md](LATENCY.md)**: which stamps bound it, what is
+excluded, and why the handshake is never counted as our overhead.
 
 **Direction.** Today `llmbridge` runs in **OpenAI-in** mode: your code speaks the
 OpenAI API and the gateway fronts a provider. (Each request is translated in both

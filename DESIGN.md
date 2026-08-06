@@ -64,9 +64,15 @@ for an *upstream* connection — `void u_tls_kick_send(Connection* u)` used both
 meanings of `u` in one signature.
 
 **This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
-first CI job (no compiler, ~90 ms) and fails the build on three things: a call crossing
-the prefixes; an **unprefixed** method reachable from only one backend; and a header
-whose namespace does not mirror its directory. The middle check is the one that earns
+first CI job (no compiler, ~90 ms) and fails the build on four things: a call crossing
+the prefixes; an **unprefixed** method reachable from only one backend; a header whose
+namespace does not mirror its directory; and a stale attribution in LATENCY.md's stamp
+table (each timing stamp names the function that assigns it, and that function must
+exist and must actually assign it). The table names functions rather than line
+numbers on purpose: line references rot on any edit above them, so the doc would
+need re-checking on every commit — and a reference that needs re-checking every
+commit is one nobody re-checks. Function names move only under a rename, which is
+exactly when the table should be revisited anyway. The middle check is the one that earns
 its keep — a crossing grep cannot catch a mislabelled method, because the offending name
 has no prefix to grep for. That is exactly how `abort_pair` survived the rename that
 introduced this convention. Each check is verified against a deliberately reintroduced
@@ -126,6 +132,12 @@ on transient conditions. This is the most safety-critical code in the repo and i
 commented inline in `gateway/src/gateway.cpp`.
 
 ## Request lifecycle (proxy)
+
+> Latency accounting for this lifecycle — the seven stamps, what each reported
+> number spans, and why connection setup is excluded from "added latency" — is
+> defined in [LATENCY.md](LATENCY.md). Change the stamps and that document is
+> the thing that must change with them.
+
 
 ```
 accept ─▶ frame request (http::parse) ─▶ [optional] translate to upstream dialect

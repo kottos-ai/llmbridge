@@ -13,6 +13,50 @@ Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting a
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
 
+## [0.10.0] — 2026-08-06
+
+Latency accounting made consistent: `LATENCY.md` was re-derived against the source and
+the mismatches fixed in the code. MINOR because one response header changes meaning.
+
+### ⚠ Breaking
+
+- **`x-llmbridge-connect-us` is now the handshake alone (t2−t1), not handshake + upstream
+  write (t3−t1).** It reads exactly **0** on a pooled connection, where it previously read
+  a few microseconds. The write moved to the new `x-llmbridge-upwrite-us`; adding the two
+  reproduces the old value. It shared a name with the `connect(TLS)` histogram but not a
+  span, so one request reported two different "connect" numbers; both now derive from one
+  function, `timing_split()`.
+
+### Added
+
+- **`x-llmbridge-upwrite-us`** — the `write()` into the kernel's socket buffer (~4.4 µs
+  p50), previously hidden inside `connect-us`. No extra clock reads.
+
+### Fixed
+
+- **Empty latency histograms print `(no samples)`, not zeros.** `p50=0 ns p99=0 ns` reads
+  as a perfect result rather than absent data, and `bench/run_bench.sh` scrapes that line
+  — a zero-sample run could have published a fabricated 0 µs. Streaming hits this every
+  run: streams count in `requests` but are never recorded in the histograms.
+
+### Documentation
+
+- **`LATENCY.md`** linked from README/DESIGN/BENCHMARKS and re-derived. Corrections: the
+  scheme is seven stamps / six intervals (a stale line said four/three); `upstream-ttfb-us`
+  bounds the provider's response *head*, not its first token (measured live: ~1 ms apart
+  for Anthropic — a per-provider fact, not a guarantee). §2 gains a stamp table mapping
+  t0–t6 to identifiers and the functions that assign them.
+- **`BENCHMARKS.md`**: streaming delivery is **99.94–100%**, not "100%" — the shortfall is
+  a load-generator boundary artifact (tripling the window cut the deficit 1,225 → 195,
+  where a loss rate would have tripled it). Dropped a stale claim that the gateway could
+  not terminate TLS to `api.anthropic.com` (shipped in 0.4.0).
+
+### Internal
+
+- `t5` → `ts_resp_built` and io_uring's `ts` → `ts_resp_sent`, matching the `ts_*` scheme
+  and the epoll twin. `check_conventions.py` gains a fourth check: LATENCY.md's stamp
+  table must name functions that exist and actually assign the stamp.
+
 ## [0.9.0] — 2026-08-04
 
 A naming audit, a JSON strictness fix, and the test suite that found it. MINOR because
@@ -1002,17 +1046,18 @@ Initial release: the C++20 translator (OpenAI ⇄ Anthropic / Gemini / Cohere,
 non-streaming chat completions), the reference gateway proxy (epoll and io_uring),
 the benchmark harness, and the test suite.
 
-[Unreleased]: https://github.com/kottosai/llmbridge/compare/v0.9.0...HEAD
-[0.9.0]: https://github.com/kottosai/llmbridge/compare/v0.8.1...v0.9.0
-[0.8.1]: https://github.com/kottosai/llmbridge/compare/v0.8.0...v0.8.1
-[0.8.0]: https://github.com/kottosai/llmbridge/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/kottosai/llmbridge/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/kottosai/llmbridge/compare/v0.5.2...v0.6.0
-[0.5.2]: https://github.com/kottosai/llmbridge/compare/v0.5.1...v0.5.2
-[0.5.1]: https://github.com/kottosai/llmbridge/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/kottosai/llmbridge/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/kottosai/llmbridge/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/kottosai/llmbridge/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/kottosai/llmbridge/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/kottosai/llmbridge/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/kottosai/llmbridge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/kottos-ai/llmbridge/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/kottos-ai/llmbridge/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/kottos-ai/llmbridge/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/kottos-ai/llmbridge/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/kottos-ai/llmbridge/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/kottos-ai/llmbridge/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/kottos-ai/llmbridge/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/kottos-ai/llmbridge/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/kottos-ai/llmbridge/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/kottos-ai/llmbridge/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/kottos-ai/llmbridge/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/kottos-ai/llmbridge/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/kottos-ai/llmbridge/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/kottos-ai/llmbridge/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/kottos-ai/llmbridge/releases/tag/v0.1.0

@@ -196,8 +196,12 @@ for i, s in enumerate(LEVELS):
         # clamp the value label for full-height bars: at 100% the bar top is MT,
         # and y-8 would push the label into the subtitle block above the plot
         lbl_y = max(y - 8, MT - 4)
+        # NEVER let a sub-100 value render as "100%". `.0f` rounded 99.93 up, which
+        # put the exact claim we removed from the prose back into the chart. Values
+        # in the last percent get two decimals so 99.93% reads as 99.93%.
+        lbl = "100%" if val >= 99.995 else (f"{val:.2f}%" if val >= 99 else f"{val:.0f}%")
         svg.append(f'<text x="{bx + barw/2:.1f}" y="{lbl_y:.1f}" font-size="{F_VAL}" font-weight="600" '
-                   f'fill="{colour}" text-anchor="middle">{val:.0f}%</text>')
+                   f'fill="{colour}" text-anchor="middle">{lbl}</text>')
     svg.append(f'<text x="{x0 + bw/2:.1f}" y="{MT + PH + 30:.1f}" font-size="{F_XLBL}" fill="{INK}" '
                f'text-anchor="middle">{s}</text>')
 

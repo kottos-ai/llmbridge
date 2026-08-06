@@ -42,6 +42,36 @@ namespace llmbridge
     // re-anchor, and is not something a single gateway can promise on its own.
     int64_t wall_ns(int64_t mono_ns) noexcept;
 
+    // THE ONE DEFINITION of how a request's stamps become reported intervals.
+    //
+    // Both reporting surfaces derive from this: the per-request `x-llmbridge-*`
+    // headers and the shutdown histograms. They previously computed their own
+    // groupings independently, and drifted — `connect-us` spanned t1->t3 (handshake
+    // PLUS the upstream write) while the `connect(TLS)` histogram spanned t1->t2
+    // (handshake only). Same name, two meanings, and a code comment that copied the
+    // histogram's "exactly 0 when pooled" onto the header's number, which is never 0.
+    // Sharing this function makes that class of drift unrepresentable.
+    //
+    // LATENCY.md is the normative prose; this is its executable form. Change one and
+    // change the other.
+    struct TimingSplit
+    {
+        int64_t compute_ns;  // (t1-t0) + (t5-t4)  our compute, both legs
+        int64_t connect_ns;  // (t2-t1)            handshake only; 0 on a pooled conn
+        int64_t upwrite_ns;  // (t3-t2)            the write() into the socket buffer
+        int64_t upstream_ns; // (t4-t3)            the provider
+        int64_t req_path_ns; // (t1-t0) + (t3-t2)  histogram grouping: compute + write
+    };
+
+    // t2 == 0 means "no connect ever happened" (pooled reuse never stamped it), in
+    // which case wire-ready IS t1 and connect_ns is exactly 0.
+    //
+    // Streaming callers have no t5 (the response is not built at one instant): pass
+    // t5 = t4 and compute_ns collapses to the request leg alone, which is the honest
+    // answer rather than an invented one.
+    TimingSplit timing_split(int64_t t0, int64_t t1, int64_t t2, int64_t t3, int64_t t4,
+                             int64_t t5) noexcept;
+
     class Histogram
     {
     public:

@@ -14,18 +14,27 @@
 // framework, no external dependencies — just net (sockets + HTTP framing) and
 // provider (dialect translation).
 //
-// Per-request added latency (the headline metric) is FOUR stamps giving three
-// intervals, of which only two are ours:
+// Per-request added latency (the headline metric). LATENCY.md is the normative
+// definition of every number below; this is the summary. Seven stamps:
 //
-//   added = (upstream_request_BUILT - client_request_received)   request path
-//         + (client_response_sent   - upstream_response_recvd)   response path
+//   t0 ts_req_recvd   client request fully framed
+//   t1 ts_req_built   upstream request built (nothing sent yet)
+//   t2 ts_wire_ready  socket can carry the request (== t1 when pooled)
+//   t3 ts_up_sent     request handed to the kernel by write()
+//   t4 ts_up_recvd    provider's response received
+//   t5                response built, client write begins
+//   t6                response fully flushed
 //
-// Excluded on purpose: the upstream's own time, and the TCP connect + TLS
-// handshake between "request built" and "bytes on the wire" (recorded separately
-// as Stats::connect). An earlier version folded connect into the request path,
-// which was harmless against a warm pooled mock and badly wrong against a cold
-// real provider — a live single-request run reported 52.66 ms of "request path"
-// that was 99.9% handshake.
+//   added = (t1-t0) + (t3-t2)   request path: our compute + the upstream write
+//         + (t4 -> t6)          response path: translate back + write + flush
+//
+// Excluded on purpose: the provider's own time (t3->t4), and the TCP connect +
+// TLS handshake (t1->t2, recorded separately as Stats::connect). Without the
+// gateway the client's own stack pays that same handshake, so it cancels in the
+// subtraction that defines "added" — see LATENCY.md §1. An earlier version
+// folded connect into the request path, which was harmless against a warm pooled
+// mock and badly wrong against a cold real provider — a live single-request run
+// reported 52.66 ms of "request path" that was 99.9% handshake.
 
 #include <netinet/in.h>
 
@@ -194,7 +203,8 @@ namespace llmbridge
 
     struct Stats
     {
-        // The four stamps (see append_timing_headers) split three ways. Keeping
+        // The t0-t6 stamps, grouped three ways (LATENCY.md §4 — note this grouping
+        // splits at t2, where the header grouping does not). Keeping
         // `connect` OUT of req_path and overhead is the whole point: a cold TCP+TLS
         // handshake is 50 ms and would otherwise sit inside a metric that claims to
         // measure OUR work and is sized for microseconds. Measured live: a single

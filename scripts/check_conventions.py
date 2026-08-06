@@ -190,6 +190,45 @@ def main():
                 f"{header.relative_to(ROOT)}:{ns_line}: NAMESPACE — `{ns}` does not mirror "
                 f"its directory; expected a `{module}` segment (e.g. llmbridge::{module}::...)")
 
+    # ---------------------------------------------------------------- 4
+    # LATENCY.md section 2 attributes every timing stamp to the function that
+    # assigns it. Verify each attribution still holds: the named method must exist
+    # and must actually assign that stamp. Deliberately NOT line numbers -- those
+    # rot on any edit above them, so every commit would have to re-check a doc, and
+    # a reference that needs re-checking every commit is one nobody re-checks.
+    # Function names move only when someone renames a function, which is exactly
+    # when this table should be revisited anyway.
+    latency = ROOT / "LATENCY.md"
+    if latency.exists():
+        doc = latency.read_text()
+        lines = text.splitlines()
+        row = re.compile(r"^\|\s*\*\*(t\d)\*\*\s*\|\s*`(\w+)`\s*\|.*\|([^|]*)\|\s*$", re.M)
+        seen = 0
+        for m in row.finditer(doc):
+            stamp, ident, sites = m.group(1), m.group(2), m.group(3)
+            doc_line = doc[: m.start()].count("\n") + 1
+            fns = re.findall(r"`(\w+)`", sites)
+            if not fns:
+                failures.append(f"LATENCY.md:{doc_line}: STAMP — {stamp} (`{ident}`) names "
+                                f"no assigning function")
+                continue
+            seen += 1
+            for f in fns:
+                if f not in spans:
+                    failures.append(
+                        f"LATENCY.md:{doc_line}: STAMP — {stamp} cites `{f}()`, which is "
+                        f"not a Gateway method (renamed or removed?)")
+                    continue
+                _, lo, hi = spans[f]
+                body = "\n".join(lines[lo:hi + 1])
+                if not re.search(rf"\b{ident}\s*=", body):
+                    failures.append(
+                        f"LATENCY.md:{doc_line}: STAMP — {stamp} says `{f}()` assigns "
+                        f"`{ident}`, but it does not")
+        if seen < 7:
+            failures.append(f"LATENCY.md: STAMP — parsed only {seen} of 7 stamp rows; "
+                            f"the table or this check is broken")
+
     # ---------------------------------------------------------------- report
     if failures:
         print(f"convention check FAILED ({len(failures)} violation"
@@ -201,7 +240,8 @@ def main():
 
     twins = sum(1 for n in spans if n.startswith("ep_") and "ur_" + n[3:] in spans)
     print(f"convention check OK — {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
-          f"0 crossings, 0 unmarked, namespaces mirror directories")
+          f"0 crossings, 0 unmarked, namespaces mirror directories, "
+          f"LATENCY.md stamp refs resolve")
     return 0
 
 
