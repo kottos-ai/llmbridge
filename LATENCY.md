@@ -133,6 +133,17 @@ the t2/t3 split is the one that matters most: t1→t2 is **not our cost**
 (the client would pay the same handshake without us) while t2→t3 **is**
 (the write only exists because we are the one sending).
 
+**Where optional TLS sits in this timeline.** On a TLS build
+(`-DLLMBRIDGE_TLS=ON`, engaged when the upstream is `https://`), the
+*handshake* is inside t1→t2, and the *per-record* crypto rides inside the
+spans it serves: encrypting the request happens in t2→t3 with the write
+(`tls_push_request` before the flush), and decrypting the response happens
+on receive, before t4's framing (`tls_feed` as upstream bytes arrive). No
+stamp separates cipher time from the write/receive it belongs to —
+per-record AES on chat-sized payloads is microseconds, dwarfed by the
+once-per-connection handshake, so it is deliberately not broken out. A
+plaintext build or a plaintext upstream does none of this.
+
 ---
 
 ## 3. Per-request headers (`--timing-headers`)
@@ -373,6 +384,13 @@ Consequences you will observe:
   **missed** — the connection was reaped, dropped by the provider, or never
   established. That makes it a usable operational signal, which it was not
   when a syscall was baked into it.
+- What the cold ~50–80 ms is made of: roughly **an even split** between the
+  TCP connect (~25–30 ms — one round trip) and the TLS handshake (~30–35 ms
+  — another round trip plus certificate-chain validation). Measured
+  2026-08-06 with `curl -w '%{time_connect} %{time_appconnect}'` against
+  `api.anthropic.com`, five fresh connections from the reference dev box:
+  TCP 23–50 ms (median ~28), TLS increment 30–36 ms (median ~33). One box,
+  one afternoon — indicative, not a benchmark; the split scales with RTT.
 - This is the same behaviour your own HTTP client has without a gateway —
   which is precisely why connect time is reported separately and excluded
   from the added-latency claim (§1).
