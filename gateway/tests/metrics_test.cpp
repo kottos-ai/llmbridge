@@ -13,10 +13,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <sstream>
 #include <string>
 
 using llmbridge::Histogram;
 using llmbridge::now_ns;
+using llmbridge::timing_split;
+using llmbridge::TimingSplit;
 
 namespace
 {
@@ -115,4 +118,102 @@ TEST(NowNs, IsMonotonicNonDecreasing)
     EXPECT_GE(b, a);
     EXPECT_GE(c, b);
     EXPECT_GT(c, 0);
+}
+
+// An empty histogram must announce that it has no data rather than print zeros.
+// This is not cosmetic: bench/run_bench.sh seds the `added-total` line for
+// `p99=<n> us`, so an all-zero print made a zero-sample run publishable as a
+// FABRICATED 0 us added latency. Streaming workloads produce exactly this state
+// every run -- streams count in `requests` but are never recorded here
+// (LATENCY.md section 4). Delete the `_total == 0` guard in Histogram::print and
+// both expectations below fail.
+TEST(Histogram, EmptyPrintsNoSamplesNotZeros)
+{
+    Histogram h;
+    std::ostringstream os;
+    h.print(os, "added-total");
+    const std::string out = os.str();
+
+    EXPECT_NE(out.find("count=0"), std::string::npos) << out;
+    EXPECT_NE(out.find("(no samples)"), std::string::npos) << out;
+    // The bench harness must find NO percentile to scrape.
+    EXPECT_EQ(out.find("p99="), std::string::npos) << out;
+    EXPECT_EQ(out.find("p50="), std::string::npos) << out;
+}
+
+// The non-empty path is unaffected: one sample still reports percentiles.
+TEST(Histogram, NonEmptyStillPrintsPercentiles)
+{
+    Histogram h;
+    h.record(5'000);
+    std::ostringstream os;
+    h.print(os, "added-total");
+    const std::string out = os.str();
+
+    EXPECT_NE(out.find("count=1"), std::string::npos) << out;
+    EXPECT_NE(out.find("p99="), std::string::npos) << out;
+    EXPECT_EQ(out.find("(no samples)"), std::string::npos) << out;
+}
+
+// ---- timing_split: the single definition shared by headers and histograms ----
+//
+// The bug these lock down: `connect-us` (header) used to span t1->t3 -- handshake
+// PLUS the upstream write -- while the `connect(TLS)` histogram spanned t1->t2,
+// handshake only. One name, two meanings, on the same request. Both surfaces now
+// derive from timing_split(), so the drift is unrepresentable; these assert the
+// arithmetic that makes that safe.
+
+TEST(TimingSplit, PooledConnectionHasExactlyZeroConnect)
+{
+    // Pooled reuse stamps t2 == t1: no handshake happened.
+    const TimingSplit s = timing_split(/*t0*/ 0, /*t1*/ 100, /*t2*/ 100, /*t3*/ 140,
+                                       /*t4*/ 9000, /*t5*/ 9100);
+    EXPECT_EQ(s.connect_ns, 0) << "a pooled connection must report exactly 0 connect";
+    EXPECT_EQ(s.upwrite_ns, 40) << "the write is its own interval, not part of connect";
+    EXPECT_EQ(s.req_path_ns, 140);          // (t1-t0)=100 compute + 40 write
+    EXPECT_EQ(s.compute_ns, 200);           // (t1-t0)=100 + (t5-t4)=100
+    EXPECT_EQ(s.upstream_ns, 8860);
+}
+
+TEST(TimingSplit, UnstampedT2FallsBackToT1)
+{
+    // t2 == 0 means no connect ever ran; wire-ready IS t1.
+    const TimingSplit s = timing_split(0, 100, 0, 140, 9000, 9100);
+    EXPECT_EQ(s.connect_ns, 0);
+    EXPECT_EQ(s.upwrite_ns, 40) << "must not attribute the write to a phantom handshake";
+}
+
+TEST(TimingSplit, ColdConnectionSeparatesHandshakeFromWrite)
+{
+    // Cold: 50 ms handshake between t1 and t2, then a 40 ns write.
+    const TimingSplit s = timing_split(0, 100, 50'000'100, 50'000'140, 60'000'000,
+                                       60'000'100);
+    EXPECT_EQ(s.connect_ns, 50'000'000) << "the handshake must land in connect, alone";
+    EXPECT_EQ(s.upwrite_ns, 40);
+    // The handshake must NOT inflate req_path -- that is the added-latency claim.
+    EXPECT_EQ(s.req_path_ns, 140);
+}
+
+TEST(TimingSplit, ConnectPlusWriteReproducesTheOldHeaderSpan)
+{
+    // Compatibility bridge: the retired `connect-us` was t3-t1. Anyone with the old
+    // semantics recovers it by adding the two headers that replaced it.
+    const int64_t t1 = 100, t2 = 50'000'100, t3 = 50'000'140;
+    const TimingSplit s = timing_split(0, t1, t2, t3, 60'000'000, 60'000'100);
+    EXPECT_EQ(s.connect_ns + s.upwrite_ns, t3 - t1);
+}
+
+TEST(TimingSplit, ReqPathIsComputeLegPlusWriteNotTheWholeCompute)
+{
+    // req_path (histogram) and compute (header) are DIFFERENT groupings of the same
+    // stamps: req_path carries the write, compute carries the response leg.
+    const TimingSplit s = timing_split(0, 100, 100, 140, 9000, 9100);
+    EXPECT_NE(s.req_path_ns, s.compute_ns);
+    EXPECT_EQ(s.req_path_ns - s.upwrite_ns, s.compute_ns - (9100 - 9000));
+}
+
+TEST(TimingSplit, StreamingPassesT5EqualT4SoComputeIsRequestLegOnly)
+{
+    const TimingSplit s = timing_split(0, 100, 100, 140, 9000, /*t5 == t4*/ 9000);
+    EXPECT_EQ(s.compute_ns, 100) << "a stream must report the request leg, not an invention";
 }

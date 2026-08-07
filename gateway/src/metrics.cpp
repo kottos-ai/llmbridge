@@ -23,11 +23,30 @@ namespace llmbridge
     {
         // Anchors captured together, once, on first use. `static` init is
         // thread-safe in C++11+ and this is not a hot path (once per response).
+        //
+        // CAVEAT — this DRIFTS. It assumes both clocks tick at the same rate after
+        // the anchor; under NTP slew they do not, and the error grows with process
+        // uptime. Good enough for correlating a request against an external log at
+        // ms granularity, which is all `x-llmbridge-t0` promises. NOT an ordering
+        // primitive: use `seq` for that. See LATENCY.md §3.
         static const int64_t mono0 = now_ns();
         static const int64_t wall0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count();
         return wall0 + (mono_ns - mono0);
+    }
+
+    TimingSplit timing_split(int64_t t0, int64_t t1, int64_t t2, int64_t t3, int64_t t4,
+                             int64_t t5) noexcept
+    {
+        const int64_t wire = t2 ? t2 : t1; // no connect stamped => wire-ready at t1
+        TimingSplit s{};
+        s.connect_ns = wire - t1;
+        s.upwrite_ns = t3 - wire;
+        s.upstream_ns = t4 - t3;
+        s.req_path_ns = (t1 - t0) + s.upwrite_ns;
+        s.compute_ns = (t1 - t0) + (t5 - t4);
+        return s;
     }
 
     namespace
@@ -46,6 +65,18 @@ namespace llmbridge
 
     void Histogram::print(std::ostream& os, const char* label) const
     {
+        // An empty histogram must NOT print zeros. It did once, and "p99=0 ns" reads
+        // as a spectacular result rather than as no data — while bench/run_bench.sh
+        // seds this very line for `p99=`, so a zero-sample run would have published a
+        // fabricated 0 us added latency. Streaming workloads hit this every time:
+        // streams are counted in `requests` but never recorded here (LATENCY.md §4).
+        if (_total == 0)
+        {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "%s  count=0  (no samples)\n", label);
+            os << buf;
+            return;
+        }
         char p50[32], p99[32], p999[32], pmax[32];
         fmt_ns(p50, sizeof(p50), percentile(0.50));
         fmt_ns(p99, sizeof(p99), percentile(0.99));

@@ -18,6 +18,12 @@ compile_commands.json
 # LiteLLM head-to-head venv (large; recreate via the note in bench/run_headtohead.sh)
 bench/.litellm-venv/
 
+# Python venv (pandas/numpy for the price observatory's feature builder). `python -m
+# venv` writes its own .venv/.gitignore containing `*`, so this is belt-and-braces —
+# but that inner file is easy to lose, and without it ~160 MB of numpy binaries become
+# untracked-and-visible in a public repo.
+.venv/
+
 # Stamped raw benchmark logs / run output.
 # Keep the committed artifacts: bench/results/*.svg and phase-a-comparison.csv
 bench/results/*.log

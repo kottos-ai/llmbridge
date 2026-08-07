@@ -277,25 +277,34 @@ namespace llmbridge
 
         // ── Timing headers (opt-in: --timing-headers) ───────────────────────
         //
-        // Four stamps bound three intervals. All monotonic; only t0 is also emitted
-        // as wall time, and that one is anchored so it can never step backward.
+        // Per-request timing headers. LATENCY.md §3 is normative; keep the two in
+        // step. Stamps are monotonic and use the t0..t6 scheme defined in
+        // gateway.hpp and LATENCY.md §2; only t0 is also emitted as wall time, and
+        // that one is anchored so it can never step backward.
         //
-        //   t0 ────────► t1 ────────► t2 ──────────────────► t3 ──────────► t4
-        //   client req    upstream     bytes on the wire       provider       response
-        //   fully framed  request      (connect + TLS done)    first byte     written to
-        //                 BUILT                                               the client
+        //   t0 ──► t1 ──► t2 ──► t3 ───────────► t4 ──► t5 ──► t6
+        //   client  req    wire   handed to       provider  resp   fully
+        //   framed  BUILT  ready  the kernel      received  built  flushed
         //
         //   x-llmbridge-t0            wall-clock epoch NANOSECONDS at t0. The one
         //                             absolute value: what orders two requests
         //                             against each other, which is why it is here
         //                             at all. Strictly increasing within a process.
-        //   x-llmbridge-gateway-us    (t1-t0) + (t4-t3) — OUR compute, and nothing
+        //   x-llmbridge-gateway-us    (t1-t0) + (t5-t4) — OUR compute, and nothing
         //                             else: framing, translation, auth mapping,
-        //                             re-serialisation.
-        //   x-llmbridge-connect-us    (t2-t1) — TCP connect + TLS handshake. ZERO
-        //                             on a pooled connection, which is the point:
-        //                             it shows when reuse worked.
-        //   x-llmbridge-upstream-us   (t3-t2) — the provider: network + inference.
+        //                             re-serialisation. It ends at t5 because the
+        //                             number travels INSIDE the response and so
+        //                             cannot include the cost of sending itself.
+        //   x-llmbridge-connect-us    (t2-t1) — the handshake ALONE: ~50-80 ms cold,
+        //                             exactly 0 on a pooled connection. Same span as
+        //                             the connect(TLS) histogram, same function.
+        //   x-llmbridge-upwrite-us    (t3-t2) — the write() into the socket buffer.
+        //                             Split out of connect-us because folding them
+        //                             gave one name two meanings across the two
+        //                             reporting surfaces. t2 was already stamped for
+        //                             the histogram, so this cost a header line and
+        //                             no extra clock reads.
+        //   x-llmbridge-upstream-us   (t4-t3) — the provider: network + inference.
         //
         // Why connect is split out rather than folded into gateway-us: measured
         // against the live API, a COLD connection put 56 ms of TCP+TLS setup inside
@@ -303,9 +312,8 @@ namespace llmbridge
         // A customer reading 56 ms as our overhead would be right to walk away, and
         // wrong about the software. One number cannot honestly carry both.
         //
-        // Streaming cannot report t3 (headers precede the body), so it emits t0 and
-        // x-llmbridge-upstream-ttfb-us = (t2-t1) instead — time to the provider's
-        // first byte.
+        // Streaming cannot report t4 (headers precede the body), so it emits t0 and
+        // x-llmbridge-upstream-ttfb-us instead — time to the provider's first byte.
         //
         // Metadata only, by construction: durations and one timestamp. No prompt,
         // no completion, no token text. "Prompt content is never logged" is a
@@ -366,8 +374,8 @@ namespace llmbridge
         }
 
         void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
-                                   int64_t connect_us, int64_t upstream_us,
-                                   const char* upstream_key)
+                                   int64_t connect_us, int64_t upwrite_us,
+                                   int64_t upstream_us, const char* upstream_key)
         {
             const auto add = [&out](const char* k, int64_t v) {
                 if (v < 0) return; // a stamp we never took; omit rather than lie
@@ -379,7 +387,12 @@ namespace llmbridge
             add("x-llmbridge-t0", wall_ns(t0));
             add("x-llmbridge-seq", static_cast<int64_t>(g_seq.fetch_add(1, std::memory_order_relaxed)));
             add("x-llmbridge-gateway-us", gateway_us);
-            add("x-llmbridge-connect-us", connect_us); // 0 = pooled connection reused
+            // connect-us is now EXACTLY the connect(TLS) histogram's span (t2-t1):
+            // handshake only, and therefore exactly 0 on a pooled connection. The
+            // upstream write it used to absorb has its own header below. One name,
+            // one meaning, on both surfaces -- see timing_split().
+            add("x-llmbridge-connect-us", connect_us);
+            add("x-llmbridge-upwrite-us", upwrite_us);
             add(upstream_key, upstream_us);
         }
 
@@ -1246,8 +1259,14 @@ namespace llmbridge
             // never laundered into a 200 stream.
             if (h.event_stream && h.status == 200)
             {
-                // t2 for a stream: the provider's first response byte. The
-                // non-streaming path stamps this after framing, which this branch
+                // t4 for a stream: the provider's response HEAD is now complete.
+                // NOT the first token, and not the first data chunk — a provider
+                // MAY send 200 + content-type as soon as it ACCEPTS the stream,
+                // well before its first generated token. Anthropic does NOT: measured
+                // 2026-08-06, its head trails its first token by ~1 ms, so for that
+                // provider this tracks TTFT closely. That is a per-provider fact, not
+                // a protocol guarantee — see LATENCY.md §3 before assuming it holds.
+                // The non-streaming path stamps this after framing, which this branch
                 // returns before reaching — so stamp it here or it stays 0 and the
                 // TTFB timing header reports garbage.
                 client->ts_up_recvd = now_ns();
@@ -1301,14 +1320,14 @@ namespace llmbridge
             std::string timing;
             if (_timing_headers)
             {
-                // t3 is now: the response is built here and written immediately after.
-                const int64_t t4 = now_ns();
-                const int64_t gw_ns = (client->ts_req_built - client->ts_req_recvd) +
-                                      (t4 - client->ts_up_recvd);
-                const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
-                const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
-                append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
-                                      up_ns / 1000, "x-llmbridge-upstream-us");
+                // t5: the response is built here and written immediately after.
+                const int64_t ts_resp_built = now_ns();
+                const TimingSplit sp = timing_split(
+                    client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
+                    client->ts_up_sent, client->ts_up_recvd, ts_resp_built);
+                append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
+                                      sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us");
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -1369,11 +1388,16 @@ namespace llmbridge
                 // req_path is OUR request-side work only; the wait for connect +
                 // TLS is its own histogram so it cannot inflate the added-latency
                 // claim. overhead = req_path + resp_path, connect excluded.
-                // Wire-ready falls back to built if a connect never happened.
-                const int64_t wire = c->ts_wire_ready ? c->ts_wire_ready : c->ts_req_built;
-                const int64_t conn_ns = wire - c->ts_req_built;              // handshake only
-                const int64_t req_ns = (c->ts_req_built - c->ts_req_recvd)   // our compute
-                                       + (c->ts_up_sent - wire);            // + the write()
+                //
+                // Derived from the SAME timing_split() the headers use, so
+                // connect(TLS) here and x-llmbridge-connect-us there cannot come to
+                // mean different things. t5 does not enter this grouping, so t4 is
+                // passed in its place.
+                const TimingSplit sp = timing_split(c->ts_req_recvd, c->ts_req_built,
+                                                    c->ts_wire_ready, c->ts_up_sent,
+                                                    c->ts_up_recvd, c->ts_up_recvd);
+                const int64_t conn_ns = sp.connect_ns;
+                const int64_t req_ns = sp.req_path_ns;
                 const int64_t resp_ns = ts_resp_sent - c->ts_up_recvd;
                 if (req_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(req_ns));
                 if (conn_ns >= 0) _stats.connect.record(static_cast<uint64_t>(conn_ns));
@@ -1404,13 +1428,16 @@ namespace llmbridge
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
-            // t2 = provider's first response byte, stamped by the caller.
+            // t4 = provider's first response byte, stamped by the caller.
             std::string timing;
-            const int64_t gw_ns = client->ts_req_built - client->ts_req_recvd;
-            const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
-            const int64_t ttfb_ns = client->ts_up_recvd - client->ts_up_sent;
-            append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
-                                  ttfb_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+            // t5 = t4: a stream's response is not built at one instant, so the
+            // compute leg is the request side alone rather than an invented figure.
+            const TimingSplit sp = timing_split(
+                client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
+                client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
+            append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
+                                  sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us");
             client->wbuf.assign(sse_head_with_timing(timing));
         }
         else
@@ -2063,7 +2090,7 @@ namespace llmbridge
                 // own status by ur_on_response below (never laundered into a 200).
                 if (h.event_stream && h.status == 200)
                 {
-                    c->peer->ts_up_recvd = now_ns(); // t2 — see the epoll mirror
+                    c->peer->ts_up_recvd = now_ns(); // t4: head complete — see the epoll mirror
                     ur_begin_stream(c, h);
                     return;
                 }
@@ -2204,13 +2231,13 @@ namespace llmbridge
             std::string timing;
             if (_timing_headers)
             {
-                const int64_t t4 = now_ns();
-                const int64_t gw_ns = (client->ts_req_built - client->ts_req_recvd) +
-                                      (t4 - client->ts_up_recvd);
-                const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
-                const int64_t up_ns = client->ts_up_recvd - client->ts_up_sent;
-                append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
-                                      up_ns / 1000, "x-llmbridge-upstream-us");
+                const int64_t ts_resp_built = now_ns(); // t5 — see the epoll twin
+                const TimingSplit sp = timing_split(
+                    client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
+                    client->ts_up_sent, client->ts_up_recvd, ts_resp_built);
+                append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
+                                      sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us");
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -2294,18 +2321,23 @@ namespace llmbridge
         // histograms — their timing stamps are unset.
         if (!c->close_after_resp)
         {
-            const int64_t ts = now_ns();
-            if (ts - _t_start >= _warmup_ns)
+            const int64_t ts_resp_sent = now_ns(); // t6 — name matches the epoll twin
+            if (ts_resp_sent - _t_start >= _warmup_ns)
             {
                 // req_path is OUR request-side work only; the wait for connect +
                 // TLS is its own histogram so it cannot inflate the added-latency
                 // claim. overhead = req_path + resp_path, connect excluded.
-                // Wire-ready falls back to built if a connect never happened.
-                const int64_t wire = c->ts_wire_ready ? c->ts_wire_ready : c->ts_req_built;
-                const int64_t conn_ns = wire - c->ts_req_built;              // handshake only
-                const int64_t req_ns = (c->ts_req_built - c->ts_req_recvd)   // our compute
-                                       + (c->ts_up_sent - wire);            // + the write()
-                const int64_t resp_ns = ts - c->ts_up_recvd;
+                //
+                // Derived from the SAME timing_split() the headers use, so
+                // connect(TLS) here and x-llmbridge-connect-us there cannot come to
+                // mean different things. t5 does not enter this grouping, so t4 is
+                // passed in its place.
+                const TimingSplit sp = timing_split(c->ts_req_recvd, c->ts_req_built,
+                                                    c->ts_wire_ready, c->ts_up_sent,
+                                                    c->ts_up_recvd, c->ts_up_recvd);
+                const int64_t conn_ns = sp.connect_ns;
+                const int64_t req_ns = sp.req_path_ns;
+                const int64_t resp_ns = ts_resp_sent - c->ts_up_recvd;
                 if (req_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(req_ns));
                 if (conn_ns >= 0) _stats.connect.record(static_cast<uint64_t>(conn_ns));
                 if (resp_ns >= 0) _stats.resp_path.record(static_cast<uint64_t>(resp_ns));
@@ -2335,13 +2367,16 @@ namespace llmbridge
         client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
-            // t2 = provider's first response byte, stamped by the caller.
+            // t4 = provider's first response byte, stamped by the caller.
             std::string timing;
-            const int64_t gw_ns = client->ts_req_built - client->ts_req_recvd;
-            const int64_t conn_ns = client->ts_up_sent - client->ts_req_built;
-            const int64_t ttfb_ns = client->ts_up_recvd - client->ts_up_sent;
-            append_timing_headers(timing, client->ts_req_recvd, gw_ns / 1000, conn_ns / 1000,
-                                  ttfb_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+            // t5 = t4: a stream's response is not built at one instant, so the
+            // compute leg is the request side alone rather than an invented figure.
+            const TimingSplit sp = timing_split(
+                client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
+                client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
+            append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
+                                  sp.connect_ns / 1000, sp.upwrite_ns / 1000,
+                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us");
             client->wpending.assign(sse_head_with_timing(timing));
         }
         else
