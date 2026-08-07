@@ -211,11 +211,11 @@ percentile.
 
 **How to read this.** llmbridge's time to first token sits **on the no-gateway floor**
 (30.7-30.8 ms against the floor's 30.6-30.7 ms) at every concurrency, and delivery stays
-at **99.94% or better** — 100.000% at 16 streams, 99.984% at 64, 99.937% at 256 and
-99.938% at 512, against the direct control's token count (medians of 3, computed from
+at **99.93% or better** — 100.000% at 16 streams, 99.983% at 64, 99.938% at 256 and
+99.931% at 512, against the direct control's token count (medians of 3, computed from
 `bench/results/stream-comparison.csv`). It is deliberately **not** rounded to "100%":
-at 512 streams that is 314 tokens of 506,963 that did not arrive, and a reader who
-re-runs will see 99.94%. A prior revision of this table did print 100%.
+at 512 streams that is ~350 tokens of 506,963 that did not arrive, and a reader who
+re-runs will see 99.93%. A prior revision of this table did print 100%.
 
 **Those tokens are a harness boundary artifact, not gateway loss** — established by
 measurement, because the alternative reading (the gateway silently drops tokens under
@@ -247,9 +247,9 @@ table still reports the measured number rather than the interpretation, because 
 measured number is what a reader reproduces. Its own per-token cost is **~55-131 us** against a 20 ms
 inter-token interval — under 1% of the token budget.
 
-LiteLLM tracks well at 16 streams (95% delivered) and then queues: by 64 streams it
-delivers 38% and first-token latency is 2.1 s; by 512 streams it delivers **3%** with a
-**13.4 s** TTFT. Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
+LiteLLM tracks well at 16 streams (94% delivered) and then queues: by 64 streams it
+delivers 40% and first-token latency is 2.0 s; by 512 streams it delivers **4%** with a
+**12.6 s** TTFT. Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
 offered load.
 
 **Measurement conditions.** Cold-booted host, `performance` governor, **stock idle
