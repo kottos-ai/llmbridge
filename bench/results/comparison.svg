@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
 <rect width="1000" height="620" fill="white"/>
-<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">llmbridge vs LiteLLM — added latency p99 (64 B body)</text>
+<text x="96" y="44" font-size="27" font-weight="700" fill="#111827">llmbridge vs LiteLLM: added latency p99 (64 B body)</text>
 <text x="96" y="74" font-size="15" fill="#6b7280">Both gateways do the full OpenAI&#8596;Anthropic translation (equal work), one worker each.</text>
 <text x="96" y="95" font-size="15" fill="#6b7280">200 ms mock backend &#183; open-loop load &#183; single co-located host &#183; log y-axis &#183; lower is better.</text>
 <line x1="96" y1="504.0" x2="956" y2="504.0" stroke="#e5e7eb" stroke-width="1"/>
@@ -36,28 +36,26 @@
 <rect x="459.3" y="171.9" width="43.0" height="332.1" fill="#dc2626" rx="2"/>
 <text x="480.8" y="164.9" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">9797.7 &#9888;</text>
 <text x="454.3" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">500 RPS</text>
-<text x="454.3" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <rect x="549.7" y="466.7" width="43.0" height="37.3" fill="#16a34a" rx="2"/>
 <text x="571.2" y="459.7" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.047</text>
 <rect x="602.7" y="163.0" width="43.0" height="341.0" fill="#dc2626" rx="2"/>
 <text x="624.2" y="156.0" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">14213.4 &#9888;</text>
 <text x="597.7" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">1000 RPS</text>
-<text x="597.7" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <rect x="693.0" y="463.0" width="43.0" height="41.0" fill="#16a34a" rx="2"/>
 <text x="714.5" y="456.0" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.055</text>
 <rect x="746.0" y="156.4" width="43.0" height="347.6" fill="#dc2626" rx="2"/>
 <text x="767.5" y="149.4" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">18678.4 &#9888;</text>
 <text x="741.0" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">2000 RPS</text>
-<text x="741.0" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
 <rect x="836.3" y="470.0" width="43.0" height="34.0" fill="#16a34a" rx="2"/>
 <text x="857.8" y="463.0" font-size="16" fill="#16a34a" text-anchor="middle" font-weight="700">0.041</text>
 <rect x="889.3" y="156.4" width="43.0" height="347.6" fill="#dc2626" rx="2"/>
 <text x="910.8" y="149.4" font-size="16" fill="#dc2626" text-anchor="middle" font-weight="700">18694.5 &#9888;</text>
 <text x="884.3" y="530.0" font-size="18" fill="#111827" text-anchor="middle" font-weight="600">5000 RPS</text>
-<text x="884.3" y="549.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated (~250 RPS cap)</text>
+<line x1="399.3" y1="538.0" x2="939.3" y2="538.0" stroke="#dc2626" stroke-width="1" opacity=".55"/>
+<text x="669.3" y="551.0" font-size="12" fill="#dc2626" text-anchor="middle">LiteLLM saturated across this range (~250 RPS cap)</text>
 <line x1="96" y1="504.0" x2="956" y2="504.0" stroke="#111827" stroke-width="1.5"/>
 <rect x="96" y="557" width="16" height="16" fill="#16a34a" rx="2"/>
-<text x="120" y="570" font-size="15" fill="#111827">llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99</text>
+<text x="120" y="570" font-size="15" fill="#111827">llmbridge (C++/io_uring, 1 worker): proxy self-measured added p99</text>
 <rect x="96" y="581" width="16" height="16" fill="#dc2626" rx="2"/>
-<text x="120" y="594" font-size="15" fill="#111827">LiteLLM (Python, 1 worker) — client-measured added p99</text>
+<text x="120" y="594" font-size="15" fill="#111827">LiteLLM (Python, 1 worker): client-measured added p99</text>
 </svg>

@@ -11,7 +11,7 @@
 # renamed public namespace all pass everything and only break for the consumer.
 #
 # v0.9.0 moved `llmbridge::json` to `llmbridge::provider::json` inside an installed
-# header. That was deliberate — but nothing verified it, so a downstream user would
+# header. That was deliberate, but nothing verified it, so a downstream user would
 # have been the one to discover it.
 cmake_minimum_required(VERSION 3.20)
 project(llmbridge_consumer CXX)

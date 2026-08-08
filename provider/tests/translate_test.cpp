@@ -163,7 +163,7 @@ TEST(StreamUsageFlag, DetectsIncludeUsage)
 // ── upstream error passthrough ──────────────────────────────────────────────
 TEST(UpstreamError, MapsAnthropicErrorEnvelope)
 {
-    // Anthropic overloaded (529) / rate limit (429) — the client must get the real
+    // Anthropic overloaded (529) / rate limit (429): the client must get the real
     // type + message so it can back off, not a generic gateway failure.
     Value out = P(llmbridge::provider::upstream_error_to_openai(
         R"({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})", "upstream_error"));
@@ -205,8 +205,8 @@ TEST(UpstreamError, RawControlBytesFromUpstreamNeverReachTheEnvelope)
     // A hostile/broken provider puts a RAW control byte in its error message.
     // Relaying it verbatim would make OUR error envelope invalid JSON for a strict
     // client. Since the parser was tightened (RFC 8259 §7) such a body does not
-    // parse at all, so we emit the generic envelope rather than guessing at a
-    // message inside malformed JSON — refusing to interpret beats sanitising and
+    // parse at all, so we emit the generic envelope instead of guessing at a
+    // message inside malformed JSON, refusing to interpret beats sanitising and
     // forwarding. The invariant under test is unchanged and is the one that
     // matters: no raw control byte, and the envelope always parses.
     std::string body = "{\"error\":{\"type\":\"api_err\",\"message\":\"boom";
@@ -225,8 +225,8 @@ TEST(UpstreamError, RawControlBytesFromUpstreamNeverReachTheEnvelope)
 TEST(UpstreamError, WellFormedProviderErrorStillRelaysItsOwnMessage)
 {
     // The case that actually happens: real providers emit valid JSON, and the
-    // stricter parser must not cost us the provider's own type and message —
-    // that is the whole point of relaying a 429 rather than laundering it to 502.
+    // stricter parser must not cost us the provider's own type and message
+    // that is the whole point of relaying a 429 instead of laundering it to 502.
     const std::string body =
         R"({"error":{"type":"rate_limit_error","message":"Number of requests has exceeded your rate limit"}})";
     const std::string out = llmbridge::provider::upstream_error_to_openai(body, "upstream_error");
@@ -536,7 +536,7 @@ TEST(RoundTrip, CohereRequestThenResponse)
 // ── Tool calling ────────────────────────────────────────────────────────────
 // The three genuine conversions (declaration shape, arguments string <-> input
 // object, tool result role) plus the failure modes. Every assertion re-parses the
-// output rather than string-matching, so a shape change cannot pass by accident.
+// output instead of string-matching, so a shape change cannot pass by accident.
 
 TEST(ToolReq, DeclarationBecomesAnthropicShape)
 {
@@ -664,7 +664,7 @@ TEST(ToolReq, ToolResultBecomesUserTurn)
 TEST(ToolReq, ConsecutiveToolResultsMergeIntoOneTurn)
 {
     // A parallel tool call yields several OpenAI tool messages that are semantically
-    // ONE turn of results. (Anthropic tolerates consecutive user turns — measured —
+    // ONE turn of results. (Anthropic tolerates consecutive user turns, measured,
     // so this is about emitting the canonical shape, not about avoiding an error.)
     const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
       {"role":"tool","tool_call_id":"a","content":"1"},
@@ -755,7 +755,7 @@ TEST(ToolResp, ToolUseBecomesToolCallsWithStringArguments)
     const Value* fn = calls->arr[0].find("function");
     ASSERT_NE(fn, nullptr);
     EXPECT_EQ(fn->str_or("name"), "get_weather");
-    // arguments is a STRING containing JSON — decoding it must yield the input.
+    // arguments is a STRING containing JSON, so decoding it must yield the input.
     const Value* args = fn->find("arguments");
     ASSERT_NE(args, nullptr);
     ASSERT_TRUE(args->is_string()) << "arguments must be a string, not an object";

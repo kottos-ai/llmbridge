@@ -21,7 +21,7 @@ namespace llmbridge::net::uring
 {
     namespace
     {
-        // Raw syscalls — glibc doesn't wrap these, and we don't pull in liburing.
+        // Raw syscalls: glibc doesn't wrap these, and we don't pull in liburing.
         int sys_io_uring_setup(unsigned entries, io_uring_params* p) noexcept
         {
             return static_cast<int>(::syscall(__NR_io_uring_setup, entries, p));
@@ -105,7 +105,7 @@ namespace llmbridge::net::uring
         _cqes = reinterpret_cast<io_uring_cqe*>(cq + p.cq_off.cqes);
 
         // We fill SQEs in ring order, so the index array is the identity map and
-        // stays constant — set it once, then submit just advances the SQ tail.
+        // stays constant: set it once, then submit just advances the SQ tail.
         for (unsigned i = 0; i < _sq_entries; ++i) _sq_array[i] = i;
         _sqe_tail = *_sq_tail; // align our cursor with the kernel's (usually 0)
         return true;

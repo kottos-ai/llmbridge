@@ -10,11 +10,11 @@
 # Find the single-thread saturation point of the llmbridge proxy.
 #
 # Uses the C++ fastbackend (instant response) so the *backend* never saturates
-# first — confirmed by also driving the backend directly at each RPS. The
+# first, confirmed by also driving the backend directly at each RPS. The
 # saturation point is the highest target RPS where the proxy still tracks the
 # target (achieved ~= target) with a tight client tail; past it, achieved
 # plateaus, the loadgen backlog explodes, and client p99 climbs while the
-# direct-to-backend leg keeps tracking — proving the proxy is the bottleneck.
+# direct-to-backend leg keeps tracking, proving the proxy is the bottleneck.
 #
 #   ./bench/saturate.sh [dur] [warmup] [rps_list...]
 set -uo pipefail
@@ -60,7 +60,7 @@ extract() { sed -n 's/.*achieved=\([0-9]*\) .*p50_us=\([0-9]*\) p99_us=\([0-9]*\
 backlog_of() { sed -n 's/.*max_backlog=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 
 {
-  echo "llmbridge single-thread saturation — $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B, io=${IO}, workers=${WORKERS}, backends=${BACKENDS})"
+  echo "llmbridge single-thread saturation, $STAMP  (instant C++ backend, ${DUR}s/level, ${WARMUP}s warmup, body=${BODY}B, io=${IO}, workers=${WORKERS}, backends=${BACKENDS})"
   printf "%-9s | %-22s | %-38s | %s\n" "TARGET" "DIRECT backend" "THROUGH proxy" "proxy"
   printf "%-9s | %-22s | %-38s | %s\n" "RPS" "achieved (p99 µs)" "achieved / p50 / p99 / p99.9 / max (µs)" "backlog"
   echo "----------+------------------------+----------------------------------------+--------"

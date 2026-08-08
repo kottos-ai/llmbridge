@@ -6,13 +6,13 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // End-to-end TLS gateway tests: a real in-process TLS "provider" (blocking
-// thread; SSL_set_fd is fine in test code — the memory-BIO constraint only
+// thread; SSL_set_fd is fine in test code; the memory-BIO constraint only
 // applies inside the gateway's event loop) fronted by the Gateway with a TLS
 // upstream, driven by a plaintext loopback client. Hermetic: self-signed cert
 // generated in-process, nothing leaves 127.0.0.1.
 //
 // What this proves that net_tls_test cannot: the PUMP WIRING inside both event
-// loops — handshake interleaved with connect/recv/send completions, the
+// loops: handshake interleaved with connect/recv/send completions, the
 // plaintext-invariant on rbuf/wbuf, session survival across the keep-alive
 // pool, and certificate rejection surfacing as a client-visible 502.
 
@@ -81,7 +81,7 @@ namespace
         }
         // The CA path must be unique per process AND per call. ctest runs this
         // binary many times in parallel (-j), and a fixed name meant one process
-        // truncated the file another was mid-way through loading — surfacing as a
+        // truncated the file another was mid-way through loading, surfacing as a
         // spurious "no certificate or crl found" in whichever test lost the race.
         // A flaky security suite is a suite people learn to ignore, so this is
         // worth the two lines.
@@ -201,14 +201,14 @@ namespace
                     if (_mode == "sse-corrupt")
                     {
                         // Start a legitimate stream (headers + first token through
-                        // TLS), then write RAW GARBAGE to the socket — a corrupt
+                        // TLS), then write RAW GARBAGE to the socket: a corrupt
                         // record. The gateway must abort the client stream, not
                         // finish it cleanly.
                         const std::string head = sse_corrupt_prefix();
                         if (SSL_write(ssl, head.data(), static_cast<int>(head.size())) <= 0)
                             goto done;
                         // Let the gateway PROCESS the prefix (stream begins, first
-                        // token reaches the client) before the corruption lands —
+                        // token reaches the client) before the corruption lands
                         // otherwise both arrive in one drain and the gateway
                         // correctly 502s a stream that never started, which is a
                         // different (already-tested) path.
@@ -252,7 +252,7 @@ namespace
             return std::string(len) + "\r\n" + s + "\r\n";
         }
 
-        // Headers + message_start + first text delta only — the stream is mid-
+        // Headers + message_start + first text delta only; the stream is mid-
         // flight when the corruption lands.
         static std::string sse_corrupt_prefix()
         {
@@ -467,7 +467,7 @@ TEST_P(GatewayTls, SseStreamsThroughTlsWithTranslation)
 TEST_P(GatewayTls, HostnameMismatchYields502NotPlaintextFallback)
 {
     // Gateway verifies the peer as "wrong.test"; the cert says provider.test.
-    // The client must see a structured 502 — and the provider must see ZERO
+    // The client must see a structured 502, and the provider must see ZERO
     // completed handshakes and ZERO requests (nothing was sent to an unverified
     // peer, which is the security property the whole TLS layer exists for).
     start(TranslateMode::None, "json", "wrong.test");
@@ -486,7 +486,7 @@ TEST_P(GatewayTls, ConcurrentTlsStreamsAllComplete)
     // 16 simultaneous SSE streams through one gateway loop: 16 independent TLS
     // sessions' handshakes, reads and writes interleave on a single thread. This
     // is the test that catches cross-session state bleed (a Session mistakenly
-    // shared or a tls_out written by the wrong conn) — any mixing corrupts a
+    // shared or a tls_out written by the wrong conn); any mixing corrupts a
     // record and kills at least one stream.
     start(TranslateMode::Anthropic, "sse");
     constexpr int kStreams = 16;
@@ -513,7 +513,7 @@ TEST_P(GatewayTls, CorruptRecordMidStreamAbortsWithoutDone)
 {
     // The stream STARTS cleanly (headers + first token through TLS), then the
     // provider writes raw garbage on the wire. The client must get the partial
-    // stream and a hard close — never a well-formed [DONE]: finalizing a
+    // stream and a hard close, never a well-formed [DONE]: finalizing a
     // corrupted stream as clean would hide the corruption entirely.
     start(TranslateMode::Anthropic, "sse-corrupt");
     Client c;
@@ -528,7 +528,7 @@ TEST_P(GatewayTls, CorruptRecordMidStreamAbortsWithoutDone)
 TEST_P(GatewayTls, ProviderClosingPooledConnDoesNotBreakNextRequest)
 {
     // Provider closes its side after every response (keep-alive header, then
-    // close — rude but real). Whichever way the gateway learns (pool eviction on
+    // close, rude but real). Whichever way the gateway learns (pool eviction on
     // EOF, or stale-conn retry at reuse time), the NEXT request must still get a
     // 200 on a fresh session. Guards the retry/eviction paths' TLS attach.
     start(TranslateMode::None, "close1");

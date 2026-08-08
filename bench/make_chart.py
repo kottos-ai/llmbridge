@@ -9,7 +9,7 @@
 
 """Render the llmbridge-vs-LiteLLM added-latency chart as a standalone SVG.
 
-Pure stdlib — emits SVG text directly (no matplotlib), so it runs anywhere and
+Pure stdlib: emits SVG text directly (no matplotlib), so it runs anywhere and
 produces a crisp vector artifact for the pitch deck / README. Log y-axis,
 because the two systems differ by ~6 orders of magnitude and a linear axis
 would render llmbridge as a flat zero.
@@ -26,7 +26,7 @@ CSV = os.path.join(HERE, "results", "phase-a-comparison.csv")
 def chart_outputs(name):
     """Where to write a generated chart. Always bench/results/ (the public OSS
     README embeds these). Also private/website/assets/ when that site tree is
-    present, so the README copy and the deployed website never drift — one run,
+    present, so the README copy and the deployed website never drift: one run,
     no manual copying. Public OSS clones (no private/) just get bench/results/."""
     outs = [os.path.join(HERE, "results", name)]
     site = os.path.join(os.path.dirname(HERE), "private", "website")
@@ -54,7 +54,7 @@ with open(CSV) as f:
             "litellm_sat": c[9].strip() == "yes",
         })
 
-# Geometry — W/H kept IDENTICAL to make_saturation_chart.py so the two figures
+# Geometry. W/H kept IDENTICAL to make_saturation_chart.py so the two figures
 # render at exactly the same size on the page.
 W, H = 1000, 620
 ML, MR, MT, MB = 96, 44, 116, 116
@@ -83,7 +83,7 @@ svg.append(
     f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">')
 svg.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 svg.append(
-    f'<text x="{ML}" y="44" font-size="{F_TITLE}" font-weight="700" fill="{INK}">llmbridge vs LiteLLM — added latency p99 (64 B body)</text>')
+    f'<text x="{ML}" y="44" font-size="{F_TITLE}" font-weight="700" fill="{INK}">llmbridge vs LiteLLM: added latency p99 (64 B body)</text>')
 svg.append(
     f'<text x="{ML}" y="74" font-size="{F_SUB}" fill="{SUB}">Both gateways do the full OpenAI&#8596;Anthropic translation (equal work), one worker each.</text>')
 svg.append(
@@ -147,11 +147,11 @@ if sat:
 # x axis line
 svg.append(f'<line x1="{ML}" y1="{axis_y:.1f}" x2="{ML + PW}" y2="{axis_y:.1f}" stroke="{INK}" stroke-width="1.5"/>')
 
-# legend — two stacked rows (bottom-left), so the longer labels never overflow
+# legend: two stacked rows (bottom-left), so the longer labels never overflow
 sw = 16
 for i, (col, label) in enumerate([
-    (LLMBRIDGE, "llmbridge (C++/io_uring, 1 worker) — proxy self-measured added p99"),
-    (LITELLM, "LiteLLM (Python, 1 worker) — client-measured added p99"),
+    (LLMBRIDGE, "llmbridge (C++/io_uring, 1 worker): proxy self-measured added p99"),
+    (LITELLM, "LiteLLM (Python, 1 worker): client-measured added p99"),
 ]):
     yy = H - 50 + i * 24
     svg.append(f'<rect x="{ML}" y="{yy - sw + 3}" width="{sw}" height="{sw}" fill="{col}" rx="2"/>')

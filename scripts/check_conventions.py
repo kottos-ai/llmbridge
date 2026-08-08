@@ -8,8 +8,8 @@
 
 """Enforce the naming conventions that keep the two event-loop backends apart.
 
-Gateway implements the whole request lifecycle twice — once on epoll, once on
-io_uring — and the two halves are 60-81% similar. Neither backend's teardown,
+Gateway implements the whole request lifecycle twice: once on epoll, once on
+io_uring, and the two halves are 60-81% similar. Neither backend's teardown,
 write-arming or completion handling is valid in the other, so a call that crosses
 from one into the other is a bug. The ep_/ur_ prefixes exist to make that
 mechanically checkable; this script is what makes them an invariant instead of a
@@ -17,18 +17,18 @@ habit. See DESIGN.md "Naming conventions".
 
 Three checks, each of which has caught a real defect:
 
-  1. CROSSING   — a ep_* function calling a ur_* one, or vice versa.
+  1. CROSSING, a ep_* function calling a ur_* one, or vice versa.
                   Caught ur_forward() calling the epoll error responder, which had
                   been invisible for as long as the epoll half was unprefixed.
 
-  2. UNMARKED   — an unprefixed Gateway method reachable from only ONE backend.
+  2. UNMARKED, an unprefixed Gateway method reachable from only ONE backend.
                   Unprefixed is supposed to mean "shared", so a one-sided unprefixed
                   method is a mislabelled backend-specific one. This is the check
                   that matters most: a crossing grep alone CANNOT catch it, because
                   the offending name has no prefix to grep for. Caught abort_pair,
                   which a prefix-only check had missed.
 
-  3. NAMESPACE  — a header whose namespace does not mirror its directory.
+  3. NAMESPACE, a header whose namespace does not mirror its directory.
                   Caught llmbridge::http (should nest under net) and llmbridge::json
                   (should nest under provider).
 
@@ -44,7 +44,7 @@ GATEWAY = ROOT / "gateway" / "src" / "gateway.cpp"
 
 # Methods that are legitimately unprefixed despite not being called from both
 # backends: entry points, accessors, and the ctor. Anything else that is
-# one-sided is a naming bug, not an exception — extend this list only with a
+# one-sided is a naming bug, not an exception. Extend this list only with a
 # reason, never to silence check 2.
 UNPREFIXED_ALLOWED = {
     "Gateway",       # constructor
@@ -67,7 +67,7 @@ def method_spans(text):
     """{name: (start_line, first_line_idx, last_line_idx)} for Gateway:: definitions.
 
     Brace-matched, so a free function defined between two methods is NOT charged
-    to whichever method happens to precede it — an error that produced a false
+    to whichever method happens to precede it, an error that produced a false
     finding when this analysis was first done by hand.
     """
     spans = {}
@@ -93,7 +93,7 @@ def method_spans(text):
 
 
 def backend_strict(name):
-    """Backend by PREFIX only — used for the crossing check.
+    """Backend by PREFIX only, used for the crossing check.
 
     Deliberately excludes run_epoll/run_uring: they are the dispatch layer, and
     run_uring() legitimately tails into run_epoll() when io_uring init or the
@@ -108,7 +108,7 @@ def backend_strict(name):
 
 
 def backend_reach(name):
-    """Backend for REACHABILITY — includes the two loop entry points.
+    """Backend for REACHABILITY, including the two loop entry points.
 
     sweep_idle is called from run_epoll and from ur_on_cqe and is genuinely
     shared; without run_epoll counting as an epoll-side caller it would look
@@ -130,7 +130,7 @@ def main():
     lines = text.splitlines()
     spans = method_spans(text)
     if len(spans) < 40:
-        print(f"error: only {len(spans)} Gateway methods parsed — the extractor is broken, "
+        print(f"error: only {len(spans)} Gateway methods parsed: the extractor is broken, "
               f"not the code. Refusing to report a clean run.", file=sys.stderr)
         return 2
 
@@ -141,7 +141,7 @@ def main():
                 if called != name and called in spans:
                     callees[name].add((called, idx + 1))
 
-    # 1. crossings — prefixed functions only (see backend_strict)
+    # 1. crossings: prefixed functions only (see backend_strict)
     for caller, calls in callees.items():
         cb = backend_strict(caller)
         if cb is None:
@@ -150,7 +150,7 @@ def main():
             tb = backend_strict(called)
             if tb is not None and tb != cb:
                 failures.append(
-                    f"{GATEWAY.relative_to(ROOT)}:{line}: CROSSING — {caller}() calls "
+                    f"{GATEWAY.relative_to(ROOT)}:{line}: CROSSING: {caller}() calls "
                     f"{called}(); {cb} and {tb} teardown/IO are not interchangeable")
 
     # 2. unprefixed methods reachable from only one backend
@@ -168,7 +168,7 @@ def main():
             only = "epoll" if "ep" in sides else "io_uring"
             pfx = "ep_" if "ep" in sides else "ur_"
             failures.append(
-                f"{GATEWAY.relative_to(ROOT)}:{decl_line}: UNMARKED — {name}() is reachable "
+                f"{GATEWAY.relative_to(ROOT)}:{decl_line}: UNMARKED: {name}() is reachable "
                 f"only from {only}, but an unprefixed name means shared. Rename to "
                 f"{pfx}{name}, or add it to UNPREFIXED_ALLOWED with a reason")
 
@@ -187,7 +187,7 @@ def main():
             continue
         if module not in ns.split("::"):
             failures.append(
-                f"{header.relative_to(ROOT)}:{ns_line}: NAMESPACE — `{ns}` does not mirror "
+                f"{header.relative_to(ROOT)}:{ns_line}: NAMESPACE: `{ns}` does not mirror "
                 f"its directory; expected a `{module}` segment (e.g. llmbridge::{module}::...)")
 
     # ---------------------------------------------------------------- 4
@@ -209,24 +209,24 @@ def main():
             doc_line = doc[: m.start()].count("\n") + 1
             fns = re.findall(r"`(\w+)`", sites)
             if not fns:
-                failures.append(f"LATENCY.md:{doc_line}: STAMP — {stamp} (`{ident}`) names "
+                failures.append(f"LATENCY.md:{doc_line}: STAMP: {stamp} (`{ident}`) names "
                                 f"no assigning function")
                 continue
             seen += 1
             for f in fns:
                 if f not in spans:
                     failures.append(
-                        f"LATENCY.md:{doc_line}: STAMP — {stamp} cites `{f}()`, which is "
+                        f"LATENCY.md:{doc_line}: STAMP: {stamp} cites `{f}()`, which is "
                         f"not a Gateway method (renamed or removed?)")
                     continue
                 _, lo, hi = spans[f]
                 body = "\n".join(lines[lo:hi + 1])
                 if not re.search(rf"\b{ident}\s*=", body):
                     failures.append(
-                        f"LATENCY.md:{doc_line}: STAMP — {stamp} says `{f}()` assigns "
+                        f"LATENCY.md:{doc_line}: STAMP: {stamp} says `{f}()` assigns "
                         f"`{ident}`, but it does not")
         if seen < 7:
-            failures.append(f"LATENCY.md: STAMP — parsed only {seen} of 7 stamp rows; "
+            failures.append(f"LATENCY.md: STAMP: parsed only {seen} of 7 stamp rows; "
                             f"the table or this check is broken")
 
     # ---------------------------------------------------------------- report
@@ -239,7 +239,7 @@ def main():
         return 1
 
     twins = sum(1 for n in spans if n.startswith("ep_") and "ur_" + n[3:] in spans)
-    print(f"convention check OK — {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
+    print(f"convention check OK: {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
           f"0 crossings, 0 unmarked, namespaces mirror directories, "
           f"LATENCY.md stamp refs resolve")
     return 0

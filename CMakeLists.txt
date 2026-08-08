@@ -1,11 +1,11 @@
-# llmbridge — sub-millisecond LLM gateway. Self-contained, dependency-free C++20.
+# llmbridge: sub-millisecond LLM gateway. Self-contained, dependency-free C++20.
 #
-#   net      (lib)  — sockets + zero-alloc HTTP/1.1 framing
-#   provider (lib)  — hand-rolled JSON + OpenAI<->Anthropic dialect translation
-#   gateway  (lib)  — the whole proxy in one epoll event-loop class + a tiny
+#   net      (lib), sockets + zero-alloc HTTP/1.1 framing
+#   provider (lib), hand-rolled JSON + OpenAI<->Anthropic dialect translation
+#   gateway  (lib), the whole proxy in one epoll event-loop class + a tiny
 #                     vendored latency histogram
-#   app      (exe)  — the runnable `llmbridge` daemon
-#   bench    (exe)  — loadgen + fastbackend
+#   app      (exe), the runnable `llmbridge` daemon
+#   bench    (exe), loadgen + fastbackend
 #
 # No third-party runtime dependencies: just a C++20 compiler. GoogleTest is
 # fetched only when building tests. Open the project root in CLion (or use the
@@ -32,7 +32,7 @@ endif ()
 # Optimization. Default Release is -O2, applied via add_compile_options so it does
 # NOT clobber a user's CMAKE_CXX_FLAGS_RELEASE (which the default `-DNDEBUG` etc.
 # still supply). We deliberately do NOT force -march=native: it bakes in the build
-# machine's instruction set and crashes with SIGILL on a different/older CPU — a
+# machine's instruction set and crashes with SIGILL on a different/older CPU, a
 # footgun for packagers and CI. Opt in for a local, non-portable perf build (this
 # is what reproduces the published benchmark numbers):
 #   cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_NATIVE_ARCH=ON
@@ -49,7 +49,7 @@ include(GNUInstallDirs) # CMAKE_INSTALL_{LIB,INCLUDE,BIN}DIR for the install rul
 # All executables collect in <build>/bin so the bench scripts find them.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# ── Tests (GoogleTest — the only fetched dependency, and only for tests) ──────
+# ── Tests (GoogleTest, the only fetched dependency, and only for tests) ──────
 option(LLMBRIDGE_BUILD_TESTS "Build llmbridge module tests" ${PROJECT_IS_TOP_LEVEL})
 if (LLMBRIDGE_BUILD_TESTS)
     include(FetchContent)
@@ -64,7 +64,7 @@ endif ()
 
 # ── llmbridge modules (bottom-up) ────────────────────────────────────────────────
 # TLS for outbound gateway connections. OpenSSL is the ONE sanctioned runtime
-# dependency (CLAUDE.md), confined to the gateway path — the translator library
+# dependency (CLAUDE.md), confined to the gateway path; the translator library
 # (`provider`) stays dependency-free and must never link it. OFF by default so a
 # plain build of the OSS remains dependency-free end to end. find_package here at
 # the root because imported targets are directory-scoped and both net/ and
@@ -72,7 +72,7 @@ endif ()
 option(LLMBRIDGE_TLS "Enable TLS for outbound gateway connections (needs OpenSSL)" OFF)
 if (LLMBRIDGE_TLS)
     find_package(OpenSSL 3.0 REQUIRED)
-    message(STATUS "llmbridge: TLS enabled — OpenSSL ${OPENSSL_VERSION}")
+    message(STATUS "llmbridge: TLS enabled. OpenSSL ${OPENSSL_VERSION}")
 endif ()
 
 add_subdirectory(net)
@@ -90,7 +90,7 @@ add_subdirectory(gateway)
 add_subdirectory(app)
 add_subdirectory(bench)
 
-# Developer debug aids (tools/debug_translate — a steppable translator harness).
+# Developer debug aids (tools/debug_translate, a steppable translator harness).
 # Top-level builds only; consumers embedding llmbridge don't get it.
 option(LLMBRIDGE_BUILD_TOOLS "Build developer debug tools (tools/)" ${PROJECT_IS_TOP_LEVEL})
 if (LLMBRIDGE_BUILD_TOOLS)

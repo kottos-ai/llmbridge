@@ -11,7 +11,7 @@
 // translators must be LOSSLESS on the covered chat surface (model, system,
 // user/assistant turns, max_tokens/temperature/top_p). We verify that by
 // reducing both the original OpenAI request and the translated provider request
-// to the same canonical form and asserting equality — i.e. the inverse mapping
+// to the same canonical form and asserting equality; i.e. the inverse mapping
 // exists and recovers the original.
 //
 // The hard cases are LARGE bodies and nasty escaping, because the zero-copy DOM
@@ -55,7 +55,7 @@ namespace
     };
 
     // Canonical chat form. Content is the RAW (still-escaped) bytes, concatenated
-    // the way both the translator and a reader would — so equality is byte-exact.
+    // the way both the translator and a reader would, so equality is byte-exact.
     struct Canon
     {
         std::string model, system;

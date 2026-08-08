@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// faststream — a C++ streaming (SSE) provider for the Phase-B saturation test.
+// faststream: a C++ streaming (SSE) provider for the Phase-B saturation test.
 // The streaming counterpart to fastbackend.cpp, and it exists for exactly the same
 // reason: the Python asyncio mock tops out around 45-50k chunks/s, which is BELOW
 // what llmbridge sustains, so a sweep against it measures the mock's ceiling and
@@ -15,7 +15,7 @@
 //
 // Wire-compatible with mock_provider.py --format anthropic: same events, same
 // chunked transfer-encoding, and the same "t=<CLOCK_MONOTONIC ns> " emission stamp
-// inside each token — which is what streamgen subtracts to get added latency.
+// inside each token, which is what streamgen subtracts to get added latency.
 //
 //   faststream [--port 9002] [--tokens 60] [--token-interval-us 20000]
 //              [--prefill-us 20000]
@@ -117,7 +117,7 @@ namespace
         // PHASE STAGGER. Streams that start together would otherwise stay aligned
         // and fire in one synchronized burst every interval, which is both
         // unrealistic (real providers are not in lockstep) and inflates measured
-        // latency for every path — the whole burst queues behind one wakeup.
+        // latency for every path: the whole burst queues behind one wakeup.
         // Spreading start phases deterministically across the interval makes the
         // emission rate smooth, so what we measure is the gateway, not our own
         // thundering herd.
@@ -144,7 +144,7 @@ namespace
     }
 
     // Emit one token, stamped with the CURRENT monotonic clock (the stamp is taken
-    // at emit time, so scheduler jitter never corrupts the latency measurement —
+    // at emit time, so scheduler jitter never corrupts the latency measurement
     // it only shifts when the token was sent, which is what we claim it is).
     void emit_token(Conn* c)
     {
@@ -271,7 +271,7 @@ int main(int argc, char** argv)
                     continue;
                 }
                 // A complete request header is enough to start (the body is small and
-                // arrives with it); we don't need to interpret it — every request to
+                // arrives with it); we don't need to interpret it: every request to
                 // this backend is a streaming request by construction.
                 if (!c->streaming && c->rbuf.find("\r\n\r\n") != std::string::npos)
                 {
@@ -284,7 +284,7 @@ int main(int argc, char** argv)
         }
 
         // Emit every token that has come due. O(active) per tick with trivial
-        // integer comparisons — the write() syscalls dominate, not this scan.
+        // integer comparisons; the write() syscalls dominate, not this scan.
         const int64_t t = now_ns();
         for (size_t k = 0; k < active.size();)
         {

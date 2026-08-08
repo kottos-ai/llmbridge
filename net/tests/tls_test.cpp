@@ -84,7 +84,7 @@ namespace
             // spurious TLS failure in whichever lost the race.
             //
             // This is the SAME bug, in the SAME copy-pasted SelfSigned helper, as the
-            // one fixed in gateway/tests/gateway_tls_test.cpp — and it was left behind
+            // one fixed in gateway/tests/gateway_tls_test.cpp, and it was left behind
             // when that one was fixed. Duplicated code, one-sided fix: exactly the
             // failure mode the ep_/ur_ audit was about. If a third copy ever appears,
             // hoist this helper into a shared test header instead.

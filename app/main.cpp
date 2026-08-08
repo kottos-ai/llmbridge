@@ -112,7 +112,7 @@ int main(int argc, char** argv)
 
     // Parse + resolve --upstream. Resolution happens ONCE, here, on the setup path:
     // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
-    // TTL expiry is future work — providers rotate IPs, but a long-lived gateway
+    // TTL expiry is future work: providers rotate IPs, but a long-lived gateway
     // pinning one A record is exactly what the pooled connections do anyway.)
     const llmbridge::net::UpstreamSpec up = llmbridge::net::parse_upstream(upstream_arg);
     if (!up.ok())
@@ -124,7 +124,7 @@ int main(int argc, char** argv)
 #ifndef LLMBRIDGE_HAVE_TLS
     if (up.tls)
     {
-        std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build — "
+        std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build. "
                              "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
                              "Refusing to speak plaintext to a TLS port.\n");
         return 2;
@@ -147,13 +147,13 @@ int main(int argc, char** argv)
 
     // Credentials over plaintext: the gateway forwards the client's provider key
     // upstream, so a non-TLS upstream that is NOT loopback puts that key on the
-    // wire in the clear. Loopback is exempt — that is the benchmark/mock setup and
+    // wire in the clear. Loopback is exempt; that is the benchmark/mock setup and
     // the sidecar deployment, where there is no network to sniff.
     {
         const bool loopback = upstream_ip.rfind("127.", 0) == 0 || upstream_ip == "::1";
         if (!up.tls && !loopback)
             std::fprintf(stderr,
-                         "llmbridge: WARNING — upstream %s:%u is plaintext HTTP and not "
+                         "llmbridge: WARNING: upstream %s:%u is plaintext HTTP and not "
                          "loopback. Any client credential forwarded to it travels "
                          "UNENCRYPTED. Use https:// for a real provider.\n",
                          up.host.c_str(), upstream_port);
@@ -162,7 +162,7 @@ int main(int argc, char** argv)
     std::signal(SIGPIPE, SIG_IGN);
 
     // N shared-nothing workers, each its own event loop binding the same port with
-    // SO_REUSEPORT — the kernel load-balances connections across them. No locks on
+    // SO_REUSEPORT: the kernel load-balances connections across them. No locks on
     // the hot path; per-worker upstream pools and stats, merged at the end.
     const int64_t warmup_ns = static_cast<int64_t>(warmup * 1e9);
     const int64_t up_timeout_ns = static_cast<int64_t>(up_timeout * 1e9);
@@ -171,7 +171,7 @@ int main(int argc, char** argv)
     {
         llmbridge::TlsConfig tls;
         tls.enabled = up.tls;
-        tls.sni_host = up.host; // SNI + hostname verification — the PARSED host,
+        tls.sni_host = up.host; // SNI + hostname verification: the PARSED host,
                                 // never the resolved IP (verification needs the name)
         gateways.push_back(std::make_unique<llmbridge::Gateway>(
             listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
@@ -214,7 +214,7 @@ int main(int argc, char** argv)
         agg.connect.merge(s.connect);
         agg.resp_path.merge(s.resp_path);
     }
-    std::fprintf(stderr, "\n=== llmbridge gateway — added-latency profile (%d worker%s) ===\n",
+    std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
     std::fprintf(stderr, "timeouts=%llu  stream_pauses=%llu  uring_enobufs=%llu\n",
                  (unsigned long long)agg.upstream_timeouts, (unsigned long long)agg.stream_pauses,

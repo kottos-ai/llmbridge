@@ -14,7 +14,7 @@
 # ── Fairness controls (each one is a way this could have been rigged) ─────────
 #  1. SAME INSTRUMENT, BOTH SIDES. Every number comes from streamgen, client-side.
 #     Neither gateway self-reports. (The non-streaming benchmark measures llmbridge
-#     by self-report and LiteLLM by client delta — this one removes that asymmetry.)
+#     by self-report and LiteLLM by client delta; this one removes that asymmetry.)
 #  2. SAME BASELINE. "Added" latency is measured against the identical
 #     direct-to-mock control run at the SAME concurrency, subtracted the same way
 #     for both. The floor (loopback + the Python mock's own jitter) is charged to
@@ -25,18 +25,18 @@
 #     first-request path is never charged to it.
 #  5. SAME WORK. Identical request body, model, mock, and token rate; neither side
 #     requests stream_options.include_usage, so neither emits an extra usage chunk.
-#  6. BOTH PROXIES STAY UP for the whole sweep — no restart between levels, so
+#  6. BOTH PROXIES STAY UP for the whole sweep: no restart between levels, so
 #     neither gets a "fresh process" advantage at any concurrency.
 #  7. ORDER ALTERNATES per level (llmbridge-first, then LiteLLM-first) so any
 #     thermal/cache drift within a level doesn't systematically favour one side.
 #  8. DISCARD ROUND. Both gateways get one full unmeasured round before the sweep
 #     begins. LiteLLM's lazy imports / first-request path cost far more than a few
-#     seconds of in-run warmup — measured directly, its FIRST level came out 134x
+#     seconds of in-run warmup: measured directly, its FIRST level came out 134x
 #     worse than the same level run later. Without this the sweep's first entry is
 #     an artifact of cold start, not of the gateway.
 #  9. MOCK-SATURATION GUARD. If the direct baseline itself degrades at a level, the
-#     Python mock — not either gateway — is the limiter, and the level is flagged
-#     UNRELIABLE rather than silently reported.
+#     Python mock, not either gateway, is the limiter, and the level is flagged
+#     UNRELIABLE instead of silently reported.
 #
 #   ./bench/run_stream_headtohead.sh [tokens] [interval_ms] [duration] [warmup] [streams...]
 set -uo pipefail
@@ -82,7 +82,7 @@ fi
 [ -z "$BIN" ] && { echo "No built llmbridge+streamgen; build first or set BIN=path" >&2; exit 1; }
 echo "Using binaries in $BIN"
 
-# A stale binary silently benchmarks the WRONG code — streaming lands in v0.3.0, so
+# A stale binary silently benchmarks the WRONG code; streaming lands in v0.3.0, so
 # refuse to run against a gateway that can't stream.
 if ! "$BIN/llmbridge" --help 2>&1 | grep -q 'upstream-timeout'; then
   echo "ERROR: $BIN/llmbridge looks stale (no --upstream-timeout). Rebuild before benchmarking." >&2
@@ -92,7 +92,7 @@ fi
 wait_port() { for _ in $(seq 1 120); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }; sleep 0.5; done; return 1; }
 
 # PROVIDER=fast (default): the C++ faststream. The Python mock saturates near
-# 45-50k chunks/s — below llmbridge — so it would cap the comparison. faststream is
+# 45-50k chunks/s, below llmbridge, so it would cap the comparison. faststream is
 # wire-identical (same events, framing and emission stamps), so BOTH gateways see
 # exactly the same upstream, and neither is measured against a limited provider.
 PROVIDER="${PROVIDER:-fast}"
@@ -155,7 +155,7 @@ run_one() { # label port -> echoes "p50 p99 p999 chunks completed"
 }
 
 {
-  echo "streaming head-to-head — $(date)"
+  echo "streaming head-to-head, $(date)"
   echo "mock: ${TOKENS} tokens @ ${INTERVAL}ms/token (=$(awk "BEGIN{printf \"%.0f\", 1000/$INTERVAL}") tok/s per stream), 20ms prefill"
   echo "per level: ${DUR}s measured, ${WARMUP}s warmup, 1 worker each, same instrument both sides"
   echo
@@ -182,7 +182,7 @@ for S in "${STREAM_LIST[@]}"; do
   note=""
   # Guard 8: if the mock itself is struggling, neither gateway number is meaningful.
   if [ "$d99" -gt 5000 ]; then note="  [UNRELIABLE: mock saturated at this level]"; fi
-  # Equal-work check: a gateway delivering far fewer chunks isn't "faster", it's lossy.
+  # Equal-work check: a gateway delivering far fewer chunks is lossy, not fast.
   if [ "$kch" -gt 0 ] && [ "$lch" -gt 0 ]; then
     ratio=$(awk "BEGIN{printf \"%.2f\", $lch/$kch}")
     note="$note  [chunk ratio ll/kb=$ratio]"

@@ -120,7 +120,7 @@ TEST(NowNs, IsMonotonicNonDecreasing)
     EXPECT_GT(c, 0);
 }
 
-// An empty histogram must announce that it has no data rather than print zeros.
+// An empty histogram must announce that it has no data instead of print zeros.
 // This is not cosmetic: bench/run_bench.sh seds the `added-total` line for
 // `p99=<n> us`, so an all-zero print made a zero-sample run publishable as a
 // FABRICATED 0 us added latency. Streaming workloads produce exactly this state

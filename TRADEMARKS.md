@@ -10,7 +10,7 @@ code is open; the name and logo are not.
 
 ## You may
 
-- Use the names truthfully to refer to this project — e.g. "built with
+- Use the names truthfully to refer to this project, e.g. "built with
   llmbridge", "compatible with llmbridge", "a fork of llmbridge".
 - Redistribute and modify the source under the terms of the Apache 2.0 license.
 

@@ -64,7 +64,7 @@ TEST(UpstreamParse, BareTrailingSlashTolerated)
     EXPECT_EQ(s.host, "api.anthropic.com");
 }
 
-// ── rejected forms — each with a specific reason, not a generic failure ──────
+// ── rejected forms; each with a specific reason, not a generic failure ──────
 
 TEST(UpstreamParse, RejectsBasePath)
 {
@@ -73,7 +73,7 @@ TEST(UpstreamParse, RejectsBasePath)
     EXPECT_NE(s.error.find("path"), std::string::npos);
 }
 
-// https://good.example@evil.example — the eyeball reads "good", the connect goes
+// https://good.example@evil.example: the eyeball reads "good", the connect goes
 // to "evil". Refusing '@' outright kills the whole class.
 TEST(UpstreamParse, RejectsUserinfo)
 {
@@ -112,7 +112,7 @@ TEST(UpstreamParse, RejectsBadPorts)
 
 // The host string is later written into an HTTP Host header and the TLS SNI
 // field. A CR/LF (or space, or slash smuggled via percent-encoding) that survived
-// parsing would be a header-injection primitive — so the charset gate IS a
+// parsing would be a header-injection primitive, so the charset gate IS a
 // security boundary and gets tested as one.
 TEST(UpstreamParse, RejectsHeaderInjectionChars)
 {
@@ -134,7 +134,7 @@ TEST(UpstreamParse, RejectsMalformedHosts)
     EXPECT_FALSE(parse_upstream("https://?q=1").ok());
 }
 
-// ── resolution — hermetic cases only ─────────────────────────────────────────
+// ── resolution: hermetic cases only ─────────────────────────────────────────
 // localhost and numeric literals resolve without a network round-trip; an
 // NXDOMAIN test would hit real DNS and is deliberately absent (tests must be
 // hermetic per project policy).

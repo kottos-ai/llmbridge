@@ -7,11 +7,11 @@
 
 #pragma once
 
-// Gateway — the whole llmbridge proxy in one self-contained class. A single-
+// Gateway: the whole llmbridge proxy in one self-contained class. A single-
 // threaded, non-blocking epoll event loop: accept clients, frame requests,
 // (optionally) translate the provider dialect, forward over a keep-alive
 // upstream pool, read the response, translate back, write to the client. No
-// framework, no external dependencies — just net (sockets + HTTP framing) and
+// framework, no external dependencies: just net (sockets + HTTP framing) and
 // provider (dialect translation).
 //
 // Per-request added latency (the headline metric). LATENCY.md is the normative
@@ -31,9 +31,9 @@
 // Excluded on purpose: the provider's own time (t3->t4), and the TCP connect +
 // TLS handshake (t1->t2, recorded separately as Stats::connect). Without the
 // gateway the client's own stack pays that same handshake, so it cancels in the
-// subtraction that defines "added" — see LATENCY.md §1. An earlier version
+// subtraction that defines "added", see LATENCY.md §1. An earlier version
 // folded connect into the request path, which was harmless against a warm pooled
-// mock and badly wrong against a cold real provider — a live single-request run
+// mock and badly wrong against a cold real provider. A live single-request run
 // reported 52.66 ms of "request path" that was 99.9% handshake.
 
 #include <netinet/in.h>
@@ -66,11 +66,11 @@ namespace llmbridge
 
     // TLS towards the upstream. Declared unconditionally so callers don't need
     // ifdefs; when the build has no TLS support (LLMBRIDGE_TLS=OFF), enabling it
-    // makes run() fail fast with an error rather than silently speaking plaintext.
+    // makes run() fail fast with an error instead of silently speaking plaintext.
     //
     // The DESIGN INVARIANT the whole integration hangs off: `Connection::rbuf` and
     // `Connection::wbuf` hold PLAINTEXT always. TLS interposes at the socket edge
-    // only — ciphertext lives in `Connection::tls_out` on the way out and inside
+    // only. Ciphertext lives in `Connection::tls_out` on the way out and inside
     // the Session's BIO on the way in. Nothing downstream (HTTP framing, SSE pump,
     // retry-resend of wbuf on a stale pooled conn) knows TLS exists.
     struct TlsConfig
@@ -93,7 +93,7 @@ namespace llmbridge
     // Per-fd connection state (client or upstream).
     struct Connection
     {
-        // Live-instance counter — an assertable invariant: every Connection the
+        // Live-instance counter, an assertable invariant: every Connection the
         // gateway allocates must eventually be freed (no acquired-upstream or
         // client leaks). Tests check s_live returns to baseline after a Gateway is
         // destroyed, catching leaks deterministically without a sanitizer.
@@ -109,13 +109,13 @@ namespace llmbridge
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
         bool doomed = false;          // closed this epoll batch; deleted after the batch
-        bool close_after_resp = false; // client-only: this is an error reply — close once it flushes
+        bool close_after_resp = false; // client-only: this is an error reply, so close once it flushes
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
 
-        // Non-streaming chunked decode state, PER CONNECTION rather than shared:
+        // Non-streaming chunked decode state, PER CONNECTION instead of shared:
         // it must persist across reads so the decoder is fed only new bytes
-        // (see net::http::ResponseDecoder — the shared-scratch form was quadratic).
+        // (see net::http::ResponseDecoder; the shared-scratch form was quadratic).
         net::http::ResponseDecoder rdec;
 
         std::string rbuf;
@@ -149,7 +149,7 @@ namespace llmbridge
         int64_t ts_up_activity = 0;
 
         // io_uring backend only: submitted-but-uncompleted SQEs referencing this
-        // conn — it is freed only when this hits 0. (Multishot recv lands data in a
+        // conn; it is freed only when this hits 0. (Multishot recv lands data in a
         // shared provided-buffer pool, so there is no per-connection recv buffer.)
         int inflight = 0;
         // io_uring stale-connection handling: was this upstream reused from the
@@ -183,7 +183,7 @@ namespace llmbridge
         bool stream_keep_alive = false;
 
         // Upstream conns only: when this connection entered the idle pool. Idle
-        // keep-alives are reaped after kIdleUpstreamNs — providers drop them on
+        // keep-alives are reaped after kIdleUpstreamNs. Providers drop them on
         // their own schedule, and a pooled corpse costs a retry to discover.
         int64_t ts_pooled = 0;
 
@@ -193,7 +193,7 @@ namespace llmbridge
         // cycles, so a pooled reuse pays no second handshake.
         std::unique_ptr<net::tls::Session> tls;
         // Ciphertext awaiting the socket. wbuf (plaintext) is NOT what gets
-        // written for a TLS conn — for these, `woff` counts plaintext bytes fed
+        // written for a TLS conn. For these, `woff` counts plaintext bytes fed
         // into the Session, and tls_out/tls_out_off track the encrypted write.
         // The request's plaintext stays intact in wbuf for stale-conn retry.
         std::string tls_out;
@@ -203,14 +203,14 @@ namespace llmbridge
 
     struct Stats
     {
-        // The t0-t6 stamps, grouped three ways (LATENCY.md §4 — note this grouping
+        // The t0-t6 stamps, grouped three ways (LATENCY.md §4, note this grouping
         // splits at t2, where the header grouping does not). Keeping
         // `connect` OUT of req_path and overhead is the whole point: a cold TCP+TLS
         // handshake is 50 ms and would otherwise sit inside a metric that claims to
         // measure OUR work and is sized for microseconds. Measured live: a single
         // cold request reported req-path p50 = 52.66 ms **[overflow!]**, of which
         // ~52.6 ms was the handshake and ~60 us was the gateway.
-        Histogram overhead;  // req_path + resp_path — everything the gateway does
+        Histogram overhead;  // req_path + resp_path: everything the gateway does
         Histogram req_path;  // framing/translate/auth PLUS the write() to the upstream
         Histogram connect;   // TCP + TLS handshake only; exactly 0 on a pooled conn
         Histogram resp_path; // upstream-recv -> client-sent
@@ -229,7 +229,7 @@ namespace llmbridge
     public:
         // `upstream_idle_ns` bounds how long a request may sit with NO bytes from
         // the upstream before the gateway gives up (0 = disabled). Without it a
-        // stalled provider pins a client connection and two fds forever — the
+        // stalled provider pins a client connection and two fds forever, the
         // classic slow-loris-by-upstream. Applies to the whole in-flight request
         // and, once streaming, to the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
@@ -237,7 +237,7 @@ namespace llmbridge
         // Keep-alive pool bounds. The pool was unbounded until streaming reuse landed;
         // a streaming gateway pools roughly one upstream per concurrent stream, so
         // without a bound it is an fd leak in slow motion (4k streams => 4k idle fds
-        // pinned indefinitely). Excess conns are closed rather than pooled, and idle
+        // pinned indefinitely). Excess conns are closed instead of pooled, and idle
         // entries are reaped after kIdleUpstreamNs on the loop's periodic tick.
         //
         // SIZE THIS GENEROUSLY. The cap must exceed the number of upstreams in flight
@@ -245,7 +245,7 @@ namespace llmbridge
         // pool is full every release closes its connection, so the next request must
         // reconnect. A first cut of 256 did exactly that and cost the non-streaming
         // path 2.4x its throughput (90k RPS target: 32,210 achieved at 256 versus
-        // 77,282 at 8192 and 78,445 before the pool existed) — the gateway was opening
+        // 77,282 at 8192 and 78,445 before the pool existed); the gateway was opening
         // more upstream connections than it served requests. git-bisected; do not lower
         // this without re-running ./bench/saturate.sh with BACKENDS=4.
         //
@@ -280,20 +280,20 @@ namespace llmbridge
 
         // Size of the io_uring provided-buffer pool (power of two), or 0 for the default.
         // Must be called before run(). Exists so a test can shrink the pool far enough to
-        // force -ENOBUFS deterministically — at the shipped size that branch was never
+        // force -ENOBUFS deterministically. At the shipped size that branch was never
         // reached even at 8192 concurrent streams, so without this hook the recovery path
         // would be untestable and could rot silently. Not a tuning knob users need.
         void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
 
     private:
-        // NAMING — the backend a method belongs to is part of its name:
+        // NAMING: the backend a method belongs to is part of its name:
         //   ep_*   epoll-only    (reachable only from run_epoll)
         //   ur_*   io_uring-only (reachable only from run_uring)
-        //   plain  shared by both loops — sweep_idle, the tls_* pump helpers
+        //   plain  shared by both loops. sweep_idle, the tls_* pump helpers
         //
         // A call that crosses the prefixes is a bug: neither backend's teardown,
         // write-arming or completion handling is valid in the other. The payoff is
-        // that the check is a grep rather than a call-graph walk —
+        // that the check is a grep instead of a call-graph walk
         //   grep -n 'ur_[a-z_]*(' gateway.cpp | grep ep_
         // Exactly one crossing existed when this convention was introduced
         // (ur_forward calling the epoll error responder); it had been invisible for
@@ -355,7 +355,7 @@ namespace llmbridge
         // ── TLS plumbing (upstream side only; every helper is a no-op-safe
         //     building block the two backends share) ──────────────────────────
         // Attach a fresh Session to a new upstream conn (SNI + hostname from
-        // _tls.sni_host). Returns false on failure — treated like connect refusal.
+        // _tls.sni_host). Returns false on failure, treated like connect refusal.
         bool tls_attach(Connection* u) noexcept;
         // Move whatever ciphertext the Session has pending into u->tls_out.
         void tls_pump_out(Connection* u) noexcept;
@@ -409,7 +409,7 @@ namespace llmbridge
         void ur_on_response(Connection* u, const net::http::ResponseHead& h,
                            std::string_view body_buf, size_t total_len) noexcept;
         void ur_finish_client(Connection* c) noexcept;
-        // io_uring streaming pump — completion-driven mirror of the epoll pump,
+        // io_uring streaming pump: a completion-driven mirror of the epoll pump,
         // with serialized sends (one SEND SQE in flight) and a bounded buffer.
         void ur_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept;
         void ur_stream_pump(Connection* u) noexcept;
@@ -448,8 +448,8 @@ namespace llmbridge
         // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a
         // response is framed and consumed entirely within one event, so there is no
-        // overlap. Reused across requests so the chunked path — which is the REAL
-        // provider path, not an edge case — does not allocate per response.
+        // overlap. Reused across requests so the chunked path, which is the REAL
+        // provider path, not an edge case. Does not allocate per response.
 #ifdef LLMBRIDGE_HAVE_TLS
         net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
         bool _tls_ctx_ok = false;
@@ -471,7 +471,7 @@ namespace llmbridge
         Stats _stats;
         // Set cross-thread by the signal/timer thread, observed by the worker loop:
         // a std::atomic (not volatile) for a correct memory-model tripwire. Relaxed
-        // is enough — it gates loop continuation, no other state depends on it.
+        // is enough; it gates loop continuation, no other state depends on it.
         std::atomic<bool> _stop{false};
     };
 } // namespace llmbridge

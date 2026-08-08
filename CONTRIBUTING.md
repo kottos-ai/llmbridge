@@ -1,6 +1,6 @@
 # Contributing to llmbridge
 
-Thanks for your interest in `llmbridge`. Before you spend time preparing a contribution, please read this document — our current contribution policy may differ from what you expect.
+Thanks for your interest in `llmbridge`. Before you spend time preparing a contribution, please read this document; our current contribution policy may differ from what you expect.
 
 ## Current policy: no external code contributions
 
@@ -49,7 +49,7 @@ We love hearing about projects using `llmbridge`. Drop a note in [Discussions](h
 
 ### Fork it
 
-The Apache 2.0 license gives you the right to fork, modify, and redistribute. If our policy or direction does not fit your needs, fork freely — that is what open source is for. We will continue to maintain the canonical repository.
+The Apache 2.0 license gives you the right to fork, modify, and redistribute. If our policy or direction does not fit your needs, fork freely; that is what open source is for. We will continue to maintain the canonical repository.
 
 ## What we currently accept
 
@@ -63,14 +63,14 @@ If you submit a documentation fix PR, we will review and merge it (or close it w
 
 To set expectations clearly:
 
-- ❌ Pull requests adding features
-- ❌ Pull requests fixing bugs (please open an issue instead and we'll fix it)
-- ❌ Pull requests refactoring code
-- ❌ Pull requests adding new provider integrations
-- ❌ Pull requests adding tests for existing functionality
-- ❌ Pull requests changing build configuration, CI, or tooling
-- ❌ Pull requests changing license terms or copyright headers
-- ❌ "Drive-by" PRs that touch many unrelated files
+- Pull requests adding features
+- Pull requests fixing bugs (please open an issue instead and we'll fix it)
+- Pull requests refactoring code
+- Pull requests adding new provider integrations
+- Pull requests adding tests for existing functionality
+- Pull requests changing build configuration, CI, or tooling
+- Pull requests changing license terms or copyright headers
+- "Drive-by" PRs that touch many unrelated files
 
 We will close these with a brief, polite note pointing here. Please do not take it personally.
 
@@ -92,4 +92,4 @@ Documentation contributions are **licensed, not assigned**. Under Section 5 of t
 
 Thanks for understanding. We know this policy is more restrictive than typical OSS projects. The tradeoff buys us focus and clarity now, and we may open it up as the project matures.
 
-— The Kottos AI team
+The Kottos AI team

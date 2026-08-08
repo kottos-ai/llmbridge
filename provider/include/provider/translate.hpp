@@ -7,7 +7,7 @@
 
 #pragma once
 
-// Provider dialect translation — the C++ analog of LiteLLM's
+// Provider dialect translation: the C++ analog of LiteLLM's
 // transform_request / transform_response. The OpenAI chat-completions dialect is
 // the canonical "in" format; each target is a structurally-different provider
 // wire format we translate to and back from.
@@ -17,13 +17,13 @@
 //   - Google Gemini              (contents/parts, role "model", generationConfig)
 //   - Cohere Chat v2             (messages, top_p -> "p", content blocks)
 // OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral,
-// Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need NO body translation —
+// Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need NO body translation because
 // the gateway byte-forwards them (TranslateMode::None) and only rewrites
 // auth/endpoint. So this module covers the cases where the body actually changes.
 //
 // Scope per target: the common chat path (model, system, user/assistant turns,
 // max_tokens/temperature/top_p; response content / finish-reason / usage).
-// Representative, not 100% provider-complete — streaming deltas, tool-calling,
+// Representative, not 100% provider-complete: streaming deltas, tool-calling,
 // vision, and cache_control are Phase B. Operates on the JSON *body* (the
 // gateway handles HTTP re-framing). Returns "" on parse failure so the caller
 // can fail the request.
@@ -43,9 +43,9 @@ namespace llmbridge::provider
     // (rate limit, overloaded GPU, context-length, auth) reaches the client as a
     // real, actionable error instead of a generic gateway failure. Anthropic sends
     // {"type":"error","error":{"type":"overloaded_error","message":"..."}}; we emit
-    // {"error":{"message":"...","type":"...","code":null}}. Never returns empty —
-    // an unparseable/foreign body still yields a valid envelope carrying `fallback`
-    // as the type — so the caller can always relay the upstream's status code.
+    // {"error":{"message":"...","type":"...","code":null}}. Never returns empty.
+    // An unparseable/foreign body still yields a valid envelope carrying `fallback`
+    // as the type, so the caller can always relay the upstream's status code.
     std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
 
     // True if a streaming OpenAI request asked for the final usage chunk

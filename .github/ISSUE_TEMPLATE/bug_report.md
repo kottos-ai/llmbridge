@@ -4,7 +4,6 @@ about: Report a defect in llmbridge
 title: '[BUG] '
 labels: bug
 assignees: ''
----
 
 ## Describe the bug
 
@@ -12,10 +11,10 @@ A clear and concise description of what the bug is.
 
 ## Reproducer
 
-The smallest possible input that demonstrates the bug. Code snippets, sample payloads, command lines — whatever it takes.
+The smallest possible input that demonstrates the bug. Code snippets, sample payloads, command lines, whatever it takes.
 
 ```cpp
-// Or Python, Go, Rust — whatever binding you're using
+// Or Python, Go, Rust, whatever binding you're using
 ```
 
 ## Expected behavior

@@ -44,20 +44,20 @@ jobs:
           script: |
             const message = `Thanks for your interest in llmbridge!
 
-            We do not currently accept external code contributions to this repository — please see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) for the full policy and rationale.
+            We do not currently accept external code contributions to this repository. Please see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) for the full policy and rationale.
 
             **What you can do instead:**
 
-            - **Found a bug?** Open an [issue](../../issues/new?template=bug_report.md) — we read every one.
+            - **Found a bug?** Open an [issue](../../issues/new?template=bug_report.md); we read every one.
             - **Want a feature?** Open a [feature request issue](../../issues/new?template=feature_request.md).
             - **Have a question?** Start a [discussion](../../discussions).
-            - **Documentation typo or broken link?** Those PRs we *do* accept — please mention this in the PR description and we'll review.
+            - **Documentation typo or broken link?** Those PRs we *do* accept. Please mention this in the PR description and we'll review.
 
             If this PR is a small documentation fix, please reopen it with a note in the description that it's a documentation-only change, and we'll review it.
 
             Thanks for understanding, and thanks for caring about the project enough to contribute.
 
-            — The Kottos AI team`;
+            The Kottos AI team`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,

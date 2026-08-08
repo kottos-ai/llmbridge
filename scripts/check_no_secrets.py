@@ -11,7 +11,7 @@
 This project's whole credibility rests on credential handling: it is a gateway that
 carries other companies' provider keys, and `private/` (which holds the live-key demo
 scripts and the price observatory) sits inside the same working tree as the public
-repo, separated only by .gitignore. One mis-added file is unrecoverable once pushed —
+repo, separated only by .gitignore. One mis-added file is unrecoverable once pushed but
 rotating the key fixes the key, not the git history or the forks of it.
 
 So this checks what is actually TRACKED, not what is on disk. A key sitting in
@@ -82,15 +82,15 @@ def main():
                 hits.append(f"{path}:{line}: {name} ({len(m.group(0))} bytes, value withheld)")
 
     if hits:
-        print(f"SECRET SCAN FAILED — {len(hits)} match(es) in TRACKED files:\n", file=sys.stderr)
+        print(f"SECRET SCAN FAILED: {len(hits)} match(es) in TRACKED files:\n", file=sys.stderr)
         for h in hits:
             print(f"  {h}", file=sys.stderr)
         print("\nIf this is a placeholder, add the path to ALLOW with a reason.\n"
-              "If it is real: rotate the credential FIRST, then remove it from history —\n"
+              "If it is real: rotate the credential FIRST, then remove it from history:\n"
               "deleting the file in a new commit does not help.", file=sys.stderr)
         return 1
 
-    print(f"secret scan OK — {scanned} tracked files, no credential material")
+    print(f"secret scan OK: {scanned} tracked files, no credential material")
     return 0
 
 

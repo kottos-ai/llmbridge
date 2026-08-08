@@ -7,7 +7,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# debug_trace.sh — trace a single request end-to-end through the llmbridge
+# debug_trace.sh: trace a single request end-to-end through the llmbridge
 # gateway, showing the dialect translation at every hop.
 #
 # Topology:   curl ──OpenAI──▶ llmbridge ──translated──▶ logging mock
@@ -239,20 +239,20 @@ sleep 0.3
 hr "1 · CLIENT → GATEWAY   (OpenAI request, you sent this)"
 pp "$WORK/request.json"
 
-hr "2 · GATEWAY → UPSTREAM  (after openai_to_${PROVIDER}_request — the translation)"
+hr "2 · GATEWAY → UPSTREAM  (after openai_to_${PROVIDER}_request, the translation)"
 [ "$PROVIDER" = none ] && echo "${D}(translate=none: byte-forwarded, identical to stage 1)${R}"
-[ -f "$WORK/upstream_body.json" ] && pp "$WORK/upstream_body.json" || echo "${Y}(no upstream request captured — gateway never forwarded)${R}"
-[ "$PROVIDER" != none ] && echo "${D}note: the format is translated (system extracted, params renamed, blocks restructured); the \"model\" string is passed through verbatim — model-name mapping is a routing decision, not part of dialect translation. (Omit \"model\" entirely and the translator falls back to a provider default.)${R}"
+[ -f "$WORK/upstream_body.json" ] && pp "$WORK/upstream_body.json" || echo "${Y}(no upstream request captured: the gateway never forwarded)${R}"
+[ "$PROVIDER" != none ] && echo "${D}note: the format is translated (system extracted, params renamed, blocks restructured); the \"model\" string is passed through verbatim; model-name mapping is a routing decision, not part of dialect translation. (Omit \"model\" entirely and the translator falls back to a provider default.)${R}"
 
 hr "3 · UPSTREAM → GATEWAY  (canned ${PROVIDER} response)"
 pp "$WORK/upstream_resp.json"
 
-hr "4 · GATEWAY → CLIENT    (after ${PROVIDER}_to_openai_response — translated back)"
+hr "4 · GATEWAY → CLIENT    (after ${PROVIDER}_to_openai_response, translated back)"
 echo "${D}$(head -1 "$WORK/resp_hdr.txt" 2>/dev/null)  [curl http_code=$HTTP_CODE]${R}"
 if [ -s "$WORK/response.json" ]; then pp "$WORK/response.json"; else echo "${Y}(empty response body)${R}"; fi
 
 hr "Gateway added-latency profile (self-measured)"
-grep -E 'gateway —|added-total|request-path|response-path|requests=' "$WORK/gateway.log" 2>/dev/null \
+grep -E 'gateway:|added-total|request-path|response-path|requests=' "$WORK/gateway.log" 2>/dev/null \
   || { echo "${D}(profile not found; full gateway log:)${R}"; cat "$WORK/gateway.log" 2>/dev/null; }
 
 if [ "$MODE" = gdb ]; then
@@ -270,7 +270,7 @@ if [ "$MODE" = strace ]; then
   hr "SYSCALL TRACE (network + read/write, gateway side)"
   grep -E 'accept|connect|recvfrom|sendto|^.*read\(|^.*write\(|io_uring|epoll' "$WORK/strace.log" 2>/dev/null \
     | sed -n '1,60p'
-  echo "${D}(full strace: $WORK/strace.log — re-run with --keep to inspect)${R}"
+  echo "${D}(full strace: $WORK/strace.log; re-run with --keep to inspect)${R}"
 fi
 
 hr "Done"

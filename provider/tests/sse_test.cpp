@@ -88,7 +88,7 @@ namespace
         return out;
     }
 
-    // Feed the input one byte at a time — worst-case fragmentation.
+    // Feed the input one byte at a time: worst-case fragmentation.
     std::string translate_byte_by_byte(std::string_view in)
     {
         AnthropicToOpenAiSse t(kFixedCreated);
@@ -194,7 +194,7 @@ namespace
 } // namespace
 
 // The property that matters: for ANY input (hostile or malformed), the emitted
-// stream is strict — no bare control bytes leak through passthrough — and the
+// stream is strict (no bare control bytes leak through passthrough) and the
 // translator never crashes (ASan/UBSan enforce the latter in CI).
 TEST(Sse, OutputIsAlwaysStrict)
 {
@@ -261,7 +261,7 @@ TEST(Sse, GarbledFrameIsSkippedStreamContinues)
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n"
         "data: {\"type\":\"message_stop\"}\n\n";
     const auto p = data_payloads(translate_whole(s));
-    // role chunk, "OK", finish chunk, [DONE] — the garbage produced nothing.
+    // role chunk, "OK", finish chunk, [DONE]; the garbage produced nothing.
     ASSERT_EQ(p.size(), 4u);
     EXPECT_EQ(P(p[1]).find("choices")->arr[0].find("delta")->str_or("content"), "OK");
     EXPECT_EQ(p.back(), "[DONE]");
@@ -371,7 +371,7 @@ TEST(Sse, CapOnEndlessEventRejects)
 namespace
 {
     // Anthropic reports input tokens in message_start and CUMULATIVE output
-    // tokens in message_delta — this stream ends at 7 output tokens.
+    // tokens in message_delta; this stream ends at 7 output tokens.
     const char* kAnthropicWithUsage =
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-3-5-sonnet\","
         "\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n"
@@ -428,7 +428,7 @@ TEST(SseUsage, OmittedEntirelyWhenNotRequested)
     EXPECT_EQ(out.find("\"usage\""), std::string::npos) << "no usage key unless asked";
     const auto p = data_payloads(out);
     EXPECT_EQ(p.back(), "[DONE]");
-    EXPECT_EQ(p.size(), 4u); // role, content, finish, [DONE] — no extra chunk
+    EXPECT_EQ(p.size(), 4u); // role, content, finish, [DONE]: no extra chunk
 }
 
 TEST(SseUsage, EmittedOnceEvenAtEofWithoutMessageStop)
@@ -469,8 +469,8 @@ TEST(SseUsage, MissingUpstreamUsageYieldsZeros)
 // reassembling its OpenAI chunks must recover exactly what
 // anthropic_to_openai_response() produces for the equivalent whole body. This
 // pins the two production paths together (the reason the shared helpers were
-// extracted) and — run over the same nasty escaping/UTF-8 payloads the request
-// reconstruction uses — proves the streaming raw-span passthrough is byte-faithful.
+// extracted) and runs over the same nasty escaping/UTF-8 payloads the request
+// reconstruction uses, which proves the streaming raw-span passthrough is byte-faithful.
 
 namespace
 {
@@ -589,7 +589,7 @@ TEST(SseReconstruction, StreamReassemblesToWholeTranslation)
 
 // The usage numbers must survive the streaming path identically to the whole-body
 // path: same provider counts, same OpenAI field names. (This closes the gap the
-// original reconstruction test could only note — streaming now emits usage.)
+// original reconstruction test could only note; streaming now emits usage.)
 TEST(SseReconstruction, UsageMatchesWholeTranslation)
 {
     const std::string id = "msg_01", model = "claude-3-5-sonnet-20241022";
@@ -710,7 +710,7 @@ TEST(SseTools, ArgumentFragmentsReassembleExactly)
     ASSERT_TRUE(t.feed(blk_start_tool(0, "t1", "f"), out));
     ASSERT_TRUE(t.feed(blk_args(0, R"({\"city\":)"), out));
     ASSERT_TRUE(t.feed(blk_args(0, R"(\"Paris\",\"n\":1.50})"), out));
-    // The fragments must concatenate to the original JSON, byte for byte —
+    // The fragments must concatenate to the original JSON, byte for byte,
     // including the 1.50 a re-serialising implementation would normalise to 1.5.
     EXPECT_EQ(reassemble(out, 0), R"({\"city\":\"Paris\",\"n\":1.50})");
 }
@@ -718,7 +718,7 @@ TEST(SseTools, ArgumentFragmentsReassembleExactly)
 TEST(SseTools, BlockIndexIsNotTheToolOrdinal)
 {
     // THE bug this mapping exists to prevent: Anthropic indexes every content
-    // block, so a leading TEXT block pushes tool blocks to 1,2 — while OpenAI's
+    // block, so a leading TEXT block pushes tool blocks to 1,2, while OpenAI's
     // tool_calls index must still start at 0. Emitting tool_calls[1] with no [0]
     // breaks client-side reassembly.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
@@ -787,7 +787,7 @@ TEST(SseTools, AbsurdBlockIndexDoesNotAllocate)
 TEST(SseTools, MalformedIndexIsRejectedNotAliasedToBlockZero)
 {
     // to_ll()/from_chars leave their output UNTOUCHED on overflow, so a naive parse
-    // turns a garbage index into 0 — attaching a customer's argument fragments to
+    // turns a garbage index into 0, attaching a customer's argument fragments to
     // whichever tool call happens to occupy block 0. Found by audit before merge.
     for (const char* bad : {"99999999999999999999", "-99999999999999999999", "1e5", "0x10"})
     {
@@ -856,7 +856,7 @@ TEST(SseTools, ToolChunksCarryUsageNullWhenIncludeUsageIsSet)
     size_t n = 0, p = 0;
     while ((p = out.find("tool_calls", p)) != std::string::npos) { ++n; ++p; }
     ASSERT_EQ(n, 2u) << out;
-    // Count chunks, then assert EVERY one carries usage:null — the role chunk does
+    // Count chunks, then assert EVERY one carries usage:null; the role chunk does
     // too, so pinning a literal 2 would have been wrong for the wrong reason.
     size_t q = 0, chunks = 0, usage = 0;
     while ((q = out.find("data: ", q)) != std::string::npos) { ++chunks; ++q; }
@@ -881,7 +881,7 @@ TEST(SseTools, ToolWithNoNameIsDroppedLikeNonStreaming)
 TEST(SseTools, TruncatedToolCallRefusesACleanEnding)
 {
     // Arguments cut mid-JSON. Emitting [DONE] would hand the client unparseable
-    // arguments inside a stream that looked complete — the same "corrupt framing
+    // arguments inside a stream that looked complete: the same "corrupt framing
     // fabricated a clean ending" failure 0.3.0 fixed for text.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
@@ -906,7 +906,7 @@ TEST(SseTools, MessageStopWithoutMessageDeltaStillEndsCleanly)
 {
     // Regression for a bug the truncation guard itself introduced: dispatch()
     // emits [DONE] on message_stop, but the guard was checked BEFORE _done, so a
-    // stream that had already ended correctly was reported as a failure — the
+    // stream that had already ended correctly was reported as a failure; the
     // gateway then counts an error and closes abruptly on a good response.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;

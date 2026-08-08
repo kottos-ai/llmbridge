@@ -9,11 +9,11 @@
 
 // Minimal, zero-dependency JSON for the llmbridge provider-translation layer.
 //
-// Deliberately hand-rolled (no library) — a tiny, allocation-light parser (the
+// Deliberately hand-rolled, no library: a tiny, allocation-light parser (the
 // DOM does allocate its node vectors, but string values are zero-copy views into
 // the input): a recursive-descent parser into an ordered DOM, plus a
 // string-append builder with escaping. Scope is "enough to translate chat
-// completion request/response bodies between provider dialects" — objects,
+// completion request/response bodies between provider dialects": objects,
 // arrays, strings, numbers, bools, null, and the common escape sequences. Not a
 // general-purpose JSON library; it is fast and correct for the shapes we move.
 
@@ -32,12 +32,12 @@ namespace llmbridge::provider::json
 
         Type type = Type::Null;
         bool boolean = false;
-        // For String, `sv` is the RAW span between the quotes (still JSON-escaped) —
-        // a view into the parsed input, never decoded, never owned. For Number, it's
+        // For String, `sv` is the RAW span between the quotes, still JSON-escaped.
+        // A view into the parsed input, never decoded, never owned. For Number, it's
         // the raw number text. This makes the DOM zero-copy: a passthrough value is
         // emitted verbatim, since the input's escaping is exactly the output's.
         // For Array and Object, `sv` is the RAW span INCLUDING the surrounding
-        // brackets/braces — set by the parser so a subtree can be forwarded byte for
+        // brackets/braces, set by the parser so a subtree can be forwarded byte for
         // byte. Tool calling needs this: a tool's `parameters` is an arbitrary JSON
         // Schema we must pass through unaltered, and re-serialising from the DOM
         // would risk changing it (number formatting, escape forms, key order).
@@ -70,7 +70,7 @@ namespace llmbridge::provider::json
             return nullptr;
         }
 
-        // A string member's raw (still-escaped) span, or `def`. Returns a view —
+        // A string member's raw (still-escaped) span, or `def`. Returns a view.
         // `def` and the parsed input must outlive the result.
         [[nodiscard]] std::string_view str_or(std::string_view key, std::string_view def = "") const
         {
@@ -85,7 +85,7 @@ namespace llmbridge::provider::json
         }
     };
 
-    // Out-of-line so the recursive vector<Value>/vector<pair<…,Value>> special
+    // Out-of-line so the recursive vector<Value>/vector<pair<...,Value>> special
     // members are only instantiated here, where Value is a complete type.
     inline Value::Value() = default;
     inline Value::Value(const Value&) = default;
@@ -126,7 +126,7 @@ namespace llmbridge::provider::json
             }
 
             // Return the RAW span between the quotes (assumes s[i]=='"'), still
-            // JSON-escaped, as a view into the input — never decoded, never copied.
+            // JSON-escaped, as a view into the input: never decoded, never copied.
             // We scan only for the real closing quote, skipping escape pairs (\X).
             //
             // STRICTNESS IS LOAD-BEARING HERE. This span is re-emitted VERBATIM on the
@@ -134,11 +134,11 @@ namespace llmbridge::provider::json
             // accepts ends up in the bytes we hand the client. An earlier revision
             // skipped both checks below, and the measured result was: a provider string
             // containing a raw newline was copied straight through, and the client got
-            // a 200 OK whose body Python's json.loads — and therefore the OpenAI SDK —
+            // a 200 OK whose body Python's json.loads (and therefore the OpenAI SDK)
             // rejects with "Invalid control character". We laundered malformed provider
             // output into a malformed client response and called it success.
             //
-            // So refuse, per the fail-closed policy, rather than sanitise-and-forward:
+            // So refuse, per the fail-closed policy, instead of sanitise-and-forward:
             // a caller that cannot re-serialise its input unchanged has no business
             // passing it on.
             std::string_view parse_string()
@@ -149,18 +149,18 @@ namespace llmbridge::provider::json
                 {
                     const unsigned char c = static_cast<unsigned char>(s[i]);
                     if (c == '"') { std::string_view sv = s.substr(start, i - start); ++i; return sv; }
-                    if (c < 0x20) break; // raw control character — RFC 8259 §7 forbids it
+                    if (c < 0x20) break; // raw control character. RFC 8259 §7 forbids it
                     if (c == '\\')
                     {
                         if (i + 1 >= s.size()) break;
                         const char e = s[i + 1];
-                        if (!is_escape_char(e)) break; // e.g. "\q" — would re-emit invalid
+                        if (!is_escape_char(e)) break; // e.g. "\q", which would re-emit invalid
                         if (e == 'u')
                         {
                             if (i + 5 >= s.size()) break;
                             if (!is_hex(s[i + 2]) || !is_hex(s[i + 3]) ||
                                 !is_hex(s[i + 4]) || !is_hex(s[i + 5]))
-                                break; // "\uZZZZ" — same problem, one level down
+                                break; // "\uZZZZ": same problem, one level down
                             i += 6;
                             continue;
                         }
@@ -181,7 +181,7 @@ namespace llmbridge::provider::json
                 if (c == '"') { Value v; v.type = Value::Type::String; v.sv = parse_string(); return v; }
                 if (c == '{' || c == '[')
                 {
-                    if (depth >= kMaxDepth) { ok = false; return {}; } // too deep — refuse to recurse
+                    if (depth >= kMaxDepth) { ok = false; return {}; } // too deep: refuse to recurse
                     const size_t start = i; // for the raw-subtree span
                     ++depth;
                     Value v = (c == '{') ? parse_object() : parse_array();
@@ -275,11 +275,11 @@ namespace llmbridge::provider::json
         return v;
     }
 
-    // Append a RAW (already JSON-escaped) span as a quoted string literal — the
+    // Append a RAW (already JSON-escaped) span as a quoted string literal. The
     // zero-copy passthrough path. The bytes came from valid JSON input, so the
     // escaping is already correct; emit verbatim, no decode/re-encode.
     // Emit `text` as a JSON string literal (with quotes), escaping what must be
-    // escaped. Use when the SOURCE IS NOT already JSON-escaped — e.g. turning a raw
+    // escaped. Use when the SOURCE IS NOT already JSON-escaped, e.g. turning a raw
     // JSON subtree into OpenAI's `arguments`, which is a *string* containing JSON.
     inline void append_escaped_string(std::string& out, std::string_view text)
     {
@@ -317,7 +317,7 @@ namespace llmbridge::provider::json
     // text has to become real JSON.
     //
     // \uXXXX is decoded to UTF-8; a lone surrogate is passed through as U+FFFD
-    // rather than emitting invalid UTF-8, since the output goes to a provider that
+    // instead of emitting invalid UTF-8, since the output goes to a provider that
     // will reject a malformed body.
     inline std::string unescape_string(std::string_view raw)
     {
@@ -409,7 +409,7 @@ namespace llmbridge::provider::json
 
     // Append `raw` (a DECODED string) as a JSON string literal, escaping as needed.
     // Bulk-copies runs of chars that don't need escaping (the common case), only
-    // escaping the special ones individually — so most content is a few memcpys.
+    // escaping the special ones individually, so most content is a few memcpys.
     inline void append_escaped(std::string& out, std::string_view raw)
     {
         out += '"';

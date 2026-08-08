@@ -82,7 +82,7 @@ TEST(Json, EmptyArrayAndObject)
 TEST(Json, StringEscapesPassedThroughRaw)
 {
     // The parser is zero-copy: a string value is the RAW span between the quotes,
-    // still JSON-escaped — never decoded. The backslash escapes survive verbatim.
+    // still JSON-escaped, never decoded. The backslash escapes survive verbatim.
     Value v = P(R"({"s":"a\"b\\c\nd\te"})");
     EXPECT_EQ(v.str_or("s"), "a\\\"b\\\\c\\nd\\te");
 }
@@ -97,7 +97,7 @@ TEST(Json, UnicodeEscapePassedThrough)
 
 TEST(Json, RawUtf8BytesPassThrough)
 {
-    // A literal multibyte char is just bytes — preserved as-is.
+    // A literal multibyte char is just bytes, preserved as-is.
     Value v = P("{\"s\":\"caf\xC3\xA9\"}");
     EXPECT_EQ(v.str_or("s"), "caf\xC3\xA9");
 }
@@ -188,7 +188,7 @@ TEST(JsonBuilder, EscapedFormIsSelfConsistent)
     EXPECT_NE(out.find("\\\""), std::string::npos);
     EXPECT_NE(out.find("\\\\"), std::string::npos);
     // The parser no longer decodes: re-parsing the escaped literal yields the raw
-    // (still-escaped) span verbatim — exactly what append_escaped emitted, minus
+    // span verbatim, still-escaped: exactly what append_escaped emitted, minus
     // the surrounding quotes. So append_escaped + parse round-trips byte-for-byte.
     const std::string doc = "{\"s\":" + out + "}"; // must outlive the view-based DOM
     bool ok = false;
@@ -211,7 +211,7 @@ TEST(JsonBuilder, EscapesControlChars)
 TEST(RawSpan, ObjectAndArraySpansIncludeTheirBrackets)
 {
     // Tool schemas are forwarded by span, so the span must be the EXACT source text
-    // including delimiters — anything else corrupts a customer's JSON Schema.
+    // including delimiters; anything else corrupts a customer's JSON Schema.
     const std::string src = R"({"o":{"a":[1,2,{"b":null}]},"arr":[{"x":1}],"s":"str"})";
     bool ok = false;
     const auto v = llmbridge::provider::json::parse(src, ok);
@@ -249,7 +249,7 @@ TEST(EscapeRoundTrip, ControlCharactersAreEscapedNotEmittedRaw)
     std::string out;
     llmbridge::provider::json::append_escaped_string(out, std::string("a\tb\nc\x01""d"));
     // A raw control byte inside a JSON string is invalid JSON that some parsers
-    // accept and others reject — exactly the ambiguity to avoid on a provider wire.
+    // accept and others reject: exactly the ambiguity to avoid on a provider wire.
     EXPECT_EQ(out.find('\x01'), std::string::npos);
     EXPECT_NE(out.find("\\u0001"), std::string::npos) << out;
     EXPECT_NE(out.find("\\t"), std::string::npos);
@@ -286,7 +286,7 @@ TEST(Unescape, TruncatedEscapesDoNotReadPastTheEnd)
 //
 // The parser's string span is re-emitted VERBATIM on the passthrough path, so
 // anything accepted here reaches the client's bytes. Accepting an illegal string
-// therefore does not produce a lenient parse — it produces a 200 OK whose body a
+// therefore does not produce a lenient parse; it produces a 200 OK whose body a
 // strict parser rejects. Measured before the fix: a provider answer containing a
 // raw newline arrived at the client as `"content":"line1<LF>line2"`, which
 // Python's json.loads (and so the OpenAI SDK) refuses with "Invalid control

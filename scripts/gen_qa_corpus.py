@@ -9,13 +9,13 @@
 """Generate the question/answer corpus used by the concurrency regression test.
 
 Run ONCE, offline; the output is committed as a fixture. The test itself is
-hermetic and never touches the network — see CLAUDE.md, "Never write tests that
+hermetic and never touches the network; see CLAUDE.md, "Never write tests that
 depend on live LLM provider APIs". This is the "record once, replay in tests"
 half of that rule.
 
-Why real answers rather than synthetic strings: the translator's job is to move
+Why real answers instead of synthetic strings: the translator's job is to move
 text across a JSON boundary intact, and real model output is what actually
-contains the hostile characters — embedded double quotes, newlines, backslashes,
+contains the hostile characters: embedded double quotes, newlines, backslashes,
 em-dashes, accented letters, emoji, code fences. A corpus of "answer_0001" would
 exercise none of it. Every byte of these answers has to survive
 Anthropic-JSON -> parse -> OpenAI-JSON re-serialisation unchanged.
@@ -30,7 +30,7 @@ argv, or written to the output. Use a throwaway key.
 The cap is part of the committed fixture, not a tuning knob: without it the
 backend_stress answers come back at ~15 KB and the file is 4.25 MB. Re-running
 WITHOUT the flag on an existing corpus will not restore the full text (it is
-gone from the file), but a fresh generation would — so keep the flag.
+gone from the file), but a fresh generation would, so keep the flag.
 
 Resumable: an existing output file is loaded and only missing ids are fetched, so
 an interrupted run costs nothing.
@@ -66,7 +66,7 @@ TOPICS = [
 
 # ---------------------------------------------------------------------------
 # Corpus categories. Each entry carries a `kind` saying what it stresses, so a
-# failure points at a character class rather than at "one of 2000 answers".
+# failure points at a character class instead of at "one of 2000 answers".
 # (The old boolean field was called `adversarial`, which wrongly suggested an
 # attacker; these are formatting-stress cases, not attacks.)
 #
@@ -74,7 +74,7 @@ TOPICS = [
 #   escape_stress  answers forced to contain JSON-hostile characters
 #   json_hostile   answers ABOUT JSON escaping, so the text is full of
 #                  backslashes, quotes and \uXXXX sequences the model wrote
-#                  literally — the reply is itself near-JSON. It does NOT
+#                  literally; the reply is itself near-JSON. It does NOT
 #                  produce raw control bytes: asked about \u0000 the model
 #                  writes the six characters, not the byte. Do not add prompts
 #                  hoping to change that; that byte class is covered by a
@@ -132,7 +132,7 @@ TRICKY_TEXT = [
     "Answer including an astral-plane character such as an ancient script glyph.",
 ]
 
-# max_tokens per kind — `long` and `backend_stress` are the point, so let them run.
+# max_tokens per kind. `long` and `backend_stress` are the point, so let them run.
 KIND_TOKENS = {
     "plain": 400, "escape_stress": 400, "json_hostile": 700,
     "tricky_text": 500, "long": 1600, "backend_stress": 4000,
@@ -156,7 +156,7 @@ def utf8_trim(text, limit):
 
     Drops trailing continuation bytes, then a dangling lead byte, so the result is
     always decodable. Safe with respect to JSON escaping because the corpus stores
-    DECODED text — escaping happens at serialisation, so there is no escape to split.
+    DECODED text: escaping happens at serialisation, so there is no escape to split.
     """
     b = text.encode()
     if len(b) <= limit:
@@ -217,7 +217,7 @@ def curate(records, target, seed):
         r.pop("_cls", None)
     for r in records:
         r.pop("_cls", None)
-    # Renumber so ids stay dense 0..N-1 — the test strides over the corpus by index.
+    # Renumber so ids stay dense 0..N-1; the test strides over the corpus by index.
     for i, r in enumerate(out):
         r["id"] = i
     return out
@@ -243,17 +243,17 @@ def call(key, prompt, max_tokens, retries=6):
         req = urllib.request.Request(API, data=body, method="POST")
         req.add_header("content-type", "application/json")
         req.add_header("anthropic-version", "2023-06-01")
-        req.add_header("x-api-key", key)  # header only — never argv, never logged
+        req.add_header("x-api-key", key)  # header only: never argv, never logged
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 out = json.loads(r.read())
             return "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
         except urllib.error.HTTPError as e:
-            # 429 rate limit / 529 overloaded / 5xx — back off and retry.
+            # 429 rate limit / 529 overloaded / 5xx: back off and retry.
             if e.code in (429, 500, 502, 503, 529) and attempt < retries - 1:
                 time.sleep(min(2 ** attempt, 30) + random.random())
                 continue
-            raise SystemExit(f"API error {e.code} (body withheld — may echo request)")
+            raise SystemExit(f"API error {e.code} (body withheld; it may echo the request)")
         except (urllib.error.URLError, TimeoutError):
             if attempt < retries - 1:
                 time.sleep(min(2 ** attempt, 30) + random.random())
@@ -264,12 +264,12 @@ def call(key, prompt, max_tokens, retries=6):
 
 def make_questions(key, n, seed, exclude):
     """Ask for varied questions in batches. `exclude` holds question text already
-    in the corpus, so a top-up run cannot reintroduce a duplicate — the test
+    in the corpus, so a top-up run cannot reintroduce a duplicate; the test
     asserts every question is unique, because two clients asking the same thing
     would make a swapped response undetectable."""
     rng = random.Random(seed)
     # Over-ask: dedup and length filtering discard some, and a short pool would
-    # silently reduce the corpus rather than fail loudly.
+    # silently reduce the corpus instead of fail loudly.
     want_per_topic = max(3, (n * 2) // len(TOPICS) + 2)
     questions, seen = [], set(exclude)
     lock = threading.Lock()
@@ -316,14 +316,14 @@ def main():
     ap.add_argument("--workers", type=int, default=12)
     # The backend_stress answers come back at ~15 KB and are 55% of the fixture, so
     # the committed corpus caps them. 6144 = 1.5x the io_uring provided-buffer size
-    # (kBufSize = 4096), which is what those entries exist to cross — the property
+    # (kBufSize = 4096), which is what those entries exist to cross. The property
     # survives the cap. Applied at WRITE time to every record, so re-running this
     # script reproduces the committed file instead of silently restoring 4.25 MB.
     ap.add_argument("--max-answer-bytes", type=int, default=0,
                     help="cap answer length in bytes (0 = no cap); marks records truncated")
-    # Curation. Generating 2000 and keeping the best 1000 beats generating 1000:
-    # the selector can then guarantee EVERY rare character class survives, which a
-    # proportional sample does not — a naive stride-2 halving of this corpus drops
+    # Curation. Generating 2000 and keeping the best 1000 beats generating 1000.
+    # The selector can then guarantee EVERY rare character class survives, which a
+    # proportional sample does not: a naive stride-2 halving of this corpus drops
     # `tab` from 18 entries to zero. Deterministic, so the committed file is
     # reproducible from the same inputs.
     ap.add_argument("--curate", type=int, default=0,
@@ -339,7 +339,7 @@ def main():
                     continue
                 rec = json.loads(line)
                 # Migrate the first-run schema: a bare `adversarial` boolean becomes
-                # a named kind. The field was misleading — those entries are
+                # a named kind. The field was misleading: those entries are
                 # formatting stress, not attacks.
                 if "kind" not in rec:
                     rec["kind"] = "escape_stress" if rec.pop("adversarial", False) else "plain"
@@ -420,7 +420,7 @@ def main():
 
     qs = [r["q"] for r in results.values()]
     if len(set(qs)) != len(qs):
-        sys.exit("ABORT: duplicate questions — the correlation check would be blind")
+        sys.exit("ABORT: duplicate questions; the correlation check would be blind")
 
     counts = {}
     for r in results.values():

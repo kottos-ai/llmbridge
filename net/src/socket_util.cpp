@@ -38,7 +38,7 @@ namespace llmbridge::net
         ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #else
         // Linux: no SO_NOSIGPIPE. SIGPIPE is ignored process-wide instead, so a
-        // write to a peer-closed fd returns EPIPE rather than killing us.
+        // write to a peer-closed fd returns EPIPE instead of killing us.
         (void)fd;
 #endif
     }

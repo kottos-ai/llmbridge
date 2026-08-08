@@ -20,7 +20,7 @@ Two figures, deliberately chosen:
 Why THESE two metrics and not per-token added latency: TTFT and delivery-rate are
 measured reliably for BOTH systems at every level. Per-token latency for LiteLLM
 exceeds the load generator's 2 s histogram range at >=256 streams, so plotting it
-would imply a precision we do not have — that number belongs in BENCHMARKS.md as
+would imply a precision we do not have; that number belongs in BENCHMARKS.md as
 ">2 s", with the caveat attached. Charts should not launder an overflow into a
 confident-looking bar.
 
@@ -64,7 +64,7 @@ def med(label, streams, field):
     return st.median(float(x[field]) for x in runs[(label, streams)])
 
 
-# Geometry / palette — identical to make_chart.py.
+# Geometry / palette: identical to make_chart.py.
 W, H = 1000, 620
 ML, MR, MT, MB = 96, 44, 116, 116
 PW = W - ML - MR
@@ -104,7 +104,7 @@ def xband(i):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 1. Time to first token (log y) — the metric a voice/agent workload feels.
+# 1. Time to first token (log y): the metric a voice/agent workload feels.
 # ════════════════════════════════════════════════════════════════════════════
 YMIN, YMAX = 10.0, 100000.0  # ms
 
@@ -170,7 +170,7 @@ for out in chart_outputs("stream-comparison.svg"):
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2. Delivery: chunks received as % of what the provider could actually supply.
-#    This is the capacity story, and it is loss — not latency — so a linear axis
+#    This is the capacity story, and it is loss and not latency, so a linear axis
 #    is the honest one.
 # ════════════════════════════════════════════════════════════════════════════
 svg = []

@@ -8,7 +8,7 @@ compile_commands.json
 /.idea/
 *.DS_Store
 
-# Private business/strategy material — NOT part of the public OSS repo.
+# Private business/strategy material, NOT part of the public OSS repo.
 # (Handoff doc, exchange thesis, GTM/discovery scripts, briefing, AI-assistant
 # instructions.) Keep these out of the public history entirely.
 /private/
@@ -19,7 +19,7 @@ compile_commands.json
 bench/.litellm-venv/
 
 # Python venv (pandas/numpy for the price observatory's feature builder). `python -m
-# venv` writes its own .venv/.gitignore containing `*`, so this is belt-and-braces —
+# venv` writes its own .venv/.gitignore containing `*`, so this is belt-and-braces;
 # but that inner file is easy to lose, and without it ~160 MB of numpy binaries become
 # untracked-and-visible in a public repo.
 .venv/

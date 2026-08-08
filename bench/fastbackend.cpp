@@ -7,13 +7,13 @@
 
 // Minimal C++ HTTP/1.1 backend for the saturation test.
 //
-// The Python asyncio mock tops out in the low tens of thousands of RPS — fine
+// The Python asyncio mock tops out in the low tens of thousands of RPS. Fine
 // for measuring llmbridge's *added latency* (where the 200 ms backend dominates),
 // but useless for finding where llmbridge itself saturates, because the mock would
 // fall over first. This backend is a stripped epoll echo-responder built on the
 // same net/ primitives: read a request, immediately write a canned
 // chat-completion response, keep-alive. Single thread, zero per-request alloc
-// beyond buffer growth — it sustains far more RPS than the proxy in front of
+// beyond buffer growth; it sustains far more RPS than the proxy in front of
 // it, so the proxy is provably the bottleneck in the ramp.
 //
 //   fastbackend [--port 9002] [--latency-us N] [--anthropic] [--tools]
@@ -24,7 +24,7 @@
 // tool_use input object and re-emit it as an OpenAI `arguments` STRING (escaping
 // it), which is measurably more work than copying text through. Without this the
 // regression sweep would report "no change" for edits that only affect the tool
-// path — which is exactly what happened once: a live check showed 19 us for tool
+// path, which is exactly what happened once: a live check showed 19 us for tool
 // responses against 15 us for plain, a difference the benchmark could not see.
 
 #include <sys/epoll.h>
@@ -61,7 +61,7 @@ namespace
         "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,"
         "\"total_tokens\":9}}";
 
-    // Anthropic Messages shape — for the translation benchmark (gateway under
+    // Anthropic Messages shape, for the translation benchmark (gateway under
     // test translates Anthropic -> OpenAI on the way back).
     const std::string kBodyAnthropic =
         "{\"id\":\"msg_fast\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fast-1\","
@@ -71,7 +71,7 @@ namespace
     // Anthropic response carrying TWO tool_use blocks (parallel calls are the
     // common agent shape) plus a text block, so the translator exercises: block
     // iteration, input-object -> arguments-string escaping, and the tool_calls
-    // array build. Kept deliberately small — this measures the translation, not
+    // array build. Kept deliberately small; this measures the translation, not
     // the memcpy of a large body.
     const std::string kBodyTools =
         "{\"id\":\"msg_fast\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"fast-1\","
@@ -82,9 +82,9 @@ namespace
         "\"input\":{\"city\":\"Rome\",\"units\":\"c\"}}],"
         "\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":24,\"output_tokens\":18}}";
 
-    // Which canned body to serve. An enum rather than a bool: the dialect list
+    // Which canned body to serve. An enum instead of a bool: the dialect list
     // already has more than two members in the translator (Gemini, Cohere) and
-    // will grow, and "bool anthropic" plus "bool tools" cannot express that —
+    // will grow, and "bool anthropic" plus "bool tools" cannot express that
     // two bools also admit a nonsense state (openai+tools) the enum makes
     // unrepresentable.
     enum class Body { OpenAi, Anthropic, AnthropicTools };

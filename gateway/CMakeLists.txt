@@ -1,4 +1,4 @@
-# gateway — the whole llmbridge proxy in one self-contained event-loop class
+# gateway: the whole llmbridge proxy in one self-contained event-loop class
 # (Gateway) + a tiny vendored latency histogram (metrics). No framework, no
 # external deps: links only `net` (sockets + HTTP framing) and `provider`
 # (dialect translation). The runnable daemon is built in app/.

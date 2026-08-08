@@ -7,13 +7,13 @@
 
 // llmbridge benchmark load generator.
 //
-// Open-loop, constant-arrival-rate HTTP/1.1 driver — the wrk2 methodology,
+// Open-loop, constant-arrival-rate HTTP/1.1 driver: the wrk2 methodology,
 // purpose-built because wrk2 isn't on the box and because owning the loop lets
 // us correct coordinated omission exactly. Requests "arrive" on a fixed
 // schedule (1/RPS apart); each request's measured latency runs from its
 // *scheduled* arrival time, not from when a connection happened to be free. So
 // if the target stalls, the backlog's latency is counted from when those
-// requests should have gone out — the tail can't hide behind a closed loop.
+// requests should have gone out, so the tail can't hide behind a closed loop.
 //
 // Single epoll thread drives a fixed pool of persistent keep-alive connections
 // (sized to cover peak concurrency = RPS x latency). The same non-blocking
@@ -209,7 +209,7 @@ int main(int argc, char** argv)
                  args.ip.c_str(), args.port, args.rps, (int)pool.size(), args.duration, args.warmup);
 
     // Write the (tiny) request. Returns false on a hard write error (the caller
-    // reconnects the socket). On EAGAIN it arms EPOLLOUT and returns true — the
+    // reconnects the socket). On EAGAIN it arms EPOLLOUT and returns true; the
     // write is finished by the EPOLLOUT handler.
     auto send_on = [&](Connection* c) -> bool {
         c->woff = 0;
@@ -219,7 +219,7 @@ int main(int argc, char** argv)
             if (n > 0) { c->woff += (size_t)n; continue; }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { arm_write(c); return true; }
             if (n < 0 && errno == EINTR) continue;
-            return false; // hard write error — caller recycles the socket
+            return false; // hard write error: caller recycles the socket
         }
         c->state = State::Awaiting;
         return true;
@@ -284,7 +284,7 @@ int main(int argc, char** argv)
                     int err = llmbridge::net::connect_result(c->fd);
                     disarm_write(c);
                     // Connect refused/failed: retire this conn (close, drop from rotation).
-                    // We do NOT reconnect here — a fully-down target would otherwise storm
+                    // We do NOT reconnect here: a fully-down target would otherwise storm
                     // reconnects. (Reconnect is for *established* conns that later error;
                     // an unreachable target simply shrinks the pool and reports errors.)
                     if (err != 0) { ++errors; ::close(c->fd); c->fd = -1; continue; }

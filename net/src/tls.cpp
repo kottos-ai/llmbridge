@@ -38,7 +38,7 @@ namespace llmbridge::net::tls
             return out.empty() ? std::string{"unknown OpenSSL error"} : out;
         }
 
-        /// BIO_* and SSL_* take int lengths. Clamp rather than cast: a span past
+        /// BIO_* and SSL_* take int lengths. Clamp instead of cast: a span past
         /// INT_MAX would otherwise go negative (error) or, past UINT_MAX, wrap to a
         /// small positive and make us report bytes consumed that never were.
         constexpr int clamp_len(size_t n) noexcept
@@ -87,7 +87,7 @@ namespace llmbridge::net::tls
         }
 
         // Verification is not optional. SSL_VERIFY_PEER makes a failed chain fail the
-        // handshake rather than being reported after the fact -- there is no window in
+        // handshake instead of being reported after the fact -- there is no window in
         // which we could send an API key to an unverified peer.
         SSL_CTX_set_verify(_ctx, SSL_VERIFY_PEER, nullptr);
 
@@ -171,7 +171,7 @@ namespace llmbridge::net::tls
         }
 
         // A memory BIO returns 0 at EOF by default, which SSL_read reads as "peer
-        // closed" rather than "nothing yet". Without this the first read on an empty
+        // closed" instead of "nothing yet". Without this the first read on an empty
         // BIO tears the connection down.
         BIO_set_mem_eof_return(_rbio, -1);
         BIO_set_mem_eof_return(_wbio, -1);
@@ -261,7 +261,7 @@ namespace llmbridge::net::tls
             return 0;
         }
 
-        // Feeding bytes may complete the handshake, so drive it here rather than
+        // Feeding bytes may complete the handshake, so drive it here instead of
         // making the caller remember to. Once done, the caller's read_plaintext()
         // picks up application data from the same buffered bytes.
         if (!_hs_done)

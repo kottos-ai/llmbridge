@@ -18,8 +18,8 @@ namespace llmbridge::provider
 {
     namespace
     {
-        // Append the raw (already JSON-escaped) text of a content field — a plain
-        // string, or an array of {type:"text",text:...} parts — to `out`, WITHOUT
+        // Append the raw (already JSON-escaped) text of a content field: a plain
+        // string, or an array of {type:"text",text:...} parts, to `out`, WITHOUT
         // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
         // the output's, so nothing is decoded or re-escaped; the bytes are viewed
         // straight out of the request/response buffer.
@@ -39,7 +39,7 @@ namespace llmbridge::provider
         // ── Tool calling: OpenAI <-> Anthropic ──────────────────────────────
         //
         // The two dialects disagree in three places, and each one is a real
-        // conversion rather than a rename:
+        // conversion instead of a rename:
         //
         //  1. TOOL DECLARATION
         //       OpenAI     {"type":"function","function":{name,description,parameters}}
@@ -65,12 +65,12 @@ namespace llmbridge::provider
         //     the model was trained on instead of leaning on provider-side
         //     turn-combining we do not control.
         //
-        // Anything malformed is dropped rather than guessed at: a half-translated
+        // Anything malformed is dropped instead of guessed at: a half-translated
         // tool call would make the provider fail in a way the client cannot read.
 
         // OpenAI tool_choice -> Anthropic tool_choice. Returns "" when nothing
         // should be emitted (OpenAI's default, or "none" which we express by
-        // omitting tools entirely — Anthropic has no exact equivalent).
+        // omitting tools entirely. Anthropic has no exact equivalent).
         std::string anthropic_tool_choice(const json::Value* tc)
         {
             if (!tc) return {};
@@ -237,7 +237,7 @@ namespace llmbridge::provider
                         const json::Value* fn = call.find("function");
                         if (!fn) continue;
                         const std::string_view name = fn->str_or("name");
-                        if (name.empty()) continue; // unusable; drop rather than guess
+                        if (name.empty()) continue; // unusable; drop instead of guess
                         if (any) messages += ',';
                         any = true;
                         messages += R"({"type":"tool_use","id":)";
@@ -284,7 +284,7 @@ namespace llmbridge::provider
         if (const json::Value* s = v.find("stream"); s && s->type == json::Value::Type::Bool && s->boolean)
             out += ",\"stream\":true";
         // Tools. tool_choice:"none" means "do not call tools", which Anthropic
-        // expresses by there being none — so we omit the whole tools block.
+        // expresses by there being none, so we omit the whole tools block.
         const json::Value* tc = v.find("tool_choice");
         const bool choice_none = tc && tc->is_string() && tc->sv == "none";
         if (!choice_none)
@@ -383,14 +383,14 @@ namespace llmbridge::provider
         }
 
         // Both spans come from an UNTRUSTED upstream body, so sanitize on the way
-        // out — same rule the SSE passthrough follows. Otherwise a provider could
+        // out: the same rule the SSE passthrough follows. Otherwise a provider could
         // make our own error envelope unparseable to a strict client.
         //
-        // This is now DEFENCE IN DEPTH rather than the primary mitigation: the
+        // This is now DEFENCE IN DEPTH instead of the primary mitigation: the
         // parser rejects raw control bytes in strings outright (RFC 8259 §7), so a
         // body carrying one no longer parses and `message`/`type` come back empty,
         // yielding the generic envelope below. An earlier version of this comment
-        // said "our parser is lenient about control bytes" — that was true when it
+        // said "our parser is lenient about control bytes"; that was true when it
         // was written and is not any more. Kept because it costs nothing on an
         // error path and the invariant it guards (no raw control byte in an
         // envelope we emit) is the one that must not regress.
@@ -461,7 +461,7 @@ namespace llmbridge::provider
             out += system;
             out += "\"}]}";
         }
-        // generationConfig — only the keys the OpenAI request actually set.
+        // generationConfig: only the keys the OpenAI request actually set.
         std::string gc;
         if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { gc += "\"maxOutputTokens\":"; gc += mt; }
         if (std::string_view t = v.num_or("temperature"); !t.empty())

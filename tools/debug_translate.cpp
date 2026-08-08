@@ -5,16 +5,16 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// debug_translate — a tiny, synchronous harness for stepping through the dialect
+// debug_translate: a tiny, synchronous harness for stepping through the dialect
 // translator in a debugger (CLion, gdb, lldb). Unlike the live gateway, there is
-// NO event loop, NO sockets, NO async I/O — each translate call runs inline on a
+// NO event loop, NO sockets, NO async I/O; each translate call runs inline on a
 // hardcoded payload, so you can set a breakpoint on the call and "Step Into"
 // (CLion: F7) to walk provider/src/translate.cpp line by line.
 //
 // Build & debug in CLion:
 //   1. Open the repo root as a CMake project.
 //   2. Pick the "Debug" CMake profile (Settings ▸ Build ▸ CMake) so it compiles
-//      -O0 -g — optimized builds make stepping jumpy.
+//      -O0 -g, because optimized builds make stepping jumpy.
 //   3. Select the `debug_translate` run/debug configuration.
 //   4. Put a breakpoint on a `provider::...` call below (or inside translate.cpp)
 //      and Debug (Shift+F9). Step Into to enter the translator.
@@ -43,7 +43,7 @@ namespace
     // A representative OpenAI chat-completion request: system message + a
     // multi-turn user/assistant exchange + sampling params. Enough to exercise
     // system extraction, message restructuring, and parameter renaming. Edit it
-    // freely — it's just a string. Set `model` to the TARGET provider's model
+    // freely; it's just a string. Set `model` to the TARGET provider's model
     // name; llmbridge passes `model` through verbatim (it translates the format,
     // not the model identity).
     std::string openai_request(std::string_view model)

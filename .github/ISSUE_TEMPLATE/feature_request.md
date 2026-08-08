@@ -1,10 +1,9 @@
 ---
 name: Feature request
-about: Suggest a feature or enhancement
+about: Suggest a feature or an improvement
 title: '[FEATURE] '
 labels: feature-request
 assignees: ''
----
 
 ## Use case
 
@@ -28,7 +27,7 @@ Have you found other ways to accomplish this? What are the tradeoffs?
 
 ## Additional context
 
-Anything else that would help us understand the request — links to documentation from other libraries that handle this well, related issues, etc.
+Anything else that would help us understand the request: links to documentation from other libraries that handle this well, related issues, etc.
 
 ---
 

@@ -24,7 +24,7 @@ namespace llmbridge
         // Anchors captured together, once, on first use. `static` init is
         // thread-safe in C++11+ and this is not a hot path (once per response).
         //
-        // CAVEAT — this DRIFTS. It assumes both clocks tick at the same rate after
+        // CAVEAT; this DRIFTS. It assumes both clocks tick at the same rate after
         // the anchor; under NTP slew they do not, and the error grows with process
         // uptime. Good enough for correlating a request against an external log at
         // ms granularity, which is all `x-llmbridge-t0` promises. NOT an ordering
@@ -66,7 +66,7 @@ namespace llmbridge
     void Histogram::print(std::ostream& os, const char* label) const
     {
         // An empty histogram must NOT print zeros. It did once, and "p99=0 ns" reads
-        // as a spectacular result rather than as no data — while bench/run_bench.sh
+        // as a spectacular result instead of as no data, while bench/run_bench.sh
         // seds this very line for `p99=`, so a zero-sample run would have published a
         // fabricated 0 us added latency. Streaming workloads hit this every time:
         // streams are counted in `requests` but never recorded here (LATENCY.md §4).

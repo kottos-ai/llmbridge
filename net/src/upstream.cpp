@@ -21,8 +21,8 @@ namespace llmbridge::net
     namespace
     {
         /// Charset a host may use before we will put it in a Host header or SNI.
-        /// Deliberately tighter than the RFCs: no percent-encoding, no underscores,
-        /// no uppercase-normalisation games — provider hostnames are plain LDH names.
+        /// Deliberately stricter than the RFCs: no percent-encoding, no underscores,
+        /// no uppercase-normalisation games, provider hostnames are plain LDH names.
         bool valid_host_chars(std::string_view h) noexcept
         {
             if (h.empty() || h.size() > 253) return false;
@@ -81,7 +81,7 @@ namespace llmbridge::net
             if (rest.substr(slash) != "/")
             {
                 spec.error = "path '" + std::string(rest.substr(slash)) +
-                             "' not supported — the gateway forwards the client's own path";
+                             "' not supported; the gateway forwards the client's own path";
                 return spec;
             }
             rest = rest.substr(0, slash);
@@ -132,7 +132,7 @@ namespace llmbridge::net
         }
         else
         {
-            // Bare "host" with no scheme and no port: refuse rather than guess.
+            // Bare "host" with no scheme and no port: refuse instead of guess.
             // The legacy form was always IP:PORT; keep that contract explicit.
             spec.error = "port required (HOST:PORT, or use http:// / https:// for defaults)";
             return spec;

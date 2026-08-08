@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// libFuzzer target for the hand-rolled JSON parser (provider/json.hpp) — the
+// libFuzzer target for the hand-rolled JSON parser (provider/json.hpp). This is the
 // highest-risk surface, since translate mode feeds client-controlled bytes into
 // it. The parser must NEVER crash, over-read, or overflow the stack on any input;
 // it may only set ok=false. Build (Clang):
@@ -24,7 +24,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     bool ok = false;
     llmbridge::provider::json::Value v =
         llmbridge::provider::json::parse(std::string_view(reinterpret_cast<const char*>(data), size), ok);
-    // Touch the result so nothing is optimised away; no assertion — the invariant
+    // Touch the result so nothing is optimised away; no assertion. The invariant
     // is simply "does not crash / ASAN-clean on any input".
     if (ok && v.is_object()) (void)v.find("model");
     return 0;

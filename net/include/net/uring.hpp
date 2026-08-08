@@ -7,13 +7,13 @@
 
 #pragma once
 
-// A minimal, hand-rolled raw io_uring — the completion-based I/O engine that will
+// A minimal, hand-rolled raw io_uring: the completion-based I/O engine that will
 // back the gateway's hot path (Phase 1), replacing the readiness-based epoll loop
 // to batch the ~4 syscalls/request toward <<1. Deliberately NO liburing: we drive
 // io_uring_setup / io_uring_enter directly and mmap the SQ/CQ rings ourselves, so
 // the runtime stays dependency-free like the rest of llmbridge.
 //
-// Single-issuer only (one thread owns the ring) — matching the one-worker design.
+// Single-issuer only (one thread owns the ring), matching the one-worker design.
 // The hot methods (get_sqe, for_each_cqe) are header-inline; setup/submit are
 // out-of-line in uring.cpp. Compiled only where <linux/io_uring.h> exists; callers
 // gate on LLMBRIDGE_HAVE_URING.
@@ -29,7 +29,7 @@
 namespace llmbridge::net::uring
 {
     // Is io_uring usable in this process? Probes by setting up and tearing down a
-    // tiny ring. False on old kernels or seccomp-sandboxed environments — the
+    // tiny ring. False on old kernels or seccomp-sandboxed environments; the
     // gateway falls back to epoll in that case.
     bool available() noexcept;
 
@@ -42,7 +42,7 @@ namespace llmbridge::net::uring
         Ring& operator=(const Ring&) = delete;
 
         // Set up a ring with `entries` submission slots (the kernel rounds up to a
-        // power of two). `flags` are IORING_SETUP_* — e.g. SINGLE_ISSUER |
+        // power of two). `flags` are IORING_SETUP_*, e.g. SINGLE_ISSUER |
         // DEFER_TASKRUN for a single-worker loop. Returns false on failure.
         bool init(unsigned entries, unsigned flags = 0) noexcept;
 
@@ -50,7 +50,7 @@ namespace llmbridge::net::uring
         [[nodiscard]] int ring_fd() const noexcept { return _ring_fd; }
 
         // Acquire the next free submission entry to fill (zeroed), or nullptr if
-        // the SQ is full — submit first, then retry.
+        // the SQ is full: submit first, then retry.
         io_uring_sqe* get_sqe() noexcept
         {
             const unsigned head = __atomic_load_n(_sq_head, __ATOMIC_ACQUIRE);
@@ -110,8 +110,8 @@ namespace llmbridge::net::uring
 
     // A provided-buffer ring (IORING_REGISTER_PBUF_RING): a pool of `count`
     // fixed-size buffers the kernel draws from for multishot recv. One submitted
-    // multishot recv per connection then delivers a completion per data arrival —
-    // each naming the buffer it used — so we stop re-submitting a recv (and a
+    // multishot recv per connection then delivers a completion per data arrival
+    // each naming the buffer it used, so we stop re-submitting a recv (and a
     // per-connection staging buffer) per read. After consuming a buffer's bytes,
     // recycle() returns it to the pool. Single-issuer, like the ring itself.
     class BufRing

@@ -70,7 +70,7 @@ python3 bench/mock_provider.py --port "$MOCK_PORT" --latency-ms "$LAT_MS" --form
   >"$RESDIR/mock-h2h-$STAMP.log" 2>&1 &
 sleep 0.5
 
-echo "Starting LiteLLM (anthropic config) — may take ~30-45s to import ..."
+echo "Starting LiteLLM (anthropic config); may take ~30-45s to import ..."
 "$VENV/bin/litellm" --config bench/litellm_config_anthropic.yaml --port "$LL_PORT" \
   >"$RESDIR/litellm-server-$STAMP.log" 2>&1 &
 ll_up=0
@@ -85,7 +85,7 @@ achieved_of() { sed -n 's/.*achieved=\([0-9]*\) .*/\1/p'; }
 ms() { awk -v u="$1" 'BEGIN{printf "%.3f", u/1000.0}'; }
 
 {
-  echo "llmbridge vs LiteLLM — equal-work (OpenAI<->Anthropic) — $STAMP"
+  echo "llmbridge vs LiteLLM, equal-work (OpenAI<->Anthropic), $STAMP"
   echo "mock(anthropic) latency=${LAT_MS}ms  dur=${DUR}s  warmup=${WARMUP}s  host=$(uname -mn)"
   echo
   printf "%-6s | %-22s | %-30s | %s\n" "RPS" "LLMBRIDGE added (ms)" "LITELLM added (ms)" "LiteLLM achieved"

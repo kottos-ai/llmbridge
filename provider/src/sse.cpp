@@ -11,13 +11,13 @@
 #include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
 #include "provider/json.hpp"
 
-// NOTE (extract at second user): feed() below is two concerns bolted together —
+// NOTE (extract at second user): feed() below is two concerns bolted together
 // (a) dialect-agnostic SSE *framing* (line splitting, the fragmentation buffer,
 // the byte caps, the O(n) resume-scan) and (b) Anthropic-specific *event mapping*
 // (dispatch -> OpenAI chunks). When the second streaming dialect lands (the
 // reverse direction, or Gemini/Cohere), lift (a) into a reusable SseFrameReader
 // with a per-dialect on_event() callback. Deliberately NOT abstracted yet:
-// with a single consumer the seams would be guesses. See CLAUDE.md — "no
+// with a single consumer the seams would be guesses. See CLAUDE.md. "no
 // premature abstraction".
 
 namespace llmbridge::provider
@@ -77,7 +77,7 @@ namespace llmbridge::provider
     // The extra usage-only chunk OpenAI streams just before [DONE] when the client
     // set stream_options.include_usage: `choices` is empty by spec, and the counts
     // are Anthropic's own (input from message_start, cumulative output from
-    // message_delta) — re-shaped, never estimated.
+    // message_delta): re-shaped, never estimated.
     void AnthropicToOpenAiSse::emit_usage(std::string& out)
     {
         if (!_include_usage || _usage_emitted) return;
@@ -109,7 +109,7 @@ namespace llmbridge::provider
     }
 
     // STRICT index parse. detail::to_ll() cannot be used here: it wraps
-    // std::from_chars, which on overflow or garbage leaves its output UNTOUCHED —
+    // std::from_chars, which on overflow or garbage leaves its output UNTOUCHED
     // so `"index": 99999999999999999999` and `"index": "abc"` both come back as 0.
     // Measured: that made a malformed index alias onto block 0 and attach its
     // argument fragments to whichever call lived there, i.e. a customer's arguments
@@ -130,7 +130,7 @@ namespace llmbridge::provider
     // "stop" is wrong once tool calls have been emitted: every OpenAI SDK branches on
     // finish_reason == "tool_calls" to decide whether to dispatch them, so reporting
     // "stop" makes the client treat a tool call as a plain answer and SILENTLY IGNORE
-    // it — no error, just a tool that never runs. Reachable whenever the upstream
+    // it: no error, just a tool that never runs. Reachable whenever the upstream
     // sends message_stop without a preceding message_delta.
     const char* AnthropicToOpenAiSse::default_finish() const noexcept
     {
@@ -141,7 +141,7 @@ namespace llmbridge::provider
     {
         if (data == "[DONE]")
         {
-            // Not an Anthropic event — Anthropic ends with message_stop. Honour it as
+            // Not an Anthropic event. Anthropic ends with message_stop. Honour it as
             // a terminator, but route it through the same path so the stream still
             // gets its finish chunk (jumping straight to emit_done left the client
             // with finish_reason:null and no way to know the message ended), and do
@@ -213,7 +213,7 @@ namespace llmbridge::provider
         }
         else if (type == "message_delta")
         {
-            // Only a stop_reason ends the message — Anthropic also sends
+            // Only a stop_reason ends the message. Anthropic also sends
             // usage-only message_delta frames mid-stream, which must NOT emit a
             // premature finish chunk.
             if (const json::Value* d = v.find("delta"))
@@ -304,7 +304,7 @@ namespace llmbridge::provider
 
     // A fragment of the arguments. Anthropic's `partial_json` and OpenAI's
     // `arguments` are BOTH JSON strings whose contents are JSON text, escaped the
-    // same way — so the raw span forwards verbatim, with no decode/re-encode round
+    // same way, so the raw span forwards verbatim, with no decode/re-encode round
     // trip that could alter a customer's argument bytes.
     void AnthropicToOpenAiSse::emit_tool_args(std::string& out, int ord, std::string_view frag)
     {
@@ -323,8 +323,8 @@ namespace llmbridge::provider
         if (_failed) return false; // sticky: a capped stream stays dead
 
         // The tail retained from the previous call is known to contain no '\n',
-        // so resume the newline search at the join point rather than rescanning
-        // it. Without this, feeding one long line one byte at a time is O(n^2) —
+        // so resume the newline search at the join point instead of rescanning
+        // it. Without this, feeding one long line one byte at a time is O(n^2)
         // a hostile upstream dribbling bytes could pin a core (CPU-DoS the byte
         // caps don't cover). With it, total scanning is O(bytes) regardless of
         // how the stream is fragmented.
@@ -363,7 +363,7 @@ namespace llmbridge::provider
                 _cur_data.append(d);
                 _have_data = true;
             }
-            // "event:" lines and ":" comments are ignored — we dispatch on the
+            // "event:" lines and ":" comments are ignored; we dispatch on the
             // data payload's own "type" field, which is authoritative for Anthropic.
         }
         _pending.erase(0, pos);
@@ -389,7 +389,7 @@ namespace llmbridge::provider
         if (_done) return true;
         // A tool call still open at EOF means its arguments were CUT MID-JSON. The
         // client would concatenate them into something unparseable inside a stream
-        // that looked complete — the "corrupt framing fabricated a clean ending"
+        // that looked complete: the "corrupt framing fabricated a clean ending"
         // failure 0.3.0 fixed for text, which streamed tool calls reintroduced.
         // Same signal: no [DONE], and the gateway counts it as an error.
         if (_tool_open) return false;

@@ -5,15 +5,15 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// nullrelay — the ZERO-WORK control for the streaming benchmark: the dumbest
+// nullrelay. The ZERO-WORK control for the streaming benchmark: the dumbest
 // possible proxy. Accept a client, connect
 // upstream, forward bytes both ways. NO HTTP parsing, NO chunked decode, NO SSE
 // translation, no per-chunk state. Whatever latency THIS adds is the irreducible
-// cost of inserting one extra process/hop into the path — i.e. the floor that any
+// cost of inserting one extra process/hop into the path; i.e. the floor that any
 // gateway pays before doing any work at all.
 //
 // This control exists because it answers the question "is the gateway's added
-// latency its own work, or the price of the hop?" — and the answer is not what
+// latency its own work, or the price of the hop?", and the answer is not what
 // intuition suggests. Measured at 64 concurrent streams, p50 added latency:
 //
 //                                        C-states default   C-states capped at C1
@@ -32,14 +32,14 @@
 //
 // 2. The hop is mostly a HOST TUNING artefact, not transit. Capping idle states at C1
 //    (2 us exit, vs 70-890 us for C3-C10) cuts the hop 3.9x. See bench/LATENCY-TUNING.md.
-//    Of the 14 us that remains, busy-polling the relay recovers only ~3 us — so the
+//    Of the 14 us that remains, busy-polling the relay recovers only ~3 us, so the
 //    residual is the loopback data path (copies, TCP, softirq, waking the RECEIVER),
 //    not this process's own wakeup.
 //
 // It also explains why io_uring and epoll measure the same here, which is not obvious:
 // io_uring really does cut syscalls (2.31 fewer per delivered token, measured with
 // strace). But a syscall costs ~537 ns on this box, so the entire theoretical saving is
-// ~1.24 us/token — under 4% of the 32 us total, and below run-to-run variance. It stays
+// ~1.24 us/token: under 4% of the 32 us total, and below run-to-run variance. It stays
 // invisible even after the C-state fix, and io_uring's own bookkeeping offsets it.
 // io_uring pays off where work-per-wakeup is high (the non-streaming ~90k RPS path),
 // not in per-token latency at a few thousand tokens/s.
@@ -68,13 +68,13 @@ std::vector<C*> doomed_list; // freed at end of batch, never mid-batch
 void add(C* c, uint32_t ev) { epoll_event e{}; e.events = ev; e.data.ptr = c; ::epoll_ctl(ep, EPOLL_CTL_ADD, c->fd, &e); }
 
 // One epoll_wait batch can carry events for BOTH ends of a pair, so a conn must not
-// be freed while that batch is still being walked — the next entry would dereference
+// be freed while that batch is still being walked; the next entry would dereference
 // freed memory. Same deferred-free discipline as the gateway's event loop.
 //
 // Status of this hazard: LATENT here, not observed. A busy-polling variant of this
 // relay (which reaps far more events per epoll_wait, so both ends of a pair share a
 // batch much more often) did corrupt its heap without this guard. 250k pair teardowns
-// under ASan did NOT reproduce it in this blocking version — the guard is hardening,
+// under ASan did NOT reproduce it in this blocking version; the guard is hardening,
 // not a fix for a demonstrated failure. Kept because a control whose own memory
 // safety is in question cannot be used to attribute latency.
 void retire(C* c) {

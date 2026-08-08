@@ -26,7 +26,7 @@ gtest_discover_tests(gateway_test)
 # 1000 requests per case; generous timeout so a slow CI runner does not flake it.
 # RUN_SERIAL: each case drives 1000 requests across 100 threads. Run concurrently
 # with the rest of the suite under `ctest -j`, it both flakes and reports
-# meaningless latencies — the numbers it prints are only worth reading when it
+# meaningless latencies; the numbers it prints are only worth reading when it
 # has the machine to itself.
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 

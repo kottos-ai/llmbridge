@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Tests for llmbridge::Stats (gateway/gateway.hpp) — the per-request accounting
+// Tests for llmbridge::Stats (gateway/gateway.hpp): the per-request accounting
 // struct: zeroed counters and three independent sub-ms-resolution histograms.
 // (Histogram internals are covered in metrics_test.cpp.)
 

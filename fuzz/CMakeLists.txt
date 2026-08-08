@@ -1,4 +1,4 @@
-# libFuzzer targets for the two hand-rolled parsers — llmbridge's highest-risk
+# libFuzzer targets for the two hand-rolled parsers, llmbridge's highest-risk
 # surface (untrusted bytes → json.hpp / http.hpp). Clang-only: libFuzzer ships
 # with Clang and needs -fsanitize=fuzzer. Enabled via -DLLMBRIDGE_BUILD_FUZZERS=ON.
 #

@@ -12,15 +12,15 @@
 //
 //   1. RESPONSE CORRELATION UNDER A SHARED POOL. Every request carries a different
 //      question and expects a different answer, and the mock provider answers by
-//      LOOKING THE QUESTION UP rather than replying with a canned body. So if the
-//      gateway ever hands client A the bytes meant for client B — the failure mode
+//      LOOKING THE QUESTION UP instead of replying with a canned body. So if the
+//      gateway ever hands client A the bytes meant for client B, the failure mode
 //      a framing desync produces, and the reason a shared upstream pool makes
-//      framing bugs cross-client — this test says so by name, instead of passing
+//      framing bugs cross-client; this test says so by name, instead of passing
 //      because both clients expected the same string. A canned-response test is
 //      structurally blind to that. Question uniqueness is asserted, not assumed.
 //
 //   2. TEXT FIDELITY ON REAL MODEL OUTPUT. The corpus is recorded Claude answers
-//      (scripts/gen_qa_corpus.py, recorded once, replayed here — the test itself
+//      (scripts/gen_qa_corpus.py, recorded once, replayed here; the test itself
 //      never touches the network). Each entry carries a `kind`:
 //
 //        plain          ordinary prose
@@ -28,7 +28,7 @@
 //        json_hostile   answers ABOUT JSON escaping, so the text is itself full of
 //                       backslashes, quotes and \uXXXX the model wrote literally.
 //                       NOTE the limit of this: asked directly about \u0000 and raw
-//                       control characters, the model DESCRIBES them — 68 answers
+//                       control characters, the model DESCRIBES them. 68 answers
 //                       carry a literal backslash-u sequence, none carries a raw
 //                       control byte. Recorded output cannot cover that byte class,
 //                       which is where the control-character defect lived, so it is covered
@@ -41,8 +41,8 @@
 //      are capped at 6144 bytes (records that hit the cap carry "truncated": true),
 //      and the best 1000 are kept by character-class coverage. Curating beats
 //      generating 1000 directly because the selector can then guarantee every RARE
-//      class survives at 100% — tab 18/18, astral 97/97, literal-\u 68/68,
-//      backslash 224/224 — while the abundant ones (newline, non-ascii) halve
+//      class survives at 100%: tab 18/18, astral 97/97, literal-\u 68/68,
+//      backslash 224/224, while the abundant ones (newline, non-ascii) halve
 //      harmlessly. A proportional sample does not do this: a naive stride-2 halving
 //      of the same 2000 drops `tab` to ZERO.
 //
@@ -64,19 +64,19 @@
 //      backend_stress answers exist because io_uring reassembles reads across a
 //      provided-buffer ring of kBufSize = 4096 while epoll grows a single buffer,
 //      and on the streaming path io_uring accumulates into `wpending` where epoll
-//      pauses reads — so answers past a few KB exercise code that is NOT shared.
+//      pauses reads, so answers past a few KB exercise code that is NOT shared.
 //
 //   4. STREAMING AS WELL AS NOT. The streamed cases drive real SSE: the provider
 //      emits the Anthropic event envelope one HTTP chunk per event, the gateway
 //      translates it to OpenAI chunks, and the client reassembles the answer from
-//      the deltas. Note the framing changes across the gateway — the upstream leg
+//      the deltas. Note the framing changes across the gateway: the upstream leg
 //      is chunked, the client leg is close-delimited.
 //
 // Latency is reported per mode, because the meaningful number differs: a single
 // round-trip for non-streaming, and TTFT (what a voice agent feels) plus stream
 // completion for streaming. Both assert only a very loose ceiling. A tight
 // wall-clock bound on a shared CI runner is a flake generator, and a flaky test is
-// one people learn to ignore — the same reasoning that replaced a timing assertion
+// one people learn to ignore, the same reasoning that replaced a timing assertion
 // in the chunked-decode regression with a deterministic one. Use the printed
 // numbers for tracking; the pass/fail signal here is correctness.
 //
@@ -128,7 +128,7 @@ namespace
 
     // ---------------------------------------------------------------- corpus
     // One JSON object per line: {"id":N,"topic":..,"q":..,"a":..,"kind":".."}
-    // Parsed with the project's own parser on purpose — it is the parser that has
+    // Parsed with the project's own parser on purpose; it is the parser that has
     // to survive these strings in production.
     const std::vector<QA>& corpus()
     {
@@ -179,7 +179,7 @@ namespace
             _port = ntohs(a.sin_port);
             // Backlog well above the highest concurrency the sweep offers. A mock
             // backlog below the client count throttles the gateway and produces a
-            // plausible wrong number — a documented hazard in this repo
+            // plausible wrong number, a documented hazard in this repo
             // (bench/BENCHMARK-CONFIG.md), not a hypothetical one.
             ::listen(_fd, 4096);
             _acc = std::thread([this] { accept_loop(); });
@@ -206,7 +206,7 @@ namespace
         // every question with this text instead of the correct answer. Simulates a
         // pooled-connection desync handing one client another's response.
         void set_wrong_answer(std::string s) { _wrong = std::move(s); }
-        // Emit the answer text into the JSON body WITHOUT escaping it — simulates an
+        // Emit the answer text into the JSON body WITHOUT escaping it, simulating an
         // escaping regression in the translator.
         void set_skip_escaping(bool b) { _skip_escape = b; }
         int served() const { return _served.load(std::memory_order_relaxed); }
@@ -251,7 +251,7 @@ namespace
         }
 
         // Split on UTF-8 character boundaries: a delta is a JSON string, so cutting
-        // mid-sequence would emit invalid UTF-8 — not the property under test, and
+        // mid-sequence would emit invalid UTF-8, which is not the property under test, and
         // rejected by the parser anyway since the RFC 8259 tightening.
         static std::vector<std::string> utf8_chunks(std::string_view sv, size_t target)
         {
@@ -278,7 +278,7 @@ namespace
         }
 
         // The Anthropic streaming envelope carrying the answer as N text deltas,
-        // framed one HTTP chunk per SSE event — what a provider actually does, and
+        // framed one HTTP chunk per SSE event, what a provider actually does, and
         // what makes the gateway's incremental decode do real work.
         std::string anthropic_sse(std::string_view answer) const
         {
@@ -435,7 +435,7 @@ namespace
         bool ok = false;
         bool saw_done = false;
         std::string content;   // reassembled from every delta
-        double ttft_ms = 0;    // to the FIRST content delta — the number voice agents feel
+        double ttft_ms = 0;    // to the FIRST content delta: the number voice agents feel
         double total_ms = 0;   // to [DONE]
         int deltas = 0;
     };
@@ -525,7 +525,7 @@ namespace
         // delta.
         //
         // NOTE the framing: the gateway's client-facing SSE is CLOSE-DELIMITED
-        // ("Connection: close", no Content-Length and no Transfer-Encoding) — the
+        // ("Connection: close", no Content-Length and no Transfer-Encoding). The
         // upstream leg is chunked, the client leg is not. An earlier version of this
         // helper ran a ChunkDecoder over the client bytes and every single stream
         // failed identically, which is the signature of a framing assumption rather
@@ -598,7 +598,7 @@ namespace
         ~Client() { close(); }
     };
 
-    // Percentiles from an unsorted sample. Sorting in place is fine — callers are
+    // Percentiles from an unsorted sample. Sorting in place is fine; callers are
     // done with the ordering by the time they report.
     struct Lat
     {
@@ -615,7 +615,7 @@ namespace
     };
 
     // The corpus is larger than one concurrency run (2000 pairs, 1000 requests), so
-    // walk it with a stride instead of taking the first kTotal — otherwise the run
+    // walk it with a stride instead of taking the first kTotal; otherwise the run
     // would only ever see the plain-prose half and never the long, json_hostile,
     // tricky_text or backend_stress entries. Distinct i -> distinct index -> distinct
     // question, which is what keeps mis-correlation detectable.
@@ -628,15 +628,15 @@ namespace
 
     // The gateway's own added-latency histogram tops out at ~2.62 ms, and
     // Histogram::percentile() returns the running MAX once the target lands in the
-    // overflow region — so a saturated histogram silently reports a number that
+    // overflow region, so a saturated histogram silently reports a number that
     // looks like a percentile and is not one. That exact artifact has produced a
     // wrong result in this project before, so refuse to print one.
     //
     // It saturates here for io_uring under concurrency because the uring stamps
     // bracket a SUBMITTED send and its completion, so the interval includes time
     // the SQE spent queued; the epoll path stamps around an inline write() and
-    // measures only compute. The two are therefore NOT comparable under load —
-    // compare them in the sequential control instead, where both read ~45 us.
+    // measures only compute. The two are therefore NOT comparable under load.
+    // Compare them in the sequential control instead, where both read ~45 us.
     std::string added_latency(const llmbridge::Histogram& h)
     {
         const uint64_t n = h.total(), of = h.overflow_count();
@@ -671,7 +671,7 @@ namespace
             for (const QA& qa : corpus()) _answers[qa.q] = qa.a;
             // Distinct questions are what make mis-correlation detectable at all:
             // if two clients asked the same thing, swapping their replies would go
-            // unnoticed. Assert the property rather than assume the generator held it.
+            // unnoticed. Assert the property instead of assume the generator held it.
             ASSERT_EQ(_answers.size(), corpus().size())
                 << "corpus contains duplicate questions; the correlation check would be blind";
         }
@@ -751,7 +751,7 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     EXPECT_EQ(non_200.load(), 0);
     EXPECT_EQ(_backend.malformed(), 0) << "the gateway sent the provider an unparseable body";
     EXPECT_EQ(_backend.unknown_questions(), 0)
-        << "the provider received a question that is not in the corpus — the gateway "
+        << "the provider received a question that is not in the corpus; the gateway "
            "corrupted or swapped a request body";
 
     std::vector<Failure> all;
@@ -786,7 +786,7 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     // The client-observed figure is dominated by QUEUEING, not by the gateway: one
     // single-threaded loop serves 100 concurrent clients, so by Little's law the
     // wait is concurrency/throughput regardless of how fast the gateway is. The
-    // harness makes it worse — ~201 threads (100 clients + up to 100 mock-provider
+    // harness makes it worse. ~201 threads (100 clients + up to 100 mock-provider
     // threads + the loop) on a 12-core box.
     //
     // The gateway's own added-latency histogram is the number that reflects this
@@ -802,10 +802,10 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
 
     // ---- latency: loose ceiling only, on purpose (see the file header) ---
     // Deliberately ~50x the observed value. This catches a collapse (the gateway
-    // stalling or serialising), never a regression — the printed numbers are for
+    // stalling or serialising), never a regression; the printed numbers are for
     // that. An earlier 250 ms bound sat within 20% of the measured p99 and flaked
     // under `ctest -j4`, which is how a load test becomes noise people ignore.
-    EXPECT_LT(pct(0.99), 2000.0) << "p99 " << pct(0.99) << " ms — collapse threshold";
+    EXPECT_LT(pct(0.99), 2000.0) << "p99 " << pct(0.99) << " ms, past the collapse threshold";
 
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();
@@ -814,11 +814,11 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     EXPECT_EQ(_backend.served(), kTotal);
     // Keep-alive must hold: 1000 requests over far fewer upstream connections.
     EXPECT_LT(_gw->stats().upstream_conns_opened, static_cast<uint64_t>(kTotal))
-        << "no upstream connection reuse — the pool is not working";
+        << "no upstream connection reuse: the pool is not working";
 }
 
 // The subset most likely to break escaping, run on its own so a failure points
-// straight at the character class rather than at "one of 1000 answers".
+// straight at the character class instead of at "one of 1000 answers".
 TEST_P(CorpusIT, TextStressAnswersRoundTripByteForByte)
 {
     start();
@@ -833,7 +833,7 @@ TEST_P(CorpusIT, TextStressAnswersRoundTripByteForByte)
         if (k == "escape_stress" || k == "json_hostile" || k == "tricky_text")
             hard.push_back(&corpus()[i]);
     }
-    ASSERT_FALSE(hard.empty()) << "corpus has no text-stress entries — regenerate it";
+    ASSERT_FALSE(hard.empty()) << "corpus has no text-stress entries; regenerate it";
 
     Client cl;
     ASSERT_TRUE(cl.connect(_port));
@@ -852,8 +852,8 @@ TEST_P(CorpusIT, TextStressAnswersRoundTripByteForByte)
                 GetParam() == IoBackend::Epoll ? "epoll" : "uring", checked);
 }
 
-// The same 1000-request shape, streamed. Latency is reported as TTFT — the number
-// a voice agent actually feels — alongside stream completion time, rather than the
+// The same 1000-request shape, streamed. Latency is reported as TTFT, the number
+// a voice agent actually feels, alongside stream completion time, instead of the
 // single round-trip figure the non-streaming case prints.
 TEST_P(CorpusIT, StreamedThousandQuestionsAcrossHundredClients)
 {
@@ -874,7 +874,7 @@ TEST_P(CorpusIT, StreamedThousandQuestionsAcrossHundredClients)
             {
                 const QA& qa = pick(c * kPerClient + k);
                 // A streamed response is close-delimited, so each one gets its own
-                // connection — which is also what an SSE client does in practice.
+                // connection, which is also what an SSE client does in practice.
                 // One retry on connect: 1000 streams means 1000 fresh connections,
                 // and ephemeral-port pressure under a loaded machine is a documented
                 // host artifact here (bench/BENCHMARK-CONFIG.md), not a gateway bug.
@@ -934,11 +934,11 @@ TEST_P(CorpusIT, StreamedThousandQuestionsAcrossHundredClients)
                 ndelta, static_cast<double>(ndelta) / kTotal);
 
     EXPECT_GT(ndelta, static_cast<long long>(kTotal))
-        << "answers arrived in one delta each — the mock is not really streaming";
+        << "answers arrived in one delta each: the mock is not really streaming";
     // See the non-streaming note: collapse threshold only, far above the observed
     // value, because this test runs 1000 concurrent streams and its wall-clock is
     // sensitive to whatever else the machine is doing.
-    EXPECT_LT(tt.pct(0.99), 2000.0) << "TTFT p99 " << tt.pct(0.99) << " ms — collapse threshold";
+    EXPECT_LT(tt.pct(0.99), 2000.0) << "TTFT p99 " << tt.pct(0.99) << " ms, past the collapse threshold";
 
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();
@@ -956,7 +956,7 @@ TEST_P(CorpusIT, LargeAnswersCrossBufferBoundariesOnBothPaths)
     for (size_t i = 0; i < corpus().size(); ++i)
         if (corpus()[i].kind == "backend_stress" || corpus()[i].kind == "long")
             big.push_back(&corpus()[i]);
-    ASSERT_FALSE(big.empty()) << "corpus has no large answers — regenerate it";
+    ASSERT_FALSE(big.empty()) << "corpus has no large answers; regenerate it";
     if (big.size() > 60) big.resize(60);
 
     size_t largest = 0, over_4k = 0;
@@ -992,13 +992,13 @@ TEST_P(CorpusIT, LargeAnswersCrossBufferBoundariesOnBothPaths)
                 "buffer | non-stream p50 %.3f ms | stream TTFT p50 %.3f ms\n",
                 GetParam() == IoBackend::Epoll ? "epoll" : "uring", big.size(), largest,
                 over_4k, plain.pct(0.50), stream_ttft.pct(0.50));
-    EXPECT_GT(over_4k, 0u) << "no answer exceeds one io_uring provided buffer — this test "
+    EXPECT_GT(over_4k, 0u) << "no answer exceeds one io_uring provided buffer; this test "
                               "is not reaching the multi-buffer path it exists for";
 }
 
 // Control for the two load tests above: identical code path, ONE client, no
 // concurrency. Anything the loaded runs report beyond what this reports is
-// queueing, not gateway cost — so this is the number to reason about when the
+// queueing, not gateway cost, so this is the number to reason about when the
 // concurrent figures look alarming.
 TEST_P(CorpusIT, SequentialBaselineSeparatesGatewayCostFromQueueing)
 {
@@ -1035,13 +1035,13 @@ TEST_P(CorpusIT, SequentialBaselineSeparatesGatewayCostFromQueueing)
 //
 // This exists to answer a specific question honestly: the 100-client runs report
 // client-observed latency in the 10 ms range, and it is fair to ask whether the
-// gateway is slow. It is not — that figure is Little's law applied to one
+// gateway is slow. It is not; that figure is Little's law applied to one
 // single-threaded loop, and this sweep shows it arriving right on schedule.
 //
 // It also shows the cost of turning the concurrency down: fewer clients means fewer
 // pooled upstream connections, which is exactly the thing the correlation test needs
 // in order to be able to observe a cross-client desync at all. So the sweep informs
-// the trade-off rather than settling it.
+// the trade-off instead of settling it.
 TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
 {
     _backend.start(&_answers);
@@ -1111,8 +1111,8 @@ TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
 // The json_hostile entries ask Claude directly about \u0000, raw control
 // characters, form feed and backspace. It answers by *describing* them: 68 corpus
 // answers contain a literal backslash-u sequence as text, and ZERO contain a raw
-// control byte. So that category exercises backslash and \u-literal handling — real
-// and worth having — but not the byte class where the control-character defect lived.
+// control byte. So that category exercises backslash and \u-literal handling: real
+// and worth having, but not the byte class where the control-character defect lived.
 //
 // Recorded model output cannot cover this, so cover it deterministically. Both
 // directions matter and they have different correct answers:
@@ -1139,7 +1139,7 @@ TEST_P(CorpusIT, ControlBytesAreRoundTrippedWhenEscapedAndRefusedWhenRaw)
         EXPECT_NE(resp.find("200 OK"), std::string::npos);
 
         // The body we hand the client must itself be legal JSON: no raw control byte
-        // after the header block. This is exactly the 0.9.0 defect — a 200
+        // after the header block. This is exactly the 0.9.0 defect: a 200
         // whose body Python's json.loads rejects.
         const size_t hdr = resp.find("\r\n\r\n");
         ASSERT_NE(hdr, std::string::npos);
@@ -1181,7 +1181,7 @@ TEST_P(CorpusIT, ControlBytesAreRoundTrippedWhenEscapedAndRefusedWhenRaw)
 // ---------------------------------------------------------------- negative controls
 //
 // The two tests above pass. That is only meaningful if they would FAIL when the
-// property they check is violated — a test that has never failed is decoration,
+// property they check is violated. A test that has never failed is decoration,
 // the same reasoning that makes every security fix here ship with a test that
 // fails without it. These two break the property on purpose and assert the
 // harness notices. If either of these ever passes silently, the tests above are
@@ -1189,7 +1189,7 @@ TEST_P(CorpusIT, ControlBytesAreRoundTrippedWhenEscapedAndRefusedWhenRaw)
 
 TEST_P(CorpusIT, NegativeControl_DetectsResponseMixing)
 {
-    // The provider answers every question with question 0's answer — exactly what a
+    // The provider answers every question with question 0's answer, exactly what a
     // client would observe if a pooled-connection desync handed it another client's
     // response body.
     _backend.set_wrong_answer(corpus()[0].a);
@@ -1212,7 +1212,7 @@ TEST_P(CorpusIT, NegativeControl_DetectsResponseMixing)
     }
     cl.close();
     EXPECT_EQ(detected, checked)
-        << "the correlation check did NOT notice deliberately mixed responses — "
+        << "the correlation check did NOT notice deliberately mixed responses; "
            "ThousandQuestionsAcrossHundredClients is not actually verifying correlation";
     std::printf("[ %-5s ] negative control: %d/%d mixed responses detected\n",
                 GetParam() == IoBackend::Epoll ? "epoll" : "uring", detected, checked);
@@ -1222,7 +1222,7 @@ TEST_P(CorpusIT, NegativeControl_DetectsEscapingRegression)
 {
     // The provider stops escaping the answer text. For answers containing a quote,
     // newline or backslash the body is now invalid JSON, so the gateway must reject
-    // it (non-200) rather than forward something malformed; for the rest the text
+    // it (non-200) instead of forward something malformed; for the rest the text
     // arrives altered. Either way the client must not see the correct answer.
     _backend.set_skip_escaping(true);
     start();
@@ -1248,9 +1248,9 @@ TEST_P(CorpusIT, NegativeControl_DetectsEscapingRegression)
         const bool ok_status = resp.find("200 OK") != std::string::npos;
         if (!ok_status || answer_of(resp) != qa.a) ++caught;
     }
-    ASSERT_GT(checked, 0) << "no answers in the corpus require escaping — regenerate it";
+    ASSERT_GT(checked, 0) << "no answers in the corpus require escaping; regenerate it";
     EXPECT_EQ(caught, checked)
-        << "an unescaped provider body was accepted AND round-tripped as correct — "
+        << "an unescaped provider body was accepted AND round-tripped as correct; "
            "TextStressAnswersRoundTripByteForByte is not actually verifying escaping";
     std::printf("[ %-5s ] negative control: %d/%d escaping regressions detected\n",
                 GetParam() == IoBackend::Epoll ? "epoll" : "uring", caught, checked);

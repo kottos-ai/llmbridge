@@ -13,7 +13,7 @@ concurrency:
 jobs:
   # Runs first and finishes in under a second: it needs no compiler and no build.
   # Guards the ep_/ur_ backend split, which is what stops a call landing in the
-  # wrong event loop — the two backends' teardown and I/O are not interchangeable,
+  # wrong event loop: the two backends' teardown and I/O are not interchangeable,
   # and one such crossing shipped undetected before this existed.
   conventions:
     name: naming conventions
@@ -24,7 +24,7 @@ jobs:
         run: python3 scripts/check_conventions.py
       # Cheap last line of defence, not a gitleaks replacement. `private/` (live-key
       # demo scripts, price observatory) shares this working tree with the public
-      # repo, separated only by .gitignore — one mis-added file is unrecoverable
+      # repo, separated only by .gitignore, so one mis-added file is unrecoverable
       # once pushed.
       - name: Check no credentials are tracked
         run: python3 scripts/check_no_secrets.py
@@ -61,9 +61,9 @@ jobs:
 
   # macOS builds the EMBEDDABLE LIBRARY only, which is the portable half and the whole
   # "drop it into your binary" story. The gateway is Linux-only by design (epoll and
-  # io_uring), so this job deliberately does not build it — that is the supported
+  # io_uring), so this job deliberately does not build it; that is the supported
   # boundary, not a gap. Configure succeeds because net/ feature-detects io_uring
-  # rather than assuming it.
+  # instead of assuming it.
   macos-library:
     name: library · macOS
     runs-on: macos-14
@@ -116,7 +116,7 @@ jobs:
       # -artifact_prefix sends crash/timeout/OOM reproducers to one directory so the
       # upload step below can collect them. libFuzzer requires the trailing slash and
       # the directory to exist. Without this the reproducer is written to the runner's
-      # CWD and discarded when the job ends — leaving a red X and no way to reproduce
+      # CWD and discarded when the job ends, leaving a red X and no way to reproduce
       # it, which for a randomised fuzzer means the finding is simply lost.
       - name: Prepare artifact directory
         run: mkdir -p fuzz-artifacts
@@ -132,7 +132,7 @@ jobs:
         run: ./build-fuzz/bin/fuzz_sse -max_total_time=60 -max_len=8192 -print_final_stats=1
              -artifact_prefix=fuzz-artifacts/ fuzz/corpus/sse
 
-      # if: failure() — runs only when a fuzz step above failed, and still runs even
+      # if: failure() runs only when a fuzz step above failed, and still runs even
       # though that failure aborts the rest of the job. Reproduce locally with:
       #   ./build-fuzz/bin/fuzz_json <downloaded-crash-file>
       - name: Upload crash reproducers
@@ -145,8 +145,8 @@ jobs:
           retention-days: 30
 
   # Builds a downstream project against an INSTALLED llmbridge, exactly as the README
-  # tells a user to. Nothing else here touches the install tree — the suite builds
-  # in-tree — so a broken export, a header that does not stand alone, or a renamed
+  # tells a user to. Nothing else here touches the install tree; the suite builds
+  # in-tree, so a broken export, a header that does not stand alone, or a renamed
   # public namespace would pass every other job and break only for the consumer.
   # v0.9.0 moved `llmbridge::json` inside an installed header; this is what would
   # have caught it.

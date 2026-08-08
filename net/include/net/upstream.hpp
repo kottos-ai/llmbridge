@@ -15,14 +15,14 @@
 //   http://HOST[:PORT]      default port 80              -> plain HTTP
 //   https://HOST[:PORT]     default port 443             -> TLS
 //
-// Deliberately rejected, with a reason in `error` rather than a guess:
-//   - userinfo ("https://a@b") — the classic URL-confusion trick where the
+// Deliberately rejected, with a reason in `error` instead of a guess:
+//   - userinfo ("https://a@b"), the classic URL-confusion trick where the
 //     eyeball host and the connect host differ
-//   - path/query/fragment beyond a bare "/" — the gateway forwards the CLIENT's
+//   - path/query/fragment beyond a bare "/", because the gateway forwards the CLIENT's
 //     path; silently dropping a base path here would misroute every request
-//   - IPv6 literals — the transport stack is sockaddr_in/AF_INET end to end;
+//   - IPv6 literals: the transport stack is sockaddr_in/AF_INET end to end;
 //     half-accepting "[::1]:443" would fail later with a worse message
-//   - hosts with characters outside [A-Za-z0-9.-] — the host string is later
+//   - hosts with characters outside [A-Za-z0-9.-]: the host string is later
 //     written into an HTTP Host header and the TLS SNI field, so a stray CR/LF
 //     here is a header-injection primitive, not a typo
 //
@@ -38,7 +38,7 @@ namespace llmbridge::net
 {
     struct UpstreamSpec
     {
-        std::string host;   ///< as written — DNS name or IPv4 literal; feeds Host header + SNI
+        std::string host;   ///< as written. DNS name or IPv4 literal; feeds Host header + SNI
         uint16_t port{0};
         bool tls{false};
         std::string error;  ///< non-empty => parse failed, other fields unspecified
@@ -50,7 +50,7 @@ namespace llmbridge::net
     [[nodiscard]] UpstreamSpec parse_upstream(std::string_view arg);
 
     /// Resolve a host to IPv4 dotted-quad strings via getaddrinfo (A records only,
-    /// deduplicated, resolver order preserved — order matters once failover lands).
+    /// deduplicated, resolver order preserved; order matters once failover lands).
     /// An IPv4 literal passes through as itself without touching the resolver.
     /// Empty result => failure, with the getaddrinfo reason in *err if given.
     [[nodiscard]] std::vector<std::string> resolve_host_ipv4(const std::string& host,

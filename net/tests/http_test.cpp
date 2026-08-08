@@ -18,10 +18,10 @@
 //   - Lenient   : documented parser quirks (identical dup CL collapses, "closed"
 //                 prefix-matching "close"). NOTE: "trailing garbage after CL is
 //                 accepted" used to live here as a quirk. It was a smuggling
-//                 primitive, not a quirk — see the HttpDesync suite, which now
+//                 primitive, not a quirk; see the HttpDesync suite, which now
 //                 asserts the rejection.
 //   - HttpDesync: framing-desync regressions from the 2026-08-03 security sweep.
-//   - Incremental: byte-by-byte arrival property — every proper prefix is
+//   - Incremental: byte-by-byte arrival property; every proper prefix is
 //                 NeedMore and never a false Complete/Error.
 
 #include "net/http.hpp"
@@ -154,7 +154,7 @@ namespace
         v.push_back({"oversize_no_terminator", "POST / HTTP/1.1\r\n" + std::string(kMaxHeaderLen + 50, 'a')});
         v.push_back({"oversize_with_terminator",
                      "POST / HTTP/1.1\r\nX-Big: " + std::string(kMaxHeaderLen, 'b') + "\r\n\r\n"});
-        // Hardening: reject Transfer-Encoding (we frame by CL only — anti-smuggling),
+        // Hardening: reject Transfer-Encoding (we frame by CL only, anti-smuggling),
         // conflicting duplicate Content-Length, and an over-cap body length.
         v.push_back({"transfer_encoding_chunked",
                      "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"});
@@ -266,7 +266,7 @@ INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_increm
 // Every case below was MEASURED against the pre-fix framer. Six of the seven had
 // the identical signature: parse_request() returned Complete with body_len == 0 while the
 // body sat unconsumed in the buffer. In passthrough mode the gateway then forwards
-// the header block verbatim — malformed header included — so an upstream that
+// the header block verbatim (malformed header included) so an upstream that
 // reads the length we could not becomes a desync, and because the upstream pool is
 // SHARED, that desync crosses clients. Hence: refuse, never re-interpret.
 //
@@ -287,7 +287,7 @@ namespace
 TEST(HttpDesync, NonNumericContentLengthIsRejected)
 {
     // std::from_chars stops at the first non-digit and still reports success, so
-    // "5x" parsed as 5 and "0x1b" as 0 — the latter framing a 27-byte body empty.
+    // "5x" parsed as 5 and "0x1b" as 0, the latter framing a 27-byte body empty.
     expect_rejected(build("POST", {"Content-Length: 5x"}, "hello"), "trailing garbage");
     expect_rejected(build("POST", {"Content-Length: 0x5"}, "hello"), "hex-looking");
     expect_rejected(build("POST", {"Content-Length: +5"}, "hello"), "leading plus");
@@ -339,7 +339,7 @@ TEST(HttpDesync, LegalContentLengthFormsStillAccepted)
 TEST(HttpDesync, ResponseWithBothChunkedAndContentLengthIsRejected)
 {
     // The two framings disagree about where the body ends. Whichever we pick, the
-    // other is what some intermediary picked — and a mis-framed response leaves
+    // other is what some intermediary picked, and a mis-framed response leaves
     // stray bytes on the POOLED connection, i.e. in the next client's response.
     const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
                             "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
@@ -371,7 +371,7 @@ TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 TEST(HttpQuirk, DuplicateContentLengthIdenticalIsAccepted)
 {
     // Identical repeats are harmless and collapse to one (a conflicting duplicate
-    // is rejected — see the HttpError `dup_content_length_conflict` case).
+    // is rejected; see the HttpError `dup_content_length_conflict` case).
     Message m;
     ASSERT_EQ(parse_request(build("POST", {"Content-Length: 5", "Content-Length: 5"}, "hello"), m),
               FrameStatus::Complete);
@@ -519,7 +519,7 @@ TEST(HttpChunkedResponse, IncrementalArrivalDecodesExactlyOnce)
 TEST(HttpChunkedResponse, ResetAllowsReuseOnAPooledConnection)
 {
     // A pooled upstream serves many responses. Without reset() the second decode
-    // would resume mid-stream and mis-frame — i.e. serve one client another's bytes.
+    // would resume mid-stream and mis-frame; i.e. serve one client another's bytes.
     llmbridge::net::http::ResponseDecoder st;
     for (int i = 0; i < 3; ++i)
     {
@@ -536,7 +536,7 @@ TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
 {
     // The deterministic form of "not quadratic". A timing assertion was tried
     // first and flaked on allocator warmth, which is exactly the kind of test
-    // people learn to ignore — so assert the invariant that actually matters:
+    // people learn to ignore, so assert the invariant that actually matters:
     // across the whole incremental arrival, the decoder's consumed count only
     // ever moves FORWARD, and each step is bounded by the bytes that just
     // arrived. Re-decoding from byte zero violates both.
@@ -552,8 +552,8 @@ TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
         const auto r = llmbridge::net::http::parse_response(rbuf, st);
         ASSERT_NE(r.status, llmbridge::net::http::FrameStatus::Error);
         const size_t now = st.dec.consumed();
-        EXPECT_GE(now, prev) << "decoder went backwards — re-decoding from the start";
-        EXPECT_LE(now - prev, read_size) << "consumed more than just arrived — re-fed old bytes";
+        EXPECT_GE(now, prev) << "decoder went backwards: re-decoding from the start";
+        EXPECT_LE(now - prev, read_size) << "consumed more than just arrived: re-fed old bytes";
         total_steps += now - prev;
         prev = now;
     }

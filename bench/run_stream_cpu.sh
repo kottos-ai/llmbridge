@@ -11,7 +11,7 @@
 #
 # Why this exists: io_uring issues 2.31 fewer syscalls per delivered token than epoll
 # (measured with strace), but a syscall costs ~537 ns here, so the whole saving is
-# ~1.24 us/token — under 4% of the added latency and below run-to-run variance. It is
+# ~1.24 us/token: under 4% of the added latency and below run-to-run variance. It is
 # therefore INVISIBLE on the latency axis. If io_uring is worth anything on the
 # streaming path it must show up as CPU EFFICIENCY (less CPU burned per token) and
 # hence as HEADROOM (a later knee). This script measures those two axes directly.
@@ -44,7 +44,7 @@ ticks_per_s=$(getconf CLK_TCK)
 cpu_ticks(){ awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
 
 # This reference box is a mobile i7-9750H that reaches TjMax under sustained load and
-# throttles. That is not a transient to wait out — it cannot be held cool while
+# throttles. That is not a transient to wait out; it cannot be held cool while
 # benchmarking. So record the thermal state per level: if late levels are throttled
 # harder than early ones, the "knee" is partly thermal and the data must say so.
 pkg_temp_c(){ local t; t=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -rn | head -1); echo $(( ${t:-0} / 1000 )); }
@@ -119,15 +119,15 @@ phase(){
   cleanup; PIDS=(); sleep 2
 }
 
-echo "llmbridge streaming CPU-efficiency + saturation — $STAMP"
+echo "llmbridge streaming CPU-efficiency + saturation, $STAMP"
 echo "host: $(uname -r), idle states: $(paste -d/ <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name | tr '\n' ' ') <(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/disable | tr '\n' ' '))"
 echo "NOTE: cpu is process-wide utime+stime over the whole run (incl. warmup), divided by"
 echo "      total chunks; identical treatment for both backends, so the RATIO is the result."
 
-phase "PHASE 1 — tokens/s scaling (stream count and token rate rise together)" \
+phase "PHASE 1: tokens/s scaling (stream count and token rate rise together)" \
       20000 50 64 256 512 1024 2048 2560 3072 3584 4096
 
-phase "PHASE 2 — connection scaling (token rate kept inside provider capacity)" \
+phase "PHASE 2: connection scaling (token rate kept inside provider capacity)" \
       100000 10 1024 2048 4096 6144 8192
 
 echo

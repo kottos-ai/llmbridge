@@ -9,7 +9,7 @@
 
 // Internal helpers shared by the two translators when producing OpenAI-shaped
 // output: the whole-body path (translate.cpp) and the streaming path (sse.cpp).
-// NOT public API — lives in src/, not include/. Kept in one place so the two
+// NOT public API: it lives in src/, not include/. Kept in one place so the two
 // paths can't drift: a new Anthropic stop_reason (or a change to how `created`
 // is stamped) must land identically for streaming and non-streaming.
 
@@ -23,7 +23,7 @@ namespace llmbridge::provider::detail
     // Append a raw (already JSON-escaped) span, neutralising C0 control bytes as
     // \u00XX. Our JSON parser is lenient and accepts a literal control char inside
     // a string, so a passthrough span from an untrusted upstream can carry bytes
-    // that are ILLEGAL in strict JSON (RFC 8259 §7) — emitting them would make our
+    // that are ILLEGAL in strict JSON (RFC 8259 §7); emitting them would make our
     // own output unparseable to a strict client. Bulk-copies the clean runs, so
     // the common (control-free) case is a memcpy.
     inline void append_sanitized(std::string& out, std::string_view raw)
@@ -43,7 +43,7 @@ namespace llmbridge::provider::detail
         out.append(raw.data() + start, raw.size() - start);
     }
 
-    // Parse a JSON number's raw text. Returns 0 for empty/garbage — usage counts
+    // Parse a JSON number's raw text. Returns 0 for empty/garbage; usage counts
     // are advisory, so a malformed one must not fail a translation.
     inline long long to_ll(std::string_view s)
     {

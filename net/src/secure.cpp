@@ -6,7 +6,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // Out-of-line on purpose. _GNU_SOURCE must be defined before ANY libc header for
-// explicit_bzero to be declared, which a header cannot reliably guarantee — and
+// explicit_bzero to be declared, which a header cannot reliably guarantee, and
 // the caller should not have to care. The call cost is irrelevant here (once per
 // request, off the token path).
 #ifndef _GNU_SOURCE
@@ -30,7 +30,7 @@ namespace llmbridge::net
     {
         // Last-resort barrier: a memset reached through a volatile function pointer.
         // The compiler cannot prove what it points to, so it cannot elide the call.
-        // Correct everywhere, but used only when no named primitive exists — see the
+        // Correct everywhere, but used only when no named primitive exists; see the
         // header for why "works for an indirect reason" is a real downside.
         void* (*const volatile memset_barrier)(void*, int, size_t) = &std::memset;
     } // namespace

@@ -79,7 +79,7 @@ namespace llmbridge
         // Anthropic's REQUIRED versioning header. Pinned, not passthrough-only:
         // an OpenAI-SDK client has never heard of it, and without it the API
         // rejects the request outright. A client that DOES send its own value
-        // wins (see auth_headers_for) — the pin is a default, not an override.
+        // wins (see auth_headers_for); the pin is a default, not an override.
         constexpr std::string_view kAnthropicVersionDefault = "2023-06-01";
 
         // Build the auth/extra header lines to inject into the translated
@@ -90,18 +90,18 @@ namespace llmbridge
         // cross the translation boundary. Echoing arbitrary client headers
         // through a rebuilt request is a smuggling surface (and our own framing
         // headers must stay authoritative). TranslateMode::None is untouched by
-        // all of this — byte-forwarding already carries every client header.
+        // all of this: byte-forwarding already carries every client header.
         //
         // Values re-emitted here cannot contain CR/LF: find_header() bounds each
         // value by its own line's CRLF, so injection via a crafted credential is
-        // structurally impossible rather than filtered.
+        // structurally impossible instead of filtered.
         //
         // The credential is handled as a transient string_view over the client's
-        // request buffer and written straight into the upstream bytes — it is
+        // request buffer and written straight into the upstream bytes; it is
         // never copied anywhere that outlives the request, and never logged.
         // Erase a credential-bearing buffer before it is released or pooled.
         // See net/secure.hpp for why this is not just memset, and why it is a
-        // detected platform primitive rather than a compiler trick.
+        // detected platform primitive instead of a compiler trick.
         //
         // Scope is deliberately narrow: the only place a credential OUTLIVES its
         // request is a pooled upstream, which idles up to kIdleUpstreamNs (30 s)
@@ -114,7 +114,7 @@ namespace llmbridge
         // Is this safe to re-emit as an HTTP header VALUE?
         //
         // Do NOT trust find_header() to have made this safe. It splits on CRLF, so
-        // a value may still contain a BARE CR (or LF, NUL, any control byte) — and
+        // a value may still contain a BARE CR (or LF, NUL, any control byte), and
         // a lenient upstream parser that treats bare CR as a line terminator would
         // then see an injected header. That is not hypothetical: it was measured
         // reaching the upstream as `x-api-key: sk\rX-Smuggled: yes` before this
@@ -123,7 +123,7 @@ namespace llmbridge
         // smuggling on one is a cross-client request-splitting vector.
         //
         // RFC 7230 field-value permits obs-text (0x80-0xFF); we are deliberately
-        // stricter — a provider API key is printable ASCII, and narrowing the
+        // stricter. A provider API key is printable ASCII, and narrowing the
         // charset costs us nothing real.
         bool header_value_safe(std::string_view v) noexcept
         {
@@ -143,8 +143,8 @@ namespace llmbridge
 
         // Every credential header we might care about, collected in ONE pass.
         //
-        // The first version called find_header() six times — four to validate, then
-        // up to two to fetch — i.e. six full walks of the client's header block per
+        // The first version called find_header() six times: four to validate, then
+        // up to two to fetch; i.e. six full walks of the client's header block per
         // request. Measured on a thermally-gated A/B at 20k RPS that cost ~40 us at
         // p99 (~8%), with p50 unchanged: exactly the shape of "a little extra work
         // on every request". One walk removes it.
@@ -183,8 +183,8 @@ namespace llmbridge
         }
 
         // Returns false when the client supplied a syntactically invalid credential
-        // (control characters). The caller MUST fail the request rather than
-        // forward — silently dropping would still send a credential-less request
+        // (control characters). The caller MUST fail the request instead of
+        // forward. Silently dropping would still send a credential-less request
         // upstream, which is a confusing 401; a 400 names the client's own bug.
         bool auth_headers_for(TranslateMode mode, std::string_view client_headers, std::string& out)
         {
@@ -192,14 +192,14 @@ namespace llmbridge
             const AuthHeaders h = scan_auth_headers(client_headers);
 
             // Validate every credential-bearing header the client sent, whether or
-            // not this dialect uses it — otherwise a malformed value routes around
+            // not this dialect uses it. Otherwise a malformed value routes around
             // the check by picking the other header.
             for (const std::string_view v :
                  {h.authorization, h.x_api_key, h.x_goog_api_key, h.anthropic_version})
                 if (!v.empty() && !header_value_safe(v)) return false;
 
             // "Bearer K" -> K (bearer scheme only; anything else is not a provider
-            // API key and is dropped rather than guessed at).
+            // API key and is dropped instead of guessed at).
             const auto bearer = [&]() -> std::string_view {
                 const std::string_view v = h.authorization;
                 if (v.size() > 7 &&
@@ -290,30 +290,30 @@ namespace llmbridge
         //                             absolute value: what orders two requests
         //                             against each other, which is why it is here
         //                             at all. Strictly increasing within a process.
-        //   x-llmbridge-gateway-us    (t1-t0) + (t5-t4) — OUR compute, and nothing
+        //   x-llmbridge-gateway-us    (t1-t0) + (t5-t4); OUR compute, and nothing
         //                             else: framing, translation, auth mapping,
         //                             re-serialisation. It ends at t5 because the
         //                             number travels INSIDE the response and so
         //                             cannot include the cost of sending itself.
-        //   x-llmbridge-connect-us    (t2-t1) — the handshake ALONE: ~50-80 ms cold,
+        //   x-llmbridge-connect-us    (t2-t1): the handshake ALONE, ~50-80 ms cold,
         //                             exactly 0 on a pooled connection. Same span as
         //                             the connect(TLS) histogram, same function.
-        //   x-llmbridge-upwrite-us    (t3-t2) — the write() into the socket buffer.
+        //   x-llmbridge-upwrite-us    (t3-t2): the write() into the socket buffer.
         //                             Split out of connect-us because folding them
         //                             gave one name two meanings across the two
         //                             reporting surfaces. t2 was already stamped for
         //                             the histogram, so this cost a header line and
         //                             no extra clock reads.
-        //   x-llmbridge-upstream-us   (t4-t3) — the provider: network + inference.
+        //   x-llmbridge-upstream-us   (t4-t3): the provider, network + inference.
         //
-        // Why connect is split out rather than folded into gateway-us: measured
+        // Why connect is split out instead of folded into gateway-us: measured
         // against the live API, a COLD connection put 56 ms of TCP+TLS setup inside
         // the "gateway" figure while the same gateway needed 47-63 us once pooled.
         // A customer reading 56 ms as our overhead would be right to walk away, and
         // wrong about the software. One number cannot honestly carry both.
         //
         // Streaming cannot report t4 (headers precede the body), so it emits t0 and
-        // x-llmbridge-upstream-ttfb-us instead — time to the provider's first byte.
+        // x-llmbridge-upstream-ttfb-us instead: time to the provider's first byte.
         //
         // Metadata only, by construction: durations and one timestamp. No prompt,
         // no completion, no token text. "Prompt content is never logged" is a
@@ -334,17 +334,17 @@ namespace llmbridge
         // WHY THIS EXISTS AT ALL: two requests can share a nanosecond, and clocks on
         // different hosts cannot be trusted to sub-millisecond agreement without PTP.
         // (t0, seq) is a total order that needs neither. This is the sequencer
-        // pattern — an exchange defines order by arrival at a sequencing point, not by
-        // comparing timestamps — and it is why the shadow order book should sequence
-        // rather than timestamp.
+        // pattern: an exchange defines order by arrival at a sequencing point, not by
+        // comparing timestamps, and it is why the tape for inference should sequence
+        // instead of timestamp.
         std::atomic<uint64_t> g_seq{0};
 
         // Pull `prompt_tokens` / `completion_tokens` out of a translated OpenAI body.
         //
         // BOUNDED on purpose: `usage` is the last object in the response we build, so
-        // this searches only the tail rather than scanning a body that may be many KB
-        // of completion text. On no match the headers are simply omitted — the
-        // existing rule everywhere in this file is to omit rather than report a
+        // this searches only the tail instead of scanning a body that may be many KB
+        // of completion text. On no match the headers are simply omitted. The
+        // existing rule everywhere in this file is to omit instead of report a
         // number we did not measure.
         struct BodyUsage { long long in = -1, out = -1; };
 
@@ -378,7 +378,7 @@ namespace llmbridge
                                    int64_t upstream_us, const char* upstream_key)
         {
             const auto add = [&out](const char* k, int64_t v) {
-                if (v < 0) return; // a stamp we never took; omit rather than lie
+                if (v < 0) return; // a stamp we never took; omit instead of lie
                 out.append(k);
                 out.append(": ");
                 out.append(std::to_string(v));
@@ -398,7 +398,7 @@ namespace llmbridge
 
         // Token counts, non-streaming only. A stream cannot carry these: headers
         // precede the body, and both the token totals and the chunk count are
-        // end-of-stream facts. They are NOT invented for streams — a streaming client
+        // end-of-stream facts. They are NOT invented for streams. A streaming client
         // that wants them sets `stream_options.include_usage` and reads the provider's
         // own counts from the final chunk.
         void append_usage_headers(std::string& out, std::string_view translated_body)
@@ -464,7 +464,7 @@ namespace llmbridge
         // Build a response that PRESERVES the upstream status code. Used to relay a
         // provider's own failure (429 rate limit, 529 overloaded, 400 context
         // length, 401 auth) to the client instead of flattening it to a gateway
-        // 502 — the client needs the real code to decide whether to back off/retry.
+        // 502. The client needs the real code to decide whether to back off/retry.
         std::string build_http_status(int status, std::string_view reason, std::string_view body)
         {
             std::string out = "HTTP/1.1 " + std::to_string(status) + " ";
@@ -502,8 +502,8 @@ namespace llmbridge
         {
             Ok,      // bytes translated (maybe none); stream continues
             Ended,   // upstream signalled end; terminal [DONE] emitted
-            Corrupt, // malformed chunked framing — drop WITHOUT a fake clean [DONE]
-            Failed   // translator refused (cap tripped / protocol error) — drop
+            Corrupt, // malformed chunked framing: drop WITHOUT a fake clean [DONE]
+            Failed   // translator refused (cap tripped / protocol error): drop
         };
 
         // The dialect/transport transform shared by the epoll and io_uring pumps:
@@ -580,7 +580,7 @@ namespace llmbridge
 #endif
         // Host header for rebuilt (translated) upstream requests. Prefer the
         // parsed hostname (rides in TlsConfig::sni_host whether or not TLS is
-        // on — real providers route/verify on it); fall back to ip:port for the
+        // on, since real providers route/verify on it); fall back to ip:port for the
         // bare IP:PORT form. Default ports are omitted per convention.
         if (!_tls.sni_host.empty())
         {
@@ -617,7 +617,7 @@ namespace llmbridge
             std::fprintf(stderr, "llmbridge: --io=uring requested but io_uring unavailable; using epoll\n");
 #endif
         const char* want = _io == IoBackend::Uring ? "uring" : _io == IoBackend::Epoll ? "epoll" : "auto";
-        std::fprintf(stderr, "llmbridge: io=%s — %s loop\n", want, _uring_active ? "io_uring" : "epoll");
+        std::fprintf(stderr, "llmbridge: io=%s, %s loop\n", want, _uring_active ? "io_uring" : "epoll");
     }
 
     Gateway::~Gateway()
@@ -625,7 +625,7 @@ namespace llmbridge
         for (auto& [id, c] : _clients)
         {
             // An in-flight (acquired, not pooled) upstream is reachable only via
-            // peer — free it too, or it leaks when we stop mid-request. (The
+            // peer: free it too, or it leaks when we stop mid-request. (The
             // io_uring loop already nulls these during its drain.)
             if (Connection* u = c->peer) { if (u->fd >= 0) ::close(u->fd); delete u; }
             if (c->fd >= 0) ::close(c->fd);
@@ -761,7 +761,7 @@ namespace llmbridge
     void Gateway::tls_pump_out(Connection* u) noexcept
     {
         // io_uring CAUTION: callers there must only pump while no SEND SQE is in
-        // flight on this conn — appending can reallocate tls_out under the kernel.
+        // flight on this conn; appending can reallocate tls_out under the kernel.
         // The SSL object's write BIO is the staging area in the meantime.
         uint8_t buf[16384];
         size_t n;
@@ -772,7 +772,7 @@ namespace llmbridge
     void Gateway::tls_push_request(Connection* u) noexcept
     {
         // Feed as much request plaintext as the Session accepts. Does NOT pump the
-        // resulting ciphertext — the two backends stage it differently.
+        // resulting ciphertext; the two backends stage it differently.
         while (u->woff < u->wbuf.size())
         {
             const auto* p = reinterpret_cast<const uint8_t*>(u->wbuf.data()) + u->woff;
@@ -796,7 +796,7 @@ namespace llmbridge
             return false;
         if (u->tls->want() == net::tls::Want::Error) return false;
 
-        // Drain whatever plaintext became available into rbuf — from here on the
+        // Drain whatever plaintext became available into rbuf. From here on the
         // existing HTTP framing / SSE pump code takes over unchanged.
         uint8_t buf[16384];
         size_t r;
@@ -852,7 +852,7 @@ namespace llmbridge
             return false;
         }
         // Feeding may have produced output (handshake flights, the request itself
-        // once the handshake completed) — put it on the wire before returning to
+        // once the handshake completed). Put it on the wire before returning to
         // the parse logic, and stamp the request-sent time on the transition.
         const bool was_flushed = u->peer && tls_request_flushed(u);
         bool done = false;
@@ -875,13 +875,13 @@ namespace llmbridge
         //                      conn it is about to close just buys a retry later
         //   stream_chunked     a close-delimited body has NO end marker except EOF,
         //                      so "the response finished" and "the connection died"
-        //                      are indistinguishable — never reuse one
+        //                      are indistinguishable, so never reuse one
         //   chunkdec.done()    the terminal 0-length chunk was consumed, so we are
-        //                      at a real message boundary rather than mid-body
+        //                      at a real message boundary instead of mid-body
         //   rbuf empty         no trailing/pipelined bytes left over; anything still
         //                      buffered would be mis-read as the NEXT response
         //   !close_after_resp  aborted, corrupt, or idle-timed-out streams are never
-        //                      pooled — we don't trust framing we already distrusted
+        //                      pooled; we don't trust framing we already distrusted
         //
         // Conservative by construction: any doubt falls through to close, which is
         // exactly the behaviour that shipped before reuse existed.
@@ -928,9 +928,9 @@ namespace llmbridge
     bool Gateway::ep_retry_upstream(Connection* u) noexcept
     {
         // Stale pooled connection: reused from the keep-alive pool, not yet retried,
-        // and failed before sending any response — the provider almost certainly
+        // and failed before sending any response. The provider almost certainly
         // dropped it idle without processing. Resend the request once on a fresh
-        // connection rather than failing the client. (Same rule as the io_uring path.)
+        // connection instead of failing the client. (Same rule as the io_uring path.)
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
         Connection* client = u->peer;
         if (!client) return false;
@@ -942,7 +942,7 @@ namespace llmbridge
         uf->is_client = false;
         uf->from_pool = false;
         uf->retried = true; // this request's one allowed retry is now spent
-        uf->wbuf = std::move(u->wbuf); // PLAINTEXT — re-pushed through the new session
+        uf->wbuf = std::move(u->wbuf); // PLAINTEXT, re-pushed through the new session
         uf->woff = 0;
         uf->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -967,7 +967,7 @@ namespace llmbridge
 
     void Gateway::ep_release_upstream(Connection* u) noexcept
     {
-        // Bounded pool: past the cap, close rather than accumulate. A streaming
+        // Bounded pool: past the cap, close instead of accumulate. A streaming
         // gateway pools roughly one upstream per concurrent stream, so an unbounded
         // pool would pin an fd per stream forever.
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { ep_close_upstream(u); return; }
@@ -975,12 +975,12 @@ namespace llmbridge
         u->rbuf.clear();
         u->rdec.reset();
         // wbuf held the REBUILT REQUEST, including the client's credential, and this
-        // connection may now idle for 30 s. Scrub rather than clear.
+        // connection may now idle for 30 s. Scrub instead of clear.
         secure_clear(u->wbuf);
         u->woff = 0;
         u->msg = net::http::Message{};
 #ifdef LLMBRIDGE_HAVE_TLS
-        u->tls_out.clear(); // per-request ciphertext; the Session itself is KEPT —
+        u->tls_out.clear(); // per-request ciphertext; the Session itself is KEPT
         u->tls_out_off = 0; // pooled reuse must not pay a second handshake
 #endif
         u->ts_pooled = now_ns(); // idle-eviction baseline
@@ -1027,7 +1027,7 @@ namespace llmbridge
         // a trap: a caller copied from one side to the other inherits the wrong
         // assumption silently.
         if (!client || client->doomed) return;
-        // We're replying to the client ourselves — drop any in-flight upstream.
+        // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
         client->wbuf = build_error(code);
         client->woff = 0;
@@ -1100,7 +1100,7 @@ namespace llmbridge
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
             if (tbody.empty()) { ep_error_respond(c, 400); return; }
-            // Remember whether the client asked for a final usage chunk — the
+            // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
@@ -1224,7 +1224,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
             // TLS parity with the io_uring path: a FATAL session error (bad record,
             // MAC failure) mid-stream must ABORT the client, never finalize the
-            // stream as clean — a corrupted stream that ends in a well-formed
+            // stream as clean: a corrupted stream that ends in a well-formed
             // [DONE] would hide the corruption from the client entirely. Only a
             // real transport EOF may end a close-delimited stream normally.
             if (u->tls && u->tls->want() == net::tls::Want::Error && client && client->streaming)
@@ -1255,19 +1255,19 @@ namespace llmbridge
             if (hs == net::http::FrameStatus::Error) { ep_error_respond(client, 502); return; }
             // Only a 200 carries a real event stream. A provider error (429 rate
             // limit, 529 overloaded, 400 context length, 401 auth) must reach the
-            // client with ITS status — relayed below once the body is framed —
+            // client with ITS status (relayed below once the body is framed)
             // never laundered into a 200 stream.
             if (h.event_stream && h.status == 200)
             {
                 // t4 for a stream: the provider's response HEAD is now complete.
-                // NOT the first token, and not the first data chunk — a provider
+                // NOT the first token, and not the first data chunk. A provider
                 // MAY send 200 + content-type as soon as it ACCEPTS the stream,
                 // well before its first generated token. Anthropic does NOT: measured
                 // 2026-08-06, its head trails its first token by ~1 ms, so for that
                 // provider this tracks TTFT closely. That is a per-provider fact, not
-                // a protocol guarantee — see LATENCY.md §3 before assuming it holds.
+                // a protocol guarantee; see LATENCY.md §3 before assuming it holds.
                 // The non-streaming path stamps this after framing, which this branch
-                // returns before reaching — so stamp it here or it stays 0 and the
+                // returns before reaching, so stamp it here or it stays 0 and the
                 // TTFB timing header reports garbage.
                 client->ts_up_recvd = now_ns();
                 ep_begin_stream(u, h);
@@ -1295,7 +1295,7 @@ namespace llmbridge
         {
             const std::string_view body = body_buf;
             // Relay a provider failure with ITS OWN status + message (rate limit,
-            // overloaded GPU, context length, auth) — translating a non-200 body as
+            // overloaded GPU, context length, auth); translating a non-200 body as
             // if it were a completion would fail and mask it as a generic 502.
             if (h.status != 0 && h.status != 200)
             {
@@ -1335,7 +1335,7 @@ namespace llmbridge
         else
         {
             // Passthrough: forward the upstream's own bytes. A chunked response is
-            // re-framed with Content-Length rather than relayed verbatim — we have
+            // re-framed with Content-Length instead of relayed verbatim; we have
             // already decoded it, and handing the client a chunked body we did not
             // re-verify would push our framing problem downstream.
             if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
@@ -1345,7 +1345,7 @@ namespace llmbridge
 
         // Response fully read -> upstream is free. Pool it only if it will stay
         // open (response keep-alive, and for passthrough the client didn't ask to
-        // close); otherwise it's about to close, so drop it rather than reuse a
+        // close); otherwise it's about to close, so drop it instead of reuse a
         // stale connection.
         const bool pool_upstream =
             h.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
@@ -1379,7 +1379,7 @@ namespace llmbridge
     void Gateway::ep_finish_client(Connection* c) noexcept
     {
         // Error replies (close_after_resp) are counted in _stats.errors, not the
-        // latency histograms — their timing stamps are unset and would be garbage.
+        // latency histograms; their timing stamps are unset and would be garbage.
         if (!c->close_after_resp)
         {
             const int64_t ts_resp_sent = now_ns();
@@ -1431,7 +1431,7 @@ namespace llmbridge
             // t4 = provider's first response byte, stamped by the caller.
             std::string timing;
             // t5 = t4: a stream's response is not built at one instant, so the
-            // compute leg is the request side alone rather than an invented figure.
+            // compute leg is the request side alone instead of an invented figure.
             const TimingSplit sp = timing_split(
                 client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
                 client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
@@ -1460,7 +1460,7 @@ namespace llmbridge
         {
             // Truncate honestly: flush what we already translated, then close
             // WITHOUT a terminal [DONE] so the client sees an aborted stream
-            // rather than a fabricated clean finish.
+            // instead of a fabricated clean finish.
             client->stream_ended = true;
             client->close_after_resp = true;
             ++_stats.errors;
@@ -1488,7 +1488,7 @@ namespace llmbridge
     }
 
     // Write buffered SSE to the client. If it doesn't all go, finish on writability
-    // and pause upstream reads (backpressure). On full flush, resume upstream — or
+    // and pause upstream reads (backpressure). On full flush, resume upstream, or
     // finalize if the stream has ended.
     void Gateway::ep_stream_flush(Connection* client) noexcept
     {
@@ -1532,7 +1532,7 @@ namespace llmbridge
     // periodic tick, so an idle gateway costs one cheap scan per tick. A client
     // that hasn't been answered yet gets a real 504; a live stream (headers already
     // sent) is closed WITHOUT a terminal [DONE], so the client sees a truncated
-    // stream rather than a fabricated clean finish.
+    // stream instead of a fabricated clean finish.
     void Gateway::sweep_idle(bool uring) noexcept
     {
         const int64_t now = now_ns();
@@ -1540,7 +1540,7 @@ namespace llmbridge
         _last_sweep_ns = now;
 
         // Reap idle pooled upstreams. Providers close idle keep-alives on their own
-        // schedule, and discovering a corpse costs a request its retry — so drop them
+        // schedule, and discovering a corpse costs a request its retry, so drop them
         // first. Pooled conns have peer == nullptr, so the in-flight scan below skips
         // them and would otherwise hold them forever.
         for (size_t i = 0; i < _idle_upstreams.size();)
@@ -1559,7 +1559,7 @@ namespace llmbridge
         }
 
         // The in-flight abort below is gated on the upstream idle timeout; pool
-        // eviction above is not — they are independent settings.
+        // eviction above is not; they are independent settings.
         if (_upstream_idle_ns <= 0) return;
 
         // Collect first: the teardown below erases from _clients.
@@ -1647,7 +1647,7 @@ namespace llmbridge
 
 #ifdef LLMBRIDGE_HAVE_URING
     // ════════════════════════════════════════════════════════════════════════
-    // io_uring backend (Phase 1) — a completion-driven mirror of the epoll loop.
+    // io_uring backend (Phase 1): a completion-driven mirror of the epoll loop.
     // Each request advances a small per-connection state machine: every CQE says
     // "this op finished with N bytes," we act, and submit the next op. A conn is
     // freed only when its `inflight` SQEs have all completed (no use-after-free on
@@ -1669,7 +1669,7 @@ namespace llmbridge
         constexpr unsigned kBufSize = 4096;
 
         // Cap on buffered SSE output for one stream. SSE is model-rate-limited, so
-        // this only trips for a pathologically slow client — rather than buffer
+        // this only trips for a pathologically slow client, instead of buffer
         // without bound we drop that stream. (The epoll pump instead pauses reads;
         // for a model-rate stream the cap is equivalent in practice.)
         constexpr size_t kStreamBufCap = 8 << 20; // 8 MiB
@@ -1783,7 +1783,7 @@ namespace llmbridge
     {
         // Serialized sends, same discipline as the client streaming pump: a SEND
         // SQE points into tls_out, so tls_out must be IMMUTABLE while one is in
-        // flight — appending could reallocate it under the kernel. Ciphertext
+        // flight; appending could reallocate it under the kernel. Ciphertext
         // produced meanwhile stages inside the Session's write BIO; we pump it
         // out here once the previous send has fully completed.
         if (u->send_inflight) return;
@@ -1833,7 +1833,7 @@ namespace llmbridge
     bool Gateway::ur_retry_upstream(Connection* u) noexcept
     {
         // Only safe to resend when the upstream was a pooled reuse, hasn't been
-        // retried, and gave us ZERO response bytes — i.e. the provider closed the
+        // retried, and gave us ZERO response bytes; i.e. the provider closed the
         // idle keep-alive connection without processing the request. (Industry
         // convention: retry an idempotent-or-idle-reused request that failed before
         // any response; don't retry once a partial response has been seen.)
@@ -1950,7 +1950,7 @@ namespace llmbridge
         Connection* c = ud_conn(user_data);
         // A multishot recv stays armed only while it keeps delivering data (F_MORE
         // set AND res > 0). Its terminal completion (EOF/error, res <= 0) can still
-        // carry F_MORE, so it must release the inflight slot — otherwise the drain
+        // carry F_MORE, so it must release the inflight slot, or the drain
         // never reaches zero. Only the consuming (terminal) completion decrements.
         const bool armed = (op == URecv) && (flags & IORING_CQE_F_MORE) && res > 0;
         if (!armed) { --c->inflight; --_uring_inflight; }
@@ -2003,7 +2003,7 @@ namespace llmbridge
         //
         // Measured scope, so nobody mistakes this for a fix to a live bug: on this kernel
         // (7.0) with kBufCount=4096, `uring_enobufs` stayed at **0** even at 8192
-        // concurrent streams (16384 armed recvs, 4x the pool) — the kernel ends the
+        // concurrent streams (16384 armed recvs, 4x the pool). The kernel ends the
         // multishot with res>0 and F_MORE clear under pool pressure, which the re-arm at
         // the bottom of this function already handles. So this is DEFENSIVE hardening for
         // a path that is reachable by contract but was never observed in practice; it is
@@ -2028,7 +2028,7 @@ namespace llmbridge
 
         // Copy the bytes out of the kernel-selected buffer, then return it to the
         // pool. For a TLS upstream the bytes are ciphertext: they go through the
-        // Session (tls_feed), whose plaintext lands in rbuf — the parse logic
+        // Session (tls_feed), whose plaintext lands in rbuf, so the parse logic
         // below sees only plaintext either way.
         bool tls_ok = true;
         if (flags & IORING_CQE_F_BUFFER)
@@ -2070,7 +2070,7 @@ namespace llmbridge
         else
         {
             // Upstream bytes are the response to the in-flight request. Stray data on
-            // an idle pooled upstream (no peer) means it's unusable — drop it.
+            // an idle pooled upstream (no peer) means it's unusable, so drop it.
             if (!c->peer) { ur_close(c); return; }
             c->peer->ts_up_activity = now_ns(); // upstream made progress
 
@@ -2090,7 +2090,7 @@ namespace llmbridge
                 // own status by ur_on_response below (never laundered into a 200).
                 if (h.event_stream && h.status == 200)
                 {
-                    c->peer->ts_up_recvd = now_ns(); // t4: head complete — see the epoll mirror
+                    c->peer->ts_up_recvd = now_ns(); // t4: head complete, see the epoll mirror
                     ur_begin_stream(c, h);
                     return;
                 }
@@ -2108,7 +2108,7 @@ namespace llmbridge
 
     void Gateway::ur_try_forward_buffered(Connection* c) noexcept
     {
-        // Forward the next framed request only when the client is idle — no request
+        // Forward the next framed request only when the client is idle. No request
         // in flight (peer) and no response still draining to it (wbuf).
         if (c->peer != nullptr || !c->wbuf.empty() || c->rbuf.empty()) return;
         net::http::Message m;
@@ -2133,13 +2133,13 @@ namespace llmbridge
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             std::string auth_hdrs;
             // Malformed credential => 400, and NOTHING goes upstream.
-            // (This called the EPOLL responder until the ep_/ur_ split — every
+            // (This called the EPOLL responder until the ep_/ur_ split. Every
             // other error in this function used the uring one. It was harmless,
             // but only by three accidents: `peer` is still null here so the epoll
             // upstream-close branch never ran; a ~100-byte error body always
             // completes inline so the epoll write-arm was never reached; and the
             // close path was already deferred via _doomed. The old naming made the
-            // crossing invisible — the prefixes turn it into a grep.)
+            // crossing invisible. The prefixes turn it into a grep.)
             if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { ur_error_respond(c, 400); return; }
             upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
@@ -2231,7 +2231,7 @@ namespace llmbridge
             std::string timing;
             if (_timing_headers)
             {
-                const int64_t ts_resp_built = now_ns(); // t5 — see the epoll twin
+                const int64_t ts_resp_built = now_ns(); // t5, see the epoll twin
                 const TimingSplit sp = timing_split(
                     client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
                     client->ts_up_sent, client->ts_up_recvd, ts_resp_built);
@@ -2245,14 +2245,14 @@ namespace llmbridge
         else
         {
             // See the epoll mirror: a decoded chunked body is re-framed with
-            // Content-Length rather than relayed verbatim.
+            // Content-Length instead of relayed verbatim.
             if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
             else client->wbuf.assign(u->rbuf.data(), total_len);
         }
         // Pool the upstream only if it will stay open: the response must say
         // keep-alive AND (for passthrough, where the client's Connection header was
         // forwarded verbatim) the client must not have asked to close. Otherwise the
-        // upstream is about to close on us — drop it instead of reusing a corpse.
+        // upstream is about to close on us. Drop it instead of reusing a corpse.
         const bool pool_upstream =
             h.keep_alive && (_translate != TranslateMode::None || client->msg.keep_alive);
         client->woff = 0;
@@ -2318,10 +2318,10 @@ namespace llmbridge
     void Gateway::ur_finish_client(Connection* c) noexcept
     {
         // Error replies (close_after_resp) are counted as errors, not in the latency
-        // histograms — their timing stamps are unset.
+        // histograms; their timing stamps are unset.
         if (!c->close_after_resp)
         {
-            const int64_t ts_resp_sent = now_ns(); // t6 — name matches the epoll twin
+            const int64_t ts_resp_sent = now_ns(); // t6, name matches the epoll twin
             if (ts_resp_sent - _t_start >= _warmup_ns)
             {
                 // req_path is OUR request-side work only; the wait for connect +
@@ -2350,7 +2350,7 @@ namespace llmbridge
         c->msg = net::http::Message{};
         if (close_now) { ur_close(c); return; }
         // The client's multishot recv is still armed; a pipelined next request may
-        // already sit in rbuf — forward it, else the armed recv delivers more.
+        // already sit in rbuf. Forward it, else the armed recv delivers more.
         ur_try_forward_buffered(c);
     }
 
@@ -2370,7 +2370,7 @@ namespace llmbridge
             // t4 = provider's first response byte, stamped by the caller.
             std::string timing;
             // t5 = t4: a stream's response is not built at one instant, so the
-            // compute leg is the request side alone rather than an invented figure.
+            // compute leg is the request side alone instead of an invented figure.
             const TimingSplit sp = timing_split(
                 client->ts_req_recvd, client->ts_req_built, client->ts_wire_ready,
                 client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
@@ -2421,7 +2421,7 @@ namespace llmbridge
 
     // Serialize sends: only one SEND SQE outstanding (concurrent sends on a fd would
     // interleave). wbuf is (re)filled from wpending ONLY when idle, so its bytes stay
-    // put while the kernel reads them for an in-flight SEND — no realloc-under-kernel.
+    // put while the kernel reads them for an in-flight SEND: no realloc-under-kernel.
     void Gateway::ur_stream_flush(Connection* client) noexcept
     {
         if (client->send_inflight) return; // a send is already draining wbuf
@@ -2494,7 +2494,7 @@ namespace llmbridge
         }
 
         // Graceful drain: stop taking new work, force every live fd's in-flight ops
-        // to complete, and reap until nothing is outstanding — so no kernel op
+        // to complete, and reap until nothing is outstanding, so no kernel op
         // writes into a buffer we're about to free. Acquired upstreams are reachable
         // only via client->peer, so shut those down too.
         _draining = true;

@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 # Streaming saturation hunt: push concurrency until something knees over, and say
-# WHICH thing kneed. Only the direct baseline and llmbridge are run — LiteLLM
+# WHICH thing kneed. Only the direct baseline and llmbridge are run. LiteLLM
 # saturates at ~64 streams (see run_stream_headtohead.sh), so including it here
 # would burn minutes per level to re-measure a known ceiling.
 #
@@ -80,7 +80,7 @@ wait_port "$GW_PORT" || { echo "llmbridge failed" >&2; exit 1; }
 "$BIN/streamgen" --port "$GW_PORT" --streams 32 --duration 6 --warmup 0 --label warm >/dev/null 2>&1
 
 run_one() { # port streams tag -> "p50 p99 chunks rate"
-  # NOTE: separate `local` statements — a single `local a=$1 log="...$a..."` does
+  # NOTE: separate `local` statements, because a single `local a=$1 log="...$a..."` does
   # not see the earlier assignment, which under `set -u` silently breaks the run.
   local port="$1"
   local streams="$2"
@@ -97,7 +97,7 @@ run_one() { # port streams tag -> "p50 p99 chunks rate"
 }
 
 {
-  echo "streaming saturation hunt — $(date)   io=$IO  provider=${PROVIDER:-fast}"
+  echo "streaming saturation hunt, $(date)   io=$IO  provider=${PROVIDER:-fast}"
   echo "mock: $TOKENS tokens @ ${INTERVAL}ms  (offered = streams x $(awk "BEGIN{printf \"%.0f\",1000/$INTERVAL}") chunks/s)"
   echo
   printf "%-8s | %-10s | %-28s | %-28s | %s\n" \
@@ -118,7 +118,7 @@ for S in "${STREAM_LIST[@]}"; do
   dpct=${dpct:-0}; kpct=${kpct:-0}
   verdict="ok"
   if [ "$dpct" -lt 90 ]; then
-    verdict="PROVIDER saturated (${dpct}%) — llmbridge number not meaningful here"
+    verdict="PROVIDER saturated (${dpct}%); llmbridge number not meaningful here"
   elif [ "$kpct" -lt 90 ]; then
     verdict="LLMBRIDGE saturated (${kpct}% of offered)"
   fi

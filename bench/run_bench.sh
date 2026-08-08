@@ -18,7 +18,7 @@
 # 1000 RPS.
 #
 # Everything runs on one box (mock + proxy + loadgen compete for the same 10
-# cores), so treat absolute tails as a dev-box upper bound — a clean number
+# cores), so treat absolute tails as a dev-box upper bound; a clean number
 # wants separate hosts (Phase D). The delta methodology cancels most co-location
 # noise because both legs see the same contention.
 #
@@ -61,7 +61,7 @@ python3 bench/mock_provider.py --port "$MOCK_PORT" --latency-ms "$LAT_MS" >"$RES
 sleep 1
 
 {
-  echo "llmbridge Phase A benchmark — $STAMP"
+  echo "llmbridge Phase A benchmark, $STAMP"
   echo "mock latency=${LAT_MS}ms  duration=${DUR}s  warmup=${WARMUP}s  host=$(uname -mn)"
   echo
   printf "%-7s | %-32s | %-32s | %s\n" "RPS" "DIRECT-to-mock (client e2e, ms)" "THROUGH-proxy (client e2e, ms)" "PROXY ADDED (ms)"

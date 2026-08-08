@@ -9,7 +9,7 @@
 
 """Mock OpenAI-compatible provider for the llmbridge Phase A benchmark.
 
-Pure stdlib asyncio (no aiohttp) — a raw HTTP/1.1 server that answers
+Pure stdlib asyncio (no aiohttp): a raw HTTP/1.1 server that answers
 POST /v1/chat/completions with a canned chat-completion JSON after a fixed,
 configurable delay. The delay simulates a real provider's generation time; the
 whole benchmark measures llmbridge's *added* latency on top of it, so this backend
@@ -40,7 +40,7 @@ import asyncio
 import json
 import time
 
-# OpenAI chat-completion shape (default — what a passthrough gateway forwards).
+# OpenAI chat-completion shape (default): what a passthrough gateway forwards.
 CANNED_OPENAI = {
     "id": "chatcmpl-llmbridge-mock",
     "object": "chat.completion",
@@ -56,7 +56,7 @@ CANNED_OPENAI = {
     "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
 }
 
-# Anthropic Messages shape — used when the gateway under test translates
+# Anthropic Messages shape, used when the gateway under test translates
 # (OpenAI -> Anthropic outbound, Anthropic -> OpenAI on the way back).
 CANNED_ANTHROPIC = {
     "id": "msg_llmbridge_mock",
@@ -86,8 +86,8 @@ async def stream_anthropic(writer: asyncio.StreamWriter, latency: float,
     """Emit an Anthropic SSE stream at a fixed token rate, chunk-encoded.
 
     Timing is absolute (scheduled off a single start point), not cumulative
-    sleeps, so the emission cadence doesn't drift with per-iteration overhead —
-    the benchmark needs the PROVIDER to be the stable reference.
+    sleeps, so the emission cadence doesn't drift with per-iteration overhead.
+    The benchmark needs the PROVIDER to be the stable reference.
     """
     writer.write(
         b"HTTP/1.1 200 OK\r\n"
@@ -215,8 +215,8 @@ async def main():
                             args.tokens, args.token_interval_ms / 1000.0),
         "127.0.0.1", args.port, limit=1 << 20,
         # FAIRNESS: asyncio's default listen backlog is 100. A gateway that opens
-        # upstream connections in bursts (rather than pooling them) can overflow
-        # that at high concurrency and get its connects REFUSED — which would
+        # upstream connections in bursts instead of pooling them, can overflow
+        # that at high concurrency and get its connects REFUSED, which would
         # look like the gateway failing when it is really the mock's socket
         # queue. A deep backlog removes the harness from the comparison.
         backlog=4096,

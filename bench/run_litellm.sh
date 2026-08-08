@@ -7,8 +7,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Head-to-head: same open-loop loadgen, same 200 ms mock backend, same RPS
-# levels — once through LiteLLM, once direct to the mock. Added gateway latency
+# Head-to-head. Same open-loop loadgen, same 200 ms mock backend, same RPS
+# levels: once through LiteLLM, once direct to the mock. Added gateway latency
 # = (through-LiteLLM e2e) - (direct e2e). Pairs with run_bench.sh's llmbridge
 # numbers to build the side-by-side artifact.
 set -uo pipefail
@@ -56,7 +56,7 @@ extract() { sed -n 's/.*p50_us=\([0-9]*\) p99_us=\([0-9]*\) p999_us=\([0-9]*\) m
 ms() { awk -v u="$1" 'BEGIN{printf "%.2f", u/1000.0}'; }
 
 {
-  echo "LiteLLM head-to-head — $STAMP  (mock ${LAT_MS}ms, ${DUR}s/level, ${WARMUP}s warmup)"
+  echo "LiteLLM head-to-head, $STAMP  (mock ${LAT_MS}ms, ${DUR}s/level, ${WARMUP}s warmup)"
   printf "%-7s | %-30s | %-30s | %s\n" "RPS" "DIRECT-to-mock e2e (ms)" "THROUGH-LiteLLM e2e (ms)" "LiteLLM ADDED (ms)"
   printf "%-7s | %-30s | %-30s | %s\n" "" "p50 / p99 / p99.9 / max" "p50 / p99 / p99.9 / max" "Δp50 / Δp99"
   echo "--------+--------------------------------+--------------------------------+--------------------"

@@ -10,7 +10,7 @@
 // Thin BSD-socket helpers for the llmbridge proxy. Linux/epoll target; the calls
 // used here (fcntl O_NONBLOCK, SO_REUSEPORT, TCP_NODELAY) are all standard on
 // Linux. SIGPIPE is suppressed process-wide (the event loop ignores it) rather
-// than per-socket, since Linux has no SO_NOSIGPIPE — kept deliberately small so
+// than per-socket, since Linux has no SO_NOSIGPIPE. Kept deliberately small so
 // swapping the poller doesn't touch this file.
 //
 // Connection *setup* is not on the hot path (it happens once per connection,
@@ -26,11 +26,11 @@ namespace llmbridge::net
     // Set O_NONBLOCK. Returns false on fcntl failure.
     bool set_nonblocking(int fd) noexcept;
 
-    // Disable Nagle (TCP_NODELAY) — we never want coalescing delay on a proxy.
+    // Disable Nagle (TCP_NODELAY); we never want coalescing delay on a proxy.
     void set_nodelay(int fd) noexcept;
 
     // Suppress SIGPIPE for this fd where the platform supports it
-    // (SO_NOSIGPIPE). On Linux this is a no-op — the process ignores SIGPIPE
+    // (SO_NOSIGPIPE). On Linux this is a no-op: the process ignores SIGPIPE
     // globally instead (see Gateway's constructor and each tool's main()).
     void set_nosigpipe(int fd) noexcept;
 
@@ -40,7 +40,7 @@ namespace llmbridge::net
     int make_listener(uint16_t port, int backlog = 1024) noexcept;
 
     // Begin a non-blocking connect to ip:port (dotted-quad ip). Returns the fd;
-    // the connect may still be in progress (EINPROGRESS) — wait for writability
+    // the connect may still be in progress (EINPROGRESS); wait for writability
     // then check connect_result(). Returns -1 only on immediate failure.
     int start_connect(const char* ip, uint16_t port) noexcept;
 
@@ -48,7 +48,7 @@ namespace llmbridge::net
     // SO_ERROR errno otherwise.
     int connect_result(int fd) noexcept;
 
-    // Create a non-blocking TCP socket with TCP_NODELAY but DON'T connect it — for
+    // Create a non-blocking TCP socket with TCP_NODELAY but DON'T connect it, for
     // the io_uring path, which issues the connect as a ring op (IORING_OP_CONNECT).
     // Returns the fd, or -1 on error.
     int make_client_socket() noexcept;

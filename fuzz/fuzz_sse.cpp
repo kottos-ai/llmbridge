@@ -6,7 +6,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // libFuzzer target for the incremental Anthropic->OpenAI SSE translator
-// (provider/sse.hpp) — untrusted upstream bytes in, client-facing SSE out. This
+// (provider/sse.hpp): untrusted upstream bytes in, client-facing SSE out. This
 // fuzzer checks more than "does not crash": it enforces the two invariants the
 // translator promises, so libFuzzer actively hunts for a violation, not just a
 // segfault. Build (Clang):
@@ -15,9 +15,9 @@
 //   ./build-fuzz/bin/fuzz_sse -max_total_time=120 fuzz/corpus/sse
 //
 // Invariants asserted on EVERY input:
-//   (1) Output strictness — the emitted stream never contains a bare C0 control
+//   (1) Output strictness. The emitted stream never contains a bare C0 control
 //       byte other than the '\n' we frame with (append_sanitized's guarantee).
-//   (2) Fragmentation-invariance — feeding the same bytes one-at-a-time yields
+//   (2) Fragmentation-invariance. Feeding the same bytes one-at-a-time yields
 //       byte-identical output to a single feed(), whenever neither run trips a
 //       buffer cap. This is the property most likely to break as state grows.
 
@@ -49,7 +49,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     using llmbridge::provider::AnthropicToOpenAiSse;
     const std::string_view in(reinterpret_cast<const char*>(data), size);
 
-    // Pin `created` so the two runs are comparable — otherwise a wall-clock
+    // Pin `created` so the two runs are comparable; otherwise a wall-clock
     // stamp read on a 1-second boundary would differ for benign reasons.
     constexpr long long kCreated = 1'700'000'000;
 
@@ -84,7 +84,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     }
     must(output_is_strict(frag));
 
-    // (c) fragmentation must not change the output — but only when neither run
+    // (c) fragmentation must not change the output, but only when neither run
     // hit a cap (a cap can stop the two feeders at different points).
     if (ok_whole && ok_frag) must(whole == frag);
 

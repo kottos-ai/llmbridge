@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// streamgen — the streaming (SSE) load generator, the Phase-B counterpart to
+// streamgen: the streaming (SSE) load generator, the Phase-B counterpart to
 // loadgen.cpp. Deliberately a SEPARATE binary: loadgen is open-loop and paced by
 // RPS (one short request per slot), while a streaming benchmark is closed-loop and
 // paced by CONCURRENCY (N long-lived streams, each delivering many chunks). It
@@ -20,7 +20,7 @@
 //     added latency = arrival_at_client - emission_at_mock
 //
 // Both processes share CLOCK_MONOTONIC (same host), so this needs no clock
-// synchronisation, and — critically — no assumption about when a token *should*
+// synchronisation, and no assumption about when a token *should*
 // have arrived. That sidesteps coordinated omission entirely: a stalled gateway
 // cannot hide by simply delivering fewer chunks, because every chunk that does
 // arrive carries the true age of its own data.
@@ -70,7 +70,7 @@ namespace
     };
 
     // Pull the mock's emission stamp out of a payload: "t=<digits>". Searching the
-    // raw bytes (rather than JSON-parsing) means the SAME parser works for the
+    // raw bytes (instead of JSON-parsing) means the SAME parser works for the
     // OpenAI chunk shape (delta.content), the raw Anthropic shape (delta.text),
     // and anything else a gateway might wrap it in.
     bool extract_stamp(std::string_view data, int64_t& out)
@@ -142,7 +142,7 @@ int main(int argc, char** argv)
 
     // One streaming request body, reused by every target: the mock triggers on
     // "stream":true, the gateway translates it to Anthropic, and LiteLLM accepts
-    // the same OpenAI shape — so all three paths do equal work.
+    // the same OpenAI shape, so all three paths do equal work.
     const std::string body =
         "{\"model\":\"" + model + "\",\"stream\":true,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
@@ -187,7 +187,7 @@ int main(int argc, char** argv)
     // Histogram RANGE MATTERS HERE. The default (20ns x 131072 = 2.62ms ceiling) is
     // sized for sub-millisecond proxy overhead; streaming under load produces
     // multi-SECOND outliers, and percentile() returns _max once the target falls in
-    // the overflow region — so an overflowing histogram silently reports
+    // the overflow region, so an overflowing histogram silently reports
     // "p50 == p99 == max" that LOOKS like a percentile but is just the maximum.
     // 1us buckets over 2s for latency/gap; 100us over 20s for TTFT (a saturated
     // Python gateway can take >10s to first token).
@@ -333,7 +333,7 @@ int main(int argc, char** argv)
     // Overflow must never be silent: if it happens the percentiles above are
     // really just the max, and the run needs a wider histogram to be reportable.
     if (h_chunk.overflow_count() || h_ttft.overflow_count() || h_gap.overflow_count())
-        std::printf("WARNING: histogram overflow (chunk=%llu ttft=%llu gap=%llu) —"
+        std::printf("WARNING: histogram overflow (chunk=%llu ttft=%llu gap=%llu):"
                     " percentiles beyond the tracked range are NOT reliable\n",
                     (unsigned long long)h_chunk.overflow_count(),
                     (unsigned long long)h_ttft.overflow_count(),

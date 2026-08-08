@@ -62,7 +62,7 @@ namespace
         return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: " +
                std::to_string(body.size()) + "\r\n\r\n" + body;
     }
-    // Same, but the upstream declares Connection: close — the gateway must not pool it.
+    // Same, but the upstream declares Connection: close, so the gateway must not pool it.
     std::string http_close(const std::string& body)
     {
         return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
@@ -152,7 +152,7 @@ namespace
             if (_fd >= 0) { ::close(_fd); _fd = -1; }  // now safe to close/null it
             // The proxy keeps upstream connections open (keep-alive pool), so the
             // handler threads are parked in a blocking read() that _stop alone
-            // won't interrupt — shut the accepted fds down to unblock them.
+            // won't interrupt: shut the accepted fds down to unblock them.
             {
                 std::lock_guard<std::mutex> lk(_mu);
                 for (int fd : _client_fds) ::shutdown(fd, SHUT_RDWR);
@@ -166,10 +166,10 @@ namespace
         void set_response(std::string r) { _resp_override = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
-        // Respond once (keep-alive), then close the connection — simulates a
+        // Respond once (keep-alive), then close the connection, which simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
-        // Frame the reply with Transfer-Encoding: chunked and NO Content-Length —
+        // Frame the reply with Transfer-Encoding: chunked and NO Content-Length
         // what real providers actually do for a non-streaming completion, since the
         // body length is unknown when headers are sent. `n` = chunks to split into.
         void set_chunked_response(int n) { _chunked_chunks = n; }
@@ -182,7 +182,7 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             return _last_request;
         }
-        // EVERY request the upstream saw, concatenated — for leak tests that must
+        // EVERY request the upstream saw, concatenated, for leak tests that must
         // assert a credential appeared in NO request, not merely the most recent.
         std::string all_requests()
         {
@@ -193,7 +193,7 @@ namespace
         // Re-frame a Content-Length reply as a chunked one, splitting the body.
         // Line-wise on purpose: an earlier version erased the Content-Length header
         // by byte range, and because it is the LAST header that left a dangling CRLF
-        // which terminated the header block early — producing a response with
+        // which terminated the header block early, producing a response with
         // neither framing header. Rebuild from lines so header order cannot matter.
         static std::string to_chunked(const std::string& resp, int nchunks)
         {
@@ -281,7 +281,7 @@ namespace
                 }
                 if (_close_mid)
                 {
-                    // Send a partial response then drop — exercises the gateway's
+                    // Send a partial response then drop. This exercises the gateway's
                     // upstream-abort path.
                     (void)!::write(c, resp.data(), resp.size() / 2 + 1);
                     ::close(c);
@@ -617,7 +617,7 @@ TEST_F(ProxyIT, ConnectionCloseHeaderClosesClientAfterResponse)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Extended correctness suite — the backend-agnostic gate that BOTH the epoll loop
+// Extended correctness suite: the backend-agnostic gate that BOTH the epoll loop
 // and (once it lands) the io_uring loop must pass identically. Drives the public
 // Gateway over real loopback sockets: translation round-trips, large bodies,
 // pipelining, partial/trickled I/O framing, and the error/abort paths.
@@ -726,7 +726,7 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     (void)c.recv_response();
     const std::string up = _backend.last_request();
     EXPECT_NE(up.find("x-api-key: sk-test-123\r\n"), std::string::npos) << up;
-    // The OpenAI-style header must NOT also cross — one credential, one shape.
+    // The OpenAI-style header must NOT also cross: one credential, one shape.
     EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
     // Anthropic's required version header is pinned when the client has none.
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
@@ -765,7 +765,7 @@ TEST_P(ProxyAuth, NoCredentialMeansNoAuthHeaderUpstream)
 TEST_P(ProxyAuth, UnrelatedClientHeadersDoNotCross)
 {
     // WHITELIST semantics: a rebuilt request must not echo arbitrary client
-    // headers — that is the smuggling surface the rebuild exists to close.
+    // headers; that is the smuggling surface the rebuild exists to close.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam());
     Client c;
@@ -857,7 +857,7 @@ TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
     }
 }
 
-// An oversized credential is refused rather than forwarded (bounded work, and a
+// An oversized credential is refused instead of forwarded (bounded work, and a
 // 8 KiB "key" is an attack or a bug, never a real provider key).
 TEST_P(ProxyAuth, OversizedCredentialRejected)
 {
@@ -892,7 +892,7 @@ TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
 // ── Credential-leak audit ────────────────────────────────────────────────────
 // The question these answer: can one client's key ever reach the provider on a
 // DIFFERENT client's request? Upstream connections are pooled and shared, so this
-// is not obvious by inspection — assert it.
+// is not obvious by inspection, so assert it.
 
 TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
 {
@@ -915,7 +915,7 @@ TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
     }
     shutdown();
 
-    // A's key must appear EXACTLY ONCE across everything the provider ever saw —
+    // A's key must appear EXACTLY ONCE across everything the provider ever saw
     // on A's own request, never re-sent on B's.
     const std::string all = _backend.all_requests();
     size_t occurrences = 0;
@@ -951,7 +951,7 @@ TEST_P(ProxyAuth, DifferentClientsCredentialsNeverCross)
 
 TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
 {
-    // A credential must not come back in any response body/headers — an error
+    // A credential must not come back in any response body/headers, not even in an error
     // path that echoed the request would leak it into client-side logs.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam());
@@ -964,7 +964,7 @@ TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
 
 TEST_P(ProxyAuth, MalformedRequestErrorDoesNotEchoCredential)
 {
-    // Same, on the 400 path — the most likely place for a "helpful" echo.
+    // Same, on the 400 path: the most likely place for a "helpful" echo.
     start(0, true, TranslateMode::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1034,7 +1034,7 @@ TEST_P(ProxyChunkedResp, PooledConnectionSurvivesAChunkedResponse)
 {
     // The end of a chunked message is found by decoding, not by Content-Length. If
     // total_len were wrong, leftover bytes would poison the pooled connection and
-    // the SECOND request would mis-frame — so two requests is the real test.
+    // the SECOND request would mis-frame, so two requests is the real test.
     const auto [backend, nchunks] = GetParam();
     _backend.set_response(http_ok(anthropic_resp_body("again")));
     _backend.set_chunked_response(nchunks);
@@ -1174,7 +1174,7 @@ TEST_F(ProxyIT, MalformedRequestClosedAndGatewaySurvives)
         EXPECT_TRUE(bad.wait_closed());
         bad.close();
     }
-    // A fresh client must still be served — the loop survived the bad input.
+    // A fresh client must still be served: the loop survived the bad input.
     Client good;
     ASSERT_TRUE(good.connect(_proxy_port));
     ASSERT_TRUE(good.send(make_request("ok")));
@@ -1290,7 +1290,7 @@ TEST_F(ProxyIT, EmptyContentTranslateRoundTrip)
 
 // ════════════════════════════════════════════════════════════════════════════
 // Backend parity: the core scenarios must behave identically on epoll AND
-// io_uring (Phase 1). Each test runs under both — if io_uring is unavailable the
+// io_uring (Phase 1). Each test runs under both; if io_uring is unavailable the
 // Gateway falls back to epoll, so this is always safe to instantiate.
 // ════════════════════════════════════════════════════════════════════════════
 namespace
@@ -1467,7 +1467,7 @@ TEST_P(ProxyBackend, ConnectionCloseHonored)
 
 TEST_P(ProxyBackend, ShutdownMidRequestIsClean)
 {
-    // Hold the upstream so the request is in flight when we tear down — exercises
+    // Hold the upstream so the request is in flight when we tear down, which exercises
     // the drain path (and, under ASan, the no-UAF-on-pending-completion property).
     _backend.set_trickle(2);
     start(0, true, TranslateMode::None, GetParam());
@@ -1664,7 +1664,7 @@ TEST_P(ProxyBackend, StaleUpstreamNeverReused_BackendClose)
 
 // ── Stale-connection retry (heavy): the provider pools a keep-alive connection
 // then drops it idle. The gateway must transparently resend on a fresh
-// connection. epoll recovers via pool eviction; io_uring via the retry path —
+// connection. epoll recovers via pool eviction; io_uring via the retry path
 // both must serve every request. 60 iterations => ~59 stale reuses on io_uring.
 TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
 {
@@ -1684,13 +1684,13 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
     EXPECT_EQ(_gw->stats().errors, 0u); // stale connections recovered, never surfaced
     // Both backends keep a recv armed on idle pooled upstreams, so between sequential
     // clients they EVICT the dead connection on EOF before reuse (occasionally retry
-    // if the timing races). Either recovery is correct — we only require every
+    // if the timing races). Either recovery is correct; we only require every
     // request was served. The pipelined variant below forces the retry path itself.
 }
 
 // Pipelined variant: two requests on ONE keep-alive connection. The 2nd is
-// forwarded by reusing the pooled (already-dropped) upstream INLINE — before the
-// event loop can evict it — so BOTH backends are forced through the retry path.
+// forwarded by reusing the pooled (already-dropped) upstream INLINE, before the
+// event loop can evict it, so BOTH backends are forced through the retry path.
 TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
@@ -1705,8 +1705,8 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u); // both requests served despite the dropped conn
-    // Recovery mechanism: epoll only processes the dead conn's EOF at epoll_wait —
-    // after the inline reuse — so it deterministically RETRIES. io_uring's always-
+    // Recovery mechanism: epoll only processes the dead conn's EOF at epoll_wait
+    // after the inline reuse, so it deterministically RETRIES. io_uring's always-
     // armed recv may instead evict the dead conn first (a completion-order race), so
     // we assert the retry path only where it's deterministic.
     if (GetParam() == llmbridge::IoBackend::Epoll)
@@ -1721,7 +1721,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyBackend,
 
 // ── Bug-2 regression (deterministic, no sanitizer needed): every Connection the
 // gateway allocates must be freed. Tear down with 50 requests in flight (acquired
-// upstreams reachable only via peer — exactly what leaked) and assert the live
+// upstreams reachable only via peer, exactly what leaked) and assert the live
 // Connection count returns to baseline after ~Gateway.
 TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
 {
@@ -2298,7 +2298,7 @@ TEST_P(ProxyStream, HealthyStreamIsNotTimedOut)
 // ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
 // Deterministic: a tiny client receive window + a multi-MB stream + a client that
 // stalls before reading forces the gateway's writes to block, which must engage
-// the pause path — and every byte must still arrive once the client drains.
+// the pause path, and every byte must still arrive once the client drains.
 TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
 {
     // ~1.6 MB of SSE: many deltas, each large enough to fill socket buffers fast.
@@ -2346,13 +2346,13 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
 //
 // A streaming request used to close its upstream unconditionally at stream end,
 // so every stream paid a fresh connect. Measured at 4096 concurrent streams that
-// was 706 connects/sec and the single largest component of time-to-first-token —
+// was 706 connects/sec and the single largest component of time-to-first-token
 // on BOTH backends. The upstream is now returned to the keep-alive pool when the
 // framing proves that is safe.
 //
 // "Safe" is conjunctive and each clause has its own test below, because the
 // failure mode of getting this wrong is silent corruption of the NEXT request's
-// response rather than a visible error.
+// response instead of a visible error.
 // ════════════════════════════════════════════════════════════════════════════
 class ProxyStreamPool : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
 
@@ -2376,7 +2376,7 @@ TEST_P(ProxyStreamPool, ReusesUpstreamAcrossSequentialStreams)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
     EXPECT_EQ(_gw->stats().requests, 3u);
-    // The point: one connect, two reuses — not three connects.
+    // The point: one connect, two reuses, not three connects.
     EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u) << "each stream re-connected instead of reusing";
     EXPECT_EQ(_gw->stats().upstream_reused, 2u);
 }
@@ -2463,7 +2463,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolACloseDelimitedStream)
 TEST_P(ProxyStreamPool, DoesNotPoolAnAbortedStream)
 {
     // Upstream vanishes mid-body: framing is untrustworthy, so the conn must be
-    // dropped rather than handed to the next request.
+    // dropped instead of handed to the next request.
     _backend.set_response(sse_chunked_response(4096));
     _backend.set_close_mid_response(true);
     start(0, true, TranslateMode::Anthropic, GetParam());
@@ -2487,20 +2487,20 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamPool,
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Provided-buffer exhaustion — io_uring only.
+// Provided-buffer exhaustion, io_uring only.
 //
 // The io_uring backend feeds its multishot recvs from a fixed pool of provided
 // buffers. When that pool is momentarily empty the kernel may end a multishot recv
 // with -ENOBUFS *without* consuming a buffer. That is a transient resource
 // shortage, not a connection error, and the only correct response is to re-arm.
 // Get it wrong and the failure is silent and ugly: the client pair is aborted, or
-// mid-stream the client is told the stream ended early — truncated output, not an
+// mid-stream the client is told the stream ended early: truncated output, not an
 // error the caller can see.
 //
-// Why the pool is shrunk here rather than driven by load: at the shipped size the
+// Why the pool is shrunk here instead of driven by load: at the shipped size the
 // branch is not reachable in practice. Measured on this kernel at 8192 concurrent
 // streams (16384 armed recvs against a 4096-buffer pool), `uring_enobufs` stayed
-// at 0 — under pool pressure the kernel instead ends the multishot with res > 0
+// at 0; under pool pressure the kernel instead ends the multishot with res > 0
 // and F_MORE clear, which the ordinary re-arm already covers. So a load-driven
 // test would prove nothing and pass whether or not the recovery works. Shrinking
 // the pool to a single buffer forces the real condition, and the assertion on the
@@ -2542,7 +2542,7 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
     EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kClients));
 
     // The point of the test. If this fires, the pool never actually ran dry and the
-    // assertions above passed without touching the recovery path — so either the
+    // assertions above passed without touching the recovery path, so either the
     // hook stopped working or the kernel no longer reports -ENOBUFS here, and the
     // recovery branch in ur_on_recv is dead code that needs re-examining.
     EXPECT_GT(enobufs, 0u)
@@ -2586,9 +2586,9 @@ TEST_P(ProxyTiming, EmitsOrderableT0AndDurations)
 
 TEST_P(ProxyTiming, T0IsStrictlyIncreasingAcrossRequests)
 {
-    // The ordering property the shadow order book depends on. Must hold even if
+    // The ordering property the tape for inference depends on. Must hold even if
     // the system clock is disciplined mid-run, which is why t0 is an anchored
-    // monotonic value rather than a raw CLOCK_REALTIME read.
+    // monotonic value instead of a raw CLOCK_REALTIME read.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     long long prev = 0;
@@ -2622,7 +2622,7 @@ TEST_P(ProxyTiming, BodyIsUnchangedWhenHeadersAreOn)
 TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
 {
     // A stream cannot know total gateway time when headers go out, so it must
-    // report TTFB instead — and must NOT claim a gateway-total it cannot have.
+    // report TTFB instead, and must NOT claim a gateway-total it cannot have.
     _backend.set_response(sse_chunked_response(64));
     start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
@@ -2639,7 +2639,7 @@ TEST_P(ProxyTiming, SeqIsUniqueAndIncreasingUnderConcurrency)
 {
     // The sequencer property: a TOTAL order that needs no clock. Driven from
     // several client threads at once, because the counter is shared across workers
-    // and a non-atomic increment would hand two requests the same number — the one
+    // and a non-atomic increment would hand two requests the same number, and the one
     // failure this must never have.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
@@ -2667,7 +2667,7 @@ TEST_P(ProxyTiming, SeqIsUniqueAndIncreasingUnderConcurrency)
     ASSERT_GE(seqs.size(), 20u);
     std::sort(seqs.begin(), seqs.end());
     EXPECT_EQ(std::adjacent_find(seqs.begin(), seqs.end()), seqs.end())
-        << "duplicate sequence number — the counter is racing";
+        << "duplicate sequence number: the counter is racing";
 }
 
 TEST_P(ProxyTiming, TokenCountsComeFromTheProviderNotEstimated)
@@ -2683,8 +2683,8 @@ TEST_P(ProxyTiming, TokenCountsComeFromTheProviderNotEstimated)
     ASSERT_NE(r.find("x-llmbridge-tokens-in:"), std::string::npos) << r;
     ASSERT_NE(r.find("x-llmbridge-tokens-out:"), std::string::npos) << r;
 
-    // Header values must equal what the body reports — one source of truth.
-    // Skip the key, then any spaces — a header has "key: 3", JSON has "key":3.
+    // Header values must equal what the body reports: one source of truth.
+    // Skip the key, then any spaces: a header has "key: 3", JSON has "key":3.
     // (An earlier version assumed a space in both and skipped past the digit.)
     const auto num_at = [](const std::string& s, const char* k) {
         size_t p = s.find(k);
@@ -2832,7 +2832,7 @@ TEST_P(ProxyTools, ToolResultTurnForwardsCorrectly)
 TEST_P(ProxyTools, StreamingRequestWithToolsStillStreams)
 {
     // Tools in a STREAMING request must not break the SSE path. (Tool-call DELTAS
-    // are not implemented yet — this asserts the stream still works when tools are
+    // are not implemented yet; this asserts the stream still works when tools are
     // merely declared, which is the case that would silently regress.)
     _backend.set_response(sse_chunked_response(64));
     start(0, true, TranslateMode::Anthropic, GetParam());
@@ -2885,7 +2885,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyTools,
 
 // ── Streamed tool calls through the gateway ─────────────────────────────────
 // The translator tests prove the chunk shapes; these prove they survive the
-// gateway pump — chunked decode, back-pressure buffers, and both event loops.
+// gateway pump: chunked decode, back-pressure buffers, and both event loops.
 // Chunk sizes are varied because the tool events are LONGER than text events and
 // so more likely to straddle a chunk boundary mid-JSON.
 class ProxyToolStream

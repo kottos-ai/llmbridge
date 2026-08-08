@@ -11,19 +11,19 @@ different jobs:
 **The numbers are not interchangeable.** A streaming request occupies a connection
 for the whole generation, so "requests per second" is not a meaningful axis for it;
 conversely "tokens delivered per second" says nothing about non-streaming throughput.
-Any comparison that mixes them is wrong, including ours — so they are reported apart,
+Any comparison that mixes them is wrong, including ours, so they are reported apart,
 with their own charts and their own caveats.
 
 Everything below is reproducible from this repository. All runs are on a **single
 co-located host** (client, gateway and provider on loopback), so absolute tails are a
 **dev-box upper bound**, not a datacenter figure.
 
-> **Host configuration changes the competitor's numbers, not just ours — and not every
+> **Host configuration changes the competitor's numbers, not just ours, and not every
 > setting is unfair.** Measured separately on one host: the `performance` governor helps
 > *both* sides (our throughput 79k → 85k; LiteLLM's capacity unchanged at ~246 req/s and
 > its latency improved), so it is used. Capping idle states (`cpupower idle-set -D 5`)
 > improves our p99 (63 → 37 µs) while cutting **LiteLLM's capacity from 247 to
-> 150 req/s** — it heats the machine and LiteLLM is CPU-bound — so it is excluded. Every
+> 150 req/s** (it heats the machine and LiteLLM is CPU-bound) so it is excluded. Every
 > competitive figure here comes from **one stated configuration**: `performance`
 > governor, stock idle states. See
 > [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md) §0.
@@ -31,22 +31,21 @@ co-located host** (client, gateway and provider on loopback), so absolute tails 
 > **Before running or quoting any number here, read
 > [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md).** It lists every knob that
 > changes a result and which configuration produced which published figure. Four results
-> in this document's history were invalidated by undocumented configuration rather than
-> by code — none of which produced an error, only a plausible wrong number. The single
+> in this document's history were invalidated by undocumented configuration, not
+> by code, none of which produced an error, only a plausible wrong number. The single
 > most important one: the ~84k RPS ceiling requires `BACKENDS=4`; at the default of 1 the
 > mock backend is the ceiling, not the gateway.
 
----
 
 ## A. Non-streaming: added latency and throughput
 
 Both gateways perform the full OpenAI ⇄ Anthropic translation against the same mock
 backend, driven by the same open-loop, coordinated-omission-corrected load generator.
 
-![llmbridge vs LiteLLM — added latency p99](bench/results/comparison.svg)
+![llmbridge vs LiteLLM: added latency p99](bench/results/comparison.svg)
 
 At the unsaturated **100 RPS** point, llmbridge adds **80 µs p99** vs LiteLLM's
-**87 ms** — a **1,088×** difference — and holds **41–80 µs p99 across 100–5,000 RPS**,
+**87 ms** (a **1,088×** difference) and holds **41–80 µs p99 across 100–5,000 RPS**,
 while a single LiteLLM uvicorn worker saturates at **~246 req/s**.
 
 | RPS | **llmbridge** p50 / p99 | LiteLLM added p99 | LiteLLM achieved |
@@ -61,7 +60,7 @@ while a single LiteLLM uvicorn worker saturates at **~246 req/s**.
 Measured on a cold-booted host, `performance` governor, **stock idle states**, IDE
 closed, starting at 57 °C with load 0.29; `ListenOverflows` did not move during the run.
 
-**On the governor.** `performance` is used because it improves *both* sides — LiteLLM's
+**On the governor.** `performance` is used because it improves *both* sides. LiteLLM's
 capacity is unchanged (246 vs 247 req/s) and its latency at 100 RPS improves from 104 ms
 to 87 ms. Capping idle states (`cpupower idle-set -D 5`) is deliberately **not** used: it
 would improve our p99 further (63 → 37 µs) but cuts LiteLLM's capacity from 247 to
@@ -69,13 +68,13 @@ would improve our p99 further (63 → 37 µs) but cuts LiteLLM's capacity from 2
 configurations are documented in
 [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md) §0.
 
-![Throughput saturation — offered vs achieved RPS](bench/results/saturation.svg)
+![Throughput saturation: offered vs achieved RPS](bench/results/saturation.svg)
 
-Single-thread ceiling is **~84k RPS** — median of three cold-boot runs (84,928; the
+Single-thread ceiling is **~84k RPS**, the median of three cold-boot runs (84,928; the
 mean, 84,763, rounds to the same claim); best single run 86,982, reproducing an earlier
 87.6k measurement on the same code. Requires `BACKENDS=4`, or the mock is the limit (at
-the default of 1 the mock caps it at ~65k). The middle run is quoted rather than the
-best, because the best run is only achievable on a cold machine — and median-of-3 is
+the default of 1 the mock caps it at ~65k). The middle run is quoted, not the
+best, because the best run is only achievable on a cold machine, and median-of-3 is
 the summary statistic used throughout this document.
 
 Throughput is strongly thermally dependent on this laptop, so the number degrades within
@@ -87,21 +86,21 @@ measurement level is short enough for the ramp to matter.
 **What sets that ceiling: the gateway's own CPU, on its single thread.** Three
 percentages follow and they have three different denominators, so to be explicit:
 
-- **87-92% of ONE CORE** — the worker thread's own utilisation. llmbridge is
+- **87-92% of ONE CORE**: the worker thread's own utilisation. llmbridge is
   single-threaded, so 100% of one core is its hard ceiling; at saturation it is nearly
   there, and that is the cap.
-- **~95% idle SYSTEM-WIDE** — across all 12 logical CPUs. One saturated core is only ~8%
+- **~95% idle SYSTEM-WIDE**, across all 12 logical CPUs. One saturated core is only ~8%
   of this box, so the machine looks idle while the gateway is maxed. It cannot reach the
   other 11 cores because it is single-threaded; that is what `--workers N` is for.
-- **89% kernel / 6.7% llmbridge** — a split of the worker's OWN CPU time (that 87-92%),
+- **89% kernel / 6.7% llmbridge**: a split of the worker's OWN CPU time (that 87-92%),
   not of the machine. Nine of every ten cycles the gateway burns execute kernel code.
 
-Softirq time is ~0%, so it is not the loopback packet path — an earlier revision of this
+Softirq time is ~0%, so it is not the loopback packet path. An earlier revision of this
 document claimed that, and the measurement contradicts it. Throughput therefore tracks
 clock speed almost linearly: the same build measures ~78k on this laptop at a thermally
 throttled 4.0 GHz and ~88k at 4.5 GHz. Scaling past it is `--workers N` (SO_REUSEPORT,
 shared-nothing) or less CPU per request. **C-states are irrelevant here** in the direct
-sense — at saturation the CPU never idles — but *disabling* them lowers throughput
+sense (at saturation the CPU never idles) but *disabling* them lowers throughput
 indirectly by heating the machine and costing turbo headroom.
 
 ### What sets the single-thread ceiling (profiled)
@@ -110,13 +109,13 @@ indirectly by heating the machine and costing turbo headroom.
 kernel; 6.7% is llmbridge's own code.**
 
 All percentages below are **shares of the worker thread's own CPU time**, not of the
-machine (the machine is ~95% idle throughout — see above).
+machine (the machine is ~95% idle throughout; see above).
 
 | cost centre | % of the worker's CPU time |
 |---|---|
 | TCP stack | 32.7% |
 | long tail (418 symbols, each <0.8%) | 31.7% |
-| **llmbridge — all of our code** | **6.7%** |
+| **llmbridge, all of our code** | **6.7%** |
 | AppArmor (LSM socket permission checks) | 6.1% |
 | locking | 4.7% |
 | skb alloc/free | 4.5% |
@@ -126,26 +125,26 @@ machine (the machine is ~95% idle throughout — see above).
 | io_uring core | 2.8% |
 
 Our hottest functions are `ur_on_cqe` (1.54%), `http::parse_request` (1.29%),
-`ur_on_recv` (1.03%). **Optimising llmbridge's code caps out at roughly 7% more throughput** — the
+`ur_on_recv` (1.03%). **Optimising llmbridge's code caps out at roughly 7% more throughput**: the
 ceiling is the kernel's TCP path, which is the irreducible price of being a TCP proxy.
 The levers that actually matter are, in order: clock speed (throughput tracks it nearly
-linearly — the same build measures ~78k at a throttled 4.0 GHz and ~88k at 4.5 GHz),
+linearly because the same build measures ~78k at a throttled 4.0 GHz and ~88k at 4.5 GHz),
 `--workers N` (the system is 95% idle at saturation, so a second worker nearly doubles
 it), and disabling AppArmor.
 
 **AppArmor costs ~6.1-6.4%** of the worker's CPU on `aa_inet_msg_perm` /
-`apparmor_socket_recvmsg` / `apparmor_socket_sendmsg` — a permission check on every send
+`apparmor_socket_recvmsg` / `apparmor_socket_sendmsg`, a permission check on every send
 and recv. Note that **stopping the AppArmor service does not remove this**: that unloads
 profiles, while the LSM's socket hooks are built into the kernel and enabled at boot.
-(6.1% in the profile above; 6.37% in the re-profile below — two runs, not one
+(6.1% in the profile above; 6.37% in the re-profile below: two runs, not one
 number.) Verified by re-profiling with the service inactive: still 6.37%. Removing it needs
-`apparmor=0` on the kernel command line and a reboot — a security tradeoff, so treat it
-as a measurement step rather than a deployment recommendation.
+`apparmor=0` on the kernel command line and a reboot, a security tradeoff, so treat it
+as a measurement step, not a deployment recommendation.
 
 **What did NOT help, measured:** `IORING_REGISTER_FILES` (fixed files) was implemented to
 attack the 3.2% fd-lookup line. It delivers **~0.5% less CPU per request and no
 detectable throughput change** (three interleaved A/B repeats at saturation: 75.9k vs
-75.3k, inside ±3% noise) — most of that 3.2% is not addressable this way, since
+75.3k, inside ±3% noise). Most of that 3.2% is not addressable this way, since
 `io_uring_enter` resolves the ring fd regardless and the per-connection registration is
 itself a syscall. **The change was reverted**: it added a slot allocator and a
 release-before-close hazard for no measurable benefit. Recorded here so it is not
@@ -158,9 +157,9 @@ proposed again from reading the profile.
 sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192 net.core.somaxconn=8192
 
 ./bench/run_headtohead.sh 200 15 4 100 250 500 1000 2000 5000  # latency vs LiteLLM
+# BACKENDS=4 is required: without it the MOCK is the ceiling (~65k), not the gateway.
 BACKENDS=4 ./bench/saturate.sh 5 2 90000 130000                # throughput ramp
-#         ^^^^^^^^^^ without this the MOCK is the ceiling (~65k), not the gateway
-python3 bench/make_chart.py                                     # regenerate the SVGs
+python3 bench/make_chart.py                                    # regenerate the SVGs
 ```
 
 **Known asymmetry.** In this benchmark llmbridge is **proxy-self-measured** (it
@@ -168,7 +167,6 @@ reports its own request-path + response-path stamps) while LiteLLM is
 **client-measured** (through-LiteLLM minus direct-to-mock), because LiteLLM cannot
 self-report. The streaming benchmark below does not have this asymmetry.
 
----
 
 ## B. Streaming (SSE): time to first token and delivered tokens
 
@@ -178,22 +176,22 @@ self-report. The streaming benchmark below does not have this asymmetry.
 
 Both gateways translate the **same Anthropic SSE stream** from the **same provider**
 into OpenAI `chat.completion.chunk`s. Every number is taken by the **same client-side
-instrument** — neither gateway self-reports.
+instrument**: neither gateway self-reports.
 
 > Charts regenerated from these runs (`bench/make_stream_chart.py`). The source CSV is
 > append-only and the chart takes a median over it, so reset it whenever the
-> CONFIGURATION changes — otherwise it silently blends incompatible runs. Repeating the
+> CONFIGURATION changes; otherwise it silently blends incompatible runs. Repeating the
 > SAME configuration is the intended use and is what the median is for: these figures
 > are the median of **three** runs on the **v0.10.0** tree, measured 2026-08-06 on a
 > host rebooted immediately beforehand (50 °C at each rep's start, load < 0.8). (An earlier revision of this note said to reset to a
 > single run's rows, which was true when only one run existed and would now silently
 > discard the repetitions.)
 
-### Results — llmbridge vs LiteLLM (50 tok/s per stream, one worker each)
+### Results: llmbridge vs LiteLLM (50 tok/s per stream, one worker each)
 
 Per-token latency is measured client-side against the provider's own embedded emission
 timestamp, so it is the true age of each token on arrival. Raw path latency is shown
-rather than a subtracted "added" figure, because subtracting percentiles does not yield a
+instead of a subtracted "added" figure, because subtracting percentiles does not yield a
 percentile (see Known limitations).
 
 | Concurrent streams | direct (floor) p50 / p99 | **llmbridge** p50 / p99 | LiteLLM p50 / p99 | TTFT: floor / **llmbridge** / LiteLLM | Tokens delivered: **llmbridge** / LiteLLM |
@@ -203,7 +201,7 @@ percentile (see Known limitations).
 | 256 | 53 / 148 us | **139 / 237 us** | 602 ms / > 2 s † | 30.8 / **30.7** / 10,256 ms | **99.94%** / 10% |
 | 512 | 43 / 229 us | **174 / 280 us** | > 2 s † | 30.7 / **30.8** / 12,601 ms | **99.93%** / 4% |
 
-† Beyond the load generator's 2 s histogram range, so not a percentile — past the tracked
+† Beyond the load generator's 2 s histogram range, so not a percentile: past the tracked
 range the percentile function returns the maximum. The generator prints an explicit
 overflow warning; it fired on **LiteLLM at 256 and 512 only**, and on **neither llmbridge
 nor the direct baseline at any level**, so every number in those columns is a real
@@ -211,19 +209,19 @@ percentile.
 
 **How to read this.** llmbridge's time to first token sits **on the no-gateway floor**
 (30.7-30.8 ms against the floor's 30.6-30.7 ms) at every concurrency, and delivery stays
-at **99.93% or better** — 100.000% at 16 streams, 99.983% at 64, 99.938% at 256 and
+at **99.93% or better**. 100.000% at 16 streams, 99.983% at 64, 99.938% at 256 and
 99.931% at 512, against the direct control's token count (medians of 3, computed from
 `bench/results/stream-comparison.csv`). It is deliberately **not** rounded to "100%":
 at 512 streams that is ~350 tokens of 506,963 that did not arrive, and a reader who
 re-runs will see 99.93%. A prior revision of this table did print 100%.
 
-**Those tokens are a harness boundary artifact, not gateway loss** — established by
+**Those tokens are a harness boundary artifact, not gateway loss**, established by
 measurement, because the alternative reading (the gateway silently drops tokens under
 load) would be serious:
 
 - `completed_streams` is **identical** on both arms at every level (256 / 1,024 /
   4,096 / 8,192) and `failures=0`. No stream was truncated, reset or dropped. Had the
-  gateway abandoned a stream, that count would diverge — it does not.
+  gateway abandoned a stream, that count would diverge; it does not.
 - `streamgen` runs to a hard wall-clock deadline (`while (now_ns() < t_end)`) and then
   closes every socket mid-flight, recycling a finished stream into a new one so that
   exactly N streams are always in progress. At the cutoff, N streams are therefore
@@ -243,22 +241,22 @@ load) would be serious:
 
 So the honest statement is: **llmbridge delivers every token the provider emits**, and
 the sub-100% figure measures where the stopwatch fell, not what the gateway did. The
-table still reports the measured number rather than the interpretation, because the
+table still reports the measured number, not the interpretation, because the
 measured number is what a reader reproduces. Its own per-token cost is **~55-131 us** against a 20 ms
-inter-token interval — under 1% of the token budget.
+inter-token interval: under 1% of the token budget.
 
 LiteLLM tracks well at 16 streams (94% delivered) and then queues: by 64 streams it
 delivers 40% and first-token latency is 2.0 s; by 512 streams it delivers **4%** with a
-**12.6 s** TTFT. Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
+**12.6 s** TTFT, Its throughput ceiling is roughly **700-1,200 tokens/s** regardless of
 offered load.
 
 **Measurement conditions.** Cold-booted host, `performance` governor, **stock idle
-states** (`cpupower idle-set -D 5` deliberately not used — it would improve our numbers
+states** (`cpupower idle-set -D 5` deliberately not used; it would improve our numbers
 while cutting LiteLLM's capacity, see section A), IDE closed, each rep starting at 50 °C.
 
 > **The reboot is not ceremony.** The same three reps on the same binaries, run after
 > an hour of builds and test sweeps on the same box, measured p99 **256 µs at 256
-> streams and 315 µs at 512** — 8% and 12% above the figures above, with tight,
+> streams and 315 µs at 512**. 8% and 12% above the figures above, with tight,
 > non-overlapping spreads that looked exactly like a regression. The floor had not
 > moved, which is what made it convincing. It was accumulated host state; cold, the
 > numbers land back on the prior series to within a microsecond. Any streaming figure
@@ -266,9 +264,9 @@ while cutting LiteLLM's capacity, see section A), IDE closed, each rep starting 
 `ListenOverflows` did not move; the client-side load generator reported `failures=0` at
 every level for every arm.
 
-*One caveat, stated because it was checked rather than assumed:* LiteLLM's server log
+*One caveat, stated because it was checked and not assumed:* LiteLLM's server log
 contains a handful of connect errors, all timestamped **10 seconds after the final
-measurement ended** — they occur during teardown, when the harness stops the mock while
+measurement ended**; they occur during teardown, when the harness stops the mock while
 LiteLLM still has a backlog queued. An earlier run of this benchmark had to be discarded
 because equivalent errors occurred *during* measurement; the check is now part of the
 runbook.
@@ -294,14 +292,14 @@ what a churn-heavy benchmark shows. See "epoll vs io_uring" below.
 
 **The `max` column is included because it does not agree with that conclusion.**
 io_uring's worst single sample across the three runs is **29.7 ms**, against epoll's
-5.8 ms — one outlier in run 2 (the other two runs: 0.86 and 1.77 ms). A max is one
+5.8 ms comes from one outlier in run 2 (the other two runs: 0.86 and 1.77 ms). A max is one
 sample, not a percentile, so it does not contradict the p99.9 result; but it is a
 30 ms outlier on the default backend and omitting the column would have hidden it.
 Unexplained, and n=3 is too few to say whether it is rare or merely rarely sampled.
 
 llmbridge adds **~0.3-0.6 ms at p99 while carrying 4,096 concurrent streams**, against a
 33 us no-gateway floor. The gateway is ~17x the floor here and that gap is not yet
-explained; it is present on both backends, so it is a gateway-wide question rather than
+explained; it is present on both backends, so it is a gateway-wide question, not
 an io_uring one.
 
 **4,096 concurrent streams is a stable operating point, not a limit being probed.** One
@@ -314,18 +312,18 @@ worker, four independent client processes, 10 tok/s per stream, idle states capp
 | client 3 | 10,240 tok/s | 169 us | 452 us | 932 us | 0 |
 | client 4 | 10,240 tok/s | 170 us | 458 us | 839 us | 0 |
 
-**40,960 of 40,960 offered tokens/s delivered — exactly 100% — with zero client-side
-failures**, and the four clients agree to within 3% on p99. The gateway holds **8,192
+**40,960 of 40,960 offered tokens/s delivered (exactly 100%) with zero client-side
+failures**, and the four clients agree to within 3% on p99, The gateway holds **8,192
 sockets** open throughout (one client plus one upstream per stream). Nothing is degrading:
 p50 under 200 us, p99 under 0.5 ms, p99.9 under 1 ms.
 
 **This table uses `cpupower idle-set -D 5`** (idle states capped at C1), which is
-permissible here because there is no competitor in it to disadvantage — unlike the
+permissible here because there is no competitor in it to disadvantage, unlike the
 head-to-head above, where the same setting would cut LiteLLM's capacity by 40%. It is
 worth ~30% at p50: the same run with stock idle states measures 226-245 us p50 and
 474-491 us p99, still with 99.998% delivery and zero failures. Absolute latency is also
-thermally sensitive (298-413 us p99 on a cool machine); the *stability* indicators —
-delivery, failure count, agreement between clients — are unaffected by either.
+thermally sensitive (298-413 us p99 on a cool machine); the *stability* indicators
+delivery, failure count, agreement between clients, are unaffected by either.
 
 ### Concurrent-stream capacity: 16,384 on one worker
 
@@ -351,18 +349,16 @@ none completes inside the window (no connection churn).
 189 MB.** That is the number to quote: unambiguously comfortable, with p99 under 0.6 ms
 and zero failures across eight independent clients.
 
-**24,576 is not llmbridge's limit — it is the host's.** At that level 49,152 of the 55,536
+**24,576 is not llmbridge's limit; it is the host's.** At that level 49,152 of the 55,536
 available ephemeral ports are in use (one per client->gateway connection, one per
 gateway->provider). The next power of two, 32,768 streams, would need 65,536 ports, which
 exceeds what a single source/destination IP pair can address. Measuring higher requires
-the load generator to spread across multiple loopback addresses — harness work that has
+the load generator to spread across multiple loopback addresses: harness work that has
 not been done, so **no number above 24,576 is claimed.**
 
 CPU scales close to linearly across the two levels (31% -> 44% for 1.5x the streams), so
 the gateway itself would reach one core somewhere near 50,000 streams. That extrapolation
-is deliberately **not** published: it is arithmetic, not a measurement.
-
-Two caveats stated rather than buried: **p99 roughly doubles** between the two levels
+is deliberately **not** published: it is arithmetic, not a measurement. Two caveats stated up front, not buried: **p99 roughly doubles** between the two levels
 (0.5 ms -> 1.2 ms), so the capacity is not free even though delivery holds; and the
 reference laptop ran at 93-94 C throughout, which is this configuration's thermal floor.
 
@@ -409,7 +405,7 @@ sudo cpupower idle-set -D 5
 sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192 net.core.somaxconn=8192
 
 ./bench/run_stream_headtohead.sh 60 20 20 6 "16 64 256 512"   # vs LiteLLM
-./bench/run_stream_cpu.sh 20 5                                 # CPU/token + saturation
+./bench/run_stream_cpu.sh 20 5                                # CPU/token + saturation
 python3 bench/make_stream_chart.py
 
 # Steady-state latency (no connection churn): 1000 tokens/stream so no stream
@@ -419,7 +415,6 @@ build-linux/bin/llmbridge --listen 8088 --upstream 127.0.0.1:9601 --translate an
 for i in 1 2 3 4; do build-linux/bin/streamgen --port 8088 --streams 1024 --duration 30 --warmup 5 & done
 ```
 
----
 
 ## Methodology: how the streaming numbers are taken
 
@@ -434,7 +429,7 @@ the payload through whatever gateway is under test, so the client computes:
 added latency = arrival_at_client − emission_at_provider
 ```
 
-No clock synchronisation (same host, same monotonic clock) and — the important part —
+No clock synchronisation (same host, same monotonic clock) and (the important part)
 **no assumption about when a token *should* have arrived**. This sidesteps coordinated
 omission structurally: a stalled gateway cannot look good by delivering fewer tokens,
 because every token that arrives carries the true age of its own data.
@@ -449,7 +444,7 @@ Each of these is a way the benchmark could have been rigged, and is therefore en
    control run at the same concurrency**, subtracted identically for both. The floor
    (loopback + provider jitter) is charged to neither gateway. It is not negligible:
    at 16 streams the floor is ~50 µs p50, comparable to llmbridge's own contribution.
-3. **Same workers.** One worker each — llmbridge single-threaded, LiteLLM one uvicorn
+3. **Same workers.** One worker each: llmbridge single-threaded, LiteLLM one uvicorn
    worker, no `SO_REUSEPORT` fan-out. Production LiteLLM deployments scale
    horizontally; these figures are **per worker**.
 4. **Same warmup, plus a discard round.** LiteLLM's lazy imports cost far more than a
@@ -458,13 +453,13 @@ Each of these is a way the benchmark could have been rigged, and is therefore en
    first measured level is really its cold start.
 5. **Same work.** Identical request bytes, model, provider and token rate. Neither side
    requests `stream_options.include_usage`, so neither emits an extra usage chunk.
-6. **Both proxies stay up** across the sweep — no restart gives either a fresh-process
+6. **Both proxies stay up** across the sweep, so no restart gives either a fresh-process
    advantage at a particular concurrency.
 7. **Order alternates** per level, so drift within a level cannot systematically favour
    one side.
 8. **Provider-saturation guard.** If the direct baseline stops scaling, the *provider*
-   is the limiter and the gateway numbers at that level are meaningless — the level is
-   flagged rather than silently reported.
+   is the limiter and the gateway numbers at that level are meaningless; the level is
+   flagged, never silently reported.
 9. **Equal-work check.** A gateway delivering far fewer tokens is not "faster", it is
    lossy; the delivered-token ratio is reported alongside every latency figure.
 10. **Connection churn is stated, not hidden.** `streamgen` opens a new connection per
@@ -473,7 +468,7 @@ Each of these is a way the benchmark could have been rigged, and is therefore en
     worse than epoll and 1.5x better. Streaming latency is therefore reported from a
     churn-free configuration (streams long enough that none complete in the window), and
     any figure taken with churn says so.
-11. **The harness must not be the limiter — including on the connect path.** The
+11. **The harness must not be the limiter, including on the connect path.** The
     provider-saturation guard (8) watches token delivery, but it does not watch the
     accept queue. A host whose SYN backlog overflows will refuse connects, and it will
     do so unequally between a gateway that pools upstream connections and one that does
@@ -482,14 +477,14 @@ Each of these is a way the benchmark could have been rigged, and is therefore en
 ### Why there are two providers
 
 `mock_provider.py` (Python, asyncio) saturates around **45–50k tokens/s**, which is
-*below* llmbridge — so sweeping against it measures the harness. `faststream.cpp` is
+*below* llmbridge, so sweeping against it measures the harness. `faststream.cpp` is
 wire-identical (same events, same chunked framing, same emission stamps) but is a
 single-threaded epoll loop with no per-token allocation, sustaining **>100k tokens/s**.
 The head-to-head and saturation sweeps use the C++ provider; the Python mock remains
 available (`PROVIDER=python`) as a cross-check.
 
 `faststream` also **staggers stream phases**. Streams that start together would
-otherwise stay in lockstep and fire in one synchronised burst each interval — both
+otherwise stay in lockstep and fire in one synchronised burst each interval; both
 unrealistic and latency-inflating for every path (it moved the control run's p99 from
 2,325 µs to 417 µs at 2,048 streams).
 
@@ -521,7 +516,7 @@ Two things follow, and the second one is a host-configuration result, not a code
 2. **The hop is mostly CPU idle-state exit latency, not transit.** Capping idle states at
    C1 (2 us exit, versus 70-890 us for C3-C10) cuts it 3.9x. Of the 14 us that remains,
    busy-polling the relay recovers only ~3 us, so the residual is the loopback data path
-   rather than this process's own wakeup.
+   instead of this process's own wakeup.
 
 See [`bench/LATENCY-TUNING.md`](bench/LATENCY-TUNING.md) for the three ways to configure
 this, and for why the *aggressive* setting backfires: disabling C1 as well leaves the
@@ -588,8 +583,7 @@ interleaved and ran at identical clocks).
   gateway fronts `https://api.anthropic.com` today. The benchmark stays on a mock
   because a live provider's queue variance (measured: 756–927 ms TTFT on identical
   requests) is orders of magnitude larger than the microseconds being compared.
-- **One worker per gateway.** Both scale out; neither was given the chance to.
-- **LiteLLM percentiles above 2 s are not resolved** — the generator's histogram tops
+- **One worker per gateway.** Both scale out; neither was given the chance to, - **LiteLLM percentiles above 2 s are not resolved**, the generator's histogram tops
   out at 2 s and says so. llmbridge and the direct baseline never overflowed it.
 - **The reference box thermally throttles**, which penalises the CPU-bound competitor far
   more than the C++ gateway. See the caveat under the results table.
@@ -604,8 +598,8 @@ interleaved and ran at identical clocks).
   which streams complete is also measuring connect cost; see "epoll vs io_uring".
 - **The CPU profile is not reproducible from this repository.** Every latency and
   throughput table above is backed by a committed CSV in `bench/results/`, but the
-  `perf record` breakdown (TCP stack 32.7%, llmbridge 6.7%, AppArmor 6.1%, …) has no
-  raw data checked in — it is a transcription of a run that no longer exists. Two
+  `perf record` breakdown (TCP stack 32.7%, llmbridge 6.7%, AppArmor 6.1%, ...) has no
+  raw data checked in; it is a transcription of a run that no longer exists. Two
   small inconsistencies in it were found by cross-reading (a 6.9% that should have
   been 6.7%, and an AppArmor figure quoted as both 6.1% and 6.37%) and could only be
   resolved by majority, not by re-derivation. Treat the profile as indicative and

@@ -11,7 +11,7 @@
 //
 // THE PROBLEM. `std::string::clear()` sets size()=0 and leaves the bytes intact;
 // a plain `memset` before releasing the memory is a DEAD STORE the optimizer is
-// entitled to delete. That is not theoretical — compiled at -O2 on this project's
+// entitled to delete. That is not theoretical: compiled at -O2 on this project's
 // toolchain, the naive version emitted ZERO instructions while the version below
 // emitted the call. Verify with:
 //
@@ -20,7 +20,7 @@
 // THE SOLUTION. There is no standard one: `std::secure_clear` (P1315) was proposed
 // and never adopted, so every real implementation calls a PLATFORM primitive and
 // falls back to a compiler barrier where none exists. That is exactly what this
-// does — the platform function is chosen at CMake configure time by feature
+// does: the platform function is chosen at CMake configure time by feature
 // detection (never by guessing from #ifdef __linux__), so the common path is a
 // purpose-built function that states its intent, not a trick:
 //
@@ -29,14 +29,14 @@
 //     SecureZeroMemory    Windows                      (_WIN32)
 //     volatile memset     documented fallback, always correct, everywhere else
 //
-// The fallback is kept because it is *sufficient* — volatile semantics are
-// mandated by the standard, so the call cannot be elided — but it is deliberately
+// The fallback is kept because it is *sufficient*: volatile semantics are
+// mandated by the standard, so the call cannot be elided, but it is deliberately
 // last, since it works for an indirect reason and the named functions do not.
 //
 // SCOPE. This is not a hot-path function and does not need to be: it runs once per
 // request when a pooled upstream is released (measured 2.4 ns for a ~96 B buffer,
 // ~0.02% of one core at 84k RPS). Do NOT sprinkle it over transient buffers that
-// are overwritten microseconds later — that buys nothing and costs the hot path.
+// are overwritten microseconds later; that buys nothing and costs the hot path.
 
 #include <cstddef>
 #include <string>
