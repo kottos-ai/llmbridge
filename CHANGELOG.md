@@ -7,11 +7,34 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with on
 pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land in
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
+
 ## [Unreleased]
 
 Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting an
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
+
+## [0.10.1]. 2026-08-09
+
+### Fixed
+
+- **The TLS handshake was billed as the upstream write.** On a cold TLS
+  connection `t2` was stamped at TCP connect, before the handshake, while `t3`
+  waits for the request ciphertext to flush. The handshake therefore landed in
+  `x-llmbridge-upwrite-us` and `x-llmbridge-connect-us` reported TCP alone: a
+  live run measured `upwrite-us` at 32-43 ms cold against 34 us warm. `t2` is now
+  stamped in `tls_feed()` when the handshake completes, on both backends; pooled
+  reuse still reports exactly 0. Published benchmark numbers are unaffected, as
+  they run plaintext on pooled connections, and the error *overstated* our own
+  added latency. PATCH: no new functionality, and the headers now mean what
+  `LATENCY.md` always said they meant.
+
+### Added
+
+- Four timing-attribution tests in `gateway_tls_test.cpp`, covering both event
+  loops on both the streaming and non-streaming paths. They stall the mock
+  provider before `SSL_accept` and assert the stall lands in `connect-us`; each
+  fails against 0.10.0.
 
 ## [0.10.0]. 2026-08-06
 
@@ -1045,6 +1068,7 @@ non-streaming chat completions), the reference gateway proxy (epoll and io_uring
 the benchmark harness, and the test suite.
 
 [Unreleased]: https://github.com/kottos-ai/llmbridge/compare/v0.10.0...HEAD
+[0.10.1]: https://github.com/kottos-ai/llmbridge/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/kottos-ai/llmbridge/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/kottos-ai/llmbridge/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/kottos-ai/llmbridge/compare/v0.8.0...v0.8.1

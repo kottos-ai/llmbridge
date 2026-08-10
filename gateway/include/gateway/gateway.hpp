@@ -351,6 +351,12 @@ namespace llmbridge
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
 
+        // Is this upstream carrying TLS? Shared by both backends (hence no
+        // ep_/ur_ prefix) and declared outside the TLS guard because the t2
+        // stamp sites call it in every build; it is a constant `false` when the
+        // project is built without TLS.
+        bool upstream_is_tls(const Connection* u) const noexcept;
+
 #ifdef LLMBRIDGE_HAVE_TLS
         // ── TLS plumbing (upstream side only; every helper is a no-op-safe
         //     building block the two backends share) ──────────────────────────

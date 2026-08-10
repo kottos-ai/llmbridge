@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cstdio>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -107,9 +108,13 @@ namespace
       public:
         // mode: "json" = keep-alive 200 with a JSON body; "sse" = one chunked
         // Anthropic event-stream response, then keep-alive for the next request.
-        void start(const SelfSigned& id, std::string mode = "json")
+        // handshake_delay_ms stalls the server before SSL_accept, so the client
+        // spends a known, large interval inside the TLS handshake and nowhere
+        // else. That is what makes the t2 attribution testable.
+        void start(const SelfSigned& id, std::string mode = "json", int handshake_delay_ms = 0)
         {
             _mode = std::move(mode);
+            _hs_delay_ms = handshake_delay_ms;
             _ctx = SSL_CTX_new(TLS_server_method());
             SSL_CTX_use_certificate(_ctx, id.crt);
             SSL_CTX_use_PrivateKey(_ctx, id.key);
@@ -179,6 +184,8 @@ namespace
                 ::close(fd);
                 return;
             }
+            if (_hs_delay_ms > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(_hs_delay_ms));
             SSL* ssl = SSL_new(_ctx);
             SSL_set_fd(ssl, fd);
             if (SSL_accept(ssl) == 1)
@@ -221,7 +228,9 @@ namespace
                         (void)SSL_read(ssl, sink, sizeof sink);
                         goto done;
                     }
-                    const std::string resp = _mode == "sse" ? sse_response() : json_response();
+                    const std::string resp = _mode == "sse"          ? sse_response()
+                                             : _mode == "anthropic-json" ? anthropic_json_response()
+                                                                         : json_response();
                     size_t off = 0;
                     while (off < resp.size())
                     {
@@ -236,6 +245,20 @@ namespace
         done:
             SSL_free(ssl); // frees nothing we still need; fd is ours to close
             ::close(fd);
+        }
+
+        // A well-formed Anthropic message. The gateway only emits timing headers
+        // where it REBUILDS the response, so a non-streaming timing test needs a
+        // body the translator accepts; the plain {"ok":true} body is byte-
+        // forwarded and carries the provider's headers untouched.
+        static std::string anthropic_json_response()
+        {
+            const std::string body =
+                R"({"id":"msg_tls","type":"message","role":"assistant","model":"claude-x",)"
+                R"("content":[{"type":"text","text":"hola"}],"stop_reason":"end_turn",)"
+                R"("usage":{"input_tokens":7,"output_tokens":11}})";
+            return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body;
         }
 
         static std::string json_response()
@@ -292,6 +315,7 @@ namespace
         uint16_t _port{0};
         std::string _mode{"json"};
         std::atomic<bool> _stopping{false};
+        int _hs_delay_ms = 0;
         std::atomic<int> _handshakes{0};
         std::atomic<int> _requests{0};
         std::thread _acc;
@@ -390,15 +414,16 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
 {
   protected:
     void start(TranslateMode mode = TranslateMode::None, const std::string& backend_mode = "json",
-               const std::string& sni = kHost)
+               const std::string& sni = kHost, int handshake_delay_ms = 0,
+               bool timing_headers = false)
     {
-        _backend.start(_id, backend_mode);
+        _backend.start(_id, backend_mode, handshake_delay_ms);
         TlsConfig tls;
         tls.enabled = true;
         tls.sni_host = sni;
         tls.ca_file = _id.write_pem();
         _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),
-                                        Gateway::kDefaultUpstreamIdleNs, tls);
+                                        Gateway::kDefaultUpstreamIdleNs, tls, timing_headers);
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
@@ -428,6 +453,87 @@ TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
     EXPECT_NE(r.find(R"("via":"tls")"), std::string::npos);
     EXPECT_EQ(_backend.handshakes(), 1);
     EXPECT_EQ(_backend.requests(), 1);
+}
+
+// The TLS handshake must land in connect-us (t2-t1), not in upwrite-us (t3-t2).
+//
+// The defect this locks down: t2 was stamped when the TCP connect completed,
+// which is BEFORE start_handshake(). t3 is stamped when the request ciphertext
+// is flushed, which cannot happen until the handshake finishes. So on a cold TLS
+// connection the whole handshake was reported as "the write() into the kernel's
+// socket buffer": a live run showed upwrite-us at 32-43 ms against 34-107 us on
+// a warm one, and LATENCY.md claims upwrite-us is ~4.4 us and that connect-us is
+// "TCP + TLS".
+//
+// The backend stalls kDelayMs before SSL_accept, so that interval is spent
+// unambiguously inside the handshake and nowhere else.
+// The TLS handshake must land in connect-us (t2-t1), not in upwrite-us (t3-t2).
+//
+// The defect these lock down (fixed in 0.10.1): t2 was stamped when the TCP
+// connect completed, which is BEFORE start_handshake(), while t3 waits for the
+// request ciphertext to flush, which cannot happen until the handshake ends. So
+// a cold TLS connection reported the entire handshake as "the write() into the
+// kernel's socket buffer". A live run measured upwrite-us at 32-43 ms cold
+// against 34 us warm, against a documented ~4.4 us.
+//
+// Run on BOTH response paths, because they build their headers in different
+// code: the non-streaming path rebuilds the response after the body arrives, the
+// streaming path emits headers up front at first upstream byte. Both are
+// parameterized over both event loops, so four tests in total.
+//
+// The mock stalls kDelayMs before SSL_accept, so that interval is spent
+// unambiguously inside the handshake and nowhere else.
+namespace
+{
+    constexpr int kHandshakeStallMs = 300;
+
+    long long header_us(const std::string& r, const char* name)
+    {
+        const size_t k = r.find(name);
+        if (k == std::string::npos) return -1;
+        const size_t v = r.find(": ", k);
+        if (v == std::string::npos) return -1;
+        return std::strtoll(r.c_str() + v + 2, nullptr, 10);
+    }
+
+    void expect_handshake_in_connect(const std::string& r)
+    {
+        const long long connect_us = header_us(r, "x-llmbridge-connect-us");
+        const long long upwrite_us = header_us(r, "x-llmbridge-upwrite-us");
+        ASSERT_GE(connect_us, 0) << "no connect-us header:\n" << r.substr(0, 400);
+        ASSERT_GE(upwrite_us, 0) << "no upwrite-us header:\n" << r.substr(0, 400);
+        EXPECT_GE(connect_us, kHandshakeStallMs * 1000LL * 8 / 10)
+            << "connect-us " << connect_us << " us does not contain the "
+            << kHandshakeStallMs << " ms handshake; it was attributed elsewhere";
+        EXPECT_LT(upwrite_us, kHandshakeStallMs * 1000LL / 2)
+            << "upwrite-us " << upwrite_us << " us contains the handshake; t2 is "
+            << "being stamped at TCP connect instead of at handshake completion";
+    }
+} // namespace
+
+TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectNonStreaming)
+{
+    start(TranslateMode::Anthropic, "anthropic-json", kHost, kHandshakeStallMs,
+          /*timing_headers=*/true);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty());
+    ASSERT_EQ(Client::status_of(r), 200) << r.substr(0, 400);
+    expect_handshake_in_connect(r);
+}
+
+TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectStreaming)
+{
+    start(TranslateMode::Anthropic, "sse", kHost, kHandshakeStallMs,
+          /*timing_headers=*/true);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true,"messages":[]})")));
+    const std::string all = c.recv_all();
+    ASSERT_FALSE(all.empty());
+    expect_handshake_in_connect(all);
 }
 
 TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)

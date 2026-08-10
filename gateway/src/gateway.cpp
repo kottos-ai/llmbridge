@@ -740,6 +740,18 @@ namespace llmbridge
         return true;
     }
 
+    // Shared by both backends, hence no ep_/ur_ prefix: is this upstream carrying
+    // TLS? Compiles to `false` in a build without TLS support.
+    bool Gateway::upstream_is_tls(const Connection* u) const noexcept
+    {
+#ifdef LLMBRIDGE_HAVE_TLS
+        return u->tls != nullptr;
+#else
+        (void)u;
+        return false;
+#endif
+    }
+
 #ifdef LLMBRIDGE_HAVE_TLS
     // ── TLS plumbing ────────────────────────────────────────────────────────
     // The invariant (see gateway.hpp): rbuf/wbuf are PLAINTEXT, always. TLS lives
@@ -806,8 +818,16 @@ namespace llmbridge
 
         // Handshake completed on this feed: the request that has been waiting in
         // wbuf can finally go through the Session.
-        if (!hs_was_done && u->tls->handshake_done() && u->woff < u->wbuf.size())
-            tls_push_request(u);
+        if (!hs_was_done && u->tls->handshake_done())
+        {
+            // t2 belongs HERE for TLS, not at TCP connect. The wire cannot carry
+            // the request until the handshake is done, so stamping t2 earlier put
+            // the entire handshake inside upwrite-us (t3-t2) and left connect-us
+            // reporting the TCP leg alone. See the attribution test in
+            // gateway/tests/gateway_tls_test.cpp.
+            if (u->peer) u->peer->ts_wire_ready = now_ns();
+            if (u->woff < u->wbuf.size()) tls_push_request(u);
+        }
         return true;
     }
 
@@ -1175,7 +1195,11 @@ namespace llmbridge
                 return;
             }
             u->connected = true;
-            if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
+            // t2 for a PLAINTEXT upstream: the socket can carry the request now.
+            // A TLS upstream is not wire-ready yet; tls_feed() stamps t2 when the
+            // handshake completes.
+            if (!upstream_is_tls(u) && u->peer && u->peer->ts_wire_ready == 0)
+                u->peer->ts_wire_ready = now_ns();
 #ifdef LLMBRIDGE_HAVE_TLS
             if (u->tls && !u->tls->handshake_done())
                 u->tls->start_handshake(); // ClientHello lands in the write BIO
@@ -2184,7 +2208,9 @@ namespace llmbridge
             return;
         }
         u->connected = true;
-        if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
+        // t2 for a PLAINTEXT upstream only; see the epoll twin and tls_feed().
+        if (!upstream_is_tls(u) && u->peer && u->peer->ts_wire_ready == 0)
+            u->peer->ts_wire_ready = now_ns();
         ur_arm_recv(u); // arm the multishot recv for this upstream's life
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
