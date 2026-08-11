@@ -564,18 +564,29 @@ namespace llmbridge
           _timing_headers(timing_headers)
     {
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (_tls.enabled)
+        if (_tls.upstream_tls)
         {
             // Setup path: a bad trust store must fail construction, not the first
             // request. Same throw discipline as the listener below.
             net::tls::Context::ClientOptions o;
             o.ca_file = _tls.ca_file;
-            _tls_ctx_ok = _tls_ctx.init_client(o);
-            if (!_tls_ctx_ok)
-                throw std::runtime_error("TLS context init failed: " + _tls_ctx.last_error());
+            if (!_tls_upstream_ctx.init_client(o))
+                throw std::runtime_error("TLS context init failed: " + _tls_upstream_ctx.last_error());
+        }
+        if (_tls.client_tls)
+        {
+            // Same discipline as above and for a sharper reason: a missing or
+            // unreadable certificate must stop the process, never downgrade the
+            // listener to plaintext. A client that dialled https and got a
+            // plaintext answer would send its credential in the clear.
+            net::tls::Context::ServerOptions so;
+            so.cert_file = _tls.cert_file;
+            so.key_file = _tls.key_file;
+            if (!_tls_client_ctx.init_server(so))
+                throw std::runtime_error("inbound TLS init failed: " + _tls_client_ctx.last_error());
         }
 #else
-        if (_tls.enabled)
+        if (_tls.upstream_tls)
             throw std::runtime_error("TLS upstream requested but built without LLMBRIDGE_TLS");
 #endif
         // Host header for rebuilt (translated) upstream requests. Prefer the
@@ -586,7 +597,7 @@ namespace llmbridge
         {
             _upstream_host_hdr = _tls.sni_host;
             const bool default_port =
-                (_tls.enabled && _upstream_port == 443) || (!_tls.enabled && _upstream_port == 80);
+                (_tls.upstream_tls && _upstream_port == 443) || (!_tls.upstream_tls && _upstream_port == 80);
             if (!default_port) _upstream_host_hdr += ":" + std::to_string(_upstream_port);
         }
         else
@@ -726,6 +737,21 @@ namespace llmbridge
     bool Gateway::ep_pump_write(Connection* c, bool* done) noexcept
     {
         *done = false;
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (!tls_invariant_ok(c)) return false; // never plaintext on a TLS conn
+        // Branching HERE and not at the call sites is deliberate: ep_respond,
+        // ep_on_client_writable and the SSE stream flush all reach the socket
+        // through this one function, so inbound TLS covers streaming for free
+        // instead of needing a fourth copy of the logic.
+        if (c->tls)
+        {
+            if (c->tls->handshake_done()) tls_push_wbuf(c);
+            bool flushed = false;
+            if (!ep_tls_flush(c, &flushed)) return false;
+            *done = flushed && tls_wbuf_flushed(c);
+            return true;
+        }
+#endif
         while (c->woff < c->wbuf.size())
         {
             ssize_t n = ::write(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff);
@@ -759,14 +785,54 @@ namespace llmbridge
     // counts plaintext fed into the Session (so retry-resend still works from
     // wbuf), and tls_out/tls_out_off track the encrypted bytes towards the socket.
 
-    bool Gateway::tls_attach(Connection* u) noexcept
+    bool Gateway::tls_required(const Connection* c) const noexcept
+    {
+        return c->is_client ? _tls.client_tls : _tls.upstream_tls;
+    }
+
+    bool Gateway::tls_invariant_ok(Connection* c) noexcept
+    {
+        if (c->tls || !tls_required(c)) return true;
+
+        // A connection the configuration says must be encrypted has no Session.
+        // Whatever the cause, the one thing we must not do is fall through to the
+        // plaintext path: on the client leg those bytes are a response to a peer
+        // that dialled TLS, and on the upstream leg the very next thing we would
+        // send is the provider credential. Either way the failure mode is a
+        // disclosure, so refuse and let the caller tear the connection down.
+        //
+        // Unreachable by construction TODAY: both accept paths close the
+        // connection immediately when tls_attach_client() fails, and both upstream
+        // paths do the same for tls_attach_upstream(). This exists so that a
+        // future edit which adds a third way to create a connection cannot quietly
+        // reintroduce a plaintext path, and so that the condition is COUNTED
+        // instead of guessed at if it ever does occur.
+        ++_stats.errors;
+        return false;
+    }
+
+    bool Gateway::tls_attach_upstream(Connection* u) noexcept
     {
         u->tls = std::make_unique<net::tls::Session>();
-        if (!u->tls->init_client(_tls_ctx, _tls.sni_host))
+        if (!u->tls->init_client(_tls_upstream_ctx, _tls.sni_host))
         {
             u->tls.reset();
             return false;
         }
+        return true;
+    }
+
+    bool Gateway::tls_attach_client(Connection* c) noexcept
+    {
+        c->tls = std::make_unique<net::tls::Session>();
+        if (!c->tls->init_server(_tls_client_ctx))
+        {
+            c->tls.reset();
+            return false;
+        }
+        // Accept state is already set by init_server. The handshake advances on the
+        // first readable event: the client speaks first with a ClientHello, so there
+        // is nothing to emit here and nothing to wait for.
         return true;
     }
 
@@ -781,7 +847,7 @@ namespace llmbridge
             u->tls_out.append(reinterpret_cast<const char*>(buf), n);
     }
 
-    void Gateway::tls_push_request(Connection* u) noexcept
+    void Gateway::tls_push_wbuf(Connection* u) noexcept
     {
         // Feed as much request plaintext as the Session accepts. Does NOT pump the
         // resulting ciphertext; the two backends stage it differently.
@@ -794,7 +860,7 @@ namespace llmbridge
         }
     }
 
-    bool Gateway::tls_request_flushed(const Connection* u) const noexcept
+    bool Gateway::tls_wbuf_flushed(const Connection* u) const noexcept
     {
         return u->woff >= u->wbuf.size() && u->tls_out_off >= u->tls_out.size() &&
                !u->tls->has_pending_output();
@@ -816,9 +882,12 @@ namespace llmbridge
             u->rbuf.append(reinterpret_cast<const char*>(buf), r);
         if (u->tls->want() == net::tls::Want::Error) return false;
 
-        // Handshake completed on this feed: the request that has been waiting in
-        // wbuf can finally go through the Session.
-        if (!hs_was_done && u->tls->handshake_done())
+        // Handshake completed on this feed. On an UPSTREAM conn the request has
+        // been waiting in wbuf and can finally go through the Session. On an
+        // INBOUND conn there is nothing pending, because the client speaks first
+        // and its request arrives as plaintext out of this very call; t2 is an
+        // upstream concept and stamping it here would be meaningless.
+        if (!hs_was_done && u->tls->handshake_done() && !u->is_client)
         {
             // t2 belongs HERE for TLS, not at TCP connect. The wire cannot carry
             // the request until the handshake is done, so stamping t2 earlier put
@@ -826,7 +895,7 @@ namespace llmbridge
             // reporting the TCP leg alone. See the attribution test in
             // gateway/tests/gateway_tls_test.cpp.
             if (u->peer) u->peer->ts_wire_ready = now_ns();
-            if (u->woff < u->wbuf.size()) tls_push_request(u);
+            if (u->woff < u->wbuf.size()) tls_push_wbuf(u);
         }
         return true;
     }
@@ -874,10 +943,10 @@ namespace llmbridge
         // Feeding may have produced output (handshake flights, the request itself
         // once the handshake completed). Put it on the wire before returning to
         // the parse logic, and stamp the request-sent time on the transition.
-        const bool was_flushed = u->peer && tls_request_flushed(u);
+        const bool was_flushed = u->peer && tls_wbuf_flushed(u);
         bool done = false;
         if (!ep_tls_flush(u, &done)) return false;
-        if (u->peer && !was_flushed && tls_request_flushed(u))
+        if (u->peer && !was_flushed && tls_wbuf_flushed(u))
             u->peer->ts_up_sent = now_ns();
         return true;
     }
@@ -932,7 +1001,7 @@ namespace llmbridge
         u->from_pool = false;
         u->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (_tls.enabled && !tls_attach(u))
+        if (_tls.upstream_tls && !tls_attach_upstream(u))
         {
             ::close(fd);
             delete u;
@@ -966,7 +1035,7 @@ namespace llmbridge
         uf->woff = 0;
         uf->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (_tls.enabled && !tls_attach(uf))
+        if (_tls.upstream_tls && !tls_attach_upstream(uf))
         {
             ::close(fd);
             delete uf;
@@ -1075,6 +1144,17 @@ namespace llmbridge
             c->is_client = true;
             c->id = _next_client_id++;
             c->rbuf.reserve(kInitialBuf);
+#ifdef LLMBRIDGE_HAVE_TLS
+            if (_tls.client_tls && !tls_attach_client(c))
+            {
+                // Fail CLOSED. Answering in plaintext because the Session would
+                // not attach is how a credential ends up on the wire in the clear.
+                ::close(fd);
+                delete c;
+                ++_stats.errors;
+                continue;
+            }
+#endif
             _clients[c->id] = c;
             ep_add_read(c);
         }
@@ -1082,7 +1162,14 @@ namespace llmbridge
 
     void Gateway::ep_on_client_readable(Connection* c) noexcept
     {
-        if (!ep_drain_read(c))
+#ifdef LLMBRIDGE_HAVE_TLS
+        // Inbound TLS: ciphertext off the socket, plaintext into rbuf. Everything
+        // below this point, framing included, is unchanged and unaware of TLS.
+        const bool ok = c->tls ? ep_tls_drain_read(c) : ep_drain_read(c);
+#else
+        const bool ok = ep_drain_read(c);
+#endif
+        if (!ok)
         {
             // EOF/error: mid-request close is a real abort; idle close is normal.
             const bool in_flight = c->peer != nullptr || !c->wbuf.empty();
@@ -1158,14 +1245,14 @@ namespace llmbridge
                 // Pooled TLS conns are always past the handshake (a fresh conn is
                 // never `connected` here). Push the plaintext through the session
                 // and flush the ciphertext; partial flushes finish on writability.
-                tls_push_request(u);
+                tls_push_wbuf(u);
                 bool done = false;
                 if (!ep_tls_flush(u, &done))
                 {
                     if (!ep_retry_upstream(u)) ep_error_respond(c, 502);
                     return;
                 }
-                if (done && tls_request_flushed(u)) c->ts_up_sent = now_ns();
+                if (done && tls_wbuf_flushed(u)) c->ts_up_sent = now_ns();
                 return;
             }
 #endif
@@ -1208,7 +1295,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
-            const bool was_flushed = u->peer && tls_request_flushed(u);
+            const bool was_flushed = u->peer && tls_wbuf_flushed(u);
             bool tdone = false;
             if (!ep_tls_flush(u, &tdone))
             {
@@ -1218,7 +1305,7 @@ namespace llmbridge
             }
             if (!tdone) return; // EPOLLOUT re-armed by ep_tls_flush
             ep_disarm_write(u); // ciphertext drained; handshake replies arrive via read
-            if (u->peer && !was_flushed && tls_request_flushed(u))
+            if (u->peer && !was_flushed && tls_wbuf_flushed(u))
                 u->peer->ts_up_sent = now_ns();
             return;
         }
@@ -1752,14 +1839,17 @@ namespace llmbridge
     bool Gateway::ur_submit_send(Connection* c) noexcept
     {
         io_uring_sqe* s = nullptr;
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (!tls_invariant_ok(c)) { ur_close(c); return false; } // never plaintext
+#endif
         if (!ur_next_sqe(&s)) { ur_close(c); return false; }
         s->opcode = IORING_OP_SEND;
         s->fd = c->fd;
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (!c->is_client && c->tls)
+        if (c->tls)
         {
-            // TLS upstream: the wire sees ciphertext. wbuf (plaintext) is fed to
-            // the Session elsewhere; woff tracks that, not this send.
+            // TLS on either leg: the wire sees ciphertext. wbuf (plaintext) is fed
+            // to the Session elsewhere; woff tracks that, not this send.
             s->addr = reinterpret_cast<uint64_t>(c->tls_out.data() + c->tls_out_off);
             s->len = static_cast<unsigned>(c->tls_out.size() - c->tls_out_off);
         }
@@ -1823,6 +1913,26 @@ namespace llmbridge
     }
 #endif
 
+    // Send wbuf to a CLIENT connection, whatever the transport.
+    //
+    // The plaintext path submits a send straight out of wbuf. A TLS conn cannot:
+    // the SQE points at tls_out, so the plaintext has to go through the Session
+    // first or the kernel is handed a zero-length send. That is exactly the bug
+    // this helper exists to make unrepeatable. It was found by running curl
+    // against both backends, and never by reading the code.
+    void Gateway::ur_client_send(Connection* c) noexcept
+    {
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->tls)
+        {
+            if (c->tls->handshake_done()) tls_push_wbuf(c);
+            ur_tls_flush(c);
+            return;
+        }
+#endif
+        ur_submit_send(c);
+    }
+
     Connection* Gateway::ur_acquire_upstream() noexcept
     {
         if (!_idle_upstreams.empty())
@@ -1843,7 +1953,7 @@ namespace llmbridge
         u->from_pool = false;
         u->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (_tls.enabled && !tls_attach(u))
+        if (_tls.upstream_tls && !tls_attach_upstream(u))
         {
             ::close(fd);
             delete u;
@@ -1880,7 +1990,7 @@ namespace llmbridge
         uf->woff = 0;
         uf->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (_tls.enabled && !tls_attach(uf))
+        if (_tls.upstream_tls && !tls_attach_upstream(uf))
         {
             ::close(fd);
             delete uf;
@@ -1948,7 +2058,7 @@ namespace llmbridge
         client->woff = 0;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
         ++_stats.errors;
-        ur_submit_send(client);
+        ur_client_send(client);
     }
 
     void Gateway::ur_maybe_free(Connection* c) noexcept
@@ -2011,6 +2121,18 @@ namespace llmbridge
         c->is_client = true;
         c->id = _next_client_id++;
         c->rbuf.reserve(kInitialBuf);
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (_tls.client_tls && !tls_attach_client(c))
+        {
+            // Fail CLOSED, exactly as the epoll twin does. No recv is armed yet, so
+            // there is nothing in flight and the Connection can be freed directly
+            // instead of going on the doomed list.
+            ::close(fd);
+            delete c;
+            ++_stats.errors;
+            return;
+        }
+#endif
         _clients[c->id] = c;
         ur_arm_recv(c); // multishot recv stays armed for the connection's life
     }
@@ -2059,7 +2181,7 @@ namespace llmbridge
         {
             const unsigned bid = flags >> IORING_CQE_BUFFER_SHIFT;
 #ifdef LLMBRIDGE_HAVE_TLS
-            if (!c->is_client && c->tls)
+            if (c->tls)
                 tls_ok = tls_feed(c, _bufring.data(bid), static_cast<size_t>(res));
             else
 #endif
@@ -2074,6 +2196,10 @@ namespace llmbridge
             // Deliberately NOT ur_stream_on_upstream_eof for a mid-stream failure: a
             // corrupted stream must not be finalized as if it ended cleanly.
             if (c->peer && c->peer->streaming) { ur_abort_pair(c->peer); return; }
+            // An inbound TLS failure is the CLIENT's connection dying, not a
+            // retryable upstream fault. Retrying it would resend the request to the
+            // provider on behalf of a peer that can no longer receive the answer.
+            if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); return; }
             if (!ur_retry_upstream(c))
             {
                 if (c->peer) ur_error_respond(c->peer, 502);
@@ -2081,7 +2207,7 @@ namespace llmbridge
             }
             return;
         }
-        if (!c->is_client && c->tls)
+        if (c->tls)
             ur_tls_flush(c); // handshake replies / newly-pushed request bytes
 #else
         (void)tls_ok;
@@ -2187,7 +2313,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)
         {
-            tls_push_request(u); // pooled conns are past the handshake
+            tls_push_wbuf(u); // pooled conns are past the handshake
             ur_tls_flush(u);
             return;
         }
@@ -2243,7 +2369,7 @@ namespace llmbridge
                 client->peer = nullptr;
                 if (h.keep_alive) ur_release_upstream(u); else ur_close(u);
                 ++_stats.errors;
-                ur_submit_send(client);
+                ur_client_send(client);
                 return;
             }
             std::string tbody = xlate_resp(_translate, body);
@@ -2288,7 +2414,7 @@ namespace llmbridge
         u->rdec.reset(); // see the epoll mirror
         if (pool_upstream) ur_release_upstream(u);
         else ur_close(u);
-        ur_submit_send(client);
+        ur_client_send(client);
     }
 
     void Gateway::ur_on_send(Connection* c, int res) noexcept
@@ -2300,18 +2426,40 @@ namespace llmbridge
             return;
         }
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (!c->is_client && c->tls)
+        if (c->tls)
         {
-            // TLS upstream: this send moved CIPHERTEXT (tls_out); woff/wbuf track
-            // plaintext fed to the Session and are not touched here.
+            // TLS on either leg: this send moved CIPHERTEXT (tls_out); woff/wbuf
+            // track plaintext fed to the Session and are not touched here.
             c->tls_out_off += static_cast<size_t>(res);
             if (c->tls_out_off < c->tls_out.size()) { ur_submit_send(c); return; } // partial
             c->send_inflight = false;
-            // The Session may hold more: later handshake flights, or request
-            // plaintext that could not be pushed before the handshake finished.
-            if (c->tls->handshake_done() && c->woff < c->wbuf.size()) tls_push_request(c);
+            // The Session may hold more: later handshake flights, or plaintext that
+            // could not be pushed before the handshake finished.
+            if (c->tls->handshake_done() && c->woff < c->wbuf.size()) tls_push_wbuf(c);
             ur_tls_flush(c); // refill from the write BIO; resubmit if non-empty
-            if (c->peer && tls_request_flushed(c)) c->peer->ts_up_sent = now_ns();
+            if (c->send_inflight) return; // more ciphertext went out; wait for it
+
+            if (!c->is_client)
+            {
+                if (c->peer && tls_wbuf_flushed(c)) c->peer->ts_up_sent = now_ns();
+                return;
+            }
+            // Inbound leg: the response is fully encrypted AND fully on the wire,
+            // so this is the same completion point the plaintext path reaches when
+            // woff catches up with wbuf. Streams continue, everything else finishes.
+            if (!tls_wbuf_flushed(c)) return;
+            if (c->streaming)
+            {
+                c->wbuf.clear();
+                c->woff = 0;
+                ur_stream_flush(c);
+            }
+            else if (!c->wbuf.empty())
+            {
+                c->wbuf.clear();
+                c->woff = 0;
+                ur_finish_client(c);
+            }
             return;
         }
 #endif
@@ -2460,7 +2608,7 @@ namespace llmbridge
         client->wpending.clear();
         client->woff = 0;
         client->send_inflight = true;
-        ur_submit_send(client); // (closes the client on SQE exhaustion; nothing more to do)
+        ur_client_send(client); // (closes the client on SQE exhaustion; nothing more to do)
     }
 
     void Gateway::ur_finalize_stream(Connection* client) noexcept

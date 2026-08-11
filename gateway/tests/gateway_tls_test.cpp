@@ -419,7 +419,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     {
         _backend.start(_id, backend_mode, handshake_delay_ms);
         TlsConfig tls;
-        tls.enabled = true;
+        tls.upstream_tls = true;
         tls.sni_host = sni;
         tls.ca_file = _id.write_pem();
         _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),

@@ -75,9 +75,24 @@ namespace llmbridge
     // retry-resend of wbuf on a stale pooled conn) knows TLS exists.
     struct TlsConfig
     {
-        bool enabled = false;
+        // Outbound: gateway -> provider. We are the TLS client and we verify them.
+        //
+        // Named for the LEG, not for a bare "enabled": with two legs, "enabled"
+        // could not say which one it meant. The pair matches the vocabulary the
+        // rest of the gateway uses for the two sides, client and upstream.
+        bool upstream_tls = false;
         std::string sni_host; // DNS name for SNI + certificate hostname verification
         std::string ca_file;  // empty = system trust store (tests pass their own CA)
+
+        // Inbound: client -> gateway. We are the TLS server and we prove identity.
+        //
+        // ONE LISTENER, ONE MODE (decided 2026-08-10): setting this makes the
+        // single listener TLS-only. There is no second plaintext port, so the
+        // answer to "am I exposed in the clear?" can be read off the command line
+        // instead of inferred from which port a client happened to use.
+        bool client_tls = false;  // set by --listen-tls
+        std::string cert_file; // PEM chain, leaf first (Let's Encrypt fullchain.pem)
+        std::string key_file;  // PEM key, mode 600 or startup refuses it
     };
 
     // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.
@@ -358,23 +373,41 @@ namespace llmbridge
         bool upstream_is_tls(const Connection* u) const noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
-        // ── TLS plumbing (upstream side only; every helper is a no-op-safe
-        //     building block the two backends share) ──────────────────────────
-        // Attach a fresh Session to a new upstream conn (SNI + hostname from
-        // _tls.sni_host). Returns false on failure, treated like connect refusal.
-        bool tls_attach(Connection* u) noexcept;
-        // Move whatever ciphertext the Session has pending into u->tls_out.
-        void tls_pump_out(Connection* u) noexcept;
-        // Feed ciphertext from the socket. Drains resulting plaintext into u->rbuf,
-        // advances the handshake, and pushes wbuf plaintext once the handshake
-        // completes. Returns false on a fatal TLS error.
-        bool tls_feed(Connection* u, const char* p, size_t n) noexcept;
-        // Push un-fed request plaintext (wbuf[woff..]) into the Session.
-        void tls_push_request(Connection* u) noexcept;
-        // True when the request is fully on the wire: all plaintext fed AND all
-        // ciphertext flushed. This is the TLS analogue of ep_pump_write's `done`,
-        // and the point where ts_up_sent is stamped.
-        bool tls_request_flushed(const Connection* u) const noexcept;
+        // ── TLS plumbing, BOTH directions ───────────────────────────────────
+        // These are no-op-safe building blocks shared by the two backends. The
+        // parameter is `c` and not `u` on purpose: since inbound TLS landed these
+        // run on client connections too, and `u` means upstream everywhere else in
+        // this file. Direction is read from `c->is_client`, never assumed.
+        //
+        // Attach a Session in CLIENT role to an upstream conn (SNI and hostname
+        // from _tls.sni_host). False on failure, treated like a connect refusal.
+        // Configuration says this connection must be carrying TLS. Reading it from
+        // the leg (client vs upstream) means the two directions cannot be confused.
+        [[nodiscard]] bool tls_required(const Connection* c) const noexcept;
+        // Guard for every path that is about to put bytes on a socket: false means
+        // the connection should be torn down instead of written to. See the
+        // definition for why this is a refusal and not an assertion.
+        [[nodiscard]] bool tls_invariant_ok(Connection* c) noexcept;
+        bool tls_attach_upstream(Connection* u) noexcept;
+        // Attach a Session in SERVER role to a freshly accepted CLIENT conn. Note
+        // the roles are crossed on purpose: our TLS role is server precisely
+        // because the peer is the client. False on failure, and the caller must
+        // then drop the connection, because a peer that dialled TLS must never be
+        // answered in plaintext.
+        bool tls_attach_client(Connection* c) noexcept;
+        // Move whatever ciphertext the Session has pending into c->tls_out.
+        void tls_pump_out(Connection* c) noexcept;
+        // Feed ciphertext from the socket. Drains resulting plaintext into c->rbuf
+        // and advances the handshake. On an UPSTREAM conn, completing the handshake
+        // also stamps t2 and pushes the pending request; on a client conn there is
+        // nothing pending, because the client speaks first. False on a fatal error.
+        bool tls_feed(Connection* c, const char* p, size_t n) noexcept;
+        // Push un-fed plaintext (wbuf[woff..]) into the Session. On an upstream
+        // conn that is the request; on a client conn it is the response.
+        void tls_push_wbuf(Connection* c) noexcept;
+        // True when wbuf is fully on the wire: all plaintext fed AND all ciphertext
+        // flushed. The TLS analogue of ep_pump_write's `done`.
+        bool tls_wbuf_flushed(const Connection* c) const noexcept;
 
         // Epoll only: write tls_out to the socket (non-blocking), arming EPOLLOUT
         // on a partial write. False = socket error.
@@ -403,6 +436,9 @@ namespace llmbridge
         void ur_submit_timer() noexcept;
         bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
         bool ur_submit_send(Connection* c) noexcept;
+        // Send wbuf to a CLIENT conn. Plaintext goes straight out; a TLS conn must
+        // pass through the Session first, because the SQE points at tls_out.
+        void ur_client_send(Connection* c) noexcept;
         bool ur_submit_connect(Connection* u) noexcept;
         void ur_submit_cancel(int fd) noexcept; // cancel all in-flight ops on a fd
         void ur_on_cqe(uint64_t user_data, int res, uint32_t flags) noexcept;
@@ -448,7 +484,7 @@ namespace llmbridge
         TranslateMode _translate;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
-        TlsConfig _tls;                    // upstream TLS (enabled => _tls_ctx inited in ctor)
+        TlsConfig _tls; // BOTH legs; each flag inits its own context in the ctor
         bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
         // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
@@ -457,8 +493,15 @@ namespace llmbridge
         // overlap. Reused across requests so the chunked path, which is the REAL
         // provider path, not an edge case. Does not allocate per response.
 #ifdef LLMBRIDGE_HAVE_TLS
-        net::tls::Context _tls_ctx;        // one SSL_CTX shared by all upstream sessions
-        bool _tls_ctx_ok = false;
+        // One SSL_CTX per direction, each shared by every Session in that
+        // direction. They are separate objects because they are configured
+        // oppositely: the client context verifies a peer, the server context
+        // presents a certificate and verifies nobody.
+        // Named for the LEG each one serves, matching TlsConfig::upstream_tls /
+        // client_tls and the tls_attach_* pair. Naming one of them for its TLS
+        // ROLE instead would collide: on the client leg our role is server.
+        net::tls::Context _tls_upstream_ctx; // upstream leg; our role is TLS client
+        net::tls::Context _tls_client_ctx;   // client leg;   our role is TLS server
 #endif
         unsigned _uring_buf_count = 0;     // 0 = kBufCount default (test hook only)
         int64_t _last_sweep_ns = 0;
