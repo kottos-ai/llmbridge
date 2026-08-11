@@ -1888,6 +1888,12 @@ namespace llmbridge
             s->len = static_cast<unsigned>(c->wbuf.size() - c->woff);
         }
         s->user_data = make_ud(c, USend);
+        // THE ONLY PLACE send_inflight IS SET. It means exactly "an SQE referencing
+        // this connection's send buffer is outstanding", and an SQE is submitted
+        // only here, so this is the only line that can truthfully assert it.
+        // Callers must not set it: two of them used to, under two different rules,
+        // and one calling into the other silently deadlocked a stream.
+        c->send_inflight = true;
         ++c->inflight;
         ++_uring_inflight;
         return true;
@@ -1936,8 +1942,7 @@ namespace llmbridge
             tls_pump_out(u);
         }
         if (u->tls_out.empty()) return;
-        u->send_inflight = true;
-        ur_submit_send(u);
+        ur_submit_send(u); // sets send_inflight; see the note there
     }
 #endif
 
@@ -2455,6 +2460,11 @@ namespace llmbridge
             else if (!ur_retry_upstream(c)) { if (c->peer) ur_error_respond(c->peer, 502); else ur_close(c); }
             return;
         }
+        // This send completed, so no SQE references the buffer right now. Cleared
+        // ONCE here, before any branch below runs; a partial send re-arms it by
+        // calling ur_submit_send again. When each branch cleared its own, two of
+        // the four forgot, and the flag meant different things on different paths.
+        c->send_inflight = false;
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
@@ -2462,7 +2472,6 @@ namespace llmbridge
             // track plaintext fed to the Session and are not touched here.
             c->tls_out_off += static_cast<size_t>(res);
             if (c->tls_out_off < c->tls_out.size()) { ur_submit_send(c); return; } // partial
-            c->send_inflight = false;
             // The Session may hold more: later handshake flights, or plaintext that
             // could not be pushed before the handshake finished.
             if (c->tls->handshake_done() && c->woff < c->wbuf.size()) tls_push_wbuf(c);
@@ -2494,7 +2503,7 @@ namespace llmbridge
         }
 #endif
         c->woff += static_cast<size_t>(res);
-        if (c->woff < c->wbuf.size()) { ur_submit_send(c); return; } // partial -> send remainder
+        if (c->woff < c->wbuf.size()) { ur_submit_send(c); return; } // partial: re-arms
 
         if (!c->is_client)
         {
@@ -2508,7 +2517,6 @@ namespace llmbridge
             // next pending bytes or finalize if the stream has ended.
             c->wbuf.clear();
             c->woff = 0;
-            c->send_inflight = false;
             ur_stream_flush(c);
         }
         else
@@ -2637,18 +2645,7 @@ namespace llmbridge
         client->wbuf = std::move(client->wpending);
         client->wpending.clear();
         client->woff = 0;
-        // Who owns send_inflight depends on the transport, and getting this wrong
-        // deadlocks the stream silently. On the plaintext path ur_submit_send
-        // submits unconditionally, so the flag is set here. On the TLS path
-        // ur_tls_flush OWNS it and refuses to run when it is already set, so
-        // setting it here made the first SSE flush a no-op and the stream hung
-        // forever. Found by InboundTlsStreamsSseEndToEnd, which passed on epoll
-        // and hung on io_uring.
-#ifdef LLMBRIDGE_HAVE_TLS
-        if (!client->tls)
-#endif
-            client->send_inflight = true;
-        ur_client_send(client); // (closes the client on SQE exhaustion; nothing more to do)
+        ur_client_send(client); // sets send_inflight; closes the client on SQE exhaustion
     }
 
     void Gateway::ur_finalize_stream(Connection* client) noexcept

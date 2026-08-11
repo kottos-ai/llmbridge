@@ -240,9 +240,27 @@ namespace llmbridge
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`
         // while a client SEND SQE is in flight, so `wbuf` (the SEND's buffer) is
-        // never reallocated under the kernel's feet. `send_inflight` serializes
-        // sends (two concurrent SENDs on one fd would interleave).
+        // never reallocated under the kernel's feet.
         std::string wpending;
+
+        // io_uring: an SQE referencing this connection's send buffer is
+        // outstanding. Two concurrent SENDs on one fd would interleave, and an
+        // SQE is immutable once submitted, so the buffer it points at must not
+        // move while this is set.
+        //
+        // OWNERSHIP, and it is worth stating because getting it wrong cost a
+        // silently hung stream:
+        //   SET    only by ur_submit_send(), the only place an SQE is submitted
+        //   CLEARED only by ur_on_send() on completion, and by
+        //           ur_release_upstream() when per-request state is reset
+        //   READ   by anyone about to touch a send buffer, to decide whether to
+        //          wait
+        //
+        // Callers must never set it. Two of them used to, under two different
+        // rules, and ur_stream_flush() setting it before calling into
+        // ur_tls_flush() (whose first line refuses to run when it is already set)
+        // meant the first SSE flush on a TLS connection did nothing at all. The
+        // stream then hung forever, on io_uring only.
         bool send_inflight = false;
         // Upstream said keep-alive on the streaming response, so the connection may
         // be pooled once the body's terminal chunk has been consumed. Held on the
