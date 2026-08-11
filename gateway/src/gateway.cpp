@@ -568,9 +568,9 @@ namespace llmbridge
         {
             // Setup path: a bad trust store must fail construction, not the first
             // request. Same throw discipline as the listener below.
-            net::tls::Context::Options o;
+            net::tls::Context::ClientOptions o;
             o.ca_file = _tls.ca_file;
-            _tls_ctx_ok = _tls_ctx.init(o);
+            _tls_ctx_ok = _tls_ctx.init_client(o);
             if (!_tls_ctx_ok)
                 throw std::runtime_error("TLS context init failed: " + _tls_ctx.last_error());
         }

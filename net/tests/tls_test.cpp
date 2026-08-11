@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -46,13 +47,15 @@ namespace
         EVP_PKEY* key{nullptr};
         X509* crt{nullptr};
 
-        SelfSigned()
+        /// `lifetime_s` is seconds from now. Negative produces an ALREADY EXPIRED
+        /// certificate, which init_server() must refuse at startup.
+        explicit SelfSigned(long lifetime_s = 3600)
         {
             key = EVP_RSA_gen(2048);
             crt = X509_new();
             ASN1_INTEGER_set(X509_get_serialNumber(crt), 1);
-            X509_gmtime_adj(X509_getm_notBefore(crt), 0);
-            X509_gmtime_adj(X509_getm_notAfter(crt), 3600);
+            X509_gmtime_adj(X509_getm_notBefore(crt), lifetime_s < 0 ? lifetime_s * 2 : 0);
+            X509_gmtime_adj(X509_getm_notAfter(crt), lifetime_s);
             X509_set_pubkey(crt, key);
 
             X509_NAME* nm = X509_get_subject_name(crt);
@@ -96,6 +99,23 @@ namespace
             EXPECT_NE(f, nullptr);
             PEM_write_X509(f, crt);
             std::fclose(f);
+            return path;
+        }
+
+        /// Write the private key to a temp PEM, mode 600 by default. `mode` exists
+        /// so a test can produce a deliberately world-readable key and check that
+        /// init_server() refuses it.
+        std::string write_key_pem(mode_t mode = 0600) const
+        {
+            static std::atomic<unsigned> seq{0};
+            std::string path = std::string(::testing::TempDir()) + "llmbridge_tls_test_key_" +
+                               std::to_string(static_cast<long>(::getpid())) + "_" +
+                               std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".pem";
+            FILE* f = std::fopen(path.c_str(), "wb");
+            EXPECT_NE(f, nullptr);
+            PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr);
+            std::fclose(f);
+            EXPECT_EQ(::chmod(path.c_str(), mode), 0);
             return path;
         }
     };
@@ -204,9 +224,9 @@ class TlsPump : public ::testing::Test
 
     void SetUp() override
     {
-        Context::Options o;
+        Context::ClientOptions o;
         o.ca_file = id.write_pem();
-        ASSERT_TRUE(ctx.init(o)) << ctx.last_error();
+        ASSERT_TRUE(ctx.init_client(o)) << ctx.last_error();
     }
 };
 
@@ -292,7 +312,7 @@ TEST_F(TlsPump, ToleratesArbitraryCiphertextFragmentation)
 TEST_F(TlsPump, RejectsUntrustedCertificate)
 {
     Context strict;
-    ASSERT_TRUE(strict.init(Context::Options{}));  // system store only
+    ASSERT_TRUE(strict.init_client(Context::ClientOptions{}));  // system store only
 
     Session c;
     ASSERT_TRUE(c.init_client(strict, kHost));
@@ -437,3 +457,139 @@ TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
 }
 
 #endif  // LLMBRIDGE_HAVE_TLS
+
+// ── Task 2: server-side context and session ─────────────────────────────────
+//
+// Inbound TLS makes llmbridge the SERVER for the first time. Every failure below
+// is a startup failure on purpose: a process that starts happily and then fails
+// every handshake gives the client an opaque alert and gives the operator
+// nothing. These tests pin that behaviour so a later "cleanup" cannot soften it
+// into a warning.
+
+TEST(ServerContext, ValidCertAndKeyInitialises)
+{
+    SelfSigned ca;
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = ca.write_pem();
+    o.key_file = ca.write_key_pem();
+    ASSERT_TRUE(ctx.init_server(o)) << ctx.last_error();
+    EXPECT_TRUE(ctx.ready());
+}
+
+TEST(ServerContext, RefusesWorldReadablePrivateKey)
+{
+    SelfSigned ca;
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = ca.write_pem();
+    o.key_file = ca.write_key_pem(0644);  // the mistake this exists to catch
+    EXPECT_FALSE(ctx.init_server(o));
+    EXPECT_NE(ctx.last_error().find("readable beyond its owner"), std::string::npos)
+        << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesKeyThatDoesNotMatchTheCert)
+{
+    SelfSigned a, b;  // two independent keypairs
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = a.write_pem();
+    o.key_file = b.write_key_pem();  // the stale-renewal / swapped-file case
+    EXPECT_FALSE(ctx.init_server(o));
+    // Assert WHICH guard fired, not just that one did. Measured 2026-08-10:
+    // SSL_CTX_use_PrivateKey_file rejects it, because the cert is already loaded
+    // by then. Deleting SSL_CTX_check_private_key leaves this test passing, so a
+    // bare EXPECT_FALSE would have been decoration.
+    EXPECT_NE(ctx.last_error().find("mismatch"), std::string::npos) << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesExpiredCertificate)
+{
+    SelfSigned expired(-3600);  // notAfter an hour in the past
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = expired.write_pem();
+    o.key_file = expired.write_key_pem();
+    EXPECT_FALSE(ctx.init_server(o));
+    EXPECT_NE(ctx.last_error().find("expired"), std::string::npos) << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesMissingFiles)
+{
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = "/nonexistent/cert.pem";
+    o.key_file = "/nonexistent/key.pem";
+    EXPECT_FALSE(ctx.init_server(o));
+}
+
+TEST(ServerContext, RefusesEmptyPaths)
+{
+    Context ctx;
+    EXPECT_FALSE(ctx.init_server(Context::ServerOptions{}));
+    EXPECT_NE(ctx.last_error().find("needs both"), std::string::npos) << ctx.last_error();
+}
+
+// The point of the whole exercise: our own client Session and our own server
+// Session complete a handshake against each other through nothing but the four
+// memory-BIO calls. If this passes, the claim that Session is direction-agnostic
+// is demonstrated instead of asserted.
+TEST(ServerSession, OurClientAndOurServerCompleteAHandshake)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+
+    Context sctx;
+    Context::ServerOptions so;
+    so.cert_file = cert;
+    so.key_file = key;
+    ASSERT_TRUE(sctx.init_server(so)) << sctx.last_error();
+
+    Context cctx;
+    Context::ClientOptions co;
+    co.ca_file = cert;  // trust our own self-signed leaf
+    ASSERT_TRUE(cctx.init_client(co)) << cctx.last_error();
+
+    Session client, server;
+    ASSERT_TRUE(client.init_client(cctx, kHost)) << client.last_error();
+    ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+
+    (void)client.start_handshake();
+
+    uint8_t buf[8192];
+    bool done = false;
+    for (int round = 0; round < 24 && !done; ++round)
+    {
+        for (;;)  // client -> server
+        {
+            const size_t n = client.pull_ciphertext(buf);
+            if (n == 0) break;
+            ASSERT_EQ(server.feed_ciphertext({buf, n}), n);
+        }
+        (void)server.start_handshake();
+        for (;;)  // server -> client
+        {
+            const size_t n = server.pull_ciphertext(buf);
+            if (n == 0) break;
+            ASSERT_EQ(client.feed_ciphertext({buf, n}), n);
+        }
+        (void)client.start_handshake();
+        done = client.handshake_done() && server.handshake_done();
+    }
+    ASSERT_TRUE(done) << "client: " << client.last_error() << " server: " << server.last_error();
+
+    // Application data both ways, which is what the gateway actually needs.
+    const std::string req = "GET /v1/models HTTP/1.1\r\n\r\n";
+    ASSERT_EQ(client.write_plaintext({reinterpret_cast<const uint8_t*>(req.data()), req.size()}),
+              req.size());
+    for (;;)
+    {
+        const size_t n = client.pull_ciphertext(buf);
+        if (n == 0) break;
+        ASSERT_EQ(server.feed_ciphertext({buf, n}), n);
+    }
+    const size_t got = server.read_plaintext(buf);
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(buf), got), req);
+}

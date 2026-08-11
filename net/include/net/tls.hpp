@@ -81,13 +81,28 @@ namespace llmbridge::net::tls
     class Context
     {
       public:
-        struct Options
+        /// Outbound: gateway -> provider. We are the client and we verify them.
+        struct ClientOptions
         {
             /// PEM bundle to trust. Empty = the system default store, which is what
             /// production wants (Ubuntu: /etc/ssl/certs/ca-certificates.crt).
             std::string ca_file{};
             /// Minimum protocol version. 1.2 floor: every provider we target speaks
             /// 1.3, and 1.0/1.1 are deprecated.
+            bool require_tls13{false};
+        };
+
+        /// Inbound: client -> gateway. We are the server and we PROVE identity
+        /// instead of checking it. These are separate structs on purpose: passing
+        /// client options to a server context, or the reverse, should not compile.
+        struct ServerOptions
+        {
+            /// PEM certificate CHAIN (leaf first, then intermediates). Let's
+            /// Encrypt calls this fullchain.pem. Using cert.pem instead omits the
+            /// intermediate and clients that do not fetch it will fail to verify.
+            std::string cert_file{};
+            /// PEM private key. Must be mode 600 or init_server() refuses it.
+            std::string key_file{};
             bool require_tls13{false};
         };
 
@@ -98,9 +113,18 @@ namespace llmbridge::net::tls
         Context(Context&&) noexcept;
         Context& operator=(Context&&) noexcept;
 
-        /// Build the SSL_CTX. Returns false and sets last_error() on failure.
+        /// Build a CLIENT SSL_CTX. Returns false and sets last_error() on failure.
         /// Call once at startup -- this is a setup path, so it may allocate freely.
-        [[nodiscard]] bool init(const Options& opts) noexcept;
+        [[nodiscard]] bool init_client(const ClientOptions& opts) noexcept;
+
+        /// Build a SERVER SSL_CTX for the inbound listener.
+        ///
+        /// Every failure here is a startup failure, deliberately: an unreadable
+        /// certificate, a key the wrong mode, a key that does not match the
+        /// certificate and an already-expired certificate all refuse to build a
+        /// context. The alternative is a process that starts happily and then fails
+        /// every handshake, which is far harder to diagnose from the client side.
+        [[nodiscard]] bool init_server(const ServerOptions& opts) noexcept;
 
         [[nodiscard]] bool ready() const noexcept { return _ctx != nullptr; }
         [[nodiscard]] const std::string& last_error() const noexcept { return _err; }
@@ -134,6 +158,11 @@ namespace llmbridge::net::tls
         /// to mean anything.
         [[nodiscard]] bool init_client(const Context& ctx, std::string_view host) noexcept;
 
+        /// Attach to a context as a SERVER (client -> gateway). Takes no host: a
+        /// server RECEIVES the SNI name and does not verify a peer, so there is
+        /// nothing to check a hostname against. The context supplies the identity.
+        [[nodiscard]] bool init_server(const Context& ctx) noexcept;
+
         /// Begin the handshake. After this, drain pull_ciphertext() and send it.
         Want start_handshake() noexcept;
 
@@ -164,6 +193,10 @@ namespace llmbridge::net::tls
         [[nodiscard]] const std::string& last_error() const noexcept { return _err; }
 
       private:
+        /// Allocate the SSL object and its memory BIO pair. Shared by both
+        /// directions; the handshake role and the peer checks stay in the callers.
+        [[nodiscard]] bool attach(const Context& ctx) noexcept;
+
         /// Translate an OpenSSL return code into Want, recording errors. Central so
         /// every entry point classifies WANT_READ/WANT_WRITE identically.
         Want classify(int rc) noexcept;
