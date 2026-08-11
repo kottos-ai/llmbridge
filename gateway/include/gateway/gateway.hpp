@@ -91,6 +91,14 @@ namespace llmbridge
         // answer to "am I exposed in the clear?" can be read off the command line
         // instead of inferred from which port a client happened to use.
         bool client_tls = false;  // set by --listen-tls
+        //
+        // What stops a TLS-required connection ever receiving plaintext is that
+        // BOTH accept paths close it outright when tls_attach_client() fails, and
+        // both upstream paths do the same for tls_attach_upstream(). A separate
+        // runtime guard on the write path, tls_invariant_ok(), backs that up. It
+        // cannot fire today and no test distinguishes it from `return true`; it is
+        // kept because six call sites must each stay right for it to stay
+        // unreachable, and two of those six are recent.
         std::string cert_file; // PEM chain, leaf first (Let's Encrypt fullchain.pem)
         std::string key_file;  // PEM key, mode 600 or startup refuses it
     };
@@ -123,7 +131,37 @@ namespace llmbridge
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
-        bool doomed = false;          // closed this epoll batch; deleted after the batch
+        // Closed, but not yet freed. The DEFERRAL RULE DIFFERS BY BACKEND, and the
+        // old one-line comment described only the epoll half:
+        //
+        //   epoll     freed at the end of the current event batch. The deferral
+        //             exists because one event can close a pair, and a later event
+        //             in the SAME batch would then dereference a freed pointer.
+        //             `inflight` is never incremented here, so the free is
+        //             unconditional.
+        //   io_uring  freed when `inflight` reaches 0, which may be several loop
+        //             iterations later. A submitted SQE references this object, and
+        //             the kernel does not care that we decided to close.
+        //
+        // `doomed` and `inflight` are therefore ONE protocol on io_uring, not two
+        // independent fields: doomed says we want it gone, inflight says whether the
+        // kernel agrees yet. Freeing on the first without checking the second is a
+        // use-after-free in a process holding customer credentials.
+        //
+        // The two UNCONDITIONAL frees, in the epoll batch loop and the destructor,
+        // are safe for reasons worth writing down, because a guard was added there
+        // and then removed once these were established:
+        //   epoll     never increments `inflight`, so it is always 0
+        //   io_uring  run_uring() ends with `while (_uring_inflight > 0)`, draining
+        //             to zero before it returns. _uring_inflight moves in lockstep
+        //             with every conn's `inflight` (both bumped at the three submit
+        //             sites, both dropped at the single completion site), so a zero
+        //             total means every per-conn count is zero too.
+        // Both are structural guarantees enforced in one place each, which is why a
+        // runtime check there was unreachable and untestable. Contrast
+        // tls_invariant_ok(), whose precondition is re-established by hand at six
+        // call sites and which is therefore kept.
+        bool doomed = false;
         bool close_after_resp = false; // client-only: this is an error reply, so close once it flushes
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
@@ -216,8 +254,20 @@ namespace llmbridge
         int64_t ts_up_activity = 0;
 
         // io_uring backend only: submitted-but-uncompleted SQEs referencing this
-        // conn; it is freed only when this hits 0. (Multishot recv lands data in a
-        // shared provided-buffer pool, so there is no per-connection recv buffer.)
+        // conn. See `doomed` above: the two are one protocol.
+        //
+        // OWNERSHIP:
+        //   INCREMENTED by the three ur_submit_* functions, each at its tail,
+        //              immediately before `return true`, so an early return cannot
+        //              leak a slot and strand the object forever
+        //   DECREMENTED in exactly one place, ur_on_cqe(), and only when the
+        //              completion is NOT armed: a multishot op carrying F_MORE is
+        //              still outstanding and has not released its slot
+        //   READ       by ur_maybe_free(), which is the only thing allowed to
+        //              conclude that freeing is safe
+        //
+        // (Multishot recv lands data in a shared provided-buffer pool, so there is
+        // no per-connection recv buffer to worry about.)
         int inflight = 0;
         // io_uring stale-connection handling: was this upstream reused from the
         // keep-alive pool (so a failure before any response is retry-eligible), and
@@ -229,12 +279,37 @@ namespace llmbridge
         // Set when the upstream response is text/event-stream: the gateway then
         // pumps (decode chunked -> translate -> write to client) instead of
         // buffering a whole body. Streamed client responses are close-delimited.
+        // A ONE-WAY LATCH, never cleared. A streamed client response is
+        // close-delimited, so the connection ends with the stream and there is no
+        // state to return to. Set in ep_begin_stream / ur_begin_stream only.
         bool streaming = false;
         bool stream_chunked = false; // upstream body uses chunked transfer-encoding
-        bool stream_ended = false;   // final [DONE] emitted; close once the client drains
-        bool read_paused = false;    // epoll backend only: upstream EPOLLIN paused
-                                     // (client-write backpressure; the uring pump
-                                     // bounds wpending with kStreamBufCap instead)
+
+        // No further stream output will be produced. It becomes true TWO ways, and
+        // the old comment here ("final [DONE] emitted") described only the first:
+        //
+        //   clean      stream_step() saw the end of the body and the SSE translator
+        //              emitted its terminal [DONE]. close_after_resp stays false.
+        //   truncated  the stream is being aborted, so NO [DONE] is emitted, on
+        //              purpose: a client must see a cut-off stream instead of a
+        //              fabricated clean finish. Always via stream_truncate().
+        //
+        // So `stream_ended && close_after_resp` is the truncated case and
+        // `stream_ended && !close_after_resp` the clean one. That pairing is the
+        // difference between a client believing it got the whole answer and knowing
+        // it did not, which makes it worth stating here and never inferring.
+        bool stream_ended = false;
+
+        // Epoll only, and it is the ONE place the two backends deliberately behave
+        // differently: under a slow client epoll pauses upstream EPOLLIN and applies
+        // back-pressure, while the io_uring pump instead bounds wpending with
+        // kStreamBufCap and drops the stream past the cap. Know which one you are
+        // reasoning about before quoting streaming behaviour to a customer.
+        //
+        // Owned entirely by ep_pause_read / ep_resume_read, which are the only
+        // writers and both guard on the current value. io_uring never touches it,
+        // and the ep_ prefix is what keeps that true.
+        bool read_paused = false;
         bool wants_usage = false;    // client set stream_options.include_usage
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
@@ -281,6 +356,24 @@ namespace llmbridge
         // written for a TLS conn. For these, `woff` counts plaintext bytes fed
         // into the Session, and tls_out/tls_out_off track the encrypted write.
         // The request's plaintext stays intact in wbuf for stale-conn retry.
+        //
+        // TWO OFFSETS, TWO QUESTIONS, and confusing them is the trap here:
+        //
+        //   woff         how much of wbuf has been HANDED TO THE TRANSPORT
+        //                  plaintext: bytes written to the socket
+        //                  TLS:       bytes fed into the Session, which have NOT
+        //                             necessarily left the machine
+        //   tls_out_off  how much ciphertext has actually reached the socket
+        //
+        // So on a TLS connection `woff >= wbuf.size()` means "fully encrypted",
+        // never "fully sent". Ask tls_wbuf_flushed() for the second question.
+        //
+        // Every existing `woff` comparison is plaintext-only and sits after a TLS
+        // early return, which is correct but invisible at the line itself. A
+        // transport-agnostic wrapper was tried and reverted: every caller is
+        // already inside a TLS-only branch, so its plaintext half was unreachable
+        // and it resolved to tls_wbuf_flushed() at every site. It read like a
+        // safety net while changing nothing, which is worse than no wrapper.
         std::string tls_out;
         size_t tls_out_off = 0;
 #endif
@@ -373,6 +466,9 @@ namespace llmbridge
         // Actual bound listen port (resolves ephemeral when 0 was requested).
         uint16_t bound_port() const noexcept;
 
+        // Test seam. Production never calls this; the default is kClientSetupNs.
+        void set_client_setup_ns(int64_t ns) noexcept { _client_setup_ns = ns; }
+
         // Size of the io_uring provided-buffer pool (power of two), or 0 for the default.
         // Must be called before run(). Exists so a test can shrink the pool far enough to
         // force -ENOBUFS deterministically. At the shipped size that branch was never
@@ -450,6 +546,10 @@ namespace llmbridge
         // ep_/ur_ prefix) and declared outside the TLS guard because the t2
         // stamp sites call it in every build; it is a constant `false` when the
         // project is built without TLS.
+        // End a stream WITHOUT a terminal [DONE], because it is being aborted.
+        // One call so the three mutations it needs cannot be split up; five sites
+        // across both backends used to write them out by hand.
+        void stream_truncate(Connection* client) noexcept;
         bool upstream_is_tls(const Connection* u) const noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -461,12 +561,12 @@ namespace llmbridge
         //
         // Attach a Session in CLIENT role to an upstream conn (SNI and hostname
         // from _tls.sni_host). False on failure, treated like a connect refusal.
-        // Configuration says this connection must be carrying TLS. Reading it from
-        // the leg (client vs upstream) means the two directions cannot be confused.
+        // Does configuration say this connection must carry TLS? Read from the leg,
+        // so the two directions cannot be confused.
         [[nodiscard]] bool tls_required(const Connection* c) const noexcept;
-        // Guard for every path that is about to put bytes on a socket: false means
-        // the connection should be torn down instead of written to. See the
-        // definition for why this is a refusal and not an assertion.
+        // Backstop before any write: false means tear the connection down instead.
+        // Unreachable today, kept because its precondition is re-established by
+        // hand at six call sites. See the definition.
         [[nodiscard]] bool tls_invariant_ok(Connection* c) noexcept;
         bool tls_attach_upstream(Connection* u) noexcept;
         // Attach a Session in SERVER role to a freshly accepted CLIENT conn. Note
@@ -561,6 +661,12 @@ namespace llmbridge
         std::string _upstream_ip;
         uint16_t _upstream_port;
         int64_t _warmup_ns;
+        // Defaults to kClientSetupNs. Settable ONLY so tests can pick a deadline
+        // they can wait for: at 30 seconds the behaviour was unverifiable, and a
+        // mutation sweep confirmed that deleting the deadline entirely broke no
+        // test. An untested deadline on an internet-facing listener is the same as
+        // no deadline, because nothing would tell us when it stopped working.
+        int64_t _client_setup_ns = kClientSetupNs;
         TranslateMode _translate;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout

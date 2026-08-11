@@ -54,6 +54,11 @@ UNPREFIXED_ALLOWED = {
     "request_stop",
     "stats",
     "bound_port",
+    # Called from the DESTRUCTOR, which runs whichever backend was used, and from
+    # the epoll batch loop. The reachability walk below starts at run_epoll /
+    # run_uring, so it cannot see the destructor and reports this as epoll-only.
+    # It is genuinely shared; the check is right to ask, and this is the answer.
+    "free_doomed_safe",
 }
 
 

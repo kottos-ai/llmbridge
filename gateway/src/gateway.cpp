@@ -768,6 +768,32 @@ namespace llmbridge
 
     // Shared by both backends, hence no ep_/ur_ prefix: is this upstream carrying
     // TLS? Compiles to `false` in a build without TLS support.
+    void Gateway::stream_truncate(Connection* client) noexcept
+    {
+        // Abort a stream honestly. NO terminal [DONE] is emitted, deliberately:
+        // fabricating one would tell the client it received a complete answer when
+        // it did not, and for an agent loop that is a silent wrong result rather
+        // than a visible failure.
+        //
+        // The three mutations are one decision, so they live in one place. Five
+        // sites across both backends wrote them out by hand, which is how a sixth
+        // ends up setting two of the three.
+        // Load-bearing, though a mutation sweep found no test that says so.
+        // {ep,ur}_stream_flush call finalize_stream ONLY when this is set; without
+        // it they resume reading from the upstream instead, and the client
+        // connection is never torn down by this path. It then lingers until the
+        // provider closes or the idle sweep fires, which is up to 30 seconds of a
+        // held socket per corrupted stream. Every mock closes promptly, so the
+        // tests see the same outcome either way.
+        //
+        // The test that would guard it: a provider that corrupts a stream and then
+        // HOLDS the connection open, asserting the client is closed promptly rather
+        // than at the idle timeout.
+        client->stream_ended = true;      // no more output will be produced
+        client->close_after_resp = true;  // close once the client drains what we have
+        ++_stats.errors;                  // and it counts as a failure, not a finish
+    }
+
     bool Gateway::upstream_is_tls(const Connection* u) const noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -794,19 +820,23 @@ namespace llmbridge
     {
         if (c->tls || !tls_required(c)) return true;
 
-        // A connection the configuration says must be encrypted has no Session.
-        // Whatever the cause, the one thing we must not do is fall through to the
-        // plaintext path: on the client leg those bytes are a response to a peer
-        // that dialled TLS, and on the upstream leg the very next thing we would
-        // send is the provider credential. Either way the failure mode is a
-        // disclosure, so refuse and let the caller tear the connection down.
+        // A connection the configuration says must be encrypted has no Session, so
+        // refuse the write and let the caller tear it down. On the client leg those
+        // bytes would be a response to a peer that dialled TLS; on the upstream leg
+        // the next thing sent is the provider credential. Both are disclosures.
         //
-        // Unreachable by construction TODAY: both accept paths close the
-        // connection immediately when tls_attach_client() fails, and both upstream
-        // paths do the same for tls_attach_upstream(). This exists so that a
-        // future edit which adds a third way to create a connection cannot quietly
-        // reintroduce a plaintext path, and so that the condition is COUNTED
-        // instead of guessed at if it ever does occur.
+        // THIS CANNOT FIRE TODAY, and a mutation sweep confirms no test can tell it
+        // from `return true`. It is kept anyway, and the reason is specific rather
+        // than defensive-in-general: what makes it unreachable is that SIX separate
+        // call sites each close the connection when tls_attach_* fails. That is an
+        // invariant re-established by hand, in six places, and two of the six were
+        // added the week inbound TLS landed. A seventh is not a hypothetical, it is
+        // the established pattern of this file, and this is the one line that would
+        // catch it.
+        //
+        // Contrast a guard whose precondition is a single structural fact: that one
+        // is noise and was deleted. The test is not "can I prove this fires", it is
+        // "how many places must stay right for it to stay unreachable".
         ++_stats.errors;
         return false;
     }
@@ -1574,9 +1604,7 @@ namespace llmbridge
             // Truncate honestly: flush what we already translated, then close
             // WITHOUT a terminal [DONE] so the client sees an aborted stream
             // instead of a fabricated clean finish.
-            client->stream_ended = true;
-            client->close_after_resp = true;
-            ++_stats.errors;
+            stream_truncate(client);
             ep_stream_flush(client);
             return;
         }
@@ -1593,9 +1621,7 @@ namespace llmbridge
         const StreamStep st = stream_step(client, u->rbuf, client->wbuf, /*at_eof=*/true);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
-            client->stream_ended = true;
-            client->close_after_resp = true;
-            ++_stats.errors;
+            stream_truncate(client);
         }
         ep_stream_flush(client);
     }
@@ -1685,7 +1711,7 @@ namespace llmbridge
             for (auto& [id, c] : _clients)
             {
                 if (c->doomed || c->ever_framed || c->ts_accepted == 0) continue;
-                if (now - c->ts_accepted > kClientSetupNs) unfinished.push_back(c);
+                if (now - c->ts_accepted > _client_setup_ns) unfinished.push_back(c);
             }
             for (Connection* c : unfinished)
             {
@@ -1717,9 +1743,7 @@ namespace llmbridge
             if (streaming)
             {
                 // Response headers are already out; truncate honestly (no [DONE]).
-                c->stream_ended = true;
-                c->close_after_resp = true;
-                ++_stats.errors;
+                stream_truncate(c);
             }
 #ifdef LLMBRIDGE_HAVE_URING
             if (uring)
@@ -2607,9 +2631,7 @@ namespace llmbridge
         {
             // Truncate honestly: no fabricated [DONE]. Flush what we have, then the
             // finalize path closes the client (an aborted SSE body).
-            client->stream_ended = true;
-            client->close_after_resp = true;
-            ++_stats.errors;
+            stream_truncate(client);
             ur_stream_flush(client);
             return;
         }
@@ -2624,9 +2646,7 @@ namespace llmbridge
         const StreamStep st = stream_step(client, u->rbuf, client->wpending, /*at_eof=*/true);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
-            client->stream_ended = true;
-            client->close_after_resp = true;
-            ++_stats.errors;
+            stream_truncate(client);
         }
         ur_stream_flush(client);
     }

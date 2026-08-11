@@ -248,6 +248,7 @@ namespace
                         goto done;
                     }
                     const std::string resp = _mode == "sse"          ? sse_response()
+                                             : _mode == "big"            ? big_response()
                                              : _mode == "anthropic-json" ? anthropic_json_response()
                                                                          : json_response();
                     size_t off = 0;
@@ -276,6 +277,24 @@ namespace
                 R"({"id":"msg_tls","type":"message","role":"assistant","model":"claude-x",)"
                 R"("content":[{"type":"text","text":"hola"}],"stop_reason":"end_turn",)"
                 R"("usage":{"input_tokens":7,"output_tokens":11}})";
+            return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body;
+        }
+
+        /// A body far larger than any socket send buffer, so the gateway cannot
+        /// hand it all to the kernel in one write. That is the only condition
+        /// under which "fed to the transport" and "on the wire" come apart.
+      public:
+        // Public so PlainBackend serves BYTE-IDENTICAL responses. If the two mocks
+        // differed, a plaintext-versus-TLS comparison would be measuring the mocks.
+        static std::string sse_response_public() { return sse_response(); }
+        static std::string big_response_public() { return big_response(); }
+        static std::string json_response_public() { return json_response(); }
+
+      private:
+        static std::string big_response()
+        {
+            const std::string body(2 * 1024 * 1024, 'x');
             return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                    std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body;
         }
@@ -344,6 +363,88 @@ namespace
     };
 
     // Plaintext loopback client (the gateway's client side is not TLS).
+    /// A PLAINTEXT mock upstream, so the client leg can be TLS while the upstream
+    /// leg is not. TlsBackend cannot serve that case: it always speaks TLS.
+    class PlainBackend
+    {
+      public:
+        void start(const std::string& mode)
+        {
+            _mode = mode;
+            _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            int one = 1;
+            ::setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = 0;
+            ::bind(_fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+            socklen_t len = sizeof a;
+            ::getsockname(_fd, reinterpret_cast<sockaddr*>(&a), &len);
+            _port = ntohs(a.sin_port);
+            ::listen(_fd, 64);
+            _run = true;
+            _acc = std::thread([this] { loop(); });
+        }
+
+        void stop()
+        {
+            if (!_run) return;
+            _run = false;
+            ::shutdown(_fd, SHUT_RDWR);
+            ::close(_fd);
+            _fd = -1;
+            if (_acc.joinable()) _acc.join();
+        }
+        ~PlainBackend() { stop(); }
+        uint16_t port() const { return _port; }
+
+      private:
+        void loop()
+        {
+            while (_run)
+            {
+                const int c = ::accept(_fd, nullptr, nullptr);
+                if (c < 0) return;
+                _conns.emplace_back([this, c] { serve(c); });
+            }
+        }
+        void serve(int c)
+        {
+            std::string in;
+            char tmp[4096];
+            while (_run)
+            {
+                llmbridge::net::http::Message m;
+                while (llmbridge::net::http::parse_request(in, m) !=
+                       llmbridge::net::http::FrameStatus::Complete)
+                {
+                    const ssize_t n = ::read(c, tmp, sizeof tmp);
+                    if (n <= 0) { ::close(c); return; }
+                    in.append(tmp, static_cast<size_t>(n));
+                }
+                in.erase(0, m.total_len);
+                const std::string resp = _mode == "sse"   ? TlsBackend::sse_response_public()
+                                         : _mode == "big" ? TlsBackend::big_response_public()
+                                                          : TlsBackend::json_response_public();
+                size_t off = 0;
+                while (off < resp.size())
+                {
+                    const ssize_t n = ::write(c, resp.data() + off, resp.size() - off);
+                    if (n <= 0) { ::close(c); return; }
+                    off += static_cast<size_t>(n);
+                }
+            }
+            ::close(c);
+        }
+        int _fd{-1};
+        uint16_t _port{0};
+        std::string _mode{"json"};
+        std::atomic<bool> _run{false};
+        std::thread _acc;
+        std::vector<std::jthread> _conns;
+    };
+
     /// A real TLS client for the gateway's own listener. The existing `Client`
     /// below is plaintext; inbound TLS needs a peer that actually handshakes,
     /// because the interesting failures are in the handshake and its teardown.
@@ -586,15 +687,38 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _gt = std::thread([this] { _gw->run(); });
     }
 
+    /// The missing row of the matrix: TLS on the CLIENT leg, plaintext upstream.
+    /// This is `--listen-tls` with `--upstream 127.0.0.1:8000`, which is what
+    /// terminating TLS at the edge in front of a local model looks like, and it is
+    /// the configuration where a leg mix-up in tls_required() or wbuf_on_wire()
+    /// would show, because the two legs disagree.
+    void start_client_tls_only(TranslateMode mode = TranslateMode::None,
+                               const std::string& backend_mode = "json")
+    {
+        _plain.start(backend_mode);
+        TlsConfig tls;
+        tls.upstream_tls = false; // plaintext upstream, on purpose
+        tls.client_tls = true;
+        tls.cert_file = _id.write_pem();
+        tls.key_file = _id.write_key_pem();
+        _ca_path = _id.write_pem();
+        _gw = std::make_unique<Gateway>(0, "127.0.0.1", _plain.port(), 0, mode, GetParam(),
+                                        Gateway::kDefaultUpstreamIdleNs, tls, false);
+        _port = _gw->bound_port();
+        _gt = std::thread([this] { _gw->run(); });
+    }
+
     void TearDown() override
     {
         if (_gw) _gw->request_stop();
         if (_gt.joinable()) _gt.join();
         _backend.stop();
+        _plain.stop();
     }
 
     SelfSigned _id;
     TlsBackend _backend;
+    PlainBackend _plain;
     std::unique_ptr<Gateway> _gw;
     std::thread _gt;
     uint16_t _port{0};
@@ -1020,4 +1144,132 @@ TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
     }
     EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 200);
     EXPECT_NE(all.find("[DONE]"), std::string::npos);
+}
+
+// ── The missing row of the matrix: TLS in, plaintext upstream ───────────────
+//
+// Every other combination of {client leg} x {upstream leg} x {streaming} was
+// covered; this row was not, and it is the one where the two legs DISAGREE.
+// tls_required(), wbuf_on_wire() and tls_invariant_ok() all read direction from
+// the leg, so a leg mix-up is invisible until the legs differ.
+
+TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamRoundTrips)
+{
+    start_client_tls_only();
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(kReq));
+    EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos);
+}
+
+TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
+{
+    start_client_tls_only(TranslateMode::Anthropic, "sse");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(make_req(kStreamBody)));
+    std::string all;
+    char tmp[4096];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const int n = c.read_raw(tmp, sizeof tmp);
+        if (n <= 0) break;
+        all.append(tmp, static_cast<size_t>(n));
+        if (all.find("[DONE]") != std::string::npos) break;
+    }
+    EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 160);
+    EXPECT_NE(all.find("[DONE]"), std::string::npos);
+}
+
+// ── A stalled client and a 2 MB body, through TLS ──────────────────────────
+//
+// This forces the partial-write path: the response cannot fit in the socket
+// buffer, the client stops reading, and the gateway has to carry ciphertext
+// across many writes without losing or duplicating any of it. Nothing else in
+// the suite covered that.
+//
+// WHAT IT DOES NOT TEST, stated because the first version of this comment
+// claimed otherwise. It does not distinguish "fed to the Session" from "on the
+// wire", even though that distinction is real and documented on `woff`.
+// Replacing wbuf_on_wire() with woff alone leaves this test passing, because
+// both call sites already establish the same fact by other means: on epoll
+// `*done` is gated on ep_tls_flush's `flushed`, which is set only after tls_out
+// drains completely, and on io_uring the send_inflight guard covers it. So
+// wbuf_on_wire() is defensive today and not load-bearing, and no test at the
+// current call sites can show otherwise. It earns its place by being the correct
+// thing for a FUTURE call site that lacks those guards, which is a weaker claim
+// than "verified" and should not be written up as one.
+TEST_P(GatewayTls, SlowClientReceivesAFullLargeBodyThroughTls)
+{
+    start_inbound(TranslateMode::None, "big");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(kReq));
+
+    // Stall long enough for the gateway to fill the socket buffer and be forced
+    // into a partial write. This is the whole point of the test.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    constexpr size_t kExpectBody = 2 * 1024 * 1024;
+    std::string all;
+    char tmp[16384];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const int n = c.read_raw(tmp, sizeof tmp);
+        if (n <= 0) break;
+        all.append(tmp, static_cast<size_t>(n));
+        const size_t hdr = all.find("\r\n\r\n");
+        if (hdr != std::string::npos && all.size() - (hdr + 4) >= kExpectBody) break;
+    }
+    const size_t hdr = all.find("\r\n\r\n");
+    ASSERT_NE(hdr, std::string::npos) << "no response head";
+    EXPECT_EQ(all.size() - (hdr + 4), kExpectBody)
+        << "body truncated: the gateway treated 'encrypted' as 'sent'";
+}
+
+// The client setup deadline, which a mutation sweep found untested: deleting it
+// outright broke no test, because 30 seconds is longer than any suite will wait.
+// An untested deadline on an internet-facing listener is the same as no deadline.
+TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
+{
+    start_inbound();
+    _gw->set_client_setup_ns(300 * 1000 * 1000LL); // 300 ms, so the test can wait
+
+    // Connect and send a fragment that can never frame as a request. On a TLS
+    // listener these never even finish a handshake, which is the case that used to
+    // hold a slot forever.
+    std::vector<int> fds;
+    for (int i = 0; i < 12; ++i)
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(_port);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        ASSERT_GT(::write(fd, "\x16\x03\x01", 3), 0);
+        fds.push_back(fd);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (_gw->stats().client_setup_timeouts < 12 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    EXPECT_GE(_gw->stats().client_setup_timeouts, 12u)
+        << "half-open clients were not dropped; the deadline is not enforced";
+    for (int fd : fds) ::close(fd);
+
+    // And a real client is unaffected: the deadline must not touch a peer that
+    // completes a request.
+    TlsClient ok;
+    ASSERT_TRUE(ok.connect(_port, _ca_path));
+    ASSERT_TRUE(ok.handshake());
+    ASSERT_TRUE(ok.send(kReq));
+    EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
 }
