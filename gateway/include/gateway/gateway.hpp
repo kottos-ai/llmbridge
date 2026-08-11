@@ -133,8 +133,52 @@ namespace llmbridge
         // (see net::http::ResponseDecoder; the shared-scratch form was quadratic).
         net::http::ResponseDecoder rdec;
 
+        // THE BUFFERS. `r` and `w` are named from the GATEWAY's point of view on
+        // THIS socket: rbuf is what we read from the peer, wbuf is what we write
+        // to it. So the same field name holds the REQUEST on one connection and
+        // the RESPONSE on the other, and which is which depends on `is_client`.
+        // That is the single most confusing thing about this struct, so here is
+        // one request crossing all four buffers:
+        //
+        //     client                      gateway                      provider
+        //       |                                                         |
+        //       |  request                                                |
+        //       |------------> c->rbuf --[frame, translate]--> u->wbuf    |
+        //       |                                                 |-------|-->
+        //       |                                                         |
+        //       |                                                response |
+        //       |  c->wbuf <--[translate back]-- u->rbuf <-----------------|
+        //       |<------------|                                           |
+        //
+        //   c->rbuf   bytes the CLIENT sent us      (the request)
+        //   u->wbuf   bytes we send the PROVIDER    (the request, translated)
+        //   u->rbuf   bytes the PROVIDER sent us    (the response)
+        //   c->wbuf   bytes we send the CLIENT      (the response, translated)
+        //
+        // Both buffers are PLAINTEXT on both legs, always, whether or not TLS is
+        // in use. TLS interposes at the socket edge only.
+        //
+        // There are five buffers on a Connection in total. The other three are
+        // declared further down with their own notes, listed here so the full set
+        // is visible in one place:
+        //   tls_out    ciphertext heading for the socket (TLS conns only)
+        //   wpending   io_uring streaming staging area, because wbuf must not move
+        //              while a SEND SQE points into it
+        //   rdec       chunked-decode state, not a byte buffer
         std::string rbuf;
         std::string wbuf;
+
+        // How much of wbuf has been dealt with. Its meaning shifts with the
+        // transport, which is a real trap:
+        //   plaintext:  bytes actually written to the socket
+        //   TLS:        bytes fed into the Session, which is NOT the same as bytes
+        //               on the wire. The wire progress is tls_out_off. woff can
+        //               reach wbuf.size() while nothing has left the machine yet.
+        // The WRITE PATH deliberately does not clear wbuf when woff catches up;
+        // callers do, at points they choose. That is what keeps an upstream
+        // request available for a resend when a pooled connection turns out to be
+        // dead (see ep_retry_upstream / ur_retry_upstream, which resend only when
+        // the connection came from the pool and no response byte has arrived).
         size_t woff = 0;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
