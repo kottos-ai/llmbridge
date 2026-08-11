@@ -229,6 +229,58 @@ def main():
             failures.append(f"LATENCY.md: STAMP: parsed only {seen} of 7 stamp rows; "
                             f"the table or this check is broken")
 
+    # ---------------------------------------------------------------- 5
+    # Identifier casing (DESIGN.md "Naming conventions"). Documented and followed
+    # by hand until now, which by this project's own standard means unenforced.
+    #
+    #   kPascalCase  compile-time constants
+    #   PascalCase   types and enum values
+    #   ALL_CAPS     PREPROCESSOR MACROS ONLY
+    #
+    # The last one is the rule with teeth. C++ constants obey scope, so they do
+    # not need the shouting that warns about a macro; and a constant in ALL_CAPS
+    # collides with any system header that defines the same name (ERROR, min and
+    # max are all real examples). Reserving the shape for macros keeps that
+    # collision impossible instead of unlikely.
+    n_consts = n_types = 0
+    src = []
+    for d in ("gateway", "net", "provider", "app"):
+        src += sorted((ROOT / d).rglob("*.hpp")) + sorted((ROOT / d).rglob("*.cpp"))
+
+    # `constexpr <type> NAME =` / `[` / `{`, but NOT `constexpr <type> name(` which
+    # is a constexpr FUNCTION and correctly snake_case.
+    const_re = re.compile(r"\bconstexpr\b[\w:<>,\s\*&]*?\b(\w+)\s*(?:=|\[|\{)")
+    type_re = re.compile(r"^\s*(?:struct|class)\s+(\w+)\s*(?:[:{]|$)", re.M)
+    for f in src:
+        rel = f.relative_to(ROOT)
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            code = line.split("//", 1)[0]
+            if "constexpr" in code:
+                for m in const_re.finditer(code):
+                    name = m.group(1)
+                    if name in ("constexpr", "static", "inline", "auto"):
+                        continue
+                    n_consts += 1
+                    if re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+                        failures.append(
+                            f"{rel}:{n}: CASING - constant `{name}` is ALL_CAPS, which is "
+                            f"reserved for macros; use k{name.title().replace('_','')}")
+                    elif not re.fullmatch(r"k[A-Z]\w*", name):
+                        failures.append(
+                            f"{rel}:{n}: CASING - constant `{name}` should be kPascalCase")
+            for m in type_re.finditer(code):
+                name = m.group(1)
+                n_types += 1
+                if not re.fullmatch(r"[A-Z]\w*", name):
+                    failures.append(f"{rel}:{n}: CASING - type `{name}` should be PascalCase")
+
+    # Same guard as the method extractor: a regex that silently stops matching
+    # would otherwise report a clean run over nothing at all.
+    if n_consts < 30 or n_types < 20:
+        print(f"error: casing check inspected only {n_consts} constants and {n_types} "
+              f"types; the extractor is broken, not the code.", file=sys.stderr)
+        return 2
+
     # ---------------------------------------------------------------- report
     if failures:
         print(f"convention check FAILED ({len(failures)} violation"
@@ -241,7 +293,8 @@ def main():
     twins = sum(1 for n in spans if n.startswith("ep_") and "ur_" + n[3:] in spans)
     print(f"convention check OK: {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
           f"0 crossings, 0 unmarked, namespaces mirror directories, "
-          f"LATENCY.md stamp refs resolve")
+          f"LATENCY.md stamp refs resolve, "
+          f"{n_consts} constants + {n_types} types correctly cased")
     return 0
 
 

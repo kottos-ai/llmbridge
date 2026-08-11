@@ -64,11 +64,13 @@ for an *upstream* connection. `void u_tls_kick_send(Connection* u)` used both
 meanings of `u` in one signature.
 
 **This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
-first CI job (no compiler, ~90 ms) and fails the build on four things: a call crossing
+first CI job (no compiler, ~90 ms) and fails the build on five things: a call crossing
 the prefixes; an **unprefixed** method reachable from only one backend; a header whose
 namespace does not mirror its directory; and a stale attribution in LATENCY.md's stamp
 table (each timing stamp names the function that assigns it, and that function must
-exist and must actually assign it). The table names functions instead of line
+exist and must actually assign it); and an identifier whose casing breaks the rules
+below (a constant that is not `kPascalCase`, or worse is `ALL_CAPS`, or a type that is
+not `PascalCase`). The table names functions instead of line
 numbers on purpose: line references rot on any edit above them, so the doc would
 need re-checking on every commit, and a reference that needs re-checking every
 commit is one nobody re-checks. Function names move only under a rename, which is
@@ -80,7 +82,16 @@ instance of the defect it exists to catch.
 
 Elsewhere: `kPascalCase` constants, `_member` privates, `PascalCase` types and enum
 values, `snake_case` functions, `ts_*` for timestamps, and `X_to_Y_request` /
-`X_to_Y_response` for the translation entry points.
+`X_to_Y_response` for the translation entry points. The constant and type forms are
+machine-checked; the rest are followed by hand.
+
+**`ALL_CAPS` is for preprocessor macros and nothing else**, and that one is worth a
+sentence of its own. A C++ constant obeys scope, so it does not need the shouting
+that warns a reader about a macro. Giving it ALL_CAPS instead creates a real
+collision: macros have no namespace, so a `constexpr int ERROR` breaks against any
+system header that defines `ERROR`, and `min`, `max` and `DEBUG` are the same story.
+Reserving the shape for macros makes that impossible, and not merely unlikely. The
+checker rejects an ALL_CAPS constant and names the `kPascalCase` form to use.
 
 ## Threading & I/O model
 
