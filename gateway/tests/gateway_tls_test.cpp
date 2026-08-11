@@ -34,6 +34,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <sys/stat.h>
+
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -86,6 +88,23 @@ namespace
         // spurious "no certificate or crl found" in whichever test lost the race.
         // A flaky security suite is a suite people learn to ignore, so this is
         // worth the two lines.
+        /// Write the private key, mode 600 so the gateway's startup guard accepts
+        /// it. Needed because inbound TLS makes US the server, so the same
+        /// self-signed identity has to be presented, and not merely trusted.
+        std::string write_key_pem() const
+        {
+            static std::atomic<unsigned> seq{0};
+            std::string path = std::string(::testing::TempDir()) + "llmbridge_gw_key_" +
+                               std::to_string(static_cast<long>(::getpid())) + "_" +
+                               std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".pem";
+            FILE* f = std::fopen(path.c_str(), "wb");
+            EXPECT_NE(f, nullptr);
+            PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr);
+            std::fclose(f);
+            EXPECT_EQ(::chmod(path.c_str(), 0600), 0);
+            return path;
+        }
+
         std::string write_pem() const
         {
             static std::atomic<unsigned> seq{0};
@@ -325,6 +344,125 @@ namespace
     };
 
     // Plaintext loopback client (the gateway's client side is not TLS).
+    /// A real TLS client for the gateway's own listener. The existing `Client`
+    /// below is plaintext; inbound TLS needs a peer that actually handshakes,
+    /// because the interesting failures are in the handshake and its teardown.
+    class TlsClient
+    {
+      public:
+        ~TlsClient() { close(); }
+
+        bool connect(uint16_t port, const std::string& ca_path)
+        {
+            _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = htons(port);
+            if (::connect(_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) return false;
+            // NOTE: no SO_RCVTIMEO here, deliberately. Adding one seemed like cheap
+            // insurance against a hanging test, and it broke three of them: with a
+            // receive deadline SSL_read and SSL_connect return -1 with WANT_READ on
+            // expiry, and these loops treat any non-positive return as fatal. The
+            // SSE test then failed in 82 ms instead of reading a stream. Bounding
+            // the hang properly means teaching every loop to retry on EAGAIN while
+            // honouring its own deadline, which is a real change and not a one-liner.
+
+            _ctx = SSL_CTX_new(TLS_client_method());
+            SSL_CTX_set_verify(_ctx, SSL_VERIFY_PEER, nullptr);
+            if (SSL_CTX_load_verify_locations(_ctx, ca_path.c_str(), nullptr) != 1) return false;
+            _ssl = SSL_new(_ctx);
+            SSL_set_fd(_ssl, _fd);
+            SSL_set_tlsext_host_name(_ssl, kHost);
+            SSL_set1_host(_ssl, kHost);
+            return true;
+        }
+
+        bool handshake() { return SSL_connect(_ssl) == 1; }
+
+        /// Send the ClientHello ONE BYTE AT A TIME. The handshake then spans many
+        /// reads on the gateway, which is the fragmentation case a single write
+        /// never exercises.
+        bool handshake_dribbled()
+        {
+            SSL_set_connect_state(_ssl);
+            BIO* wb = BIO_new(BIO_s_mem());
+            BIO* rb = BIO_new(BIO_s_mem());
+            BIO_set_mem_eof_return(rb, -1);
+            SSL* s2 = SSL_new(_ctx);
+            SSL_set_bio(s2, rb, wb);
+            SSL_set_connect_state(s2);
+            SSL_set1_host(s2, kHost);
+            (void)SSL_do_handshake(s2);
+            char buf[16384];
+            const int n = BIO_read(wb, buf, sizeof buf);
+            SSL_free(s2);
+            for (int i = 0; i < n; ++i)
+                if (::write(_fd, buf + i, 1) != 1) return false;
+            return n > 0;
+        }
+
+        bool send(const std::string& s)
+        {
+            size_t off = 0;
+            while (off < s.size())
+            {
+                const int n = SSL_write(_ssl, s.data() + off, static_cast<int>(s.size() - off));
+                if (n <= 0) return false;
+                off += static_cast<size_t>(n);
+            }
+            return true;
+        }
+
+        /// Read until one complete HTTP response is framed, or the deadline passes.
+        std::string recv_response(int timeout_ms = 5000)
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(timeout_ms);
+            char tmp[8192];
+            for (;;)
+            {
+                llmbridge::net::http::ResponseHead h;
+                if (llmbridge::net::http::parse_response_head(_buf, h) ==
+                        llmbridge::net::http::FrameStatus::Complete &&
+                    _buf.size() >= h.header_len + h.content_length)
+                {
+                    const size_t total = h.header_len + h.content_length;
+                    std::string out = _buf.substr(0, total);
+                    _buf.erase(0, total);
+                    return out;
+                }
+                if (std::chrono::steady_clock::now() > deadline) return {};
+                const int n = SSL_read(_ssl, tmp, sizeof tmp);
+                if (n <= 0)
+                {
+                    const int e = SSL_get_error(_ssl, n);
+                    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+                    return {};
+                }
+                _buf.append(tmp, static_cast<size_t>(n));
+            }
+        }
+
+        /// Raw SSL_read for close-delimited bodies (SSE), where no Content-Length
+        /// exists to frame against.
+        int read_raw(char* buf, size_t n) { return SSL_read(_ssl, buf, static_cast<int>(n)); }
+
+        void close()
+        {
+            if (_ssl) { SSL_free(_ssl); _ssl = nullptr; }
+            if (_ctx) { SSL_CTX_free(_ctx); _ctx = nullptr; }
+            if (_fd >= 0) { ::close(_fd); _fd = -1; }
+        }
+        int fd() const { return _fd; }
+
+      private:
+        int _fd{-1};
+        SSL_CTX* _ctx{nullptr};
+        SSL* _ssl{nullptr};
+        std::string _buf;
+    };
+
     class Client
     {
       public:
@@ -427,6 +565,27 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
+    /// Inbound TLS: the gateway becomes a TLS SERVER for its own listener. The
+    /// upstream leg stays TLS too, so one test covers a request crossing two
+    /// independent TLS sessions in opposite roles, which is the real deployment.
+    void start_inbound(TranslateMode mode = TranslateMode::None,
+                       const std::string& backend_mode = "json")
+    {
+        _backend.start(_id, backend_mode, 0);
+        TlsConfig tls;
+        tls.upstream_tls = true;
+        tls.sni_host = kHost;
+        tls.ca_file = _id.write_pem();
+        tls.client_tls = true;
+        tls.cert_file = _id.write_pem();
+        tls.key_file = _id.write_key_pem();
+        _ca_path = tls.ca_file;
+        _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),
+                                        Gateway::kDefaultUpstreamIdleNs, tls, false);
+        _port = _gw->bound_port();
+        _gt = std::thread([this] { _gw->run(); });
+    }
+
     void TearDown() override
     {
         if (_gw) _gw->request_stop();
@@ -439,6 +598,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     std::unique_ptr<Gateway> _gw;
     std::thread _gt;
     uint16_t _port{0};
+    std::string _ca_path;
 };
 
 TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
@@ -676,3 +836,188 @@ INSTANTIATE_TEST_SUITE_P(Backends, GatewayTls,
                          });
 
 #endif // LLMBRIDGE_HAVE_TLS
+
+// ── Task 5: inbound TLS, the gateway as a TLS SERVER ────────────────────────
+//
+// Everything below runs on BOTH backends. That is not ceremony: when inbound
+// TLS was first wired, 920 tests passed and the convention checker was clean
+// while io_uring was completely broken, because no test reached the new path.
+// Thirty seconds of curl found it. These exist so the next such break is caught
+// by CI instead of by hand.
+
+// Build the request from the body so Content-Length cannot disagree with it.
+// Hardcoding it was wrong twice here, and the byte-forwarding tests passed anyway
+// because a truncated body still reaches a mock that answers 200 to anything. Only
+// the translating test noticed. Compute, never count by hand.
+static std::string make_req(const std::string& body)
+{
+    return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+}
+static const std::string kBody = R"({"model":"m","messages":[{"role":"u","content":"h"}]})";
+static const std::string kStreamBody =
+    R"({"model":"m","stream":true,"messages":[{"role":"u","content":"h"}]})";
+static const std::string kReq = make_req(kBody);
+
+TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)
+{
+    // Anthropic mode on purpose: translation PARSES the body, so a malformed or
+    // truncated request fails here instead of being byte-forwarded to a mock that
+    // answers 200 to anything.
+    start_inbound(TranslateMode::Anthropic);
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(kReq));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp.substr(0, 120);
+}
+
+TEST_P(GatewayTls, InboundKeepAliveServesSeveralRequestsOnOneSession)
+{
+    // One TLS session, three requests. Catches a write path that only works for
+    // the first response, and a Session left in a bad state after a flush.
+    start_inbound();
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    for (int i = 0; i < 3; ++i)
+    {
+        ASSERT_TRUE(c.send(kReq)) << "send " << i;
+        EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos) << "response " << i;
+    }
+}
+
+TEST_P(GatewayTls, InboundHandshakeSplitAcrossSingleByteWrites)
+{
+    // The ClientHello arrives one byte per read, so the gateway must hold partial
+    // TLS records across many events. A single-write handshake never tests this.
+    start_inbound();
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake_dribbled());
+    // The gateway must still be serving afterwards: a fresh client succeeds.
+    TlsClient c2;
+    ASSERT_TRUE(c2.connect(_port, _ca_path));
+    ASSERT_TRUE(c2.handshake());
+    ASSERT_TRUE(c2.send(kReq));
+    EXPECT_NE(c2.recv_response().find("200 OK"), std::string::npos);
+}
+
+TEST_P(GatewayTls, PlaintextSentToTlsListenerIsRefusedAndNothingIsServed)
+{
+    // A plaintext request to a TLS listener must never be answered in plaintext:
+    // the reply would be readable by anyone, and the request may carry a key.
+    start_inbound();
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(kReq));
+    EXPECT_TRUE(c.recv_response(1500).empty()) << "a plaintext response escaped a TLS listener";
+    EXPECT_EQ(_gw->stats().requests, 0u);
+}
+
+// ── 3.8: lifetime. These are the hazards, expressed as tests ────────────────
+//
+// io_uring can hold submitted operations referencing a Connection after the
+// point the code would like to free it. Inbound TLS applies that hazard to a
+// second class of connection and hangs an SSL object with its own lifetime off
+// it. Run under ASan for these to mean anything.
+
+TEST_P(GatewayTls, ClientVanishesMidHandshake)
+{
+    start_inbound();
+    for (int i = 0; i < 20; ++i)
+    {
+        TlsClient c;
+        ASSERT_TRUE(c.connect(_port, _ca_path));
+        // Half a ClientHello, then gone: a send of our handshake reply may well be
+        // in flight when the peer disappears.
+        const char partial[] = "\x16\x03\x01\x00\x2f\x01";
+        ::write(c.fd(), partial, sizeof partial - 1);
+        c.close();
+    }
+    // Survival check: the gateway still serves.
+    TlsClient ok;
+    ASSERT_TRUE(ok.connect(_port, _ca_path));
+    ASSERT_TRUE(ok.handshake());
+    ASSERT_TRUE(ok.send(kReq));
+    EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
+}
+
+TEST_P(GatewayTls, ClientVanishesMidRequest)
+{
+    start_inbound();
+    for (int i = 0; i < 20; ++i)
+    {
+        TlsClient c;
+        ASSERT_TRUE(c.connect(_port, _ca_path));
+        ASSERT_TRUE(c.handshake());
+        ASSERT_TRUE(c.send(kReq.substr(0, 40)));  // headers only, no body
+        c.close();
+    }
+    TlsClient ok;
+    ASSERT_TRUE(ok.connect(_port, _ca_path));
+    ASSERT_TRUE(ok.handshake());
+    ASSERT_TRUE(ok.send(kReq));
+    EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
+}
+
+TEST_P(GatewayTls, ClientVanishesImmediatelyAfterSendingAFullRequest)
+{
+    // The response is built and a send submitted while the peer is already gone.
+    // On io_uring that is the case where a Session could be freed with an SQE
+    // still pointing into its ciphertext buffer.
+    start_inbound();
+    for (int i = 0; i < 20; ++i)
+    {
+        TlsClient c;
+        ASSERT_TRUE(c.connect(_port, _ca_path));
+        ASSERT_TRUE(c.handshake());
+        ASSERT_TRUE(c.send(kReq));
+        c.close();  // no read at all
+    }
+    TlsClient ok;
+    ASSERT_TRUE(ok.connect(_port, _ca_path));
+    ASSERT_TRUE(ok.handshake());
+    ASSERT_TRUE(ok.send(kReq));
+    EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
+}
+
+TEST_P(GatewayTls, ManyConcurrentInboundTlsClientsAllComplete)
+{
+    start_inbound();
+    constexpr int kN = 24;
+    std::vector<std::thread> ts;
+    std::atomic<int> ok{0};
+    for (int i = 0; i < kN; ++i)
+        ts.emplace_back([&] {
+            TlsClient c;
+            if (!c.connect(_port, _ca_path) || !c.handshake()) return;
+            if (!c.send(kReq)) return;
+            if (c.recv_response(8000).find("200 OK") != std::string::npos) ++ok;
+        });
+    for (auto& t : ts) t.join();
+    EXPECT_EQ(ok.load(), kN);
+}
+
+TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
+{
+    start_inbound(TranslateMode::Anthropic, "sse");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(make_req(kStreamBody)));
+    // Streamed responses are close-delimited, so read raw until the stream ends.
+    std::string all;
+    char tmp[4096];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const int n = c.read_raw(tmp, sizeof tmp);
+        if (n <= 0) break;
+        all.append(tmp, static_cast<size_t>(n));
+        if (all.find("[DONE]") != std::string::npos) break;
+    }
+    EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 200);
+    EXPECT_NE(all.find("[DONE]"), std::string::npos);
+}

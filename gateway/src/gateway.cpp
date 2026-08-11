@@ -2637,7 +2637,17 @@ namespace llmbridge
         client->wbuf = std::move(client->wpending);
         client->wpending.clear();
         client->woff = 0;
-        client->send_inflight = true;
+        // Who owns send_inflight depends on the transport, and getting this wrong
+        // deadlocks the stream silently. On the plaintext path ur_submit_send
+        // submits unconditionally, so the flag is set here. On the TLS path
+        // ur_tls_flush OWNS it and refuses to run when it is already set, so
+        // setting it here made the first SSE flush a no-op and the stream hung
+        // forever. Found by InboundTlsStreamsSseEndToEnd, which passed on epoll
+        // and hung on io_uring.
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (!client->tls)
+#endif
+            client->send_inflight = true;
         ur_client_send(client); // (closes the client on SQE exhaustion; nothing more to do)
     }
 
