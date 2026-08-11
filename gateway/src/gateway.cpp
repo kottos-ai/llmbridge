@@ -1143,6 +1143,7 @@ namespace llmbridge
             c->fd = fd;
             c->is_client = true;
             c->id = _next_client_id++;
+            c->ts_accepted = now_ns();
             c->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
             if (_tls.client_tls && !tls_attach_client(c))
@@ -1229,6 +1230,7 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
+        c->ever_framed = true;        // past the setup deadline for good
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
@@ -1667,6 +1669,32 @@ namespace llmbridge
                 continue;
             }
             ++i;
+        }
+
+        // Drop clients that never finished setting up. This runs BEFORE the
+        // upstream-idle early return below, deliberately: the two are unrelated,
+        // and a deployment with the upstream timeout disabled still must not let a
+        // peer hold a connection open forever by sending nothing.
+        //
+        // Measured before this existed: 50 half-open connections, each holding a
+        // slot with a partial request, and the gateway closed none of them. On a
+        // loopback sidecar that is nearly harmless. On an internet-facing listener
+        // it is a resource-exhaustion vector that costs an attacker one packet.
+        {
+            std::vector<Connection*> unfinished;
+            for (auto& [id, c] : _clients)
+            {
+                if (c->doomed || c->ever_framed || c->ts_accepted == 0) continue;
+                if (now - c->ts_accepted > kClientSetupNs) unfinished.push_back(c);
+            }
+            for (Connection* c : unfinished)
+            {
+                ++_stats.client_setup_timeouts;
+#ifdef LLMBRIDGE_HAVE_URING
+                if (uring) { ur_close(c); continue; }
+#endif
+                ep_close_client(c);
+            }
         }
 
         // The in-flight abort below is gated on the upstream idle timeout; pool
@@ -2120,6 +2148,7 @@ namespace llmbridge
         c->fd = fd;
         c->is_client = true;
         c->id = _next_client_id++;
+        c->ts_accepted = now_ns();
         c->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (_tls.client_tls && !tls_attach_client(c))
@@ -2306,6 +2335,7 @@ namespace llmbridge
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
+        c->ever_framed = true;        // past the setup deadline for good
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
