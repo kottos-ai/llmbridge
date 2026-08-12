@@ -224,6 +224,26 @@ namespace
                     }
                     buf.erase(0, m.total_len);
                     ++_requests;
+                    if (_mode == "sse-badchunk-hold")
+                    {
+                        // Valid TLS throughout, but INVALID CHUNKED FRAMING inside
+                        // it. That reaches stream_step()'s Corrupt path, which calls
+                        // stream_truncate(), and not the TLS record failure that
+                        // "sse-corrupt" exercises. Then HOLD the connection: the
+                        // point is whether the gateway tears the client down itself,
+                        // or waits for a provider that never closes.
+                        const std::string head = sse_corrupt_prefix();
+                        if (SSL_write(ssl, head.data(), static_cast<int>(head.size())) <= 0)
+                            goto done;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                        const std::string bad = "ZZZZNOTAHEXSIZE\r\n";
+                        (void)SSL_write(ssl, bad.data(), static_cast<int>(bad.size()));
+                        // Block forever. If the gateway is waiting for US to close,
+                        // it waits until the 120 s idle sweep.
+                        char sink[256];
+                        (void)SSL_read(ssl, sink, sizeof sink);
+                        goto done;
+                    }
                     if (_mode == "sse-corrupt")
                     {
                         // Start a legitimate stream (headers + first token through
@@ -1272,4 +1292,47 @@ TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
     ASSERT_TRUE(ok.handshake());
     ASSERT_TRUE(ok.send(kReq));
     EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
+}
+
+// The gap a mutation sweep found: deleting `stream_ended = true` from
+// stream_truncate() broke no test, because every mock closes promptly after
+// sending and the client goes away either way.
+//
+// Here the provider corrupts the chunked framing and then HOLDS the connection
+// open. stream_ended is what gates finalize_stream, so without it the gateway
+// resumes reading from an upstream that will never speak again and the client
+// socket is held until the 120 s idle sweep. With it, the client is closed at
+// once. The assertion is therefore about TIME, which is the only way the two
+// behaviours differ.
+TEST_P(GatewayTls, CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient)
+{
+    start_inbound(TranslateMode::Anthropic, "sse-badchunk-hold");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(make_req(kStreamBody)));
+
+    // Read until the gateway closes us. A clean EOF here is the whole assertion:
+    // it must arrive in seconds, never at the 120 s upstream idle timeout.
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string all;
+    char tmp[4096];
+    bool closed = false;
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(15))
+    {
+        const int n = c.read_raw(tmp, sizeof tmp);
+        if (n <= 0) { closed = true; break; }
+        all.append(tmp, static_cast<size_t>(n));
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    ASSERT_TRUE(closed) << "the gateway never closed the client; it is waiting for a "
+                        << "provider that never will. elapsed=" << elapsed.count() << "ms";
+    EXPECT_LT(elapsed.count(), 10000)
+        << "closed only after " << elapsed.count() << "ms, which suggests the idle "
+        << "sweep did it rather than the truncation path";
+    // Truncated honestly: the client saw real tokens and NO fabricated terminator.
+    EXPECT_NE(all.find("hola"), std::string::npos) << "no tokens reached the client";
+    EXPECT_EQ(all.find("[DONE]"), std::string::npos) << "fabricated a clean finish";
 }

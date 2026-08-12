@@ -778,17 +778,15 @@ namespace llmbridge
         // The three mutations are one decision, so they live in one place. Five
         // sites across both backends wrote them out by hand, which is how a sixth
         // ends up setting two of the three.
-        // Load-bearing, though a mutation sweep found no test that says so.
-        // {ep,ur}_stream_flush call finalize_stream ONLY when this is set; without
-        // it they resume reading from the upstream instead, and the client
-        // connection is never torn down by this path. It then lingers until the
-        // provider closes or the idle sweep fires, which is up to 30 seconds of a
-        // held socket per corrupted stream. Every mock closes promptly, so the
-        // tests see the same outcome either way.
-        //
-        // The test that would guard it: a provider that corrupts a stream and then
-        // HOLDS the connection open, asserting the client is closed promptly rather
-        // than at the idle timeout.
+        // Load-bearing, and now guarded. {ep,ur}_stream_flush call finalize_stream
+        // ONLY when this is set; without it they resume reading from an upstream
+        // that will never speak again, and the client socket is held until the
+        // 120 s idle sweep. A mutation sweep found no test that noticed, because
+        // every mock closed promptly and the client went away either way.
+        // CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient
+        // supplies the missing provider: it corrupts the chunked framing inside
+        // valid TLS and then holds the connection, so the only difference left is
+        // WHEN the client is closed. Deleting this line makes that test fail.
         client->stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
         ++_stats.errors;                  // and it counts as a failure, not a finish
