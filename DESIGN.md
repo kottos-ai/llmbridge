@@ -144,6 +144,12 @@ commented inline in `gateway/src/gateway.cpp`.
 
 ## Request lifecycle (proxy)
 
+> For the mechanism behind the shape, see
+> [GATEWAY-INTERNALS.md](GATEWAY-INTERNALS.md): which buffer holds what on each
+> connection, who owns each piece of mutable state, when a connection may be
+> freed on each backend, where the credential is scrubbed, and how pooling and
+> the two TLS legs fit together.
+
 > Latency accounting for this lifecycle: the seven stamps, what each reported
 > number spans, and why connection setup is excluded from "added latency", is
 > defined in [LATENCY.md](LATENCY.md). Change the stamps and that document is

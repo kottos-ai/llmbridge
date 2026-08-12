@@ -225,7 +225,7 @@ splitting a request into four disjoint spans: gateway compute, the TCP+TLS hands
 returns an orderable arrival timestamp, a monotonic sequence number, and the provider's
 own token counts. Metadata only: no prompt or completion text. Every one of those numbers
 is defined precisely in **[LATENCY.md](LATENCY.md)**: which stamps bound it, what is
-excluded, and why the handshake is never counted as our overhead.
+excluded, and why the handshake is never counted as our overhead. For how the proxy works inside, on both event-loop backends, see **[GATEWAY-INTERNALS.md](GATEWAY-INTERNALS.md)**.
 
 **Direction.** Today `llmbridge` runs in **OpenAI-in** mode: your code speaks the
 OpenAI API and the gateway fronts a provider. Each request is translated in both
