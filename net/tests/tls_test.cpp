@@ -31,6 +31,7 @@
 #include <openssl/x509v3.h>
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -619,6 +620,118 @@ namespace
         return fed;
     }
 } // namespace
+
+// No failure path may put private key MATERIAL into an error string. Paths and
+// OpenSSL reason strings are fine and useful; the base64 body of the key is not.
+//
+// Audited alongside this (2026-08-12): `Session::last_error()` is consumed nowhere in
+// shipped code, so a failed handshake emits nothing at all, and `Context::last_error()`
+// reaches exactly two call sites, both `std::runtime_error` at startup. There is no
+// per-request path from OpenSSL text to a client body or a stats line.
+namespace
+{
+    /// The base64 lines of a PEM file, which is the material itself. The BEGIN/END
+    /// armour is not secret and appears in no error string anyway.
+    std::vector<std::string> pem_body_lines(const std::string& path)
+    {
+        std::ifstream in(path);
+        std::vector<std::string> out;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("-----", 0) == 0) continue;
+            if (line.size() >= 32) out.push_back(line);
+        }
+        return out;
+    }
+
+    void expect_no_key_material(const std::string& text, const std::vector<std::string>& secret,
+                                const char* where)
+    {
+        ASSERT_FALSE(secret.empty()) << "the key had no body to look for";
+        for (const std::string& line : secret)
+            EXPECT_EQ(text.find(line), std::string::npos)
+                << "key material surfaced in " << where << ": " << text;
+    }
+} // namespace
+
+TEST(ServerContext, NoFailurePathLeaksKeyMaterial)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+    const std::vector<std::string> secret = pem_body_lines(key);
+
+    // Positive control: the detector must be able to detect. Without this the test
+    // passes for any error string at all, including one that leaks.
+    {
+        std::ifstream in(key);
+        const std::string whole((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        bool found = false;
+        for (const std::string& line : secret)
+            if (whole.find(line) != std::string::npos) found = true;
+        ASSERT_TRUE(found) << "the leak detector cannot detect a leak";
+    }
+
+    // Every distinct startup failure, each of which builds an error string, and one
+    // of which interpolates the key PATH (which is allowed and wanted).
+    {   // key that does not match the certificate
+        SelfSigned other;
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = other.write_key_pem();
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), secret, "mismatched-key error");
+    }
+    {   // key readable beyond its owner
+        SelfSigned loose;
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = loose.write_pem();
+        o.key_file = loose.write_key_pem(0644);
+        EXPECT_FALSE(ctx.init_server(o));
+        EXPECT_NE(ctx.last_error().find(o.key_file), std::string::npos) << "path should be named";
+        expect_no_key_material(ctx.last_error(), secret, "permissions error");
+    }
+    {   // already-expired certificate
+        SelfSigned expired(-3600);
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = expired.write_pem();
+        o.key_file = expired.write_key_pem();
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), pem_body_lines(o.key_file), "expiry error");
+    }
+    {   // unreadable key path
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = "/nonexistent/llmbridge/key.pem";
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), secret, "missing-file error");
+    }
+
+    // And a Session that fails its handshake: the error text is derived from the same
+    // OpenSSL queue, on a context that HAS loaded the key.
+    {
+        Context sctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = key;
+        ASSERT_TRUE(sctx.init_server(o)) << sctx.last_error();
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        const std::string junk = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"; // plaintext at a TLS server
+        (void)server.feed_ciphertext(
+            {reinterpret_cast<const uint8_t*>(junk.data()), junk.size()});
+        (void)server.start_handshake();
+        EXPECT_EQ(server.want(), Want::Error);
+        expect_no_key_material(server.last_error(), secret, "handshake error");
+    }
+}
 
 TEST(ServerSession, UnfinishedHandshakeCannotBufferWithoutBound)
 {

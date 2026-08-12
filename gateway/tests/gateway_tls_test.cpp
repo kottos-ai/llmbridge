@@ -40,6 +40,8 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <fstream>
+#include <fcntl.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1308,6 +1310,85 @@ TEST_P(GatewayTls, HandshakingClientCannotReachThePooledUpstream)
     // opened one directly. Either way this count moves.
     EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
     EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "the pooled conn was taken or dropped";
+}
+
+// The end-to-end half. The unit test in net/tests proves no ERROR STRING
+// carries key material; this proves nothing the process actually EMITS does, over a
+// run that includes the failure paths. stderr is captured for the whole run and
+// every byte any client received is kept, then both are searched for the base64
+// body of the private key the listener is using.
+TEST_P(GatewayTls, InboundTlsEmitsNoKeyMaterialAnywhere)
+{
+    // Capture stderr for the duration, including the gateway's startup lines.
+    const std::string cap = std::string(::testing::TempDir()) + "llmbridge_46_" +
+                            std::to_string(static_cast<long>(::getpid())) + ".log";
+    const int saved = ::dup(STDERR_FILENO);
+    ASSERT_GE(saved, 0);
+    const int capfd = ::open(cap.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
+    ASSERT_GE(capfd, 0);
+    ASSERT_GE(::dup2(capfd, STDERR_FILENO), 0);
+
+    std::string client_bytes;
+    start_inbound(TranslateMode::Anthropic);
+    {
+        // (a) a healthy request
+        TlsClient ok;
+        ASSERT_TRUE(ok.connect(_port, _ca_path));
+        ASSERT_TRUE(ok.handshake());
+        ASSERT_TRUE(ok.send(kReq));
+        client_bytes += ok.recv_response();
+
+        // (b) plaintext at the TLS listener, which fails the handshake
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(_port);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        const std::string plain = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        ASSERT_GT(::write(fd, plain.data(), plain.size()), 0);
+        char buf[4096];
+        for (;;)
+        {
+            const ssize_t n = ::read(fd, buf, sizeof buf);
+            if (n <= 0) break;
+            client_bytes.append(buf, static_cast<size_t>(n));
+        }
+        ::close(fd);
+
+        // (c) a truncated handshake, abandoned
+        const int fd2 = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_EQ(::connect(fd2, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        ASSERT_GT(::write(fd2, "\x16\x03\x01\x00\x40", 5), 0);
+        ::close(fd2);
+    }
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+
+    ::fflush(stderr);
+    ASSERT_GE(::dup2(saved, STDERR_FILENO), 0);
+    ::close(saved);
+    ::close(capfd);
+    std::ifstream in(cap);
+    const std::string log((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ::unlink(cap.c_str());
+
+    // The material: the base64 body of the key this listener is serving with.
+    std::ifstream kin(_id.write_key_pem());
+    std::vector<std::string> secret;
+    for (std::string line; std::getline(kin, line);)
+    {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("-----", 0) != 0 && line.size() >= 32) secret.push_back(line);
+    }
+    ASSERT_FALSE(secret.empty());
+    ASSERT_FALSE(log.empty()) << "captured nothing, so this test would pass vacuously";
+
+    for (const std::string& line : secret)
+    {
+        EXPECT_EQ(log.find(line), std::string::npos) << "key material reached stderr";
+        EXPECT_EQ(client_bytes.find(line), std::string::npos) << "key material reached a client";
+    }
 }
 
 // ── The missing row of the matrix: TLS in, plaintext upstream ───────────────
