@@ -792,6 +792,14 @@ namespace llmbridge
         ++_stats.errors;                  // and it counts as a failure, not a finish
     }
 
+    bool Gateway::pooled_buffer_contains(std::string_view needle) const noexcept
+    {
+        if (needle.empty()) return false;
+        for (const Connection* u : _idle_upstreams)
+            if (u->wbuf.find(needle) != std::string::npos) return true;
+        return false;
+    }
+
     bool Gateway::upstream_is_tls(const Connection* u) const noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -1092,7 +1100,13 @@ namespace llmbridge
         u->rbuf.clear();
         u->rdec.reset();
         // wbuf held the REBUILT REQUEST, including the client's credential, and this
-        // connection may now idle for 30 s. Scrub instead of clear.
+        // connection may now idle for 30 s before being handed to whichever client
+        // asks next. Scrub instead of clear.
+        //
+        // Guarded by ProxyAuth.CredentialIsScrubbedFromAPooledUpstreamBuffer.
+        // A mutation sweep found this line could be deleted with nothing failing:
+        // every other auth test inspects what reached the UPSTREAM, and the leak
+        // is in what stays behind.
         secure_clear(u->wbuf);
         u->woff = 0;
         u->msg = net::http::Message{};

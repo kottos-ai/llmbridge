@@ -469,6 +469,22 @@ namespace llmbridge
         // Test seam. Production never calls this; the default is kClientSetupNs.
         void set_client_setup_ns(int64_t ns) noexcept { _client_setup_ns = ns; }
 
+        // Test seam: does any POOLED upstream still hold `needle` in its request
+        // buffer? A pooled connection idles for up to 30 s and is then handed to
+        // whichever client asks next, so a credential left in that buffer outlives
+        // the request that supplied it.
+        //
+        // It answers yes or no and NEVER returns or logs buffer contents, which is
+        // the only shape a credential-adjacent accessor should have. It exists
+        // because a mutation sweep showed secure_clear() could be deleted with no
+        // test noticing, and the invariant is not observable from outside the
+        // process by any other means.
+        [[nodiscard]] bool pooled_buffer_contains(std::string_view needle) const noexcept;
+        [[nodiscard]] size_t pooled_upstream_count() const noexcept
+        {
+            return _idle_upstreams.size();
+        }
+
         // Size of the io_uring provided-buffer pool (power of two), or 0 for the default.
         // Must be called before run(). Exists so a test can shrink the pool far enough to
         // force -ENOBUFS deterministically. At the shipped size that branch was never

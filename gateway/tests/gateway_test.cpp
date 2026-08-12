@@ -732,6 +732,43 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
 }
 
+TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
+{
+    // A keep-alive upstream goes back into the pool holding the REBUILT REQUEST,
+    // credential included, and idles there for up to 30 s before being handed to
+    // whichever client asks next. Scrubbing it is what stops one customer's API
+    // key sitting in a buffer another customer's request will reuse.
+    //
+    // A mutation sweep found secure_clear() could be deleted with nothing failing:
+    // every existing auth test inspects what reached the UPSTREAM, and none looks
+    // at what stays behind. This looks at what stays behind.
+    static constexpr const char* kCanary = "sk-canary-DO-NOT-LEAVE-IN-THE-POOL";
+
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", std::string("Authorization: Bearer ") + kCanary + "\r\n")));
+    ASSERT_FALSE(c.recv_response().empty());
+
+    // It must really have been pooled, or this asserts nothing at all.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (_gw->pooled_upstream_count() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_GT(_gw->pooled_upstream_count(), 0u)
+        << "no upstream was pooled, so the scrub was never exercised";
+
+    // The credential did reach the provider ...
+    EXPECT_NE(_backend.last_request().find(kCanary), std::string::npos)
+        << "the canary never reached the upstream; the test proves nothing";
+    // ... and must not still be sitting in the pooled connection's buffer.
+    EXPECT_FALSE(_gw->pooled_buffer_contains(kCanary))
+        << "a customer credential is idling in a pooled buffer that the next "
+           "client's request will reuse";
+}
+
 TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
