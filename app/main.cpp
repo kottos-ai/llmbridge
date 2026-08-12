@@ -139,6 +139,19 @@ static int run(int argc, char** argv)
         std::fprintf(stderr, "llmbridge: --tls-cert/--tls-key given without --listen-tls\n");
         return 2;
     }
+#ifndef LLMBRIDGE_HAVE_TLS
+    if (listen_tls)
+    {
+        // The dangerous direction of the guard above, and the one that fails OPEN:
+        // without this the flag is accepted, the listener serves plaintext, and the
+        // operator has every client credential on the wire believing otherwise. The
+        // upstream leg refuses the mirror case a few lines down.
+        std::fprintf(stderr, "llmbridge: --listen-tls requires a TLS build. "
+                             "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
+                             "Refusing to serve plaintext on a listener asked to be TLS.\n");
+        return 2;
+    }
+#endif
 
     // Parse + resolve --upstream. Resolution happens ONCE, here, on the setup path:
     // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
@@ -244,6 +257,8 @@ static int run(int argc, char** argv)
         agg.upstream_retries += s.upstream_retries;
         agg.upstream_reused += s.upstream_reused;
         agg.upstream_unsent += s.upstream_unsent;
+        if (s.tls_buffered_peak > agg.tls_buffered_peak)
+            agg.tls_buffered_peak = s.tls_buffered_peak;
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
         agg.connect.merge(s.connect);

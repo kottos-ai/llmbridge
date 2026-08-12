@@ -470,6 +470,11 @@ namespace llmbridge::net::tls
         return classify(rc);
     }
 
+    size_t Session::pending_output_bytes() const noexcept
+    {
+        return _wbio ? static_cast<size_t>(BIO_ctrl_pending(_wbio)) : 0;
+    }
+
     bool Session::has_pending_output() const noexcept
     {
         return _wbio && BIO_ctrl_pending(_wbio) > 0;

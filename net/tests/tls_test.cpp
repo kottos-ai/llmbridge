@@ -593,3 +593,73 @@ TEST(ServerSession, OurClientAndOurServerCompleteAHandshake)
     const size_t got = server.read_plaintext(buf);
     EXPECT_EQ(std::string(reinterpret_cast<char*>(buf), got), req);
 }
+
+// A handshake that never completes must not let a peer buffer without bound.
+// Measured 2026-08-12 before writing any cap, because the cap would otherwise be a
+// fix for a condition nobody had shown occurs: OpenSSL's record layer already
+// bounds it at ONE record. Two shapes, both refused at ~16 KiB.
+//
+// This test exists to keep that true. It fails if a future change adds buffering of
+// our own ahead of the Session, which is the only way the bound could be lost.
+namespace
+{
+    // A server Session that has been handed `hdr` + dribbled bytes, never a valid
+    // handshake. Returns total bytes accepted before it refuses.
+    size_t bytes_accepted_before_refusal(Session& server, const uint8_t* hdr, size_t hdr_len)
+    {
+        size_t fed = server.feed_ciphertext({hdr, hdr_len});
+        (void)server.start_handshake();
+        const uint8_t one = 'A';
+        for (size_t i = 0; i < 5u * 1024 * 1024; ++i)
+        {
+            fed += server.feed_ciphertext({&one, 1});
+            (void)server.start_handshake();
+            if (server.want() == Want::Error) break;
+        }
+        return fed;
+    }
+} // namespace
+
+TEST(ServerSession, UnfinishedHandshakeCannotBufferWithoutBound)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+    Context sctx;
+    Context::ServerOptions so;
+    so.cert_file = cert;
+    so.key_file = key;
+    ASSERT_TRUE(sctx.init_server(so)) << sctx.last_error();
+
+    // Shape 1: a record declaring the maximum payload, dribbled a byte at a time and
+    // never completed. Measured 16,389 bytes accepted, then refused.
+    {
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        const uint8_t hdr[5] = {0x16, 0x03, 0x01, 0x40, 0x00}; // handshake, 16384 bytes
+        const size_t fed = bytes_accepted_before_refusal(server, hdr, sizeof hdr);
+        EXPECT_EQ(server.want(), Want::Error);
+        EXPECT_LT(fed, 64u * 1024) << "dribbled record buffered " << fed << " bytes";
+    }
+
+    // Shape 2: a well-formed record whose handshake message declares a 16 MB
+    // ClientHello. Refused on the FIRST record, 16,009 bytes including the header.
+    {
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        std::string rec;
+        rec.push_back('\x16');
+        rec.push_back('\x03');
+        rec.push_back('\x01');
+        rec.push_back('\x3e');
+        rec.push_back('\x84'); // 16004-byte payload: 1 type + 3 length + 16000 body
+        rec.push_back('\x01'); // client_hello
+        rec.append("\xff\xff\xff", 3);      // declaring 16 MB
+        rec.append(16000, 'A');
+        const size_t n = server.feed_ciphertext(
+            {reinterpret_cast<const uint8_t*>(rec.data()), rec.size()});
+        (void)server.start_handshake();
+        EXPECT_EQ(server.want(), Want::Error);
+        EXPECT_LT(n, 64u * 1024);
+    }
+}

@@ -190,6 +190,9 @@ namespace llmbridge::net::tls
 
         [[nodiscard]] Want want() const noexcept { return _want; }
         [[nodiscard]] bool has_pending_output() const noexcept;
+        /// Bytes of ciphertext staged in the write BIO. Measurement seam: the
+        /// bool above answers "any?", and bounding a buffer needs "how much?".
+        [[nodiscard]] size_t pending_output_bytes() const noexcept;
         [[nodiscard]] const std::string& last_error() const noexcept { return _err; }
 
       private:

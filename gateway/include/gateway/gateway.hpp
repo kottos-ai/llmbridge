@@ -398,6 +398,10 @@ namespace llmbridge
         uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
         uint64_t upstream_reused = 0;   // requests served on a pooled keep-alive conn
         uint64_t upstream_unsent = 0;   // response beat our request out; conn closed, not pooled
+        // Peak ciphertext staged for ONE connection: tls_out plus whatever is still
+        // in the write BIO. Measurement seam for the question "can a client that
+        // never reads grow us without bound?", which is answerable only by a number.
+        uint64_t tls_buffered_peak = 0;
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
                                             // first request (stall, or a client
@@ -481,6 +485,9 @@ namespace llmbridge
         // test noticing, and the invariant is not observable from outside the
         // process by any other means.
         [[nodiscard]] bool pooled_buffer_contains(std::string_view needle) const noexcept;
+        // Test seam. Like stats(), this reads state owned by the loop thread, so it
+        // is valid only once that thread has been joined. Reading it live is a data
+        // race, which TSan reports; production obeys this, see app/main.cpp.
         [[nodiscard]] size_t pooled_upstream_count() const noexcept
         {
             return _idle_upstreams.size();

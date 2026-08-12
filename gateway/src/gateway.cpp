@@ -881,6 +881,8 @@ namespace llmbridge
         size_t n;
         while ((n = u->tls->pull_ciphertext({buf, sizeof buf})) > 0)
             u->tls_out.append(reinterpret_cast<const char*>(buf), n);
+        const uint64_t staged = u->tls_out.size() + u->tls->pending_output_bytes();
+        if (staged > _stats.tls_buffered_peak) _stats.tls_buffered_peak = staged;
     }
 
     void Gateway::tls_push_wbuf(Connection* u) noexcept

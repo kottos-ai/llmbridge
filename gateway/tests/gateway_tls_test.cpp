@@ -268,6 +268,7 @@ namespace
                         goto done;
                     }
                     const std::string resp = _mode == "sse"          ? sse_response()
+                                             : _mode == "sse-flood"      ? sse_flood()
                                              : _mode == "big"            ? big_response()
                                              : _mode == "anthropic-json" ? anthropic_json_response()
                                                                          : json_response();
@@ -349,6 +350,36 @@ namespace
                    chunk(ev);
         }
 
+        // ~32 MiB of well-formed deltas, ONE CHUNK PER EVENT. The first version of
+        // this put the whole body in a single chunk, which the decoder correctly
+        // refuses as a hostile chunk size (kMaxBodyLen is 16 MiB), so 96 bytes
+        // reached the client and the "bounded" result below was measuring nothing.
+        // The control test is what caught it.
+        static std::string sse_flood()
+        {
+            const std::string head =
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\","
+                "\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+                "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+            const std::string filler(4000, 'z');
+            const std::string delta =
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+                "\"delta\":{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+            std::string out = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                              "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n";
+            out.reserve(34u * 1024 * 1024);
+            out += chunk(head);
+            for (int i = 0; i < 8000; ++i) out += chunk(delta); // ~32 MiB in 8000 chunks
+            out += chunk(
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":"
+                "\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n"
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            out += "0\r\n\r\n";
+            return out;
+        }
+
         static std::string sse_response()
         {
             // Minimal-but-real Anthropic event stream, chunked, keep-alive.
@@ -369,7 +400,9 @@ namespace
         }
 
         SSL_CTX* _ctx{nullptr};
-        int _lfd{-1};
+        // Written by stop() on one thread, read by accept_loop on another. Plain
+        // int here is a real data race, and TSan reported it.
+        std::atomic<int> _lfd{-1};
         uint16_t _port{0};
         std::string _mode{"json"};
         std::atomic<bool> _stopping{false};
@@ -457,7 +490,8 @@ namespace
             }
             ::close(c);
         }
-        int _fd{-1};
+        // See TlsBackend::_lfd: written by stop(), read by the accept loop.
+        std::atomic<int> _fd{-1};
         uint16_t _port{0};
         std::string _mode{"json"};
         std::atomic<bool> _run{false};
@@ -689,8 +723,11 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     /// Inbound TLS: the gateway becomes a TLS SERVER for its own listener. The
     /// upstream leg stays TLS too, so one test covers a request crossing two
     /// independent TLS sessions in opposite roles, which is the real deployment.
+    /// `setup_ns` is applied BEFORE the loop thread starts. Setting it afterwards
+    /// writes state the loop thread reads in sweep_idle, which is a genuine data
+    /// race that TSan reports; the seam is not for live reconfiguration.
     void start_inbound(TranslateMode mode = TranslateMode::None,
-                       const std::string& backend_mode = "json")
+                       const std::string& backend_mode = "json", int64_t setup_ns = 0)
     {
         _backend.start(_id, backend_mode, 0);
         TlsConfig tls;
@@ -703,6 +740,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _ca_path = tls.ca_file;
         _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),
                                         Gateway::kDefaultUpstreamIdleNs, tls, false);
+        if (setup_ns > 0) _gw->set_client_setup_ns(setup_ns);
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
@@ -857,6 +895,10 @@ TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)
     }
     EXPECT_EQ(_backend.requests(), 2);
     EXPECT_EQ(_backend.handshakes(), 1) << "pooled reuse paid a second TLS handshake";
+    // stats() belongs to the loop thread; join before reading it. See the note on
+    // pooled_upstream_count().
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
     EXPECT_GE(_gw->stats().upstream_reused, 1u);
 }
 
@@ -1166,6 +1208,108 @@ TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
     EXPECT_NE(all.find("[DONE]"), std::string::npos);
 }
 
+// 4.7: a client that completes the handshake and then never reads must not grow
+// the gateway without bound through the write BIO. Written as a MEASUREMENT, not an
+// argument: the upstream floods ~32 MiB of stream while the client reads nothing,
+// and the assertion is on the peak ciphertext staged for that connection. If the
+// buffer were unbounded the peak would track what was produced.
+TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
+{
+    start_inbound(TranslateMode::Anthropic, "sse-flood");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(make_req(kStreamBody)));
+
+    // Read NOTHING. Give the gateway time to pull everything the upstream will give
+    // it and stage as much as it is willing to stage.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    c.close();
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+    const uint64_t peak = _gw->stats().tls_buffered_peak;
+    std::fprintf(stderr, "MEASURED tls_buffered_peak = %llu bytes\n",
+                 static_cast<unsigned long long>(peak));
+    // The stream cap is 8 MiB; allow generous slack for one record and the BIO.
+    EXPECT_LT(peak, 12u * 1024 * 1024)
+        << "staged " << peak << " bytes for one non-reading client";
+}
+
+// The control for the test above, and it is not optional. A peak of ~1 KiB is the
+// right answer only if the flood actually flows when somebody reads it; if the mock
+// were broken, the bounded result would be measuring nothing. This drains the same
+// stream and asserts megabytes arrive.
+TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
+{
+    start_inbound(TranslateMode::Anthropic, "sse-flood");
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    ASSERT_TRUE(c.send(make_req(kStreamBody)));
+
+    size_t total = 0;
+    char tmp[65536];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const int n = c.read_raw(tmp, sizeof tmp);
+        if (n <= 0) break;
+        total += static_cast<size_t>(n);
+        if (total > 8u * 1024 * 1024) break; // enough to prove it flows
+    }
+    std::fprintf(stderr, "CONTROL delivered %zu bytes to a reading client\n", total);
+    EXPECT_GT(total, 8u * 1024 * 1024);
+}
+
+// 4.8: a connection still in the handshake must not be able to reach the pooled
+// upstream. Structurally it cannot, because acquiring an upstream needs a framed
+// request and framing needs plaintext, but "structurally it cannot" is the kind of
+// claim this file has been wrong about before. Measured with a pool that is known
+// to be non-empty, so the test can tell "did not touch it" from "there was nothing
+// to touch".
+TEST_P(GatewayTls, HandshakingClientCannotReachThePooledUpstream)
+{
+    start_inbound(TranslateMode::Anthropic);
+
+    // Put exactly one upstream in the pool via a completed request. Release runs
+    // synchronously with the response the client just read, so no polling is needed,
+    // and polling would be wrong: the seams below read gateway state that only the
+    // loop thread may touch while it runs. See the note on pooled_upstream_count().
+    {
+        TlsClient warm;
+        ASSERT_TRUE(warm.connect(_port, _ca_path));
+        ASSERT_TRUE(warm.handshake());
+        ASSERT_TRUE(warm.send(kReq));
+        ASSERT_NE(warm.recv_response().find("200 OK"), std::string::npos);
+    }
+
+    // Six clients that start a handshake and never finish one.
+    std::vector<int> fds;
+    for (int i = 0; i < 6; ++i)
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(_port);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+        ASSERT_GT(::write(fd, "\x16\x03\x01\x00\x40", 5), 0); // record header, no body
+        fds.push_back(fd);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    for (int fd : fds) ::close(fd);
+
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+    // Exactly one upstream was ever opened, by the warm request. Had a handshaking
+    // client reached the pool it would have taken that connection and the next
+    // request would have opened another; had it bypassed the pool it would have
+    // opened one directly. Either way this count moves.
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 1u);
+    EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "the pooled conn was taken or dropped";
+}
+
 // ── The missing row of the matrix: TLS in, plaintext upstream ───────────────
 //
 // Every other combination of {client leg} x {upstream leg} x {streaming} was
@@ -1257,8 +1401,8 @@ TEST_P(GatewayTls, SlowClientReceivesAFullLargeBodyThroughTls)
 // An untested deadline on an internet-facing listener is the same as no deadline.
 TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
 {
-    start_inbound();
-    _gw->set_client_setup_ns(300 * 1000 * 1000LL); // 300 ms, so the test can wait
+    // 300 ms deadline, applied before the loop thread starts. See start_inbound().
+    start_inbound(TranslateMode::None, "json", 300 * 1000 * 1000LL);
 
     // Connect and send a fragment that can never frame as a request. On a TLS
     // listener these never even finish a handshake, which is the case that used to
@@ -1276,22 +1420,24 @@ TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
         fds.push_back(fd);
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (_gw->stats().client_setup_timeouts < 12 &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Comfortably past the 300 ms deadline. This used to poll stats() in a loop,
+    // which reads loop-thread state from the test thread; TSan reported it, and a
+    // suite with known-benign races is a suite where a real one gets ignored.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-    EXPECT_GE(_gw->stats().client_setup_timeouts, 12u)
-        << "half-open clients were not dropped; the deadline is not enforced";
-    for (int fd : fds) ::close(fd);
-
-    // And a real client is unaffected: the deadline must not touch a peer that
-    // completes a request.
+    // A real client is unaffected: the deadline must not touch a peer that
+    // completes a request. Done BEFORE the join, since it needs a live gateway.
     TlsClient ok;
     ASSERT_TRUE(ok.connect(_port, _ca_path));
     ASSERT_TRUE(ok.handshake());
     ASSERT_TRUE(ok.send(kReq));
     EXPECT_NE(ok.recv_response().find("200 OK"), std::string::npos);
+
+    for (int fd : fds) ::close(fd);
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+    EXPECT_GE(_gw->stats().client_setup_timeouts, 12u)
+        << "half-open clients were not dropped; the deadline is not enforced";
 }
 
 // The gap a mutation sweep found: deleting `stream_ended = true` from
