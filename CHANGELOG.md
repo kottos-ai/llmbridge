@@ -14,6 +14,72 @@ Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting a
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
 
+## [0.11.0]. 2026-08-12
+
+**Inbound TLS.** The gateway now terminates the client's TLS as well as originating
+its own to the provider, so it can be a remote endpoint instead of only a loopback
+sidecar. MINOR, because this is new functionality; nothing existing changed shape.
+
+### Added
+
+- **`--listen-tls --tls-cert PATH --tls-key PATH`.** TLS 1.2 floor, ALPN advertising
+  `http/1.1` only and failing the handshake on no overlap, renegotiation disabled.
+  **One listener, one mode**: `--listen-tls` makes the single listener TLS-only, so
+  "am I exposed in the clear?" is answered by reading the command line.
+- **Startup validation, each with its own error**: a private key readable beyond its
+  owner, a key that does not match the certificate, an already-expired certificate, an
+  unreadable path, and either TLS flag given without the other.
+- **`accept(TLS)` histogram**, the inbound handshake from accept to handshake-done.
+  It completes *before* t0, so no other number in `LATENCY.md` could see it. It is
+  deliberately **not** folded into `added-total`: a handshake is per connection and
+  `added-total` is per request, so spreading it either way invents a cost or inflates
+  one request. Unlike the upstream handshake, this one exists only because the gateway
+  is in the path, so it **is** ours; `LATENCY.md` section 1 explains the asymmetry.
+- **`streamgen --tls --ca FILE`** in the benchmark harness, the only client in the
+  tree that can drive a TLS listener. Verification is not disableable.
+- **A libFuzzer target for the inbound handshake** (`fuzz_tls_server`), wired into CI.
+  It is the first surface an unauthenticated remote peer reaches.
+
+### Fixed
+
+- **A non-TLS build silently ignored `--listen-tls`**: it bound the listener, served
+  **plaintext**, did not check that the certificate paths existed, and warned about
+  nothing. The default build has no TLS, so an operator following the inbound-TLS
+  instructions without `-DLLMBRIDGE_TLS=ON` would have put every client's API key on a
+  routable address believing the listener was encrypted. The mirror guard for the
+  upstream leg already existed; this direction, the one that fails open, had none.
+  `main.cpp` is linked by no unit test, so every CLI guard in the file was uncovered;
+  four `ctest` cases now assert the exact refusal messages.
+- **A pooled upstream could be released with its request half-sent.** The upstream's
+  recv is armed before the send, so a provider that answers early (a 413 or 401 on the
+  headers of a large body) delivers a complete response while our request is still
+  going out. Releasing that connection scrubbed and re-used a buffer the transport had
+  not finished with, and left a truncated request on the wire for the next client to
+  inherit. Reproduced on **both** backends, where the next client's request was
+  silently dropped. Such a connection is now closed instead of pooled
+  (`stats.upstream_unsent` counts it).
+- **Both handshake histograms overflowed their range.** They used the default 20 ns
+  buckets over 2.62 ms, sized for the sub-millisecond overhead claim, while a cold
+  handshake is 50-80 ms: every cold sample landed in overflow, where `percentile()`
+  returns the running maximum, so p50, p99 and max printed one clamped number wearing
+  three labels. Local mocks hid it entirely. Now 1 us buckets over 262 ms.
+- **`connect(TLS)` never read "exactly 0" on a pooled connection**, as `LATENCY.md`
+  claimed; `percentile()` reports a bucket's upper edge, so it read 20 ns. The header
+  `x-llmbridge-connect-us` is the exact surface and does read 0. Documented, with the
+  quantisation stated, and both halves pinned by tests.
+- **A response head with a malformed status line was accepted.** `parse_response` now
+  requires `HTTP/1.0` or `HTTP/1.1` followed by a space, which also closed a test that
+  had been passing vacuously.
+
+### Known gaps
+
+- **No client authentication.** Anything that can reach the listener can use it with
+  its own key. There is no per-client token, quota or rate limit, which is why a
+  remote deployment needs an authenticating layer in front of it.
+- **No mutual TLS**; client certificates are not requested or verified.
+- **Certificate renewal requires a restart**, dropping in-flight requests and streams.
+  There is no reload on signal.
+
 ## [0.10.1]. 2026-08-09
 
 ### Fixed

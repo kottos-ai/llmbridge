@@ -216,12 +216,32 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
-## TLS to the upstream (`-DLLMBRIDGE_TLS=ON`)
+## TLS on both legs (`-DLLMBRIDGE_TLS=ON`)
 
 Off by default. The default build stays **zero-dependency** end to end; enabling TLS
 links OpenSSL (≥3.0), the one sanctioned runtime dependency, confined to the gateway.
 The translator library (`provider/`) never links it, in any configuration. CI proves
 both states: the gcc/clang matrix builds TLS-off, the sanitizer job TLS-on.
+
+### Two sessions in opposite roles, never one pipe
+
+The same build does both legs, and they are independent `Session` objects: the gateway
+is the **server** for the client (`--listen-tls --tls-cert --tls-key`) and the **client**
+to the provider (`--upstream https://...`). It terminates one and originates the other,
+which is what lets it translate dialects and swap credentials in between. Neither leg
+implies the other: TLS in with a plaintext upstream is a supported configuration and is
+what terminating at the edge in front of a local model looks like.
+
+What differs between the roles is only the handshake state (`SSL_set_accept_state`
+against `SSL_set_connect_state`) and what gets verified. The client leg presents a
+certificate and verifies nobody, because requiring client certificates is a product
+decision we have not taken; the upstream leg verifies the provider's chain **and** its
+hostname, with no way to disable it. Those are different decisions, and the code says
+so at the site, so nobody "makes them consistent" later.
+
+Deployment consequence, and it is the important one: TLS decides what is on the wire,
+never who may connect. `llmbridge` authenticates no client. Either front it with
+something that does, or keep the listener on loopback. See SECURITY.md.
 
 ### Why memory BIOs, not `SSL_set_fd`
 
@@ -295,6 +315,15 @@ TLS, 16 concurrent interleaved sessions, corrupt-record-mid-stream aborts withou
 `[DONE]`, provider closing pooled conns, provider dropping the TCP connection
 mid-handshake, and wrong-hostname surfacing as a client 502 with **zero** requests
 reaching the unverified peer.
+
+The inbound leg adds its own: handshake split across single-byte writes, plaintext sent
+to a TLS listener refused with nothing served, three disconnect tests (mid-handshake,
+mid-request, immediately after a request) at twenty iterations each under ASan and
+UBSan, a bounded-buffering proof for a handshake that never completes, and a check that
+a client which never reads cannot grow the gateway without bound. A libFuzzer target
+(`fuzz/fuzz_tls_server.cpp`) drives arbitrary bytes at a server-role `Session`, because
+that is the first surface an unauthenticated remote peer reaches. The whole inbound
+suite also runs clean under ThreadSanitizer.
 
 ## Benchmark methodology
 
