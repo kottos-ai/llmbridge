@@ -847,8 +847,8 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
     // WITHOUT THIS the test is vacuous, and it was: it passed with the pooled
     // rbuf.clear() deleted, because the second request had opened a FRESH upstream
     // and never touched the poisoned one. Assert the reuse actually happened.
-    EXPECT_GT(_gw->stats().upstream_reused, 0u)
-        << "no upstream was reused, so the residue path was never exercised";
+    // Reuse is asserted after the join at the end: stats() belongs to the loop
+    // thread, and polling it live is a data race TSan reports.
     // THE CANARY MUST CONTAIN CRLF, and the first version did not. Residue with
     // no space and no CRLF is silently ABSORBED into the next response's status
     // line, because parse_response() finds the first space anywhere in the head
@@ -873,6 +873,11 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
            "poisoned pooled connection looks like from outside: " << r2.substr(0, 160);
     EXPECT_EQ(r2.find("TRAILING-GARBAGE"), std::string::npos)
         << "residue from the FIRST response reached the SECOND client: " << r2.substr(0, 160);
+
+    c2.close();
+    shutdown();
+    EXPECT_GT(_gw->stats().upstream_reused, 0u)
+        << "no upstream was reused, so the residue path was never exercised";
 }
 
 TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
@@ -917,18 +922,22 @@ TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
         "hi", std::string("Authorization: Bearer ") + kCanary + "\r\n")));
     ASSERT_FALSE(c.recv_response().empty());
 
-    // It must really have been pooled, or this asserts nothing at all.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (_gw->pooled_upstream_count() == 0 &&
-           std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    ASSERT_GT(_gw->pooled_upstream_count(), 0u)
-        << "no upstream was pooled, so the scrub was never exercised";
-
     // The credential did reach the provider ...
     EXPECT_NE(_backend.last_request().find(kCanary), std::string::npos)
         << "the canary never reached the upstream; the test proves nothing";
-    // ... and must not still be sitting in the pooled connection's buffer.
+
+    // pooled_upstream_count() and pooled_buffer_contains() read state owned by the
+    // loop thread, so join first. Polling them live is a data race that TSan reports,
+    // and a suite carrying known-benign races is one where a real report is ignored.
+    // Release runs synchronously with the response already received, so no poll is
+    // needed to observe the pooling.
+    c.close();
+    shutdown();
+
+    // It must really have been pooled, or this asserts nothing at all.
+    ASSERT_GT(_gw->pooled_upstream_count(), 0u)
+        << "no upstream was pooled, so the scrub was never exercised";
+    // ... and the credential must not still be sitting in the pooled buffer.
     EXPECT_FALSE(_gw->pooled_buffer_contains(kCanary))
         << "a customer credential is idling in a pooled buffer that the next "
            "client's request will reuse";
@@ -2738,8 +2747,8 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
         cs[i]->close();
     }
 
+    shutdown(); // join BEFORE reading stats(); the loop owns it
     const uint64_t enobufs = _gw->stats().uring_enobufs;
-    shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u) << "buffer starvation must not be reported as an error";
     EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kClients));
 

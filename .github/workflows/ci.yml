@@ -103,6 +103,36 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-san --output-on-failure
 
+  tsan:
+    name: tests · ThreadSanitizer
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      # setarch -R disables ASLR. TSan aborts with "unexpected memory mapping" under
+      # the entropy recent kernels use, and CMAKE_CROSSCOMPILING_EMULATOR makes
+      # gtest_discover_tests run the binary the same way at BUILD time, where the
+      # failure would otherwise delete the executable it just linked.
+      - name: Configure (TSan, TLS on)
+        run: >
+          cmake -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLMBRIDGE_BUILD_TESTS=ON
+          -DLLMBRIDGE_TLS=ON
+          -DCMAKE_CROSSCOMPILING_EMULATOR="/usr/bin/setarch;x86_64;-R"
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build
+        run: cmake --build build-tsan -j
+      # Why this job exists: the gateway is one shared-nothing thread per worker, so
+      # the expectation is silence, and silence is exactly what makes a report worth
+      # reading. It has already caught two classes of defect, both tests reading
+      # loop-thread state through a debug seam while the loop ran.
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1:history_size=7
+        run: setarch x86_64 -R ctest --test-dir build-tsan --output-on-failure
+
   fuzz:
     name: fuzz parsers · libFuzzer
     runs-on: ubuntu-24.04

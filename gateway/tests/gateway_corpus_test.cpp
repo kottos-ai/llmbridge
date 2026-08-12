@@ -390,7 +390,10 @@ namespace
         }
 
         const std::unordered_map<std::string, std::string>* _answers = nullptr;
-        int _fd = -1;
+        // Written by stop() on one thread, read by the accept loop on another.
+        // A plain int here is a real data race, and TSan reported it. Same fix as
+        // TlsBackend::_lfd and PlainBackend::_fd in gateway_tls_test.cpp.
+        std::atomic<int> _fd{-1};
         uint16_t _port = 0;
         std::thread _acc;
         std::vector<std::thread> _conns;
@@ -793,6 +796,12 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     // codebase. If the two ever converge, the loop really has become the
     // bottleneck; while they differ by orders of magnitude, the client figure is
     // measuring the test harness.
+    // stats() is owned by the loop thread, so join before reading it. The join used
+    // to happen twenty lines further down, after this diagnostic print, which is a
+    // data race TSan reports. Nothing below needs a live gateway.
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+
     const llmbridge::Stats& st = _gw->stats();
     std::printf("[ %-5s ] %d reqs / %d clients in %.0f ms = %.0f req/s | "
                 "client-observed p50 %.3f  p99 %.3f  max %.3f ms | gateway added %s\n",
@@ -807,8 +816,6 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     // under `ctest -j4`, which is how a load test becomes noise people ignore.
     EXPECT_LT(pct(0.99), 2000.0) << "p99 " << pct(0.99) << " ms, past the collapse threshold";
 
-    _gw->request_stop();
-    if (_gt.joinable()) _gt.join();
     EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kTotal));
     EXPECT_EQ(_gw->stats().errors, 0u);
     EXPECT_EQ(_backend.served(), kTotal);
