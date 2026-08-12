@@ -169,10 +169,36 @@ Gemini) and forwards **only** that; no other client header crosses into the rebu
 upstream request. Certificate and hostname verification are always on and cannot be
 disabled.
 
-> **Where the credential travels.** Client → gateway is **plain HTTP** (there is no
-> inbound TLS yet), so run `llmbridge` as a **loopback sidecar** next to your app. A
-> non-loopback plaintext upstream prints a startup warning, because a forwarded key
-> would cross the network in the clear.
+### Inbound TLS: terminating the client's connection
+
+The same build also terminates TLS for clients, so the gateway can be a remote
+endpoint instead of only a loopback sidecar:
+
+```sh
+llmbridge --listen 8443 --listen-tls --tls-cert cert.pem --tls-key key.pem \
+          --upstream https://api.anthropic.com --translate anthropic
+```
+
+**One listener, one mode.** `--listen-tls` makes the single listener TLS-only; there is
+no second plaintext port, so "am I exposed in the clear?" is answered by reading the
+command line. The private key must not be readable beyond its owner, an expired
+certificate is refused at startup, and a build without TLS **refuses** `--listen-tls`
+instead of quietly serving plaintext.
+
+> **Choose the deployment deliberately.** Two are supported and they differ in one
+> thing only, who may connect:
+>
+> - **Loopback sidecar**, on `127.0.0.1` beside your app. Nothing to observe, so
+>   plaintext inbound is fine and TLS is unnecessary. Simplest, and the default.
+> - **Remote endpoint**, reachable from another machine. Requires `--listen-tls`, and
+>   `llmbridge` **authenticates nobody**: anything that can reach the listener can use
+>   it with its own key. Put an authenticating layer in front, or restrict who can
+>   reach the port. TLS keeps the credential off the wire; it does not decide who may
+>   connect.
+>
+> A non-loopback plaintext *upstream* prints a startup warning; there is no equivalent
+> warning for a plaintext listener, because the gateway cannot tell whether it is
+> reachable from outside the host. See [SECURITY.md](SECURITY.md).
 
 <!--
 ### Language bindings (planned)
@@ -217,7 +243,9 @@ be disabled. The client's own key is mapped across the dialect boundary
 (`Authorization: Bearer` → `x-api-key` / `x-goog-api-key`) and forwarded on a strict
 whitelist; no other client header enters the rebuilt upstream request. Credentials are
 never logged, never placed in an error body, and pooled connection buffers are scrubbed
-on release. Client → gateway is **plaintext**, so deploy as a loopback sidecar.
+on release. `--listen-tls` terminates the client's TLS too, so the gateway can be a
+remote endpoint; it still authenticates nobody, so put something in front of it or keep
+it on loopback.
 
 **Observability.** `--timing-headers` (opt-in) adds `x-llmbridge-*` response headers
 splitting a request into four disjoint spans: gateway compute, the TCP+TLS handshake
@@ -225,7 +253,7 @@ splitting a request into four disjoint spans: gateway compute, the TCP+TLS hands
 returns an orderable arrival timestamp, a monotonic sequence number, and the provider's
 own token counts. Metadata only: no prompt or completion text. Every one of those numbers
 is defined precisely in **[LATENCY.md](LATENCY.md)**: which stamps bound it, what is
-excluded, and why the handshake is never counted as our overhead.
+excluded, and why the handshake is never counted as our overhead. For how the proxy works inside, on both event-loop backends, see **[GATEWAY-INTERNALS.md](GATEWAY-INTERNALS.md)**.
 
 **Direction.** Today `llmbridge` runs in **OpenAI-in** mode: your code speaks the
 OpenAI API and the gateway fronts a provider. Each request is translated in both

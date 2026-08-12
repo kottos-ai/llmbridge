@@ -14,6 +14,11 @@ target_link_libraries(fastbackend PRIVATE net)
 # provider under measurement shares nothing with the code being measured.
 add_executable(streamgen streamgen.cpp)
 target_link_libraries(streamgen PRIVATE net gateway)
+# --tls arm: the only client in this tree that can drive an inbound-TLS listener.
+if (LLMBRIDGE_TLS)
+    target_compile_definitions(streamgen PRIVATE LLMBRIDGE_HAVE_TLS)
+    target_link_libraries(streamgen PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif ()
 
 add_executable(faststream faststream.cpp)
 

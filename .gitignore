@@ -33,3 +33,4 @@ bench/results/*.yaml
 # Python bytecode
 __pycache__/
 *.pyc
+.mutate_check_active.json

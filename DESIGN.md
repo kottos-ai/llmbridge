@@ -64,11 +64,13 @@ for an *upstream* connection. `void u_tls_kick_send(Connection* u)` used both
 meanings of `u` in one signature.
 
 **This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
-first CI job (no compiler, ~90 ms) and fails the build on four things: a call crossing
+first CI job (no compiler, ~90 ms) and fails the build on five things: a call crossing
 the prefixes; an **unprefixed** method reachable from only one backend; a header whose
 namespace does not mirror its directory; and a stale attribution in LATENCY.md's stamp
 table (each timing stamp names the function that assigns it, and that function must
-exist and must actually assign it). The table names functions instead of line
+exist and must actually assign it); and an identifier whose casing breaks the rules
+below (a constant that is not `kPascalCase`, or worse is `ALL_CAPS`, or a type that is
+not `PascalCase`). The table names functions instead of line
 numbers on purpose: line references rot on any edit above them, so the doc would
 need re-checking on every commit, and a reference that needs re-checking every
 commit is one nobody re-checks. Function names move only under a rename, which is
@@ -80,7 +82,16 @@ instance of the defect it exists to catch.
 
 Elsewhere: `kPascalCase` constants, `_member` privates, `PascalCase` types and enum
 values, `snake_case` functions, `ts_*` for timestamps, and `X_to_Y_request` /
-`X_to_Y_response` for the translation entry points.
+`X_to_Y_response` for the translation entry points. The constant and type forms are
+machine-checked; the rest are followed by hand.
+
+**`ALL_CAPS` is for preprocessor macros and nothing else**, and that one is worth a
+sentence of its own. A C++ constant obeys scope, so it does not need the shouting
+that warns a reader about a macro. Giving it ALL_CAPS instead creates a real
+collision: macros have no namespace, so a `constexpr int ERROR` breaks against any
+system header that defines `ERROR`, and `min`, `max` and `DEBUG` are the same story.
+Reserving the shape for macros makes that impossible, and not merely unlikely. The
+checker rejects an ALL_CAPS constant and names the `kPascalCase` form to use.
 
 ## Threading & I/O model
 
@@ -132,6 +143,12 @@ on transient conditions. This is the most safety-critical code in the repo and i
 commented inline in `gateway/src/gateway.cpp`.
 
 ## Request lifecycle (proxy)
+
+> For the mechanism behind the shape, see
+> [GATEWAY-INTERNALS.md](GATEWAY-INTERNALS.md): which buffer holds what on each
+> connection, who owns each piece of mutable state, when a connection may be
+> freed on each backend, where the credential is scrubbed, and how pooling and
+> the two TLS legs fit together.
 
 > Latency accounting for this lifecycle: the seven stamps, what each reported
 > number spans, and why connection setup is excluded from "added latency", is
@@ -199,12 +216,32 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
-## TLS to the upstream (`-DLLMBRIDGE_TLS=ON`)
+## TLS on both legs (`-DLLMBRIDGE_TLS=ON`)
 
 Off by default. The default build stays **zero-dependency** end to end; enabling TLS
 links OpenSSL (≥3.0), the one sanctioned runtime dependency, confined to the gateway.
 The translator library (`provider/`) never links it, in any configuration. CI proves
 both states: the gcc/clang matrix builds TLS-off, the sanitizer job TLS-on.
+
+### Two sessions in opposite roles, never one pipe
+
+The same build does both legs, and they are independent `Session` objects: the gateway
+is the **server** for the client (`--listen-tls --tls-cert --tls-key`) and the **client**
+to the provider (`--upstream https://...`). It terminates one and originates the other,
+which is what lets it translate dialects and swap credentials in between. Neither leg
+implies the other: TLS in with a plaintext upstream is a supported configuration and is
+what terminating at the edge in front of a local model looks like.
+
+What differs between the roles is only the handshake state (`SSL_set_accept_state`
+against `SSL_set_connect_state`) and what gets verified. The client leg presents a
+certificate and verifies nobody, because requiring client certificates is a product
+decision we have not taken; the upstream leg verifies the provider's chain **and** its
+hostname, with no way to disable it. Those are different decisions, and the code says
+so at the site, so nobody "makes them consistent" later.
+
+Deployment consequence, and it is the important one: TLS decides what is on the wire,
+never who may connect. `llmbridge` authenticates no client. Either front it with
+something that does, or keep the listener on loopback. See SECURITY.md.
 
 ### Why memory BIOs, not `SSL_set_fd`
 
@@ -278,6 +315,15 @@ TLS, 16 concurrent interleaved sessions, corrupt-record-mid-stream aborts withou
 `[DONE]`, provider closing pooled conns, provider dropping the TCP connection
 mid-handshake, and wrong-hostname surfacing as a client 502 with **zero** requests
 reaching the unverified peer.
+
+The inbound leg adds its own: handshake split across single-byte writes, plaintext sent
+to a TLS listener refused with nothing served, three disconnect tests (mid-handshake,
+mid-request, immediately after a request) at twenty iterations each under ASan and
+UBSan, a bounded-buffering proof for a handshake that never completes, and a check that
+a client which never reads cannot grow the gateway without bound. A libFuzzer target
+(`fuzz/fuzz_tls_server.cpp`) drives arbitrary bytes at a server-role `Session`, because
+that is the first surface an unauthenticated remote peer reaches. The whole inbound
+suite also runs clean under ThreadSanitizer.
 
 ## Benchmark methodology
 

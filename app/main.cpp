@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -46,7 +47,14 @@ namespace
     }
 } // namespace
 
-int main(int argc, char** argv)
+// The real body. `main` below turns any escaping exception into a single
+// readable line, because a startup failure that reaches the default handler
+// prints "terminate called after throwing an instance of ..." and buries the
+// message an operator actually needs. Every throw on this path is a setup
+// failure with a specific cause: an unreadable certificate, a key with the
+// wrong mode, a key that does not match, an expired certificate, a port already
+// bound. Each of those deserves to be legible on the first read.
+static int run(int argc, char** argv)
 {
     uint16_t listen_port = 8088;
     std::string upstream_arg = "127.0.0.1:9001";
@@ -56,6 +64,11 @@ int main(int argc, char** argv)
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     int workers = 1;
     bool timing_headers = false;
+    // Inbound TLS. ONE LISTENER, ONE MODE: --listen-tls makes the single listener
+    // TLS-only, so "am I exposed in the clear?" is answerable from the command
+    // line. There is deliberately no second plaintext port.
+    bool listen_tls = false;
+    std::string tls_cert, tls_key;
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
@@ -76,6 +89,9 @@ int main(int argc, char** argv)
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--timing-headers") timing_headers = true;
+        else if (a == "--listen-tls") listen_tls = true;
+        else if (a == "--tls-cert") { if (const char* v = nextarg()) tls_cert = v; }
+        else if (a == "--tls-key")  { if (const char* v = nextarg()) tls_key = v; }
         else if (a == "--translate")
         {
             if (const char* v = nextarg())
@@ -104,11 +120,38 @@ int main(int argc, char** argv)
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
                         "[--upstream-timeout SECONDS] "
+                        "[--listen-tls --tls-cert PATH --tls-key PATH] "
                         "[--io auto|epoll|uring] [--workers N] [--timing-headers]\n", argv[0]);
             return 0;
         }
     }
     if (workers < 1) workers = 1;
+
+    if (listen_tls && (tls_cert.empty() || tls_key.empty()))
+    {
+        std::fprintf(stderr, "llmbridge: --listen-tls needs --tls-cert and --tls-key\n");
+        return 2;
+    }
+    if (!listen_tls && (!tls_cert.empty() || !tls_key.empty()))
+    {
+        // A certificate given without --listen-tls means the operator believes the
+        // listener is encrypted when it is not. Refuse instead of ignoring it.
+        std::fprintf(stderr, "llmbridge: --tls-cert/--tls-key given without --listen-tls\n");
+        return 2;
+    }
+#ifndef LLMBRIDGE_HAVE_TLS
+    if (listen_tls)
+    {
+        // The dangerous direction of the guard above, and the one that fails OPEN:
+        // without this the flag is accepted, the listener serves plaintext, and the
+        // operator has every client credential on the wire believing otherwise. The
+        // upstream leg refuses the mirror case a few lines down.
+        std::fprintf(stderr, "llmbridge: --listen-tls requires a TLS build. "
+                             "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
+                             "Refusing to serve plaintext on a listener asked to be TLS.\n");
+        return 2;
+    }
+#endif
 
     // Parse + resolve --upstream. Resolution happens ONCE, here, on the setup path:
     // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
@@ -170,9 +213,12 @@ int main(int argc, char** argv)
     for (int i = 0; i < workers; ++i)
     {
         llmbridge::TlsConfig tls;
-        tls.enabled = up.tls;
+        tls.upstream_tls = up.tls;
         tls.sni_host = up.host; // SNI + hostname verification: the PARSED host,
                                 // never the resolved IP (verification needs the name)
+        tls.client_tls = listen_tls;
+        tls.cert_file = tls_cert;
+        tls.key_file = tls_key;
         gateways.push_back(std::make_unique<llmbridge::Gateway>(
             listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
             timing_headers));
@@ -204,28 +250,59 @@ int main(int argc, char** argv)
         agg.requests += s.requests;
         agg.errors += s.errors;
         agg.upstream_timeouts += s.upstream_timeouts;
+        agg.client_setup_timeouts += s.client_setup_timeouts;
         agg.stream_pauses += s.stream_pauses;
         agg.uring_enobufs += s.uring_enobufs;
         agg.upstream_conns_opened += s.upstream_conns_opened;
         agg.upstream_retries += s.upstream_retries;
         agg.upstream_reused += s.upstream_reused;
+        agg.upstream_unsent += s.upstream_unsent;
+        if (s.tls_buffered_peak > agg.tls_buffered_peak)
+            agg.tls_buffered_peak = s.tls_buffered_peak;
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
         agg.connect.merge(s.connect);
+        agg.accept_tls.merge(s.accept_tls);
         agg.resp_path.merge(s.resp_path);
     }
     std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
-    std::fprintf(stderr, "timeouts=%llu  stream_pauses=%llu  uring_enobufs=%llu\n",
-                 (unsigned long long)agg.upstream_timeouts, (unsigned long long)agg.stream_pauses,
+    std::fprintf(stderr, "timeouts=%llu  client_setup_timeouts=%llu  stream_pauses=%llu  uring_enobufs=%llu\n",
+                 (unsigned long long)agg.upstream_timeouts,
+                 (unsigned long long)agg.client_setup_timeouts, (unsigned long long)agg.stream_pauses,
                  (unsigned long long)agg.uring_enobufs);
-    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu\n",
+    std::fprintf(stderr,
+                 "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu  "
+                 "unsent=%llu\n",
                  (unsigned long long)agg.requests, (unsigned long long)agg.errors,
                  (unsigned long long)agg.upstream_conns_opened,
-                 (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries);
+                 (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries,
+                 (unsigned long long)agg.upstream_unsent);
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
     agg.connect.print(std::cerr, "  connect(TLS) ");
+    // Only when it has samples. A plaintext listener never terminates a handshake,
+    // and a permanent "(no samples)" line for a feature that is off reads as a
+    // missing measurement. This is the one handshake that IS ours; see LATENCY.md 1.
+    if (agg.accept_tls.total() > 0) agg.accept_tls.print(std::cerr, "accept(TLS)   ");
     agg.resp_path.print(std::cerr, "  response-path");
     return 0;
+}
+
+int main(int argc, char** argv)
+{
+    try
+    {
+        return run(argc, argv);
+    }
+    catch (const std::exception& e)
+    {
+        std::fprintf(stderr, "llmbridge: %s\n", e.what());
+        return 1;
+    }
+    catch (...)
+    {
+        std::fprintf(stderr, "llmbridge: unknown fatal error during startup\n");
+        return 1;
+    }
 }

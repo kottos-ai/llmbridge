@@ -136,6 +136,7 @@ namespace
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = 0;
+            if (_rcvbuf > 0) ::setsockopt(_fd, SOL_SOCKET, SO_RCVBUF, &_rcvbuf, sizeof(_rcvbuf));
             ::bind(_fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
             socklen_t len = sizeof(a);
             ::getsockname(_fd, reinterpret_cast<sockaddr*>(&a), &len);
@@ -176,6 +177,15 @@ namespace
         // Stall modes for timeout tests: 1 = read the request then never reply;
         // 2 = send half the response, then hold the connection open forever.
         void set_stall(int mode) { _stall = mode; }
+        // Answer with a complete keep-alive response the instant the connection is
+        // accepted, WITHOUT reading the request, and never read afterwards. Combined
+        // with set_small_rcvbuf() this pins the gateway's request send half-written
+        // while a full response is already framed, which is what a provider doing an
+        // early reject (413/401 on the headers) of a large body looks like.
+        void set_reply_before_read(bool b) { _reply_before_read = b; }
+        // Shrink the receive window on accepted sockets, so the gateway's write to
+        // this backend blocks after a few hundred KB instead of many MB.
+        void set_small_rcvbuf(int b) { _rcvbuf = b; }
         int requests_seen() const { return _requests_seen.load(); }
         std::string last_request()
         {
@@ -247,6 +257,14 @@ namespace
         {
             std::string buf;
             char tmp[16384];
+            if (_reply_before_read)
+            {
+                const std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                (void)!::write(c, resp.data(), resp.size());
+                while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
+                ::close(c);
+                return;
+            }
             while (!_stop)
             {
                 llmbridge::net::http::Message m;
@@ -318,6 +336,8 @@ namespace
         bool _close_mid = false;
         bool _close_after_first = false;
         int _stall = 0;
+        bool _reply_before_read = false;
+        int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
         std::string _all_requests;
@@ -488,6 +508,43 @@ TEST_F(ProxyIT, SingleRequestRoundTrip)
     EXPECT_EQ(_gw->stats().requests, 1u);
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
+
+// A provider may answer BEFORE it has read the whole request (an early 413/401 on
+// the headers of a large body), and the upstream recv is armed before the send, so
+// a complete response can be framed while our request SEND is still outstanding.
+// Releasing the upstream then scrubs and re-uses a buffer the transport has not
+// finished with. Under io_uring that buffer is the target of a live SQE.
+class ProxyEarlyResponse : public ProxyIT,
+                           public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+TEST_P(ProxyEarlyResponse, PooledUpstreamStaysUsable)
+{
+    _backend.set_small_rcvbuf(4096); // gateway's write blocks after a few hundred KB
+    _backend.set_reply_before_read(true);
+    start(0, true, TranslateMode::None, GetParam());
+
+    // Larger than any socket buffer, so the send cannot have completed.
+    const std::string big(8 * 1024 * 1024, 'x');
+    Client c1;
+    ASSERT_TRUE(c1.connect(_proxy_port));
+    ASSERT_TRUE(c1.send(make_request(big)));
+    EXPECT_EQ(c1.recv_status(5000), 200);
+    c1.close();
+
+    // The upstream was pooled with that send still in flight. The next client
+    // acquires it; the request must still be served.
+    Client c2;
+    ASSERT_TRUE(c2.connect(_proxy_port));
+    ASSERT_TRUE(c2.send(make_request("second")));
+    EXPECT_EQ(c2.recv_status(5000), 200) << "pooled upstream was released mid-send";
+    c2.close();
+    shutdown();
+    // Assert the mechanism, not just the outcome: a test that passes because the
+    // send happened to finish would prove nothing about the guard.
+    EXPECT_GE(_gw->stats().upstream_unsent, 1u);
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyEarlyResponse,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
 
 TEST_F(ProxyIT, ResponseBodyIntegrity)
 {
@@ -730,6 +787,151 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
     // Anthropic's required version header is pinned when the client has none.
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
+}
+
+// ── Content-Length disagreeing with the actual body ─────────────────────────
+//
+// The parser-level cases live in HttpDesync (non-numeric, chunked+CL, conflicting
+// duplicates). These are the END-TO-END ones: what a CLIENT sees, and what the
+// NEXT client sees, when the bytes on the wire do not match the declared length.
+// The second question is the dangerous one, because a keep-alive upstream is
+// shared, so one response's residue is the next customer's problem.
+
+TEST_P(ProxyAuth, UpstreamBodyShorterThanContentLengthNeverBecomesASuccess)
+{
+    // The provider declares 4096 bytes, sends a handful, then closes. The client
+    // must NOT receive a 200 carrying a truncated body: a half answer presented as
+    // a whole one is a silent wrong result for an agent loop.
+    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                       "Content-Length: 4096\r\n\r\n{\"partial\":true}";
+    _backend.set_response(resp);
+    _backend.set_close_mid_response(true);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    const std::string got = c.recv_response(4000);
+    // Either a structured error or nothing at all. Never a 200.
+    EXPECT_EQ(got.find("HTTP/1.1 200"), std::string::npos)
+        << "a truncated upstream body was presented to the client as success: "
+        << got.substr(0, 120);
+}
+
+TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest)
+{
+    // The provider declares N and sends N PLUS trailing bytes on a keep-alive
+    // connection. The extra must never survive into the pool: the next client to
+    // reuse that connection would read it as the head of ITS response, which is a
+    // cross-client desync and the most severe failure this codebase can have.
+    const std::string body = R"({"content":[{"type":"text","text":"ok"}]})";
+    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) +
+                       "\r\nConnection: keep-alive\r\n\r\n" + body +
+                       "X-Injected: yes\r\nTRAILING-GARBAGE\r\n";
+    _backend.set_response(resp);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    Client c1;
+    ASSERT_TRUE(c1.connect(_proxy_port));
+    ASSERT_TRUE(c1.send(openai_request_hdrs("one", "")));
+    const std::string r1 = c1.recv_response(4000);
+    ASSERT_NE(r1.find("HTTP/1.1 200"), std::string::npos) << r1.substr(0, 120);
+
+    // Second client, which is what the pooled connection gets handed to.
+    Client c2;
+    ASSERT_TRUE(c2.connect(_proxy_port));
+    ASSERT_TRUE(c2.send(openai_request_hdrs("two", "")));
+    const std::string r2 = c2.recv_response(4000);
+    ASSERT_FALSE(r2.empty()) << "second client got nothing; the pooled connection "
+                                "was left unusable by the first response";
+    // WITHOUT THIS the test is vacuous, and it was: it passed with the pooled
+    // rbuf.clear() deleted, because the second request had opened a FRESH upstream
+    // and never touched the poisoned one. Assert the reuse actually happened.
+    EXPECT_GT(_gw->stats().upstream_reused, 0u)
+        << "no upstream was reused, so the residue path was never exercised";
+    // THE CANARY MUST CONTAIN CRLF, and the first version did not. Residue with
+    // no space and no CRLF is silently ABSORBED into the next response's status
+    // line, because parse_response() finds the first space anywhere in the head
+    // and reads three digits after it; it never checks the line begins with
+    // "HTTP/". So "TRAILING-GARBAGE...POOL" merged into "...POOLHTTP/1.1 200 OK",
+    // yielded status 200, and the test passed with the pooled clear DELETED.
+    // Residue carrying CRLF cannot be absorbed that way, so it reaches the header
+    // parser and the message is refused, which is the difference this asserts.
+    //
+    // It proves the observable contract: an over-long upstream body does not stop
+    // the next client on a REUSED connection from getting a correct answer.
+    // upstream_reused is asserted above so the reuse really happens.
+    //
+    // It does NOT prove that ep/ur_release_upstream's rbuf.clear() is what
+    // protects that. Deleting BOTH clears leaves this test passing and the second
+    // client still receiving a 200, so some other part of the path is keeping the
+    // connection sane. Which part is not yet identified. The clear is obviously
+    // right and stays, but calling this test its guard would be a claim the
+    // measurement does not support.
+    EXPECT_NE(r2.find("HTTP/1.1 200"), std::string::npos)
+        << "the second client did not get a successful response, which is what a "
+           "poisoned pooled connection looks like from outside: " << r2.substr(0, 160);
+    EXPECT_EQ(r2.find("TRAILING-GARBAGE"), std::string::npos)
+        << "residue from the FIRST response reached the SECOND client: " << r2.substr(0, 160);
+}
+
+TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
+{
+    // The classic smuggling shape from the other direction: the client declares N
+    // and sends N plus something that looks like another request. Exactly ONE
+    // request may reach the provider.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+
+    const std::string body = R"({"model":"m","messages":[{"role":"u","content":"hi"}]})";
+    const std::string smuggled =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Smuggled: yes\r\n"
+        "Content-Length: 0\r\n\r\n";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body + smuggled));
+    (void)c.recv_response(4000);
+    EXPECT_EQ(_backend.last_request().find("X-Smuggled"), std::string::npos)
+        << "a second request rode in on the first one's body";
+}
+
+TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
+{
+    // A keep-alive upstream goes back into the pool holding the REBUILT REQUEST,
+    // credential included, and idles there for up to 30 s before being handed to
+    // whichever client asks next. Scrubbing it is what stops one customer's API
+    // key sitting in a buffer another customer's request will reuse.
+    //
+    // A mutation sweep found secure_clear() could be deleted with nothing failing:
+    // every existing auth test inspects what reached the UPSTREAM, and none looks
+    // at what stays behind. This looks at what stays behind.
+    static constexpr const char* kCanary = "sk-canary-DO-NOT-LEAVE-IN-THE-POOL";
+
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs(
+        "hi", std::string("Authorization: Bearer ") + kCanary + "\r\n")));
+    ASSERT_FALSE(c.recv_response().empty());
+
+    // It must really have been pooled, or this asserts nothing at all.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (_gw->pooled_upstream_count() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_GT(_gw->pooled_upstream_count(), 0u)
+        << "no upstream was pooled, so the scrub was never exercised";
+
+    // The credential did reach the provider ...
+    EXPECT_NE(_backend.last_request().find(kCanary), std::string::npos)
+        << "the canary never reached the upstream; the test proves nothing";
+    // ... and must not still be sitting in the pooled connection's buffer.
+    EXPECT_FALSE(_gw->pooled_buffer_contains(kCanary))
+        << "a customer credential is idling in a pooled buffer that the next "
+           "client's request will reuse";
 }
 
 TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)

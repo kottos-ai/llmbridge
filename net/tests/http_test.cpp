@@ -362,6 +362,39 @@ TEST(HttpDesync, ResponseBareCrAndBadLengthAreRejected)
     EXPECT_EQ(llmbridge::net::http::parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello", h),
               llmbridge::net::http::FrameStatus::Error);
 }
+TEST(HttpDesync, ResponseWithoutAnHttpVersionStatusLineIsRejected)
+{
+    using llmbridge::net::http::FrameStatus;
+    using llmbridge::net::http::parse_response_head;
+    llmbridge::net::http::ResponseHead h;
+
+    // The status-line parser used to take the first space ANYWHERE in the head and
+    // read three digits after it, never checking the line began with "HTTP/". Any
+    // bytes prepended to a response were therefore ABSORBED into the status line
+    // and never rejected, provided they held no space and no CRLF.
+    //
+    // Reachable only if stray bytes survive on a pooled upstream, which
+    // {ep,ur}_release_upstream prevents. This is the second lock: the shape of the
+    // v0.8.1 defects was malformed input becoming INVISIBLE input, and the cure
+    // was refusing it at the framer instead of relying on one guard upstream.
+    EXPECT_EQ(parse_response_head("JUNKHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Error);
+    EXPECT_EQ(parse_response_head("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Error) << "a REQUEST line must not frame as a response";
+    EXPECT_EQ(parse_response_head("HTTP/9.9 200 OK\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Error) << "unknown major version";
+    EXPECT_EQ(parse_response_head(" HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Error) << "leading space before the version";
+
+    // The legal forms must still frame.
+    EXPECT_EQ(parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Complete);
+    EXPECT_EQ(h.status, 200);
+    EXPECT_EQ(parse_response_head("HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", h),
+              FrameStatus::Complete);
+    EXPECT_EQ(h.status, 503);
+}
+
 TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 {
     Message m;

@@ -14,8 +14,12 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <sys/stat.h>
+
 #include <algorithm>
+#include <cstring>
 #include <limits>
+#include <string>
 #include <utility>
 
 namespace llmbridge::net::tls
@@ -68,7 +72,7 @@ namespace llmbridge::net::tls
         return *this;
     }
 
-    bool Context::init(const Options& opts) noexcept
+    bool Context::init_client(const ClientOptions& opts) noexcept
     {
         _ctx = SSL_CTX_new(TLS_client_method());
         if (!_ctx)
@@ -112,6 +116,123 @@ namespace llmbridge::net::tls
         return true;
     }
 
+    namespace
+    {
+        // ALPN: we speak HTTP/1.1 and nothing else. Without this a client offering
+        // h2 can end up negotiating it, and HTTP/2 frames would then arrive at an
+        // HTTP/1.1 parser that cannot read them. The failure would look like a
+        // corrupt request instead of an unsupported protocol.
+        //
+        // Fail CLOSED on no overlap: a client that offers ONLY h2 gets a fatal
+        // no_application_protocol alert, which is a clear error at its end. Clients
+        // that send no ALPN extension at all never reach this callback and are
+        // treated as HTTP/1.1, which is correct.
+        constexpr unsigned char kAlpnHttp11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+
+        int alpn_select(ssl_st*, const unsigned char** out, unsigned char* outlen,
+                        const unsigned char* in, unsigned int inlen, void*)
+        {
+            unsigned char* chosen = nullptr;
+            const int rc = SSL_select_next_proto(&chosen, outlen, kAlpnHttp11,
+                                                 sizeof kAlpnHttp11, in, inlen);
+            if (rc != OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_ALERT_FATAL;
+            *out = chosen;
+            return SSL_TLSEXT_ERR_OK;
+        }
+
+        /// A private key readable by anyone but the owner is a finding, not a
+        /// warning. Refusing at startup is the only point where we can say so
+        /// before the key has been used.
+        bool key_mode_is_private(const std::string& path, std::string& err)
+        {
+            struct stat st{};
+            if (::stat(path.c_str(), &st) != 0)
+            {
+                err = "cannot stat private key " + path + ": " + std::strerror(errno);
+                return false;
+            }
+            if (st.st_mode & (S_IRWXG | S_IRWXO))
+            {
+                err = "private key " + path + " is readable beyond its owner; chmod 600 it";
+                return false;
+            }
+            return true;
+        }
+    }  // namespace
+
+    bool Context::init_server(const ServerOptions& opts) noexcept
+    {
+        if (opts.cert_file.empty() || opts.key_file.empty())
+        {
+            _err = "server TLS needs both a certificate and a private key";
+            return false;
+        }
+        if (!key_mode_is_private(opts.key_file, _err)) return false;
+
+        _ctx = SSL_CTX_new(TLS_server_method());
+        if (!_ctx)
+        {
+            _err = drain_errors();
+            return false;
+        }
+
+        const int floor_ver = opts.require_tls13 ? TLS1_3_VERSION : TLS1_2_VERSION;
+        if (SSL_CTX_set_min_proto_version(_ctx, floor_ver) != 1)
+        {
+            _err = drain_errors();
+            return false;
+        }
+
+        // The CHAIN, not just the leaf. A client that cannot fetch the missing
+        // intermediate itself would fail to verify, and which clients do that is
+        // not something we get to choose.
+        if (SSL_CTX_use_certificate_chain_file(_ctx, opts.cert_file.c_str()) != 1)
+        {
+            _err = "cannot load certificate chain " + opts.cert_file + ": " + drain_errors();
+            return false;
+        }
+        if (SSL_CTX_use_PrivateKey_file(_ctx, opts.key_file.c_str(), SSL_FILETYPE_PEM) != 1)
+        {
+            _err = "cannot load private key " + opts.key_file + ": " + drain_errors();
+            return false;
+        }
+        // Belt and braces, and measured to be exactly that: with the certificate
+        // already loaded above, SSL_CTX_use_PrivateKey_file ITSELF rejects a
+        // mismatched pair ("key values mismatch"), so removing this line does not
+        // change the outcome today. It is kept because it becomes the only guard if
+        // the two loads are ever reordered, which is a one-line edit away. Verified
+        // by deleting it and watching the test still pass, which is why the test
+        // asserts the message and not merely the failure.
+        if (SSL_CTX_check_private_key(_ctx) != 1)
+        {
+            _err = "private key does not match the certificate: " + drain_errors();
+            return false;
+        }
+
+        // An expired certificate produces a handshake failure at every client, and
+        // the client-side message rarely points here. Say it once, at startup.
+        if (X509* leaf = SSL_CTX_get0_certificate(_ctx))
+        {
+            if (X509_cmp_current_time(X509_get0_notAfter(leaf)) < 0)
+            {
+                _err = "certificate " + opts.cert_file + " has already expired";
+                return false;
+            }
+        }
+
+        // NO SSL_CTX_set_verify here, and that is a DIFFERENT decision from the
+        // client path, not an oversight. A server verifying a peer means requiring
+        // client certificates (mutual TLS), which we do not do: callers are
+        // identified by a bearer token at the HTTP layer. The client context must
+        // keep SSL_VERIFY_PEER, because there we are the one deciding whether to
+        // hand a credential to the peer. Do not "make these consistent".
+
+        SSL_CTX_set_mode(_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
+        SSL_CTX_set_options(_ctx, SSL_OP_NO_RENEGOTIATION | SSL_OP_CIPHER_SERVER_PREFERENCE);
+        SSL_CTX_set_alpn_select_cb(_ctx, alpn_select, nullptr);
+        return true;
+    }
+
     // ── Session ─────────────────────────────────────────────────────────────────
 
     Session::~Session()
@@ -146,7 +267,10 @@ namespace llmbridge::net::tls
         return *this;
     }
 
-    bool Session::init_client(const Context& ctx, std::string_view host) noexcept
+    // Allocate the SSL object and its memory BIO pair. Shared by both directions
+    // because the byte-transform plumbing is identical; only the handshake role and
+    // the peer checks differ, and those stay in the callers below.
+    bool Session::attach(const Context& ctx) noexcept
     {
         if (!ctx.ready()) return false;
 
@@ -177,6 +301,23 @@ namespace llmbridge::net::tls
         BIO_set_mem_eof_return(_wbio, -1);
 
         SSL_set_bio(_ssl, _rbio, _wbio);  // takes ownership of both
+        return true;
+    }
+
+    bool Session::init_server(const Context& ctx) noexcept
+    {
+        if (!attach(ctx)) return false;
+        // The only difference from the client path. A server presents the
+        // certificate the Context holds, receives the peer's SNI instead of sending
+        // one, and verifies nothing about the peer: callers are identified by a
+        // bearer token at the HTTP layer, not by a client certificate.
+        SSL_set_accept_state(_ssl);
+        return true;
+    }
+
+    bool Session::init_client(const Context& ctx, std::string_view host) noexcept
+    {
+        if (!attach(ctx)) return false;
         SSL_set_connect_state(_ssl);
 
         const std::string host_z{host};
@@ -327,6 +468,11 @@ namespace llmbridge::net::tls
             return _want;
         }
         return classify(rc);
+    }
+
+    size_t Session::pending_output_bytes() const noexcept
+    {
+        return _wbio ? static_cast<size_t>(BIO_ctrl_pending(_wbio)) : 0;
     }
 
     bool Session::has_pending_output() const noexcept

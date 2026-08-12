@@ -49,6 +49,15 @@
 
 #include "gateway/metrics.hpp" // llmbridge::Histogram + now_ns()
 
+// Optional TLS arm, so the inbound-TLS cost can be measured at all. Without it
+// there is no client in this tree that speaks TLS to the gateway, and the only
+// well-formed comparison (same gateway, --listen-tls on against off) cannot run.
+// Verification is NOT disableable here either; pass the CA with --ca.
+#ifdef LLMBRIDGE_HAVE_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
 namespace
 {
     using llmbridge::Histogram;
@@ -57,6 +66,10 @@ namespace
     struct Conn
     {
         int fd = -1;
+#ifdef LLMBRIDGE_HAVE_TLS
+        SSL* ssl = nullptr;
+        bool hs_done = false;
+#endif
         bool connected = false;
         bool req_sent = false;
         bool head_done = false;   // response headers consumed
@@ -103,6 +116,58 @@ namespace
         }
         return fd;
     }
+
+#ifdef LLMBRIDGE_HAVE_TLS
+    SSL_CTX* g_ctx = nullptr;
+
+    /// -1 = fatal, 0 = would block, 1 = handshake complete. `want_write` tells the
+    /// caller which epoll event to arm, which is the whole reason this is not a
+    /// blocking SSL_connect.
+    int tls_handshake(Conn* c, bool& want_write)
+    {
+        want_write = false;
+        const int r = SSL_connect(c->ssl);
+        if (r == 1) { c->hs_done = true; return 1; }
+        const int e = SSL_get_error(c->ssl, r);
+        if (e == SSL_ERROR_WANT_WRITE) { want_write = true; return 0; }
+        if (e == SSL_ERROR_WANT_READ) return 0;
+        return -1;
+    }
+#endif
+
+    /// read()/write() or their TLS equivalents. Returns the same conventions as the
+    /// syscalls (>0 bytes, 0 = peer closed, <0 with EAGAIN = would block) so the
+    /// event loop below is identical on both transports.
+    ssize_t conn_read(Conn* c, char* p, size_t n)
+    {
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->ssl)
+        {
+            const int r = SSL_read(c->ssl, p, static_cast<int>(n));
+            if (r > 0) return r;
+            const int e = SSL_get_error(c->ssl, r);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) { errno = EAGAIN; return -1; }
+            return 0; // ZERO_RETURN or fatal: treat as closed, as the caller does
+        }
+#endif
+        return ::read(c->fd, p, n);
+    }
+
+    ssize_t conn_write(Conn* c, const char* p, size_t n)
+    {
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->ssl)
+        {
+            const int w = SSL_write(c->ssl, p, static_cast<int>(n));
+            if (w > 0) return w;
+            const int e = SSL_get_error(c->ssl, w);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) { errno = EAGAIN; return -1; }
+            errno = EIO;
+            return -1;
+        }
+#endif
+        return ::write(c->fd, p, n);
+    }
 } // namespace
 
 int main(int argc, char** argv)
@@ -116,6 +181,8 @@ int main(int argc, char** argv)
     std::string model = "mock-1";
     const char* csv = nullptr;
     const char* label = "run";
+    bool tls = false;
+    const char* ca_file = nullptr;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -131,11 +198,13 @@ int main(int argc, char** argv)
         else if (a == "--header") { if (const char* v = next()) extra_header = v; }
         else if (a == "--csv") { if (const char* v = next()) csv = v; }
         else if (a == "--label") { if (const char* v = next()) label = v; }
+        else if (a == "--tls") { tls = true; }
+        else if (a == "--ca") { if (const char* v = next()) ca_file = v; }
         else if (a == "--help" || a == "-h")
         {
             std::printf("usage: %s [--host IP] [--port N] [--streams N] [--duration S]\n"
                         "          [--warmup S] [--path P] [--model M] [--header \"K: V\"]\n"
-                        "          [--csv FILE] [--label NAME]\n", argv[0]);
+                        "          [--csv FILE] [--label NAME] [--tls --ca FILE]\n", argv[0]);
             return 0;
         }
     }
@@ -150,6 +219,35 @@ int main(int argc, char** argv)
     if (!extra_header.empty()) req += extra_header + "\r\n";
     req += "Content-Type: application/json\r\nAccept: text/event-stream\r\n";
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+#ifdef LLMBRIDGE_HAVE_TLS
+    if (tls)
+    {
+        if (!ca_file)
+        {
+            // No unverified mode, deliberately: a benchmark client that skips
+            // verification is one somebody copies into production.
+            std::fprintf(stderr, "streamgen: --tls needs --ca FILE\n");
+            return 2;
+        }
+        g_ctx = SSL_CTX_new(TLS_client_method());
+        if (!g_ctx) { std::fprintf(stderr, "streamgen: SSL_CTX_new failed\n"); return 1; }
+        SSL_CTX_set_min_proto_version(g_ctx, TLS1_2_VERSION);
+        SSL_CTX_set_verify(g_ctx, SSL_VERIFY_PEER, nullptr);
+        if (SSL_CTX_load_verify_locations(g_ctx, ca_file, nullptr) != 1)
+        {
+            std::fprintf(stderr, "streamgen: cannot load CA %s\n", ca_file);
+            return 1;
+        }
+    }
+#else
+    if (tls)
+    {
+        std::fprintf(stderr, "streamgen: --tls needs a TLS build (-DLLMBRIDGE_TLS=ON)\n");
+        return 2;
+    }
+    (void)ca_file;
+#endif
 
     const int epfd = ::epoll_create1(0);
     if (epfd < 0) { std::perror("epoll_create1"); return 1; }
@@ -166,9 +264,23 @@ int main(int argc, char** argv)
 
     auto start_stream = [&](Conn* c) {
         if (c->fd >= 0) { ::epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, nullptr); ::close(c->fd); }
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->ssl) { SSL_free(c->ssl); c->ssl = nullptr; }
+#endif
         *c = Conn{};
         c->fd = connect_nb(host, port);
         if (c->fd < 0) return false;
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (g_ctx)
+        {
+            c->ssl = SSL_new(g_ctx);
+            if (!c->ssl) return false;
+            SSL_set_fd(c->ssl, c->fd);
+            SSL_set_tlsext_host_name(c->ssl, host);   // SNI
+            SSL_set1_host(c->ssl, host);              // and hostname verification
+            SSL_set_connect_state(c->ssl);
+        }
+#endif
         c->wbuf = req;
         epoll_event e{};
         e.events = EPOLLOUT;
@@ -219,9 +331,19 @@ int main(int argc, char** argv)
                     if (err != 0) { ++failures; start_stream(c); continue; }
                     c->connected = true;
                 }
+#ifdef LLMBRIDGE_HAVE_TLS
+                if (c->ssl && !c->hs_done)
+                {
+                    bool want_write = false;
+                    const int hs = tls_handshake(c, want_write);
+                    if (hs < 0) { ++failures; start_stream(c); continue; }
+                    if (hs == 0) { arm(c, want_write ? EPOLLOUT : EPOLLIN); continue; }
+                }
+#endif
                 while (c->woff < c->wbuf.size())
                 {
-                    const ssize_t w = ::write(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff);
+                    const ssize_t w =
+                        conn_write(c, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff);
                     if (w > 0) { c->woff += static_cast<size_t>(w); continue; }
                     if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
                     ++failures;
@@ -238,11 +360,25 @@ int main(int argc, char** argv)
 
             if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR))
             {
+#ifdef LLMBRIDGE_HAVE_TLS
+                // The handshake can be waiting on a READ, which is why it is driven
+                // from both branches. Resuming it only on EPOLLOUT deadlocks after
+                // the ClientHello has gone out.
+                if (c->ssl && !c->hs_done)
+                {
+                    bool want_write = false;
+                    const int hs = tls_handshake(c, want_write);
+                    if (hs < 0) { ++failures; start_stream(c); continue; }
+                    if (hs == 0) { arm(c, want_write ? EPOLLOUT : EPOLLIN); continue; }
+                    arm(c, EPOLLOUT); // handshake done: go send the request
+                    continue;
+                }
+#endif
                 char tmp[16384];
                 bool closed = false;
                 for (;;)
                 {
-                    const ssize_t r = ::read(c->fd, tmp, sizeof(tmp));
+                    const ssize_t r = conn_read(c, tmp, sizeof(tmp));
                     if (r > 0) { c->rbuf.append(tmp, static_cast<size_t>(r)); continue; }
                     if (r == 0) { closed = true; break; }
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;

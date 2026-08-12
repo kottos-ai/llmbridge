@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -30,6 +31,7 @@
 #include <openssl/x509v3.h>
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -46,13 +48,15 @@ namespace
         EVP_PKEY* key{nullptr};
         X509* crt{nullptr};
 
-        SelfSigned()
+        /// `lifetime_s` is seconds from now. Negative produces an ALREADY EXPIRED
+        /// certificate, which init_server() must refuse at startup.
+        explicit SelfSigned(long lifetime_s = 3600)
         {
             key = EVP_RSA_gen(2048);
             crt = X509_new();
             ASN1_INTEGER_set(X509_get_serialNumber(crt), 1);
-            X509_gmtime_adj(X509_getm_notBefore(crt), 0);
-            X509_gmtime_adj(X509_getm_notAfter(crt), 3600);
+            X509_gmtime_adj(X509_getm_notBefore(crt), lifetime_s < 0 ? lifetime_s * 2 : 0);
+            X509_gmtime_adj(X509_getm_notAfter(crt), lifetime_s);
             X509_set_pubkey(crt, key);
 
             X509_NAME* nm = X509_get_subject_name(crt);
@@ -96,6 +100,23 @@ namespace
             EXPECT_NE(f, nullptr);
             PEM_write_X509(f, crt);
             std::fclose(f);
+            return path;
+        }
+
+        /// Write the private key to a temp PEM, mode 600 by default. `mode` exists
+        /// so a test can produce a deliberately world-readable key and check that
+        /// init_server() refuses it.
+        std::string write_key_pem(mode_t mode = 0600) const
+        {
+            static std::atomic<unsigned> seq{0};
+            std::string path = std::string(::testing::TempDir()) + "llmbridge_tls_test_key_" +
+                               std::to_string(static_cast<long>(::getpid())) + "_" +
+                               std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".pem";
+            FILE* f = std::fopen(path.c_str(), "wb");
+            EXPECT_NE(f, nullptr);
+            PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr);
+            std::fclose(f);
+            EXPECT_EQ(::chmod(path.c_str(), mode), 0);
             return path;
         }
     };
@@ -204,9 +225,9 @@ class TlsPump : public ::testing::Test
 
     void SetUp() override
     {
-        Context::Options o;
+        Context::ClientOptions o;
         o.ca_file = id.write_pem();
-        ASSERT_TRUE(ctx.init(o)) << ctx.last_error();
+        ASSERT_TRUE(ctx.init_client(o)) << ctx.last_error();
     }
 };
 
@@ -292,7 +313,7 @@ TEST_F(TlsPump, ToleratesArbitraryCiphertextFragmentation)
 TEST_F(TlsPump, RejectsUntrustedCertificate)
 {
     Context strict;
-    ASSERT_TRUE(strict.init(Context::Options{}));  // system store only
+    ASSERT_TRUE(strict.init_client(Context::ClientOptions{}));  // system store only
 
     Session c;
     ASSERT_TRUE(c.init_client(strict, kHost));
@@ -437,3 +458,321 @@ TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
 }
 
 #endif  // LLMBRIDGE_HAVE_TLS
+
+// ── Task 2: server-side context and session ─────────────────────────────────
+//
+// Inbound TLS makes llmbridge the SERVER for the first time. Every failure below
+// is a startup failure on purpose: a process that starts happily and then fails
+// every handshake gives the client an opaque alert and gives the operator
+// nothing. These tests pin that behaviour so a later "cleanup" cannot soften it
+// into a warning.
+
+TEST(ServerContext, ValidCertAndKeyInitialises)
+{
+    SelfSigned ca;
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = ca.write_pem();
+    o.key_file = ca.write_key_pem();
+    ASSERT_TRUE(ctx.init_server(o)) << ctx.last_error();
+    EXPECT_TRUE(ctx.ready());
+}
+
+TEST(ServerContext, RefusesWorldReadablePrivateKey)
+{
+    SelfSigned ca;
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = ca.write_pem();
+    o.key_file = ca.write_key_pem(0644);  // the mistake this exists to catch
+    EXPECT_FALSE(ctx.init_server(o));
+    EXPECT_NE(ctx.last_error().find("readable beyond its owner"), std::string::npos)
+        << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesKeyThatDoesNotMatchTheCert)
+{
+    SelfSigned a, b;  // two independent keypairs
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = a.write_pem();
+    o.key_file = b.write_key_pem();  // the stale-renewal / swapped-file case
+    EXPECT_FALSE(ctx.init_server(o));
+    // Assert WHICH guard fired, not just that one did. Measured 2026-08-10:
+    // SSL_CTX_use_PrivateKey_file rejects it, because the cert is already loaded
+    // by then. Deleting SSL_CTX_check_private_key leaves this test passing, so a
+    // bare EXPECT_FALSE would have been decoration.
+    EXPECT_NE(ctx.last_error().find("mismatch"), std::string::npos) << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesExpiredCertificate)
+{
+    SelfSigned expired(-3600);  // notAfter an hour in the past
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = expired.write_pem();
+    o.key_file = expired.write_key_pem();
+    EXPECT_FALSE(ctx.init_server(o));
+    EXPECT_NE(ctx.last_error().find("expired"), std::string::npos) << ctx.last_error();
+}
+
+TEST(ServerContext, RefusesMissingFiles)
+{
+    Context ctx;
+    Context::ServerOptions o;
+    o.cert_file = "/nonexistent/cert.pem";
+    o.key_file = "/nonexistent/key.pem";
+    EXPECT_FALSE(ctx.init_server(o));
+}
+
+TEST(ServerContext, RefusesEmptyPaths)
+{
+    Context ctx;
+    EXPECT_FALSE(ctx.init_server(Context::ServerOptions{}));
+    EXPECT_NE(ctx.last_error().find("needs both"), std::string::npos) << ctx.last_error();
+}
+
+// The point of the whole exercise: our own client Session and our own server
+// Session complete a handshake against each other through nothing but the four
+// memory-BIO calls. If this passes, the claim that Session is direction-agnostic
+// is demonstrated instead of asserted.
+TEST(ServerSession, OurClientAndOurServerCompleteAHandshake)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+
+    Context sctx;
+    Context::ServerOptions so;
+    so.cert_file = cert;
+    so.key_file = key;
+    ASSERT_TRUE(sctx.init_server(so)) << sctx.last_error();
+
+    Context cctx;
+    Context::ClientOptions co;
+    co.ca_file = cert;  // trust our own self-signed leaf
+    ASSERT_TRUE(cctx.init_client(co)) << cctx.last_error();
+
+    Session client, server;
+    ASSERT_TRUE(client.init_client(cctx, kHost)) << client.last_error();
+    ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+
+    (void)client.start_handshake();
+
+    uint8_t buf[8192];
+    bool done = false;
+    for (int round = 0; round < 24 && !done; ++round)
+    {
+        for (;;)  // client -> server
+        {
+            const size_t n = client.pull_ciphertext(buf);
+            if (n == 0) break;
+            ASSERT_EQ(server.feed_ciphertext({buf, n}), n);
+        }
+        (void)server.start_handshake();
+        for (;;)  // server -> client
+        {
+            const size_t n = server.pull_ciphertext(buf);
+            if (n == 0) break;
+            ASSERT_EQ(client.feed_ciphertext({buf, n}), n);
+        }
+        (void)client.start_handshake();
+        done = client.handshake_done() && server.handshake_done();
+    }
+    ASSERT_TRUE(done) << "client: " << client.last_error() << " server: " << server.last_error();
+
+    // Application data both ways, which is what the gateway actually needs.
+    const std::string req = "GET /v1/models HTTP/1.1\r\n\r\n";
+    ASSERT_EQ(client.write_plaintext({reinterpret_cast<const uint8_t*>(req.data()), req.size()}),
+              req.size());
+    for (;;)
+    {
+        const size_t n = client.pull_ciphertext(buf);
+        if (n == 0) break;
+        ASSERT_EQ(server.feed_ciphertext({buf, n}), n);
+    }
+    const size_t got = server.read_plaintext(buf);
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(buf), got), req);
+}
+
+// A handshake that never completes must not let a peer buffer without bound.
+// Measured 2026-08-12 before writing any cap, because the cap would otherwise be a
+// fix for a condition nobody had shown occurs: OpenSSL's record layer already
+// bounds it at ONE record. Two shapes, both refused at ~16 KiB.
+//
+// This test exists to keep that true. It fails if a future change adds buffering of
+// our own ahead of the Session, which is the only way the bound could be lost.
+namespace
+{
+    // A server Session that has been handed `hdr` + dribbled bytes, never a valid
+    // handshake. Returns total bytes accepted before it refuses.
+    size_t bytes_accepted_before_refusal(Session& server, const uint8_t* hdr, size_t hdr_len)
+    {
+        size_t fed = server.feed_ciphertext({hdr, hdr_len});
+        (void)server.start_handshake();
+        const uint8_t one = 'A';
+        for (size_t i = 0; i < 5u * 1024 * 1024; ++i)
+        {
+            fed += server.feed_ciphertext({&one, 1});
+            (void)server.start_handshake();
+            if (server.want() == Want::Error) break;
+        }
+        return fed;
+    }
+} // namespace
+
+// No failure path may put private key MATERIAL into an error string. Paths and
+// OpenSSL reason strings are fine and useful; the base64 body of the key is not.
+//
+// Audited alongside this (2026-08-12): `Session::last_error()` is consumed nowhere in
+// shipped code, so a failed handshake emits nothing at all, and `Context::last_error()`
+// reaches exactly two call sites, both `std::runtime_error` at startup. There is no
+// per-request path from OpenSSL text to a client body or a stats line.
+namespace
+{
+    /// The base64 lines of a PEM file, which is the material itself. The BEGIN/END
+    /// armour is not secret and appears in no error string anyway.
+    std::vector<std::string> pem_body_lines(const std::string& path)
+    {
+        std::ifstream in(path);
+        std::vector<std::string> out;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("-----", 0) == 0) continue;
+            if (line.size() >= 32) out.push_back(line);
+        }
+        return out;
+    }
+
+    void expect_no_key_material(const std::string& text, const std::vector<std::string>& secret,
+                                const char* where)
+    {
+        ASSERT_FALSE(secret.empty()) << "the key had no body to look for";
+        for (const std::string& line : secret)
+            EXPECT_EQ(text.find(line), std::string::npos)
+                << "key material surfaced in " << where << ": " << text;
+    }
+} // namespace
+
+TEST(ServerContext, NoFailurePathLeaksKeyMaterial)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+    const std::vector<std::string> secret = pem_body_lines(key);
+
+    // Positive control: the detector must be able to detect. Without this the test
+    // passes for any error string at all, including one that leaks.
+    {
+        std::ifstream in(key);
+        const std::string whole((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        bool found = false;
+        for (const std::string& line : secret)
+            if (whole.find(line) != std::string::npos) found = true;
+        ASSERT_TRUE(found) << "the leak detector cannot detect a leak";
+    }
+
+    // Every distinct startup failure, each of which builds an error string, and one
+    // of which interpolates the key PATH (which is allowed and wanted).
+    {   // key that does not match the certificate
+        SelfSigned other;
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = other.write_key_pem();
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), secret, "mismatched-key error");
+    }
+    {   // key readable beyond its owner
+        SelfSigned loose;
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = loose.write_pem();
+        o.key_file = loose.write_key_pem(0644);
+        EXPECT_FALSE(ctx.init_server(o));
+        EXPECT_NE(ctx.last_error().find(o.key_file), std::string::npos) << "path should be named";
+        expect_no_key_material(ctx.last_error(), secret, "permissions error");
+    }
+    {   // already-expired certificate
+        SelfSigned expired(-3600);
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = expired.write_pem();
+        o.key_file = expired.write_key_pem();
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), pem_body_lines(o.key_file), "expiry error");
+    }
+    {   // unreadable key path
+        Context ctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = "/nonexistent/llmbridge/key.pem";
+        EXPECT_FALSE(ctx.init_server(o));
+        expect_no_key_material(ctx.last_error(), secret, "missing-file error");
+    }
+
+    // And a Session that fails its handshake: the error text is derived from the same
+    // OpenSSL queue, on a context that HAS loaded the key.
+    {
+        Context sctx;
+        Context::ServerOptions o;
+        o.cert_file = cert;
+        o.key_file = key;
+        ASSERT_TRUE(sctx.init_server(o)) << sctx.last_error();
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        const std::string junk = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"; // plaintext at a TLS server
+        (void)server.feed_ciphertext(
+            {reinterpret_cast<const uint8_t*>(junk.data()), junk.size()});
+        (void)server.start_handshake();
+        EXPECT_EQ(server.want(), Want::Error);
+        expect_no_key_material(server.last_error(), secret, "handshake error");
+    }
+}
+
+TEST(ServerSession, UnfinishedHandshakeCannotBufferWithoutBound)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+    Context sctx;
+    Context::ServerOptions so;
+    so.cert_file = cert;
+    so.key_file = key;
+    ASSERT_TRUE(sctx.init_server(so)) << sctx.last_error();
+
+    // Shape 1: a record declaring the maximum payload, dribbled a byte at a time and
+    // never completed. Measured 16,389 bytes accepted, then refused.
+    {
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        const uint8_t hdr[5] = {0x16, 0x03, 0x01, 0x40, 0x00}; // handshake, 16384 bytes
+        const size_t fed = bytes_accepted_before_refusal(server, hdr, sizeof hdr);
+        EXPECT_EQ(server.want(), Want::Error);
+        EXPECT_LT(fed, 64u * 1024) << "dribbled record buffered " << fed << " bytes";
+    }
+
+    // Shape 2: a well-formed record whose handshake message declares a 16 MB
+    // ClientHello. Refused on the FIRST record, 16,009 bytes including the header.
+    {
+        Session server;
+        ASSERT_TRUE(server.init_server(sctx)) << server.last_error();
+        std::string rec;
+        rec.push_back('\x16');
+        rec.push_back('\x03');
+        rec.push_back('\x01');
+        rec.push_back('\x3e');
+        rec.push_back('\x84'); // 16004-byte payload: 1 type + 3 length + 16000 body
+        rec.push_back('\x01'); // client_hello
+        rec.append("\xff\xff\xff", 3);      // declaring 16 MB
+        rec.append(16000, 'A');
+        const size_t n = server.feed_ciphertext(
+            {reinterpret_cast<const uint8_t*>(rec.data()), rec.size()});
+        (void)server.start_handshake();
+        EXPECT_EQ(server.want(), Want::Error);
+        EXPECT_LT(n, 64u * 1024);
+    }
+}
