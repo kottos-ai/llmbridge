@@ -32,6 +32,22 @@ same handshake on the same schedule (once per connection, again after idle).
 It is reported separately because it is real latency the request
 experienced and an operator should see it; it is just not *ours*.
 
+**The INBOUND handshake is a different argument, and it goes the other way.**
+When the gateway terminates TLS for the client (`--listen-tls`), that handshake
+exists only because the gateway is in the path. Nothing on the other side of the
+subtraction cancels it: without us, the client connects straight to the provider
+and pays one handshake, and with us it pays two. So the reasoning above does not
+transfer, and applying it would be the convenient mistake.
+
+It is not folded into `added-total` either, because the two are not
+commensurable. `added-total` is per request; a handshake is per connection, and
+a keep-alive client amortises one handshake over thousands of requests. Booking
+it per request would either inflate the first request absurdly or, spread
+evenly, invent a cost nobody paid. It gets its own line, `accept(TLS)`, measured
+from accept to handshake-done, and an operator reading the profile has to add it
+themselves with the connection-reuse ratio they actually run. That is the honest
+presentation: the number is real, ours, and not a per-request number.
+
 The published benchmark figures (41–80 µs added p99 from 100 to 5,000 RPS)
 are measured externally against a no-gateway control using the same
 keep-alive discipline on both arms, so handshakes land on the same side of
@@ -105,6 +121,15 @@ assigns the stamp attributed to it.
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `ep_on_upstream_readable` / `ur_on_response` |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `ep_finish_client` / `ur_finish_client` |
 
+**One stamp sits outside the scheme, deliberately.** `ts_accepted` is taken when
+the client connection is accepted, which is before t0 and on a different clock
+of relevance: t0–t6 describe one REQUEST, and `ts_accepted` belongs to the
+CONNECTION that carries it. It feeds two things and neither is a request
+interval: the client setup deadline in `sweep_idle`, and the `accept(TLS)`
+histogram (§4), stamped where the inbound handshake completes in `tls_feed`. Do
+not add it to the table above; a per-connection stamp in a per-request scheme is
+how `connect-us` came to mean two things.
+
 Two consequences of that table worth reading off it:
 
 - **t2 has two assignment sites per backend, and that is the whole point.** The
@@ -151,7 +176,7 @@ own decomposition of that specific request:
 | `x-llmbridge-t0` | wall-clock ns at t0 | anchor for ordering against external logs |
 | `x-llmbridge-seq` | atomic counter | total order across all workers: two requests can share a nanosecond, and a sequencer cannot lie about order |
 | `x-llmbridge-gateway-us` | (t1−t0) + (t5−t4) | **our compute, and nothing else**: framing, translation, auth mapping, re-serialisation |
-| `x-llmbridge-connect-us` | (t2−t1) | the handshake **alone**. TCP + TLS on a cold connection (~50–80 ms), and **exactly 0** on a pooled one. Identical span to the `connect(TLS)` histogram. |
+| `x-llmbridge-connect-us` | (t2−t1) | the handshake **alone**. TCP + TLS on a cold connection (~50–80 ms), and **exactly 0** on a pooled one. Identical span to the `connect(TLS)` histogram, though the header is exact and the histogram quantises; see below. |
 | `x-llmbridge-upwrite-us` | (t3−t2) | the `write()` copying the request into the kernel's socket buffer (~4.4 µs p50). Ours, because it exists only because we are the one sending. |
 | `x-llmbridge-upstream-us` | (t4−t3) | the provider: network, queue, prefill, generation |
 | `x-llmbridge-tokens-in/out` | from the response body | usage, non-streaming only |
@@ -269,17 +294,47 @@ added-total    count=...  p50=...  p99=...  p99.9=...  max=...
   request-path   ...
   connect(TLS)   ...
   response-path  ...
+accept(TLS)    ...          <- only when --listen-tls; see below
 ```
 
 | line | span | contents |
 |---|---|---|
 | `request-path` | (t1−t0) + (t3−t2) | our request-side compute **plus** the upstream `write()` (~4.4 µs p50 measured); the handshake between them is excluded |
-| `connect(TLS)` | (t2−t1) | handshake only: exactly 0 on a pooled connection, and this line existing separately is the point |
+| `connect(TLS)` | (t2−t1) | handshake only: **no handshake at all** on a pooled connection, and this line existing separately is the point. See the note on resolution below |
 | `response-path` | t4 → t6 | translate-back **plus** the client write, through full flush |
-| `added-total` | request-path + response-path | everything the gateway did to this request; **connect excluded** |
+| `added-total` | request-path + response-path | everything the gateway did to this request; **both handshakes excluded** |
+| `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per CONNECTION, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,
-t2→t1, and are computed by the same function. They cannot disagree.
+t2→t1, and are computed by the same function. They cannot disagree on the
+value, but the header is exact while the histogram quantises, and that
+distinction was documented wrongly here until 2026-08-12.
+
+### The handshake histograms use a different range, and why
+
+`connect(TLS)` and `accept(TLS)` are built with **1 µs buckets over 262 ms**; the
+overhead lines keep the default 20 ns over 2.62 ms. Two failures bracket that
+choice, and both were live.
+
+The default range is sized for a sub-millisecond overhead claim, but a cold
+handshake is 50–80 ms, twenty to thirty times the range. Every cold sample
+therefore landed in the overflow region, where `percentile()` returns the running
+maximum, so p50, p99 and max printed one clamped number wearing three labels.
+Local mocks hid it completely: a loopback handshake fits in 2.62 ms.
+
+Widening the *bucket* far enough to fix that introduces the opposite error.
+`percentile()` reports a bucket's **upper** edge, deliberately, so the gateway
+never under-reports its own overhead. The cost is that a value of zero reads as
+one bucket width. This document previously said `connect(TLS)` reads "exactly 0"
+on a pooled connection; it read **20 ns**, and nobody questioned it because 20 ns
+reads as zero. At 10 µs buckets it would have read 10 µs, inventing handshake
+time that was never paid. 1 µs keeps the artifact below the noise while covering
+any real handshake.
+
+**So: `max()` is exact, percentiles are quantised upward by up to one bucket, and
+a pooled connection shows ≤ 1 µs, not a true zero.** The per-request
+header `x-llmbridge-connect-us` is exact and does read 0. There is a test pinning
+each half of this.
 
 That was not always true. `connect-us` used to span t1→t3 (handshake **plus**
 the upstream write) while this histogram split at t2, so one name carried two

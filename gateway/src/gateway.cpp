@@ -925,6 +925,15 @@ namespace llmbridge
         // INBOUND conn there is nothing pending, because the client speaks first
         // and its request arrives as plaintext out of this very call; t2 is an
         // upstream concept and stamping it here would be meaningless.
+        if (!hs_was_done && u->tls->handshake_done() && u->is_client)
+        {
+            // The inbound handshake finishes BEFORE t0 (t0 is the framed request),
+            // so it is invisible to every other number this file reports. Recorded
+            // here or it cannot be seen at all. Warm-up gated like the others.
+            const int64_t now = now_ns();
+            if (u->ts_accepted > 0 && now - _t_start >= _warmup_ns)
+                _stats.accept_tls.record(static_cast<uint64_t>(now - u->ts_accepted));
+        }
         if (!hs_was_done && u->tls->handshake_done() && !u->is_client)
         {
             // t2 belongs HERE for TLS, not at TCP connect. The wire cannot carry

@@ -390,7 +390,27 @@ namespace llmbridge
         // ~52.6 ms was the handshake and ~60 us was the gateway.
         Histogram overhead;  // req_path + resp_path: everything the gateway does
         Histogram req_path;  // framing/translate/auth PLUS the write() to the upstream
-        Histogram connect;   // TCP + TLS handshake only; exactly 0 on a pooled conn
+        // TCP + TLS handshake only; ~one bucket width on a pooled conn, see below.
+        //
+        // NOT the default range, and the sizing is a compromise between two
+        // failures. The default (20 ns over 2.62 ms) is sized for the sub-ms
+        // overhead claim, but LATENCY.md documents a cold handshake at 50-80 ms, so
+        // every cold sample landed in overflow, where percentile() returns the
+        // running max: p50, p99 and max became one clamped number wearing three
+        // labels. Widening the BUCKET instead of the count would have been worse:
+        // percentile() reports a bucket's UPPER edge (conservative, so our own
+        // overhead is never under-reported), which means a pooled connection that
+        // paid no handshake reads as one bucket width. At 10 us that invents 10 us
+        // of cost that did not happen. 1 us over 262 ms keeps that artifact below
+        // the noise while covering any real handshake. 2 MB per worker.
+        Histogram connect{1'000, 262'144};
+        // INBOUND handshake: accept -> client handshake done. Unlike `connect`,
+        // this one exists ONLY because the gateway is in the path, so the
+        // reasoning that excludes the upstream handshake does not apply. See
+        // LATENCY.md section 1. Empty unless --listen-tls.
+        //
+        // Same range as `connect`, and for the same reasons; see the note there.
+        Histogram accept_tls{1'000, 262'144};
         Histogram resp_path; // upstream-recv -> client-sent
         uint64_t requests = 0;
         uint64_t errors = 0;

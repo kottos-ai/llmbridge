@@ -1391,6 +1391,46 @@ TEST_P(GatewayTls, InboundTlsEmitsNoKeyMaterialAnywhere)
     }
 }
 
+// 6.1: the INBOUND handshake completes before t0, so every other number in
+// LATENCY.md is blind to it. accept(TLS) is the only place its cost is visible.
+// Three claims, because one of them alone would pass for the wrong reason: it
+// records on an inbound-TLS listener, it counts one sample per handshake (not per
+// request), and it stays empty when the listener is plaintext.
+TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
+{
+    start_inbound(TranslateMode::Anthropic);
+    for (int i = 0; i < 3; ++i)
+    {
+        TlsClient c;
+        ASSERT_TRUE(c.connect(_port, _ca_path));
+        ASSERT_TRUE(c.handshake());
+        ASSERT_TRUE(c.send(kReq));           // two requests on the SECOND session, so
+        if (i == 1) ASSERT_TRUE(c.send(kReq)); // samples cannot be per-request
+        ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
+        if (i == 1) ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
+    }
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+
+    EXPECT_EQ(_gw->stats().accept_tls.total(), 3u) << "one sample per inbound handshake";
+    EXPECT_EQ(_gw->stats().requests, 4u);
+}
+
+TEST_P(GatewayTls, AcceptTlsStaysEmptyOnAPlaintextListener)
+{
+    start(TranslateMode::Anthropic); // TLS upstream, PLAINTEXT listener
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+
+    // The UPSTREAM handshake must not be booked here: it is the one that cancels.
+    EXPECT_EQ(_gw->stats().accept_tls.total(), 0u);
+    EXPECT_GT(_gw->stats().connect.total(), 0u) << "the upstream handshake still lands in connect";
+}
+
 // ── The missing row of the matrix: TLS in, plaintext upstream ───────────────
 //
 // Every other combination of {client leg} x {upstream leg} x {streaming} was

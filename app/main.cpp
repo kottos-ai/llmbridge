@@ -262,6 +262,7 @@ static int run(int argc, char** argv)
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
         agg.connect.merge(s.connect);
+        agg.accept_tls.merge(s.accept_tls);
         agg.resp_path.merge(s.resp_path);
     }
     std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
@@ -280,6 +281,10 @@ static int run(int argc, char** argv)
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
     agg.connect.print(std::cerr, "  connect(TLS) ");
+    // Only when it has samples. A plaintext listener never terminates a handshake,
+    // and a permanent "(no samples)" line for a feature that is off reads as a
+    // missing measurement. This is the one handshake that IS ours; see LATENCY.md 1.
+    if (agg.accept_tls.total() > 0) agg.accept_tls.print(std::cerr, "accept(TLS)   ");
     agg.resp_path.print(std::cerr, "  response-path");
     return 0;
 }

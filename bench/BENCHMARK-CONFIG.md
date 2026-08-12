@@ -472,3 +472,34 @@ bench/.litellm-venv/bin/pip install "litellm[proxy]==1.95.0" \
 ```
 
 Verify before a run: the proxy must answer `GET /health/liveliness` with 200.
+
+## Inbound TLS arm (added 2026-08-12)
+
+`streamgen` gained `--tls --ca FILE`, the only client in this tree that can drive
+a `--listen-tls` gateway. Certificate and hostname verification are on and there
+is no way to turn them off: a benchmark client that skips verification is one
+somebody copies into production.
+
+**The comparison has to be gateway-against-gateway, not gateway-against-control.**
+The usual streaming benchmark differences the gateway arm against a no-gateway
+control, and that control cannot exist here: with no gateway there is nobody to
+terminate the client's TLS, and pointing the client at a TLS mock instead would
+measure the mock's TLS stack. The well-formed question is what the inbound
+transform costs, so both arms are the same binary against the same mock, one with
+`--listen-tls` and one without:
+
+```sh
+# same gateway, same mock, TLS on the listener as the only variable
+./build-tls/bin/faststream --port 9401 &
+./build-tls/bin/llmbridge --listen 9410 --upstream 127.0.0.1:9401 &
+./build-tls/bin/llmbridge --listen 9411 --upstream 127.0.0.1:9401 \
+    --listen-tls --tls-cert CERT --tls-key KEY &
+
+./build-tls/bin/streamgen --port 9410 --streams 512 --duration 60 --warmup 20 --label plain
+./build-tls/bin/streamgen --port 9411 --streams 512 --duration 60 --warmup 20 \
+    --tls --ca CERT --label tls
+```
+
+Cold-booted host, median of three, per section 3 of this document. Nothing from a
+warm or busy box is quotable, and the load generator now pays TLS costs of its
+own, so it must be watched for becoming the bottleneck before the gateway does.

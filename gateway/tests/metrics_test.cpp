@@ -8,6 +8,7 @@
 // Tests for the vendored metrics (gateway/metrics.hpp): the linear-bucket
 // Histogram and the monotonic now_ns() clock.
 
+#include "gateway/gateway.hpp" // Stats, which owns the histogram ranges
 #include "gateway/metrics.hpp"
 
 #include <gtest/gtest.h>
@@ -216,4 +217,48 @@ TEST(TimingSplit, StreamingPassesT5EqualT4SoComputeIsRequestLegOnly)
 {
     const TimingSplit s = timing_split(0, 100, 100, 140, 9000, /*t5 == t4*/ 9000);
     EXPECT_EQ(s.compute_ns, 100) << "a stream must report the request leg, not an invention";
+}
+
+// The handshake histograms need a different range from the overhead ones, and this
+// is not a preference: the default is 20 ns buckets over 2.62 ms, sized for a
+// sub-millisecond overhead claim, while LATENCY.md section 3 documents a cold
+// connect at ~50-80 ms. Every cold sample therefore landed in the overflow region,
+// where percentile() returns the running MAX, so the printed p50/p99/max were one
+// clamped number wearing three labels. Local mocks hid it: a loopback handshake
+// fits in the default range, so only a real provider triggered it.
+TEST(Stats, HandshakeHistogramsCoverARealHandshake)
+{
+    llmbridge::Stats s;
+    // 80 ms, the top of the documented cold-connect range, on both surfaces.
+    s.connect.record(80ull * 1000 * 1000);
+    s.accept_tls.record(80ull * 1000 * 1000);
+
+    EXPECT_EQ(s.connect.overflow_count(), 0u)
+        << "cold upstream handshakes overflow; percentiles are clamped maxima";
+    EXPECT_EQ(s.accept_tls.overflow_count(), 0u)
+        << "cold inbound handshakes overflow; percentiles are clamped maxima";
+    EXPECT_GE(s.connect.max_tracked_ns(), 100ull * 1000 * 1000);
+    EXPECT_GE(s.accept_tls.max_tracked_ns(), 100ull * 1000 * 1000);
+
+    // The overhead histograms keep the fine range: they measure microseconds and a
+    // coarse bucket would erase the number the project is actually judged on.
+    EXPECT_LE(s.overhead.bucket_ns(), 100u);
+    EXPECT_LE(s.req_path.bucket_ns(), 100u);
+    EXPECT_LE(s.resp_path.bucket_ns(), 100u);
+}
+
+// The property the connect line exists to make: a pooled connection paid no
+// handshake. percentile() reports a bucket's UPPER edge, so it reads as one bucket
+// width and not as zero; max() is exact. LATENCY.md said "exactly 0" for years and
+// the histogram was printing 20 ns, which nobody questioned because 20 ns reads as
+// zero. It stops reading as zero the moment somebody widens the bucket, so this
+// test pins the artifact below 1 us.
+TEST(Stats, PooledConnectionReadsAsNoHandshake)
+{
+    llmbridge::Stats s;
+    for (int i = 0; i < 100; ++i) s.connect.record(0);
+    EXPECT_EQ(s.connect.max(), 0u) << "max is exact and must show the truth";
+    EXPECT_LE(s.connect.percentile(0.5), 1'000u)
+        << "a pooled connection is reporting handshake time it never paid";
+    EXPECT_LE(s.connect.percentile(0.99), 1'000u);
 }
