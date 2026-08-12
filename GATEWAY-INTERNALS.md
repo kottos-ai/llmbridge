@@ -292,6 +292,8 @@ time to first token.
         |
         +-- pool at kMaxIdleUpstreams (8192)? close instead of accumulate
         |
+        +-- request not fully on the wire? close, ++upstream_unsent  <- see below
+        |
         +-- otherwise: SCRUB (section 9), stamp ts_pooled, push to _idle_upstreams
 
   sweep_idle(): evict anything idle past kIdleUpstreamNs (30 s)
@@ -300,6 +302,19 @@ time to first token.
 **Why the 30 s reap.** Providers drop idle keep-alives on their own schedule, and
 discovering a corpse costs a request its retry. Reaping first is cheaper than
 finding out the hard way.
+
+**A response can beat our own request out the door, and such a connection must
+not be pooled.** The upstream's recv is armed before the request is sent, so a
+provider that answers early, a 413 or 401 on the headers of a large body, hands
+us a complete response while the request is still half-written. Pooling that
+connection scrubs and later overwrites a buffer the transport has not finished
+with, and leaves a truncated request on the wire for the next client to inherit.
+`upstream_request_sent()` is the predicate, checked by both backends before
+anything else in release, and the connection is closed instead. It fails closed
+because the provider's view of that connection is not something we can
+reconstruct. Reproduced on both backends by `ProxyEarlyResponse`, where the next
+client's request was silently dropped, and mutation-guarded on each backend
+separately.
 
 **Stale-connection retry.** A pooled connection that fails before any response
 byte arrives is retry-eligible (`from_pool && !retried`): the request is resent

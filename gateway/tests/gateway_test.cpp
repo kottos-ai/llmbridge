@@ -136,6 +136,7 @@ namespace
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = 0;
+            if (_rcvbuf > 0) ::setsockopt(_fd, SOL_SOCKET, SO_RCVBUF, &_rcvbuf, sizeof(_rcvbuf));
             ::bind(_fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
             socklen_t len = sizeof(a);
             ::getsockname(_fd, reinterpret_cast<sockaddr*>(&a), &len);
@@ -176,6 +177,15 @@ namespace
         // Stall modes for timeout tests: 1 = read the request then never reply;
         // 2 = send half the response, then hold the connection open forever.
         void set_stall(int mode) { _stall = mode; }
+        // Answer with a complete keep-alive response the instant the connection is
+        // accepted, WITHOUT reading the request, and never read afterwards. Combined
+        // with set_small_rcvbuf() this pins the gateway's request send half-written
+        // while a full response is already framed, which is what a provider doing an
+        // early reject (413/401 on the headers) of a large body looks like.
+        void set_reply_before_read(bool b) { _reply_before_read = b; }
+        // Shrink the receive window on accepted sockets, so the gateway's write to
+        // this backend blocks after a few hundred KB instead of many MB.
+        void set_small_rcvbuf(int b) { _rcvbuf = b; }
         int requests_seen() const { return _requests_seen.load(); }
         std::string last_request()
         {
@@ -247,6 +257,14 @@ namespace
         {
             std::string buf;
             char tmp[16384];
+            if (_reply_before_read)
+            {
+                const std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                (void)!::write(c, resp.data(), resp.size());
+                while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
+                ::close(c);
+                return;
+            }
             while (!_stop)
             {
                 llmbridge::net::http::Message m;
@@ -318,6 +336,8 @@ namespace
         bool _close_mid = false;
         bool _close_after_first = false;
         int _stall = 0;
+        bool _reply_before_read = false;
+        int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
         std::string _all_requests;
@@ -488,6 +508,43 @@ TEST_F(ProxyIT, SingleRequestRoundTrip)
     EXPECT_EQ(_gw->stats().requests, 1u);
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
+
+// A provider may answer BEFORE it has read the whole request (an early 413/401 on
+// the headers of a large body), and the upstream recv is armed before the send, so
+// a complete response can be framed while our request SEND is still outstanding.
+// Releasing the upstream then scrubs and re-uses a buffer the transport has not
+// finished with. Under io_uring that buffer is the target of a live SQE.
+class ProxyEarlyResponse : public ProxyIT,
+                           public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+TEST_P(ProxyEarlyResponse, PooledUpstreamStaysUsable)
+{
+    _backend.set_small_rcvbuf(4096); // gateway's write blocks after a few hundred KB
+    _backend.set_reply_before_read(true);
+    start(0, true, TranslateMode::None, GetParam());
+
+    // Larger than any socket buffer, so the send cannot have completed.
+    const std::string big(8 * 1024 * 1024, 'x');
+    Client c1;
+    ASSERT_TRUE(c1.connect(_proxy_port));
+    ASSERT_TRUE(c1.send(make_request(big)));
+    EXPECT_EQ(c1.recv_status(5000), 200);
+    c1.close();
+
+    // The upstream was pooled with that send still in flight. The next client
+    // acquires it; the request must still be served.
+    Client c2;
+    ASSERT_TRUE(c2.connect(_proxy_port));
+    ASSERT_TRUE(c2.send(make_request("second")));
+    EXPECT_EQ(c2.recv_status(5000), 200) << "pooled upstream was released mid-send";
+    c2.close();
+    shutdown();
+    // Assert the mechanism, not just the outcome: a test that passes because the
+    // send happened to finish would prove nothing about the guard.
+    EXPECT_GE(_gw->stats().upstream_unsent, 1u);
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyEarlyResponse,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
 
 TEST_F(ProxyIT, ResponseBodyIntegrity)
 {

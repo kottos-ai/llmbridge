@@ -397,6 +397,7 @@ namespace llmbridge
         uint64_t upstream_conns_opened = 0;
         uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
         uint64_t upstream_reused = 0;   // requests served on a pooled keep-alive conn
+        uint64_t upstream_unsent = 0;   // response beat our request out; conn closed, not pooled
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
                                             // first request (stall, or a client
@@ -567,6 +568,16 @@ namespace llmbridge
         // across both backends used to write them out by hand.
         void stream_truncate(Connection* client) noexcept;
         bool upstream_is_tls(const Connection* u) const noexcept;
+        // True when the request in this upstream's wbuf has left the machine on
+        // every transport it uses. A pooled upstream MUST satisfy this: the recv is
+        // armed before the send, so a provider that answers early (a 413/401 on the
+        // headers of a large body) can hand us a complete response while our request
+        // is still half-written. Release then scrubs wbuf and offers the connection
+        // to the next client, which under io_uring rewrites a buffer a live SQE
+        // points at, and on either backend leaves a truncated request on the wire.
+        // Reachability is not theoretical: ProxyEarlyResponse reproduces it on both
+        // backends, where the next client's request was silently dropped.
+        bool upstream_request_sent(const Connection* u) const noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         // ── TLS plumbing, BOTH directions ───────────────────────────────────

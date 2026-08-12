@@ -243,6 +243,7 @@ static int run(int argc, char** argv)
         agg.upstream_conns_opened += s.upstream_conns_opened;
         agg.upstream_retries += s.upstream_retries;
         agg.upstream_reused += s.upstream_reused;
+        agg.upstream_unsent += s.upstream_unsent;
         agg.overhead.merge(s.overhead);
         agg.req_path.merge(s.req_path);
         agg.connect.merge(s.connect);
@@ -254,10 +255,13 @@ static int run(int argc, char** argv)
                  (unsigned long long)agg.upstream_timeouts,
                  (unsigned long long)agg.client_setup_timeouts, (unsigned long long)agg.stream_pauses,
                  (unsigned long long)agg.uring_enobufs);
-    std::fprintf(stderr, "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu\n",
+    std::fprintf(stderr,
+                 "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu  "
+                 "unsent=%llu\n",
                  (unsigned long long)agg.requests, (unsigned long long)agg.errors,
                  (unsigned long long)agg.upstream_conns_opened,
-                 (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries);
+                 (unsigned long long)agg.upstream_reused, (unsigned long long)agg.upstream_retries,
+                 (unsigned long long)agg.upstream_unsent);
     agg.overhead.print(std::cerr, "added-total  ");
     agg.req_path.print(std::cerr, "  request-path ");
     agg.connect.print(std::cerr, "  connect(TLS) ");

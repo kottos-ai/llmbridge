@@ -1090,12 +1090,30 @@ namespace llmbridge
         return true;
     }
 
+    bool Gateway::upstream_request_sent(const Connection* u) const noexcept
+    {
+        if (u->send_inflight) return false;      // an SQE still owns the send buffer
+        if (u->woff < u->wbuf.size()) return false; // plaintext not fully handed over
+#ifdef LLMBRIDGE_HAVE_TLS
+        // On TLS, woff only means "fed to the Session". Ciphertext may still be
+        // queued in tls_out or inside OpenSSL.
+        if (u->tls && (u->tls_out_off < u->tls_out.size() || u->tls->has_pending_output()))
+            return false;
+#endif
+        return true;
+    }
+
     void Gateway::ep_release_upstream(Connection* u) noexcept
     {
         // Bounded pool: past the cap, close instead of accumulate. A streaming
         // gateway pools roughly one upstream per concurrent stream, so an unbounded
         // pool would pin an fd per stream forever.
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { ep_close_upstream(u); return; }
+        // Fail closed: the response arrived before our request finished going out, so
+        // the provider saw a truncated request and this connection's state is not ours
+        // to reason about. Close it; the client keeps the response it already has.
+        // See upstream_request_sent().
+        if (!upstream_request_sent(u)) { ++_stats.upstream_unsent; ep_close_upstream(u); return; }
         u->peer = nullptr;
         u->rbuf.clear();
         u->rdec.reset();
@@ -2079,10 +2097,16 @@ namespace llmbridge
 
     void Gateway::ur_release_upstream(Connection* u) noexcept
     {
+        // Checked FIRST: the reset below destroys the very state it reads. See
+        // ep_release_upstream for why an unsent request means close, not pool.
+        if (!upstream_request_sent(u)) { ++_stats.upstream_unsent; ur_close(u); return; }
+        // send_inflight is NOT reset here, and must not be: the guard above returns
+        // for any connection that still has one, so it is already false. It used to
+        // be cleared at the top of this function, inside the TLS ifdef, which papered
+        // over the case the guard now refuses outright.
 #ifdef LLMBRIDGE_HAVE_TLS
         u->tls_out.clear(); // per-request ciphertext; Session kept for reuse
         u->tls_out_off = 0;
-        u->send_inflight = false;
 #endif
         // See ep_release_upstream: bounded pool, closed past the cap.
         if (_idle_upstreams.size() >= kMaxIdleUpstreams) { ur_close(u); return; }
