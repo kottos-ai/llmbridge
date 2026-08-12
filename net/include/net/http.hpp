@@ -315,6 +315,22 @@ namespace llmbridge::net::http
 
         std::string_view headers = buf.substr(0, hdr_end);
 
+        // The status line MUST be "HTTP/1.x SP ...", and checking that is what stops
+        // arbitrary leading bytes being ABSORBED into it. The scan below takes the
+        // first space anywhere in the head and reads three digits after it, so
+        // without this check a blob prepended to a response frames as a normal
+        // reply whenever it contains no space and no CRLF: "JUNKHTTP/1.1 200 OK"
+        // yields status 200 and the junk disappears.
+        //
+        // Only reachable if stray bytes survive on a pooled upstream, which
+        // {ep,ur}_release_upstream prevents by clearing rbuf. This is the second
+        // lock. The v0.8.1 defects were all one shape, malformed input becoming
+        // INVISIBLE input, and the cure is refusing it here instead of trusting a
+        // single guard elsewhere.
+        if (headers.size() < 9 || headers.compare(0, 7, "HTTP/1.") != 0 ||
+            (headers[7] != '0' && headers[7] != '1') || headers[8] != ' ')
+            return FrameStatus::Error;
+
         // Status line: "HTTP/1.1 <code> <reason>". Pull the 3-digit code.
         size_t sp = headers.find(' ');
         if (sp != std::string_view::npos)

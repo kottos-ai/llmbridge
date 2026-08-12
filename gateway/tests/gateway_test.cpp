@@ -732,6 +732,114 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
 }
 
+// ── Content-Length disagreeing with the actual body ─────────────────────────
+//
+// The parser-level cases live in HttpDesync (non-numeric, chunked+CL, conflicting
+// duplicates). These are the END-TO-END ones: what a CLIENT sees, and what the
+// NEXT client sees, when the bytes on the wire do not match the declared length.
+// The second question is the dangerous one, because a keep-alive upstream is
+// shared, so one response's residue is the next customer's problem.
+
+TEST_P(ProxyAuth, UpstreamBodyShorterThanContentLengthNeverBecomesASuccess)
+{
+    // The provider declares 4096 bytes, sends a handful, then closes. The client
+    // must NOT receive a 200 carrying a truncated body: a half answer presented as
+    // a whole one is a silent wrong result for an agent loop.
+    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                       "Content-Length: 4096\r\n\r\n{\"partial\":true}";
+    _backend.set_response(resp);
+    _backend.set_close_mid_response(true);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    const std::string got = c.recv_response(4000);
+    // Either a structured error or nothing at all. Never a 200.
+    EXPECT_EQ(got.find("HTTP/1.1 200"), std::string::npos)
+        << "a truncated upstream body was presented to the client as success: "
+        << got.substr(0, 120);
+}
+
+TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest)
+{
+    // The provider declares N and sends N PLUS trailing bytes on a keep-alive
+    // connection. The extra must never survive into the pool: the next client to
+    // reuse that connection would read it as the head of ITS response, which is a
+    // cross-client desync and the most severe failure this codebase can have.
+    const std::string body = R"({"content":[{"type":"text","text":"ok"}]})";
+    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) +
+                       "\r\nConnection: keep-alive\r\n\r\n" + body +
+                       "X-Injected: yes\r\nTRAILING-GARBAGE\r\n";
+    _backend.set_response(resp);
+    start(0, true, TranslateMode::Anthropic, GetParam());
+
+    Client c1;
+    ASSERT_TRUE(c1.connect(_proxy_port));
+    ASSERT_TRUE(c1.send(openai_request_hdrs("one", "")));
+    const std::string r1 = c1.recv_response(4000);
+    ASSERT_NE(r1.find("HTTP/1.1 200"), std::string::npos) << r1.substr(0, 120);
+
+    // Second client, which is what the pooled connection gets handed to.
+    Client c2;
+    ASSERT_TRUE(c2.connect(_proxy_port));
+    ASSERT_TRUE(c2.send(openai_request_hdrs("two", "")));
+    const std::string r2 = c2.recv_response(4000);
+    ASSERT_FALSE(r2.empty()) << "second client got nothing; the pooled connection "
+                                "was left unusable by the first response";
+    // WITHOUT THIS the test is vacuous, and it was: it passed with the pooled
+    // rbuf.clear() deleted, because the second request had opened a FRESH upstream
+    // and never touched the poisoned one. Assert the reuse actually happened.
+    EXPECT_GT(_gw->stats().upstream_reused, 0u)
+        << "no upstream was reused, so the residue path was never exercised";
+    // THE CANARY MUST CONTAIN CRLF, and the first version did not. Residue with
+    // no space and no CRLF is silently ABSORBED into the next response's status
+    // line, because parse_response() finds the first space anywhere in the head
+    // and reads three digits after it; it never checks the line begins with
+    // "HTTP/". So "TRAILING-GARBAGE...POOL" merged into "...POOLHTTP/1.1 200 OK",
+    // yielded status 200, and the test passed with the pooled clear DELETED.
+    // Residue carrying CRLF cannot be absorbed that way, so it reaches the header
+    // parser and the message is refused, which is the difference this asserts.
+    //
+    // It proves the observable contract: an over-long upstream body does not stop
+    // the next client on a REUSED connection from getting a correct answer.
+    // upstream_reused is asserted above so the reuse really happens.
+    //
+    // It does NOT prove that ep/ur_release_upstream's rbuf.clear() is what
+    // protects that. Deleting BOTH clears leaves this test passing and the second
+    // client still receiving a 200, so some other part of the path is keeping the
+    // connection sane. Which part is not yet identified. The clear is obviously
+    // right and stays, but calling this test its guard would be a claim the
+    // measurement does not support.
+    EXPECT_NE(r2.find("HTTP/1.1 200"), std::string::npos)
+        << "the second client did not get a successful response, which is what a "
+           "poisoned pooled connection looks like from outside: " << r2.substr(0, 160);
+    EXPECT_EQ(r2.find("TRAILING-GARBAGE"), std::string::npos)
+        << "residue from the FIRST response reached the SECOND client: " << r2.substr(0, 160);
+}
+
+TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
+{
+    // The classic smuggling shape from the other direction: the client declares N
+    // and sends N plus something that looks like another request. Exactly ONE
+    // request may reach the provider.
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+
+    const std::string body = R"({"model":"m","messages":[{"role":"u","content":"hi"}]})";
+    const std::string smuggled =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Smuggled: yes\r\n"
+        "Content-Length: 0\r\n\r\n";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body + smuggled));
+    (void)c.recv_response(4000);
+    EXPECT_EQ(_backend.last_request().find("X-Smuggled"), std::string::npos)
+        << "a second request rode in on the first one's body";
+}
+
 TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
 {
     // A keep-alive upstream goes back into the pool holding the REBUILT REQUEST,
