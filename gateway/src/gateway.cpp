@@ -744,6 +744,8 @@ namespace llmbridge
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = true;
         ++_stats.stream_pauses; // observability: proves backpressure actually engaged
+        LB_DEBUG("CAP backpressure, pausing upstream reads ", *c,
+                 " (the client is slower than the provider)");
     }
 
     void Gateway::ep_resume_read(Connection* c) noexcept
@@ -950,8 +952,22 @@ namespace llmbridge
         const bool hs_was_done = u->tls->handshake_done();
         if (n > 0 &&
             u->tls->feed_ciphertext({reinterpret_cast<const uint8_t*>(p), n}) != n)
+        {
+            LB_WARN("TLS input refused ", *u, " handshake_done=", hs_was_done,
+                    " err=", u->tls->last_error());
             return false;
-        if (u->tls->want() == net::tls::Want::Error) return false;
+        }
+        if (u->tls->want() == net::tls::Want::Error)
+        {
+            // Session::last_error() was consumed NOWHERE in shipped code until now, so
+            // a failed handshake produced a closed socket and no diagnostic at all.
+            // Wrong CA, wrong hostname and a protocol mismatch all looked identical
+            // from outside, which is the first thing a new deployment hits. The string
+            // is an OpenSSL reason plus a file path; it carries no key material.
+            LB_WARN("TLS failed ", *u, " during=", hs_was_done ? "session" : "handshake",
+                    " err=", u->tls->last_error());
+            return false;
+        }
 
         // Drain whatever plaintext became available into rbuf. From here on the
         // existing HTTP framing / SSE pump code takes over unchanged.
@@ -959,7 +975,11 @@ namespace llmbridge
         size_t r;
         while ((r = u->tls->read_plaintext({buf, sizeof buf})) > 0)
             u->rbuf.append(reinterpret_cast<const char*>(buf), r);
-        if (u->tls->want() == net::tls::Want::Error) return false;
+        if (u->tls->want() == net::tls::Want::Error)
+        {
+            LB_WARN("TLS read failed ", *u, " err=", u->tls->last_error());
+            return false;
+        }
 
         // Handshake completed on this feed. On an UPSTREAM conn the request has
         // been waiting in wbuf and can finally go through the Session. On an
@@ -972,6 +992,7 @@ namespace llmbridge
             // so it is invisible to every other number this file reports. Recorded
             // here or it cannot be seen at all. Warm-up gated like the others.
             const int64_t now = now_ns();
+            LB_DEBUG("TLS established ", *u);
             if (u->ts_accepted > 0 && now - _t_start >= _warmup_ns)
                 _stats.accept_tls.record(static_cast<uint64_t>(now - u->ts_accepted));
         }
@@ -1138,6 +1159,7 @@ namespace llmbridge
         ep_arm_write(uf); // learn when connect completes, then send the request
         ++_stats.upstream_conns_opened;
         ++_stats.upstream_retries;
+        LB_DEBUG("upstream stale, resending on a fresh connection ", *u);
 
         u->peer = nullptr;
         ep_close_upstream(u); // discard the dead connection
@@ -1164,12 +1186,24 @@ namespace llmbridge
         // Bounded pool: past the cap, close instead of accumulate. A streaming
         // gateway pools roughly one upstream per concurrent stream, so an unbounded
         // pool would pin an fd per stream forever.
-        if (_idle_upstreams.size() >= kMaxIdleUpstreams) { ep_close_upstream(u); return; }
+        if (_idle_upstreams.size() >= kMaxIdleUpstreams)
+        {
+            LB_WARN("CAP pool full, closing instead of pooling ", *u,
+                    " limit=", kMaxIdleUpstreams, " (reuse stops here)");
+            ep_close_upstream(u);
+            return;
+        }
         // Fail closed: the response arrived before our request finished going out, so
         // the provider saw a truncated request and this connection's state is not ours
         // to reason about. Close it; the client keeps the response it already has.
         // See upstream_request_sent().
-        if (!upstream_request_sent(u)) { ++_stats.upstream_unsent; ep_close_upstream(u); return; }
+        if (!upstream_request_sent(u))
+        {
+            LB_WARN("closing instead of pooling, request was still going out ", *u);
+            ++_stats.upstream_unsent;
+            ep_close_upstream(u);
+            return;
+        }
         u->peer = nullptr;
         u->rbuf.clear();
         u->rdec.reset();
@@ -1232,13 +1266,18 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ep_error_respond(Connection* client, int code) noexcept
+    void Gateway::ep_error_respond(Connection* client, int code, const char* why) noexcept
     {
         // Null-tolerant to match ur_error_respond exactly. Every current epoll call
         // site already guarantees non-null, but twins with different contracts are
         // a trap: a caller copied from one side to the other inherits the wrong
         // assumption silently.
         if (!client || client->doomed) return;
+        // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
+        // Getting that backwards means drowning in 4xx noise at scale or missing an
+        // outage, so the level is derived from the code, never chosen per site.
+        if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
         client->wbuf = build_error(code);
@@ -1315,7 +1354,7 @@ namespace llmbridge
         net::http::Message m;
         auto st = net::http::parse_request(c->rbuf, m);
         if (st == net::http::FrameStatus::NeedMore) return;
-        if (st == net::http::FrameStatus::Error) { ep_error_respond(c, 400); return; }
+        if (st == net::http::FrameStatus::Error) { ep_error_respond(c, 400, "request framing"); return; }
 
         c->msg = m;
         c->ts_req_recvd = t0;
@@ -1337,14 +1376,15 @@ namespace llmbridge
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
-            if (tbody.empty()) { ep_error_respond(c, 400); return; }
+            if (tbody.empty()) { ep_error_respond(c, 400, "request translate"); return; }
             // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             std::string auth_hdrs;
             // Malformed credential => 400, and NOTHING goes upstream.
-            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { ep_error_respond(c, 400); return; }
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs))
+            { ep_error_respond(c, 400, "malformed credential"); return; }
             upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
@@ -1353,7 +1393,7 @@ namespace llmbridge
         }
 
         Connection* u = ep_acquire_upstream();
-        if (!u) { ep_error_respond(c, 502); return; }
+        if (!u) { ep_error_respond(c, 502, "no upstream (connect failed)"); return; }
 
         LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
                  " dest=", _upstream_ip, ":", _upstream_port);
@@ -1384,7 +1424,7 @@ namespace llmbridge
                 bool done = false;
                 if (!ep_tls_flush(u, &done))
                 {
-                    if (!ep_retry_upstream(u)) ep_error_respond(c, 502);
+                    if (!ep_retry_upstream(u)) ep_error_respond(c, 502, "upstream write failed, retry exhausted");
                     return;
                 }
                 if (done && tls_wbuf_flushed(u)) c->ts_up_sent = now_ns();
@@ -1392,7 +1432,7 @@ namespace llmbridge
             }
 #endif
             bool done = false;
-            if (!ep_pump_write(u, &done)) { if (!ep_retry_upstream(u)) ep_error_respond(c, 502); return; }
+            if (!ep_pump_write(u, &done)) { if (!ep_retry_upstream(u)) ep_error_respond(c, 502, "upstream write failed, retry exhausted"); return; }
             if (done) c->ts_up_sent = now_ns(); // request fully sent (end of request path)
             else ep_arm_write(u);               // socket full; finish on writability
         }
@@ -1412,7 +1452,7 @@ namespace llmbridge
                 Connection* client = u->peer;
                 u->peer = nullptr;
                 ep_close_upstream(u);
-                if (client) { client->peer = nullptr; ep_error_respond(client, 502); }
+                if (client) { client->peer = nullptr; ep_error_respond(client, 502, "upstream connect refused"); }
                 else ++_stats.errors;
                 return;
             }
@@ -1434,7 +1474,7 @@ namespace llmbridge
             bool tdone = false;
             if (!ep_tls_flush(u, &tdone))
             {
-                if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502); }
+                if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
                 else ep_close_upstream(u);
                 return;
             }
@@ -1448,7 +1488,7 @@ namespace llmbridge
         bool done = false;
         if (!ep_pump_write(u, &done))
         {
-            if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502); }
+            if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
             else ep_close_upstream(u);
             return;
         }
@@ -1481,7 +1521,7 @@ namespace llmbridge
 #endif
             if (client && client->streaming) { ep_stream_on_upstream_eof(u); return; }
             if (client == nullptr) ep_close_upstream(u); // idle pooled conn dropped (eviction)
-            else if (!ep_retry_upstream(u)) ep_error_respond(client, 502);
+            else if (!ep_retry_upstream(u)) ep_error_respond(client, 502, "upstream EOF, retry exhausted");
             return;
         }
         if (client == nullptr) return; // stray bytes on an idle pooled conn
@@ -1498,7 +1538,7 @@ namespace llmbridge
             net::http::ResponseHead h;
             const auto hs = net::http::parse_response_head(u->rbuf, h);
             if (hs == net::http::FrameStatus::NeedMore) return;
-            if (hs == net::http::FrameStatus::Error) { ep_error_respond(client, 502); return; }
+            if (hs == net::http::FrameStatus::Error) { ep_error_respond(client, 502, "upstream response head framing"); return; }
             // Only a 200 carries a real event stream. A provider error (429 rate
             // limit, 529 overloaded, 400 context length, 401 auth) must reach the
             // client with ITS status (relayed below once the body is framed)
@@ -1529,7 +1569,7 @@ namespace llmbridge
         // `r.body` aliases rbuf (Content-Length) or _resp_scratch (chunked); it is
         // dead before rbuf is erased or the upstream released, below.
         const auto r = net::http::parse_response(u->rbuf, u->rdec);
-        if (r.failed()) { ep_error_respond(client, 502); return; }
+        if (r.failed()) { ep_error_respond(client, 502, "upstream response framing"); return; }
         if (!r.complete()) return;
         const net::http::ResponseHead& h = r.head;
         const std::string_view body_buf = r.body;
@@ -1560,7 +1600,7 @@ namespace llmbridge
             {
                 client->peer = nullptr;
                 ep_release_upstream(u); // framing was valid; the upstream conn is reusable
-                ep_error_respond(client, 502);
+                ep_error_respond(client, 502, "response translate");
                 return;
             }
             std::string timing;
@@ -1823,6 +1863,8 @@ namespace llmbridge
             for (Connection* c : unfinished)
             {
                 ++_stats.client_setup_timeouts;
+                LB_WARN("TIMEOUT client never framed a request ", *c,
+                        " after_ns=", now - c->ts_accepted, " limit_ns=", _client_setup_ns);
 #ifdef LLMBRIDGE_HAVE_URING
                 if (uring) { ur_close(c); continue; }
 #endif
@@ -1848,6 +1890,8 @@ namespace llmbridge
             for (Connection* c : quiet)
             {
                 ++_stats.client_idle_timeouts;
+                LB_WARN("TIMEOUT client idle ", *c, " after_ns=", now - c->ts_client_activity,
+                        " limit_ns=", _client_idle_ns);
 #ifdef LLMBRIDGE_HAVE_URING
                 if (uring) ur_close(c);
                 else
@@ -1872,6 +1916,9 @@ namespace llmbridge
         for (Connection* c : stale)
         {
             ++_stats.upstream_timeouts;
+            LB_WARN(ReqId{c->req_seq}, " TIMEOUT upstream silent ", *c,
+                    " after_ns=", now - c->ts_up_activity, " limit_ns=", _upstream_idle_ns,
+                    " streaming=", c->streaming);
             const bool streaming = c->streaming;
             if (streaming)
             {
@@ -1882,14 +1929,14 @@ namespace llmbridge
             if (uring)
             {
                 if (streaming) ur_abort_pair(c);
-                else ur_error_respond(c, 504);
+                else ur_error_respond(c, 504, "upstream idle timeout");
                 continue;
             }
 #else
             (void)uring;
 #endif
             if (streaming) ep_abort_pair(c);
-            else ep_error_respond(c, 504);
+            else ep_error_respond(c, 504, "upstream idle timeout");
         }
     }
 
@@ -2196,6 +2243,7 @@ namespace llmbridge
         client->peer = uf;
         uf->peer = client;
         ++_stats.upstream_retries;
+        LB_DEBUG("upstream stale, resending on a fresh connection ", *u);
         ur_submit_connect(uf); // connect fresh, then send on completion
         return true;
     }
@@ -2204,7 +2252,13 @@ namespace llmbridge
     {
         // Checked FIRST: the reset below destroys the very state it reads. See
         // ep_release_upstream for why an unsent request means close, not pool.
-        if (!upstream_request_sent(u)) { ++_stats.upstream_unsent; ur_close(u); return; }
+        if (!upstream_request_sent(u))
+        {
+            LB_WARN("closing instead of pooling, request was still going out ", *u);
+            ++_stats.upstream_unsent;
+            ur_close(u);
+            return;
+        }
         // send_inflight is NOT reset here, and must not be: the guard above returns
         // for any connection that still has one, so it is already false. It used to
         // be cleared at the top of this function, inside the TLS ifdef, which papered
@@ -2214,7 +2268,13 @@ namespace llmbridge
         u->tls_out_off = 0;
 #endif
         // See ep_release_upstream: bounded pool, closed past the cap.
-        if (_idle_upstreams.size() >= kMaxIdleUpstreams) { ur_close(u); return; }
+        if (_idle_upstreams.size() >= kMaxIdleUpstreams)
+        {
+            LB_WARN("CAP pool full, closing instead of pooling ", *u,
+                    " limit=", kMaxIdleUpstreams, " (reuse stops here)");
+            ur_close(u);
+            return;
+        }
         u->peer = nullptr;
         u->rbuf.clear();
         u->rdec.reset();
@@ -2257,9 +2317,11 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ur_error_respond(Connection* client, int code) noexcept
+    void Gateway::ur_error_respond(Connection* client, int code, const char* why) noexcept
     {
         if (!client || client->doomed) return;
+        if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
         client->wbuf = build_error(code);
         client->woff = 0;
@@ -2369,6 +2431,8 @@ namespace llmbridge
         if (res == -ENOBUFS)
         {
             ++_stats.uring_enobufs;
+            LB_WARN("CAP io_uring provided buffers exhausted; recv re-armed"
+                    " total=", _stats.uring_enobufs);
             ur_arm_recv(c);
             return;
         }
@@ -2378,7 +2442,8 @@ namespace llmbridge
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
             else if (c->peer && c->peer->streaming) ur_stream_on_upstream_eof(c); // stream end, not a failure
-            else if (!ur_retry_upstream(c)) { if (c->peer) ur_error_respond(c->peer, 502); else ur_close(c); }
+            else if (!ur_retry_upstream(c))
+            { if (c->peer) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); else ur_close(c); }
             return;
         }
 
@@ -2412,7 +2477,7 @@ namespace llmbridge
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); return; }
             if (!ur_retry_upstream(c))
             {
-                if (c->peer) ur_error_respond(c->peer, 502);
+                if (c->peer) ur_error_respond(c->peer, 502, "upstream write failed, retry exhausted");
                 else ur_close(c);
             }
             return;
@@ -2445,7 +2510,8 @@ namespace llmbridge
                 net::http::ResponseHead h;
                 const auto hs = net::http::parse_response_head(c->rbuf, h);
                 if (hs == net::http::FrameStatus::NeedMore) return; // wait for the full head
-                if (hs == net::http::FrameStatus::Error) { ur_error_respond(c->peer, 502); return; }
+                if (hs == net::http::FrameStatus::Error)
+                { ur_error_respond(c->peer, 502, "upstream response head framing"); return; }
                 // Only a 200 is a real stream; a provider error is relayed with its
                 // own status by ur_on_response below (never laundered into a 200).
                 if (h.event_stream && h.status == 200)
@@ -2459,7 +2525,7 @@ namespace llmbridge
             // parse_response, NOT parse: providers return non-streaming bodies
             // chunked over HTTP/1.1 and parse_request() rejects that by design (http.hpp).
             const auto r = net::http::parse_response(c->rbuf, c->rdec);
-            if (r.failed()) { ur_error_respond(c->peer, 502); return; }
+            if (r.failed()) { ur_error_respond(c->peer, 502, "upstream response framing"); return; }
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
             ur_on_response(c, r.head, r.body, r.total_len);
@@ -2474,7 +2540,7 @@ namespace llmbridge
         net::http::Message m;
         const auto st = net::http::parse_request(c->rbuf, m);
         if (st == net::http::FrameStatus::NeedMore) return; // the armed recv will deliver more
-        if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400); return; }
+        if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400, "request framing"); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
         // See the epoll mirror: assigned here, before forward touches rbuf.
@@ -2491,7 +2557,7 @@ namespace llmbridge
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
-            if (tbody.empty()) { ur_error_respond(c, 400); return; }
+            if (tbody.empty()) { ur_error_respond(c, 400, "request translate"); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             std::string auth_hdrs;
@@ -2503,7 +2569,8 @@ namespace llmbridge
             // completes inline so the epoll write-arm was never reached; and the
             // close path was already deferred via _doomed. The old naming made the
             // crossing invisible. The prefixes turn it into a grep.)
-            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs)) { ur_error_respond(c, 400); return; }
+            if (!auth_headers_for(_translate, client_hdrs, auth_hdrs))
+            { ur_error_respond(c, 400, "malformed credential"); return; }
             upstream_bytes = build_http_request(start_line, tbody, _upstream_host_hdr, auth_hdrs);
         }
         else
@@ -2512,7 +2579,7 @@ namespace llmbridge
         }
 
         Connection* u = ur_acquire_upstream();
-        if (!u) { ur_error_respond(c, 502); return; }
+        if (!u) { ur_error_respond(c, 502, "no upstream (connect failed)"); return; }
 
         LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
                  " dest=", _upstream_ip, ":", _upstream_port);
@@ -2546,7 +2613,7 @@ namespace llmbridge
             Connection* cl = u->peer;
             u->peer = nullptr;
             ur_close(u);
-            if (cl) { cl->peer = nullptr; ur_error_respond(cl, 502); }
+            if (cl) { cl->peer = nullptr; ur_error_respond(cl, 502, "upstream connect refused"); }
             else ++_stats.errors;
             return;
         }
@@ -2594,7 +2661,7 @@ namespace llmbridge
             {
                 client->peer = nullptr;
                 ur_release_upstream(u); // framing was valid; the upstream conn is reusable
-                ur_error_respond(client, 502);
+                ur_error_respond(client, 502, "response translate");
                 return;
             }
             std::string timing;
@@ -2640,7 +2707,8 @@ namespace llmbridge
         if (res <= 0)
         {
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
-            else if (!ur_retry_upstream(c)) { if (c->peer) ur_error_respond(c->peer, 502); else ur_close(c); }
+            else if (!ur_retry_upstream(c))
+            { if (c->peer) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); else ur_close(c); }
             return;
         }
         // This send completed, so no SQE references the buffer right now. Cleared
@@ -2800,7 +2868,15 @@ namespace llmbridge
             ur_stream_flush(client);
             return;
         }
-        if (client->wpending.size() + client->wbuf.size() > kStreamBufCap) { ur_abort_pair(client); return; }
+        if (client->wpending.size() + client->wbuf.size() > kStreamBufCap)
+        {
+            LB_WARN("CAP stream buffer exceeded, dropping the stream ", *client,
+                    " buffered=", client->wpending.size() + client->wbuf.size(),
+                    " limit=", static_cast<uint64_t>(kStreamBufCap),
+                    " (the client is slower than the provider)");
+            ur_abort_pair(client);
+            return;
+        }
         ur_stream_flush(client);
     }
 

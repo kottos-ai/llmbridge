@@ -645,7 +645,11 @@ namespace llmbridge
         // Reply to the client with a structured HTTP error (400 malformed request /
         // 502 upstream failure) and close, instead of a bare TCP reset. Tears down
         // any in-flight upstream peer.
-        void ep_error_respond(Connection* client, int code) noexcept;
+        /// Reply with `code` and abandon any upstream. `why` is a SHORT literal naming
+        /// the cause, logged with the request id: 28 call sites collapse into three
+        /// status codes, so without it a log can say a request failed but never why,
+        /// which is the question an incident actually asks.
+        void ep_error_respond(Connection* client, int code, const char* why) noexcept;
 
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
@@ -764,7 +768,7 @@ namespace llmbridge
         bool ur_retry_upstream(Connection* u) noexcept;
         void ur_close(Connection* c) noexcept;
         void ur_abort_pair(Connection* client) noexcept;
-        void ur_error_respond(Connection* client, int code) noexcept; // uring mirror of ep_error_respond
+        void ur_error_respond(Connection* client, int code, const char* why) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;
