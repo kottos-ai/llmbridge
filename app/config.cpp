@@ -180,10 +180,15 @@ namespace llmbridge::app
         {
             if (!g->is_object()) return fail(err, "config: \"runtime\" must be an object");
             if (!only(*g, "runtime",
-                      {"io", "workers", "timing_headers", "duration_s", "warmup_s"}, err))
+                      {"io", "workers", "timing_headers", "duration_s", "warmup_s", "log_level"},
+                      err))
                 return false;
             if (!want_str(*g, "runtime", "io", out.io, err)) return false;
             if (!one_of(out.io, "runtime", "io", {"auto", "epoll", "uring"}, err)) return false;
+            if (!want_str(*g, "runtime", "log_level", out.log_level, err)) return false;
+            if (!one_of(out.log_level, "runtime", "log_level",
+                        {"trace", "debug", "info", "warn", "error", "off"}, err))
+                return false;
             double w = 0;
             if (!want_num(*g, "runtime", "workers", out.has_workers, w, 1, 4096, err))
                 return false;

@@ -40,6 +40,9 @@
     "_io": "auto | epoll | uring. auto prefers io_uring and falls back to epoll when it is unavailable.",
     "io": "auto",
 
+    "_log_level": "trace | debug | info | warn | error | off. Lines BELOW the level compiled in at build time do not exist at all, so raising this at runtime cannot resurrect them: build with -DLLMBRIDGE_LOG_LEVEL=debug for the per-connection lines. Release compiles in info and above so the published latency numbers are measured on what ships.",
+    "log_level": "info",
+
     "_workers": "Shared-nothing event loops, one thread each, all binding the same port with SO_REUSEPORT. The kernel picks a worker per CONNECTION by hashing the 4-tuple, so a single keep-alive client stays on one worker for that connection's life; a client wanting to spread across workers opens several connections.",
     "workers": 1,
 

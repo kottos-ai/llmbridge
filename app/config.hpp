@@ -71,6 +71,7 @@ namespace llmbridge::app
 
         // runtime
         std::string io;              // "auto" | "epoll" | "uring"
+        std::string log_level;       // "trace".."off"
         bool has_workers = false;
         int workers = 0;
         bool has_timing_headers = false;

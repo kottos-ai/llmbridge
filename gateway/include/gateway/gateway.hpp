@@ -47,6 +47,7 @@
 
 #include "gateway/metrics.hpp"
 #include "net/http.hpp"
+#include "net/log.hpp"
 #include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 #include "provider/sse.hpp"
@@ -128,6 +129,21 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        // Log identity, distinct from `id` below: `id` is the client-map KEY and is 0
+        // on every upstream, so it cannot name an upstream in a log line. This one is
+        // process-unique for every Connection of either kind and never changes, which
+        // is what makes a connection's whole life greppable as "Connection#42".
+        uint64_t log_inst = net::log::next_instance();
+        // CLIENT conns: the sequencer value for the request currently in flight.
+        // Assigned once at framing and consumed by both the log lines and the
+        // x-llmbridge-seq header, so the two surfaces name the same request.
+        uint64_t req_seq = 0;
+        // Provider-reported token counts for the request in flight, -1 when the
+        // provider did not report them. Non-streaming: scanned out of the translated
+        // body. Streaming: read off the SSE translator at finalize. Metadata, never
+        // content, which is the same rule the recorder and the policy seam follow.
+        long long tok_in = -1;
+        long long tok_out = -1;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
@@ -384,6 +400,39 @@ namespace llmbridge
 #endif
     };
 
+    /// Connection's "print method". A free function, found by ADL, so logging a
+    /// connection costs one call and no iostream: `LB_INFO("closed ", *c)` renders
+    /// `Connection#42(fd=17,client)`. Deliberately prints NOTHING from rbuf or wbuf:
+    /// those hold the customer's request, including its credential.
+    inline void log_put(net::log::Line& l, const Connection& c)
+    {
+        // The class NAME is the subject, so a line says what it is about before it
+        // says anything else: ClientConnection#3(fd=6,cid=2) against
+        // UpstreamConnection#2(fd=7). One grep separates the two halves of the proxy.
+        l.put(net::log::Id{c.is_client ? "ClientConnection" : "UpstreamConnection", c.log_inst});
+        l.put("(fd=");
+        l.put(static_cast<int64_t>(c.fd));
+        if (c.is_client && c.id)
+        {
+            l.put(",cid=");
+            l.put(c.id);
+        }
+        l.put(')');
+    }
+
+    /// The third subject. A request is not an object with a lifetime, so it is named
+    /// by the sequencer: `Request#123`. One number, assigned once when the request
+    /// frames, reused by the timing header, so a log line and a response header
+    /// cannot disagree about which request they mean.
+    struct ReqId
+    {
+        uint64_t seq;
+    };
+    inline void log_put(net::log::Line& l, ReqId r)
+    {
+        l.put(net::log::Id{"Request", r.seq});
+    }
+
     struct Stats
     {
         // The t0-t6 stamps, grouped three ways (LATENCY.md §4, note this grouping
@@ -602,7 +651,11 @@ namespace llmbridge
         // Reply to the client with a structured HTTP error (400 malformed request /
         // 502 upstream failure) and close, instead of a bare TCP reset. Tears down
         // any in-flight upstream peer.
-        void ep_error_respond(Connection* client, int code) noexcept;
+        /// Reply with `code` and abandon any upstream. `why` is a SHORT literal naming
+        /// the cause, logged with the request id: 28 call sites collapse into three
+        /// status codes, so without it a log can say a request failed but never why,
+        /// which is the question an incident actually asks.
+        void ep_error_respond(Connection* client, int code, const char* why) noexcept;
 
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
@@ -721,7 +774,7 @@ namespace llmbridge
         bool ur_retry_upstream(Connection* u) noexcept;
         void ur_close(Connection* c) noexcept;
         void ur_abort_pair(Connection* client) noexcept;
-        void ur_error_respond(Connection* client, int code) noexcept; // uring mirror of ep_error_respond
+        void ur_error_respond(Connection* client, int code, const char* why) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;
