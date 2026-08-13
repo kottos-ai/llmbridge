@@ -222,3 +222,30 @@ TEST_F(LogTest, ConcurrentWritersProduceWholeLines)
     log_::set_sink(&sink);
     SUCCEED();
 }
+
+// The subjects. A reader greps one of three words to follow a client, an upstream, or
+// a request, and a line that could be about either half of the proxy is a line that
+// costs a reader time. These are pinned because the names are the interface.
+TEST_F(LogTest, SubjectsAreDistinctAndLeadTheMessage)
+{
+    // Stand-ins with the same shape the gateway uses, so this test does not need to
+    // build a Gateway to pin the naming.
+    struct C { uint64_t inst; bool client; int fd; };
+    auto put = [](log_::Line& l, const C& c) {
+        l.put(log_::Id{c.client ? "ClientConnection" : "UpstreamConnection", c.inst});
+        l.put("(fd=");
+        l.put(static_cast<int64_t>(c.fd));
+        l.put(')');
+    };
+    log_::Line a;
+    put(a, C{7, true, 5});
+    EXPECT_EQ(a.view(), "ClientConnection#7(fd=5)");
+
+    log_::Line b;
+    put(b, C{8, false, 6});
+    EXPECT_EQ(b.view(), "UpstreamConnection#8(fd=6)");
+
+    log_::Line c;
+    c.put(log_::Id{"Request", 99});
+    EXPECT_EQ(c.view(), "Request#99");
+}

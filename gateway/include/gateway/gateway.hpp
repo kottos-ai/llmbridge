@@ -134,6 +134,10 @@ namespace llmbridge
         // process-unique for every Connection of either kind and never changes, which
         // is what makes a connection's whole life greppable as "Connection#42".
         uint64_t log_inst = net::log::next_instance();
+        // CLIENT conns: the sequencer value for the request currently in flight.
+        // Assigned once at framing and consumed by both the log lines and the
+        // x-llmbridge-seq header, so the two surfaces name the same request.
+        uint64_t req_seq = 0;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
@@ -396,16 +400,31 @@ namespace llmbridge
     /// those hold the customer's request, including its credential.
     inline void log_put(net::log::Line& l, const Connection& c)
     {
-        l.put(net::log::Id{"Connection", c.log_inst});
+        // The class NAME is the subject, so a line says what it is about before it
+        // says anything else: ClientConnection#3(fd=6,cid=2) against
+        // UpstreamConnection#2(fd=7). One grep separates the two halves of the proxy.
+        l.put(net::log::Id{c.is_client ? "ClientConnection" : "UpstreamConnection", c.log_inst});
         l.put("(fd=");
         l.put(static_cast<int64_t>(c.fd));
-        l.put(c.is_client ? ",client" : ",upstream");
         if (c.is_client && c.id)
         {
             l.put(",cid=");
             l.put(c.id);
         }
         l.put(')');
+    }
+
+    /// The third subject. A request is not an object with a lifetime, so it is named
+    /// by the sequencer: `Request#123`. One number, assigned once when the request
+    /// frames, reused by the timing header, so a log line and a response header
+    /// cannot disagree about which request they mean.
+    struct ReqId
+    {
+        uint64_t seq;
+    };
+    inline void log_put(net::log::Line& l, ReqId r)
+    {
+        l.put(net::log::Id{"Request", r.seq});
     }
 
     struct Stats

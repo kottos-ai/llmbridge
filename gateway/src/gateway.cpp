@@ -34,6 +34,30 @@ namespace llmbridge
         // Log-friendly name for the dialect. Kept next to the log sites, not on
         // TranslateMode itself: the enum is part of the public API and does not need
         // a printing concern attached to it.
+        /// The request line ("POST /v1/chat/completions HTTP/1.1") for a log line,
+        /// bounded. Safe to log: the start line carries no credential, unlike every
+        /// header after it. Truncated hard so a hostile long URI cannot dominate the
+        /// log, and cut at the first CR so it can never run into a header.
+        std::string_view request_line(std::string_view buf) noexcept
+        {
+            constexpr size_t kMax = 128;
+            const size_t eol = buf.find('\r');
+            size_t n = eol == std::string_view::npos ? buf.size() : eol;
+            if (n > kMax) n = kMax;
+            return buf.substr(0, n);
+        }
+
+        /// Status code off the front of a response we are about to send. Reads the
+        /// buffer we built ourselves, so the "HTTP/1.x NNN" shape is guaranteed;
+        /// returns 0 if it is not, which is worth seeing in a log instead of hiding.
+        int status_of(std::string_view resp) noexcept
+        {
+            if (resp.size() < 12 || resp.compare(0, 5, "HTTP/") != 0) return 0;
+            const char a = resp[9], b = resp[10], c = resp[11];
+            if (a < '0' || a > '9' || b < '0' || b > '9' || c < '0' || c > '9') return 0;
+            return (a - '0') * 100 + (b - '0') * 10 + (c - '0');
+        }
+
         const char* translate_name(TranslateMode m) noexcept
         {
             switch (m)
@@ -393,7 +417,7 @@ namespace llmbridge
 
         void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
                                    int64_t connect_us, int64_t upwrite_us,
-                                   int64_t upstream_us, const char* upstream_key)
+                                   int64_t upstream_us, const char* upstream_key, uint64_t seq)
         {
             const auto add = [&out](const char* k, int64_t v) {
                 if (v < 0) return; // a stamp we never took; omit instead of lie
@@ -403,7 +427,7 @@ namespace llmbridge
                 out.append("\r\n");
             };
             add("x-llmbridge-t0", wall_ns(t0));
-            add("x-llmbridge-seq", static_cast<int64_t>(g_seq.fetch_add(1, std::memory_order_relaxed)));
+            add("x-llmbridge-seq", static_cast<int64_t>(seq));
             add("x-llmbridge-gateway-us", gateway_us);
             // connect-us is now EXACTLY the connect(TLS) histogram's span (t2-t1):
             // handshake only, and therefore exactly 0 on a pooled connection. The
@@ -1055,7 +1079,6 @@ namespace llmbridge
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
-            LB_DEBUG("upstream reuse ", *u, " pool=", _idle_upstreams.size());
             return u;
         }
         int fd = net::start_connect(_upstream_ip.c_str(), _upstream_port);
@@ -1296,6 +1319,11 @@ namespace llmbridge
 
         c->msg = m;
         c->ts_req_recvd = t0;
+        // ONE assignment point for the sequencer, HERE and not later: the upstream
+        // and status lines below quote it, and ep_forward erases the request out of
+        // rbuf, so a log placed after it prints an empty request line and a stale seq.
+        c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+        LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         ep_forward(c);
     }
 
@@ -1327,6 +1355,8 @@ namespace llmbridge
         Connection* u = ep_acquire_upstream();
         if (!u) { ep_error_respond(c, 502); return; }
 
+        LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
+                 " dest=", _upstream_ip, ":", _upstream_port);
         u->wbuf = std::move(upstream_bytes);
         u->woff = 0;
         c->rbuf.erase(0, c->msg.total_len);
@@ -1543,7 +1573,8 @@ namespace llmbridge
                     client->ts_up_sent, client->ts_up_recvd, ts_resp_built);
                 append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                       sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us");
+                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
+                                      client->req_seq);
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -1624,6 +1655,8 @@ namespace llmbridge
             }
         }
         ep_disarm_write(c);
+        LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
+                 " keep_alive=", c->msg.keep_alive, " on ", *c);
         c->wbuf.clear(); // response fully sent; ep_pump_write no longer clears it for us
         c->woff = 0;
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
@@ -1653,7 +1686,8 @@ namespace llmbridge
                 client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
             append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
+                                  client->req_seq);
             client->wbuf.assign(sse_head_with_timing(timing));
         }
         else
@@ -2098,7 +2132,6 @@ namespace llmbridge
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
-            LB_DEBUG("upstream reuse ", *u, " pool=", _idle_upstreams.size());
             return u;
         }
         const int fd = net::make_client_socket();
@@ -2444,6 +2477,9 @@ namespace llmbridge
         if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
+        // See the epoll mirror: assigned here, before forward touches rbuf.
+        c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+        LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         ur_forward(c);
     }
 
@@ -2478,6 +2514,8 @@ namespace llmbridge
         Connection* u = ur_acquire_upstream();
         if (!u) { ur_error_respond(c, 502); return; }
 
+        LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
+                 " dest=", _upstream_ip, ":", _upstream_port);
         u->wbuf = std::move(upstream_bytes);
         u->woff = 0;
         c->rbuf.erase(0, c->msg.total_len);
@@ -2568,7 +2606,8 @@ namespace llmbridge
                     client->ts_up_sent, client->ts_up_recvd, ts_resp_built);
                 append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                       sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us");
+                                      sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
+                                      client->req_seq);
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -2639,6 +2678,9 @@ namespace llmbridge
             }
             else if (!c->wbuf.empty())
             {
+                LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf),
+                         " bytes=", c->wbuf.size(), " keep_alive=", c->msg.keep_alive,
+                         " on ", *c);
                 c->wbuf.clear();
                 c->woff = 0;
                 ur_finish_client(c);
@@ -2665,6 +2707,8 @@ namespace llmbridge
         }
         else
         {
+            LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
+                     " keep_alive=", c->msg.keep_alive, " on ", *c);
             c->wbuf.clear();
             c->woff = 0;
             ur_finish_client(c);
@@ -2732,7 +2776,8 @@ namespace llmbridge
                 client->ts_up_sent, client->ts_up_recvd, client->ts_up_recvd);
             append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
-                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us");
+                                  sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
+                                  client->req_seq);
             client->wpending.assign(sse_head_with_timing(timing));
         }
         else
