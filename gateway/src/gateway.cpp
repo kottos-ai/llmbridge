@@ -37,11 +37,17 @@ namespace llmbridge
         // Log-friendly name for the dialect. Kept next to the log sites, not on
         // TranslateMode itself: the enum is part of the public API and does not need
         // a printing concern attached to it.
+        /// [[maybe_unused]] because this is called ONLY from an LB_DEBUG line, and at
+        /// the default info floor that line compiles to nothing, leaving an
+        /// unreferenced static. Clang makes that fatal under -Werror
+        /// (-Wunneeded-internal-declaration); GCC says nothing, which is how it
+        /// reached CI. Any helper used only from a compiled-out log line needs this.
+        ///
         /// The request line ("POST /v1/chat/completions HTTP/1.1") for a log line,
         /// bounded. Safe to log: the start line carries no credential, unlike every
         /// header after it. Truncated hard so a hostile long URI cannot dominate the
         /// log, and cut at the first CR so it can never run into a header.
-        std::string_view request_line(std::string_view buf) noexcept
+        [[maybe_unused]] std::string_view request_line(std::string_view buf) noexcept
         {
             constexpr size_t kMax = 128;
             const size_t eol = buf.find('\r');
@@ -53,7 +59,7 @@ namespace llmbridge
         /// Status code off the front of a response we are about to send. Reads the
         /// buffer we built ourselves, so the "HTTP/1.x NNN" shape is guaranteed;
         /// returns 0 if it is not, which is worth seeing in a log instead of hiding.
-        int status_of(std::string_view resp) noexcept
+        [[maybe_unused]] int status_of(std::string_view resp) noexcept
         {
             if (resp.size() < 12 || resp.compare(0, 5, "HTTP/") != 0) return 0;
             const char a = resp[9], b = resp[10], c = resp[11];

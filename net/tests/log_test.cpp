@@ -198,12 +198,17 @@ TEST_F(LogTest, LevelNamesRoundTripAndTyposAreRefused)
 // helper below is what every credential-adjacent site must use.
 TEST_F(LogTest, RedactedHelperNeverPrintsTheValue)
 {
-    const std::string secret = "sk-ant-super-secret-value-000";
+    // Deliberately NOT shaped like a real key. An `sk-ant-...` fixture here would
+    // trip scripts/check_no_secrets.py, and the right response to that is a
+    // different fixture, never an ALLOW entry: the scanner exists to catch exactly
+    // that pattern in tracked files, and an exception for test convenience is how
+    // a real key eventually slips past it.
+    const std::string secret = "CREDENTIAL-PLACEHOLDER-MUST-NOT-BE-LOGGED";
     // The pattern: name and LENGTH, never the value.
     LB_INFO("auth header present name=authorization len=", secret.size());
     const std::string s = sink.all();
     EXPECT_EQ(s.find(secret), std::string::npos) << "a credential reached a log line";
-    EXPECT_NE(s.find("len=29"), std::string::npos) << s;
+    EXPECT_NE(s.find("len=41"), std::string::npos) << s;
 }
 
 TEST_F(LogTest, ConcurrentWritersProduceWholeLines)
