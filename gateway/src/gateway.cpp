@@ -8,6 +8,9 @@
 #include "gateway/gateway.hpp"
 
 #include "net/secure.hpp"
+// Only for translate_failure(): the error path re-parses a rejected body to
+// say WHY it was rejected. Not used anywhere on the success path.
+#include "provider/json.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -56,6 +59,27 @@ namespace llmbridge
             const char a = resp[9], b = resp[10], c = resp[11];
             if (a < '0' || a > '9' || b < '0' || b > '9' || c < '0' || c > '9') return 0;
             return (a - '0') * 100 + (b - '0') * 10 + (c - '0');
+        }
+
+        /// Why a request translation failed, for the log only. The translator returns
+        /// an empty string on any failure and keeps no reason, so this re-parses the
+        /// body to separate the two cases a caller can actually act on: bytes that
+        /// are not JSON at all, against JSON whose shape we cannot translate. Costs a
+        /// parse, but only on a path that has already failed and is about to answer
+        /// 400, so it is never on the hot path.
+        ///
+        /// It exists because "request translate" told an operator nothing: a client
+        /// sending Python's `True` instead of `true` and a client sending a model we
+        /// do not support produced the identical line.
+        const char* translate_failure(std::string_view body) noexcept
+        {
+            bool ok = false;
+            const provider::json::Value v = provider::json::parse(body, ok);
+            if (!ok) return "request translate: body is not valid JSON";
+            if (!v.is_object()) return "request translate: body is not a JSON object";
+            if (!v.find("model")) return "request translate: no \"model\" field";
+            if (!v.find("messages")) return "request translate: no \"messages\" field";
+            return "request translate: unsupported request shape";
         }
 
         const char* translate_name(TranslateMode m) noexcept
@@ -838,6 +862,16 @@ namespace llmbridge
         // supplies the missing provider: it corrupts the chunked framing inside
         // valid TLS and then holds the connection, so the only difference left is
         // WHEN the client is closed. Deleting this line makes that test fail.
+        // Logged HERE, in the one shared place, and not at the five call sites: a
+        // truncated stream is the one outcome a client CANNOT tell from a clean
+        // finish, because the honest absence of [DONE] looks like a connection that
+        // simply stopped. If it is not recorded on our side, nobody can answer
+        // "did my stream complete?" afterwards. The abort paths bypass
+        // finalize_stream, so its completion line never runs for these.
+        LB_WARN(ReqId{client->req_seq}, " stream TRUNCATED (no [DONE] emitted)",
+                " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
+                " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                " on ", *client);
         client->stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
         ++_stats.errors;                  // and it counts as a failure, not a finish
@@ -1389,7 +1423,7 @@ namespace llmbridge
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
-            if (tbody.empty()) { ep_error_respond(c, 400, "request translate"); return; }
+            if (tbody.empty()) { ep_error_respond(c, 400, translate_failure(body)); return; }
             // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
@@ -1609,6 +1643,15 @@ namespace llmbridge
                 return;
             }
             std::string tbody = xlate_resp(_translate, body);
+            // Scanned unconditionally, NOT only when --timing-headers is on: the
+            // response header is one surface for these numbers and the log is
+            // another, and a number that appears in one but not the other is the
+            // kind of inconsistency this file has been bitten by before.
+            {
+                const BodyUsage bu = scan_usage(tbody);
+                client->tok_in = bu.in;
+                client->tok_out = bu.out;
+            }
             if (tbody.empty())
             {
                 client->peer = nullptr;
@@ -1821,6 +1864,16 @@ namespace llmbridge
             if (reusable) ep_release_upstream(u);
             else ep_close_upstream(u);
         }
+        // A stream never reaches the non-streaming completion log, so without this a
+        // streamed request logged its start and then nothing at all: no outcome, no
+        // size, no tokens. `close_after_resp` here means the stream was TRUNCATED
+        // (stream_truncate emits no [DONE] on purpose), which is the one outcome a
+        // client cannot distinguish from a clean finish by itself.
+        LB_DEBUG(ReqId{client->req_seq}, " stream ended ",
+                 client->close_after_resp ? "TRUNCATED" : "clean",
+                 " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
+                 " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                 " on ", *client);
         // Only a stream that terminated cleanly counts as a served request; an
         // aborted one (close_after_resp) was already counted in _stats.errors.
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
@@ -2575,7 +2628,7 @@ namespace llmbridge
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
             std::string tbody = xlate_req(_translate, body, start_line);
-            if (tbody.empty()) { ur_error_respond(c, 400, "request translate"); return; }
+            if (tbody.empty()) { ur_error_respond(c, 400, translate_failure(body)); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             std::string auth_hdrs;
@@ -2675,6 +2728,15 @@ namespace llmbridge
                 return;
             }
             std::string tbody = xlate_resp(_translate, body);
+            // Scanned unconditionally, NOT only when --timing-headers is on: the
+            // response header is one surface for these numbers and the log is
+            // another, and a number that appears in one but not the other is the
+            // kind of inconsistency this file has been bitten by before.
+            {
+                const BodyUsage bu = scan_usage(tbody);
+                client->tok_in = bu.in;
+                client->tok_out = bu.out;
+            }
             if (tbody.empty())
             {
                 client->peer = nullptr;
@@ -2765,7 +2827,8 @@ namespace llmbridge
             else if (!c->wbuf.empty())
             {
                 LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf),
-                         " bytes=", c->wbuf.size(), " keep_alive=", c->msg.keep_alive,
+                         " bytes=", c->wbuf.size(), " tokens_in=", c->tok_in,
+                         " tokens_out=", c->tok_out, " keep_alive=", c->msg.keep_alive,
                          " on ", *c);
                 c->wbuf.clear();
                 c->woff = 0;
@@ -2794,6 +2857,7 @@ namespace llmbridge
         else
         {
             LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
+                     " tokens_in=", c->tok_in, " tokens_out=", c->tok_out,
                      " keep_alive=", c->msg.keep_alive, " on ", *c);
             c->wbuf.clear();
             c->woff = 0;
@@ -2937,6 +3001,11 @@ namespace llmbridge
             if (reusable) ur_release_upstream(u); // see the epoll mirror
             else ur_close(u);
         }
+        LB_DEBUG(ReqId{client->req_seq}, " stream ended ",
+                 client->close_after_resp ? "TRUNCATED" : "clean",
+                 " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
+                 " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                 " on ", *client);
         // Only a cleanly-terminated stream counts as served (see the epoll mirror).
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
         ur_close(client);

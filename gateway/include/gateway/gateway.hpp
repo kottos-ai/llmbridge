@@ -138,6 +138,12 @@ namespace llmbridge
         // Assigned once at framing and consumed by both the log lines and the
         // x-llmbridge-seq header, so the two surfaces name the same request.
         uint64_t req_seq = 0;
+        // Provider-reported token counts for the request in flight, -1 when the
+        // provider did not report them. Non-streaming: scanned out of the translated
+        // body. Streaming: read off the SSE translator at finalize. Metadata, never
+        // content, which is the same rule the recorder and the policy seam follow.
+        long long tok_in = -1;
+        long long tok_out = -1;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
