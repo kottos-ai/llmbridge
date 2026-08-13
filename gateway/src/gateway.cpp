@@ -744,8 +744,13 @@ namespace llmbridge
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = true;
         ++_stats.stream_pauses; // observability: proves backpressure actually engaged
-        LB_DEBUG("CAP backpressure, pausing upstream reads ", *c,
-                 " (the client is slower than the provider)");
+        // Both guards above are edge-triggered (`read_paused` early-returns), so this
+        // is one line per episode, not per event. WARN like every other CAP: at the
+        // default INFO floor a DEBUG line is compiled out, which would make the epoll
+        // half of this behaviour invisible in production while the io_uring half
+        // (the 8 MiB drop) stayed visible. Same event, two backends, one log.
+        LB_WARN("CAP backpressure, pausing upstream reads ", *c,
+                " (the client is slower than the provider)");
     }
 
     void Gateway::ep_resume_read(Connection* c) noexcept
@@ -756,6 +761,9 @@ namespace llmbridge
         ev.data.ptr = c;
         ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = false;
+        // Same level as the pause: a log that opens an episode and never closes it
+        // reads as still stuck.
+        LB_WARN("CAP backpressure cleared, resuming upstream reads ", *c);
     }
 
     bool Gateway::ep_drain_read(Connection* c) noexcept
@@ -1159,7 +1167,12 @@ namespace llmbridge
         ep_arm_write(uf); // learn when connect completes, then send the request
         ++_stats.upstream_conns_opened;
         ++_stats.upstream_retries;
-        LB_DEBUG("upstream stale, resending on a fresh connection ", *u);
+        // WARN, not DEBUG: it is not a cap, it is a RECOVERED failure. A pooled
+        // connection was dead when we used it, and the client never learns. That is
+        // the point of the retry and also the reason it must be visible: a rising
+        // rate here means the provider is dropping keep-alives faster than
+        // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
+        LB_WARN("upstream stale, resending on a fresh connection ", *u);
 
         u->peer = nullptr;
         ep_close_upstream(u); // discard the dead connection
@@ -2243,7 +2256,12 @@ namespace llmbridge
         client->peer = uf;
         uf->peer = client;
         ++_stats.upstream_retries;
-        LB_DEBUG("upstream stale, resending on a fresh connection ", *u);
+        // WARN, not DEBUG: it is not a cap, it is a RECOVERED failure. A pooled
+        // connection was dead when we used it, and the client never learns. That is
+        // the point of the retry and also the reason it must be visible: a rising
+        // rate here means the provider is dropping keep-alives faster than
+        // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
+        LB_WARN("upstream stale, resending on a fresh connection ", *u);
         ur_submit_connect(uf); // connect fresh, then send on completion
         return true;
     }
