@@ -47,6 +47,7 @@
 
 #include "gateway/metrics.hpp"
 #include "net/http.hpp"
+#include "net/log.hpp"
 #include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 #include "provider/sse.hpp"
@@ -128,6 +129,11 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        // Log identity, distinct from `id` below: `id` is the client-map KEY and is 0
+        // on every upstream, so it cannot name an upstream in a log line. This one is
+        // process-unique for every Connection of either kind and never changes, which
+        // is what makes a connection's whole life greppable as "Connection#42".
+        uint64_t log_inst = net::log::next_instance();
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
@@ -383,6 +389,24 @@ namespace llmbridge
         size_t tls_out_off = 0;
 #endif
     };
+
+    /// Connection's "print method". A free function, found by ADL, so logging a
+    /// connection costs one call and no iostream: `LB_INFO("closed ", *c)` renders
+    /// `Connection#42(fd=17,client)`. Deliberately prints NOTHING from rbuf or wbuf:
+    /// those hold the customer's request, including its credential.
+    inline void log_put(net::log::Line& l, const Connection& c)
+    {
+        l.put(net::log::Id{"Connection", c.log_inst});
+        l.put("(fd=");
+        l.put(static_cast<int64_t>(c.fd));
+        l.put(c.is_client ? ",client" : ",upstream");
+        if (c.is_client && c.id)
+        {
+            l.put(",cid=");
+            l.put(c.id);
+        }
+        l.put(')');
+    }
 
     struct Stats
     {

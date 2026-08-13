@@ -26,6 +26,31 @@ OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, a
   load-balancing device**: a short window would charge a reconnecting client a fresh
   TCP+TLS handshake to solve a problem the client cannot observe. Requests and streams
   in flight are never reaped, and `stats.client_idle_timeouts` counts what was.
+- **A logger**, replacing every `fprintf` that described the running process
+  (`--log-level`, `runtime.log_level`, default `info`; stderr).
+
+  Sized so it cannot cost the latency claim. Roughly twenty interesting events per
+  request at ~84k RPS is 1.7M records/second against a budget of 41-80 us added p99
+  for the whole request, and one `fprintf` costs 1-5 us and takes a lock, so a
+  conventional logger would invalidate the benchmark.
+  Hence: a **compile-time floor** (`-DLLMBRIDGE_LOG_LEVEL=`, default `info`) that
+  removes lower call sites entirely so their arguments are never even evaluated; a
+  runtime level behind one relaxed atomic load; a **fixed stack buffer** with no
+  allocation and no iostreams; and one `write(2)` per line so concurrent workers
+  interleave whole lines with no mutex.
+
+  Every line names its **thread** (`worker/2`, not a 15-digit `pthread_self`), and
+  objects carry a stable identity: a connection is `Connection#42(fd=17,client,cid=3)`
+  for its whole life, via a free `log_put` found by ADL, which is how a class gets a
+  print method without dragging iostreams onto the event loop. Connection lifecycle,
+  live client count on change, and upstream pool reuse are `DEBUG`, so a lab build
+  (`-DLLMBRIDGE_LOG_LEVEL=debug`) shows them and a Release build does not carry them.
+
+  **No credential is logged at any level**, and the header states the rule the call
+  sites must follow: a header's name and length, never its value.
+
+  There is a `Sink` seam. The built-in one writes to stderr.
+
 - **`--config FILE`**, an optional JSON configuration file. Fourteen flags is
   uncomfortable and the fifteenth is impossible: multi-upstream routing needs an
   ordered list with per-upstream fields, which flat flags cannot express without

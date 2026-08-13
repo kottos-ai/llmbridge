@@ -69,6 +69,31 @@ endif ()
 # plain build of the OSS remains dependency-free end to end. find_package here at
 # the root because imported targets are directory-scoped and both net/ and
 # gateway/tests/ link them.
+# Compile-time log floor. Release keeps info and above so a running process still
+# says something; a lab or debugging build passes `debug` (or `trace`) to compile the
+# per-connection and per-request lines IN. They are compiled OUT by default so the
+# published latency numbers are measured on exactly what ships.
+set(LLMBRIDGE_LOG_LEVEL "info" CACHE STRING "Compiled-in log floor: trace|debug|info|warn|error|off")
+set_property(CACHE LLMBRIDGE_LOG_LEVEL PROPERTY STRINGS trace debug info warn error off)
+if (LLMBRIDGE_LOG_LEVEL STREQUAL "trace")
+    set(_lb_log 0)
+elseif (LLMBRIDGE_LOG_LEVEL STREQUAL "debug")
+    set(_lb_log 1)
+elseif (LLMBRIDGE_LOG_LEVEL STREQUAL "info")
+    set(_lb_log 2)
+elseif (LLMBRIDGE_LOG_LEVEL STREQUAL "warn")
+    set(_lb_log 3)
+elseif (LLMBRIDGE_LOG_LEVEL STREQUAL "error")
+    set(_lb_log 4)
+elseif (LLMBRIDGE_LOG_LEVEL STREQUAL "off")
+    set(_lb_log 5)
+else ()
+    message(FATAL_ERROR
+            "LLMBRIDGE_LOG_LEVEL must be trace|debug|info|warn|error|off, got '${LLMBRIDGE_LOG_LEVEL}'")
+endif ()
+add_compile_definitions(LLMBRIDGE_LOG_COMPILE_LEVEL=${_lb_log})
+message(STATUS "llmbridge: compiled-in log floor = ${LLMBRIDGE_LOG_LEVEL}")
+
 option(LLMBRIDGE_TLS "Enable TLS for outbound gateway connections (needs OpenSSL)" OFF)
 if (LLMBRIDGE_TLS)
     find_package(OpenSSL 3.0 REQUIRED)

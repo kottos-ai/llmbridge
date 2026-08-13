@@ -31,6 +31,24 @@ namespace llmbridge
 {
     namespace
     {
+        // Log-friendly name for the dialect. Kept next to the log sites, not on
+        // TranslateMode itself: the enum is part of the public API and does not need
+        // a printing concern attached to it.
+        const char* translate_name(TranslateMode m) noexcept
+        {
+            switch (m)
+            {
+                case TranslateMode::None: return "none";
+                case TranslateMode::Anthropic: return "anthropic";
+                case TranslateMode::Gemini: return "gemini";
+                case TranslateMode::Cohere: return "cohere";
+            }
+            return "?";
+        }
+    } // namespace
+
+    namespace
+    {
         constexpr size_t kInitialBuf = 4096;
         constexpr int kMaxEvents = 1024;
         constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
@@ -615,9 +633,8 @@ namespace llmbridge
         _listen_conn = new Connection();
         _listen_conn->fd = _listen_fd;
         ep_add_read(_listen_conn);
-        std::fprintf(stderr, "llmbridge: listening :%u -> upstream %s:%u%s\n",
-                     _listen_port, _upstream_ip.c_str(), _upstream_port,
-                     _translate == TranslateMode::Anthropic ? " (translate: anthropic)" : "");
+        LB_INFO("listening port=", _listen_port, " upstream=", _upstream_ip, ":", _upstream_port,
+                " translate=", translate_name(_translate));
 
         // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel
         // supports it, else epoll. Uring requested but unavailable -> epoll.
@@ -625,10 +642,10 @@ namespace llmbridge
         const bool uring_ok = net::uring::available();
         if (_io == IoBackend::Uring || _io == IoBackend::Auto) _uring_active = uring_ok;
         if (_io == IoBackend::Uring && !uring_ok)
-            std::fprintf(stderr, "llmbridge: --io=uring requested but io_uring unavailable; using epoll\n");
+            LB_WARN("io_uring requested but unavailable; falling back to epoll");
 #endif
         const char* want = _io == IoBackend::Uring ? "uring" : _io == IoBackend::Epoll ? "epoll" : "auto";
-        std::fprintf(stderr, "llmbridge: io=%s, %s loop\n", want, _uring_active ? "io_uring" : "epoll");
+        LB_INFO("backend requested=", want, " active=", _uring_active ? "io_uring" : "epoll");
     }
 
     Gateway::~Gateway()
@@ -1038,6 +1055,7 @@ namespace llmbridge
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
+            LB_DEBUG("upstream reuse ", *u, " pool=", _idle_upstreams.size());
             return u;
         }
         int fd = net::start_connect(_upstream_ip.c_str(), _upstream_port);
@@ -1058,6 +1076,10 @@ namespace llmbridge
         ep_add_read(u);
         ep_arm_write(u); // learn when the non-blocking connect completes
         ++_stats.upstream_conns_opened;
+        // Pair for the "upstream reuse" line above. Without it an upstream first
+        // appears in the log at its second request and never at its birth, which
+        // reads as if the pool created nothing.
+        LB_DEBUG("upstream open ", *u, " pool=", _idle_upstreams.size());
         return u;
     }
 
@@ -1156,7 +1178,11 @@ namespace llmbridge
     void Gateway::ep_close_client(Connection* c) noexcept
     {
         if (c->doomed) return;
-        if (c->id) _clients.erase(c->id);
+        if (c->id)
+        {
+            _clients.erase(c->id);
+            LB_DEBUG("close ", *c, " clients=", _clients.size());
+        }
         if (c->fd >= 0) { ::close(c->fd); c->fd = -1; }
         c->doomed = true;
         _doomed.push_back(c);
@@ -1167,6 +1193,9 @@ namespace llmbridge
         if (u->doomed) return;
         for (auto it = _idle_upstreams.begin(); it != _idle_upstreams.end(); ++it)
             if (*it == u) { _idle_upstreams.erase(it); break; }
+        // Logged AFTER the erase, so `pool=` is the count this connection is not
+        // in; logging before would print a pool that still contains a dead entry.
+        LB_DEBUG("upstream close ", *u, " pool=", _idle_upstreams.size());
         if (u->fd >= 0) { ::close(u->fd); u->fd = -1; }
         u->doomed = true;
         _doomed.push_back(u);
@@ -1229,6 +1258,7 @@ namespace llmbridge
             }
 #endif
             _clients[c->id] = c;
+            LB_DEBUG("accept ", *c, " clients=", _clients.size());
             ep_add_read(c);
         }
     }
@@ -2068,6 +2098,7 @@ namespace llmbridge
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
+            LB_DEBUG("upstream reuse ", *u, " pool=", _idle_upstreams.size());
             return u;
         }
         const int fd = net::make_client_socket();
@@ -2087,6 +2118,8 @@ namespace llmbridge
         }
 #endif
         ++_stats.upstream_conns_opened;
+        // Pair for the "upstream reuse" line above; see the epoll twin.
+        LB_DEBUG("upstream open ", *u, " pool=", _idle_upstreams.size());
         return u;
     }
 
@@ -2162,9 +2195,18 @@ namespace llmbridge
     void Gateway::ur_close(Connection* c) noexcept
     {
         if (c->doomed) return;
-        if (c->is_client && c->id) _clients.erase(c->id);
+        if (c->is_client && c->id)
+        {
+            _clients.erase(c->id);
+            LB_DEBUG("close ", *c, " clients=", _clients.size());
+        }
         for (auto it = _idle_upstreams.begin(); it != _idle_upstreams.end(); ++it)
             if (*it == c) { _idle_upstreams.erase(it); break; }
+        // Upstream twin of the client line above. This backend closes both kinds in
+        // one function where epoll has two, so the branch lives here instead of in a
+        // dedicated ep_close_upstream. Logged after the erase for the same reason.
+        if (!c->is_client)
+            LB_DEBUG("upstream close ", *c, " pool=", _idle_upstreams.size());
         // Force any in-flight op on this fd to complete so its inflight count drains
         // (the fd is closed at free time). shutdown alone does NOT end an armed
         // multishot recv, so also cancel everything on the fd.
@@ -2268,6 +2310,7 @@ namespace llmbridge
         }
 #endif
         _clients[c->id] = c;
+        LB_DEBUG("accept ", *c, " clients=", _clients.size());
         ur_arm_recv(c); // multishot recv stays armed for the connection's life
     }
 
@@ -2770,13 +2813,13 @@ namespace llmbridge
 #endif
         if (!_ring.init(kRingDepth, flags) && !_ring.init(kRingDepth, 0))
         {
-            std::fprintf(stderr, "llmbridge: io_uring init failed; using epoll\n");
+            LB_WARN("io_uring init failed; falling back to epoll");
             return run_epoll();
         }
         const unsigned bufcount = _uring_buf_count ? _uring_buf_count : kBufCount;
         if (!_bufring.init(_ring, kBufGroup, bufcount, kBufSize))
         {
-            std::fprintf(stderr, "llmbridge: io_uring provided-buffer ring unavailable; using epoll\n");
+            LB_WARN("io_uring provided-buffer ring unavailable; falling back to epoll");
             return run_epoll();
         }
         if (!net::resolve_ipv4(_upstream_ip.c_str(), _upstream_port, _upstream_addr))

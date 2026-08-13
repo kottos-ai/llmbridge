@@ -32,7 +32,7 @@ TEST(Config, FullFileAppliesEveryGroup)
       "upstream": { "url": "https://api.anthropic.com", "translate": "anthropic" },
       "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
-                    "duration_s": 12, "warmup_s": 2 }
+                    "duration_s": 12, "warmup_s": 2, "log_level": "debug" }
     })";
     ConfigFile c;
     std::string err;
@@ -51,6 +51,7 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
     EXPECT_DOUBLE_EQ(c.pool_idle_s, 45);
     EXPECT_EQ(c.io, "uring");
+    EXPECT_EQ(c.log_level, "debug");
     EXPECT_EQ(c.workers, 3);
     EXPECT_TRUE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 12);
@@ -113,6 +114,7 @@ INSTANTIATE_TEST_SUITE_P(
         // bad enum values, and the message lists what is allowed
         std::make_pair(R"({"upstream":{"translate":"claude"}})", "must be one of"),
         std::make_pair(R"({"runtime":{"io":"kqueue"}})", "must be one of"),
+        std::make_pair(R"({"runtime":{"log_level":"verbose"}})", "must be one of"),
         // out of range: a typo meaning milliseconds must not disable a timeout
         std::make_pair(R"({"listen":{"port":70000}})", "out of range"),
         std::make_pair(R"({"timeouts":{"pool_idle_s":99999999}})", "out of range"),
@@ -167,6 +169,7 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_DOUBLE_EQ(c.pool_idle_s,
                      static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9);
     EXPECT_EQ(c.io, "auto");
+    EXPECT_EQ(c.log_level, "info");
     EXPECT_EQ(c.workers, 1);
     EXPECT_FALSE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 0);

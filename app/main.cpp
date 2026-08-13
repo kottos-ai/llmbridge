@@ -36,6 +36,7 @@
 
 #include "config.hpp"
 #include "gateway/gateway.hpp"
+#include "net/log.hpp"
 #include "net/upstream.hpp"
 
 namespace
@@ -65,6 +66,7 @@ static int run(int argc, char** argv)
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     double client_idle = static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9;
     double pool_idle = static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9;
+    std::string log_level = "info";
     int workers = 1;
     bool timing_headers = false;
     // Inbound TLS. ONE LISTENER, ONE MODE: --listen-tls makes the single listener
@@ -135,6 +137,7 @@ static int run(int argc, char** argv)
             io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
                  : cfg.io == "uring" ? llmbridge::IoBackend::Uring
                                      : llmbridge::IoBackend::Auto;
+        if (!cfg.log_level.empty()) log_level = cfg.log_level;
         if (cfg.has_workers) workers = cfg.workers;
         if (cfg.has_timing_headers) timing_headers = cfg.timing_headers;
         if (cfg.has_duration_s) duration = static_cast<int>(cfg.duration_s);
@@ -159,6 +162,7 @@ static int run(int argc, char** argv)
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--client-idle")      { if (const char* v = nextarg()) client_idle = std::atof(v); }
         else if (a == "--pool-idle")        { if (const char* v = nextarg()) pool_idle = std::atof(v); }
+        else if (a == "--log-level")        { if (const char* v = nextarg()) log_level = v; }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--timing-headers") timing_headers = true;
         else if (a == "--listen-tls") listen_tls = true;
@@ -192,11 +196,24 @@ static int run(int argc, char** argv)
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
+                        "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
                         "[--io auto|epoll|uring] [--workers N] [--timing-headers] [--config FILE]\n", argv[0]);
             return 0;
         }
     }
+    llmbridge::net::log::register_thread("main", 0);
+    {
+        llmbridge::net::log::Level lv{};
+        if (!llmbridge::net::log::level_from_name(log_level, lv))
+        {
+            std::fprintf(stderr, "llmbridge: unknown --log-level '%s'; expected one of "
+                                 "trace debug info warn error off\n", log_level.c_str());
+            return 2;
+        }
+        llmbridge::net::log::set_level(lv);
+    }
+
     if (workers < 1) workers = 1;
 
     if (listen_tls && (tls_cert.empty() || tls_key.empty()))
@@ -270,11 +287,9 @@ static int run(int argc, char** argv)
     {
         const bool loopback = upstream_ip.rfind("127.", 0) == 0 || upstream_ip == "::1";
         if (!up.tls && !loopback)
-            std::fprintf(stderr,
-                         "llmbridge: WARNING: upstream %s:%u is plaintext HTTP and not "
-                         "loopback. Any client credential forwarded to it travels "
-                         "UNENCRYPTED. Use https:// for a real provider.\n",
-                         up.host.c_str(), upstream_port);
+            LB_WARN("upstream is plaintext HTTP and not loopback; any client credential "
+                    "forwarded to it travels UNENCRYPTED, use https:// for a real provider. "
+                    "host=", up.host, " port=", upstream_port);
     }
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -317,7 +332,13 @@ static int run(int argc, char** argv)
     }
 
     std::vector<std::thread> threads;
-    for (auto& g : gateways) threads.emplace_back([gp = g.get()] { gp->run(); });
+    unsigned widx = 0;
+    for (auto& g : gateways)
+        threads.emplace_back([gp = g.get(), i = widx++] {
+            // Before anything the loop logs, so every line names its worker.
+            llmbridge::net::log::register_thread("worker", i);
+            gp->run();
+        });
     for (auto& t : threads) t.join();
     if (timer.joinable()) timer.join();
 
