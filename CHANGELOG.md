@@ -8,7 +8,81 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
-## [Unreleased]
+## [0.13.0]. 2026-08-13
+
+**Logging.** The gateway said almost nothing about itself: five `fprintf` lines at
+startup, and silence thereafter. Twenty-eight error sites collapsed into three status
+codes with no cause, every TLS handshake failure looked identical to a closed socket,
+and every configured limit was reached without a word. This release makes a running
+process describe itself.
+
+MINOR: new functionality. `net/log.hpp` is internal (only `provider/include/provider`
+is installed), so the public C++ API is unchanged.
+
+### Added
+
+- **A logger** (`--log-level`, `runtime.log_level`, `-DLLMBRIDGE_LOG_LEVEL`; stderr,
+  default `info`), sized so it cannot cost the latency claim. Twenty events per request
+  at ~84k RPS is 1.7M records/second against a budget of 41-80 us added p99 for the
+  whole request, and one `fprintf` costs 1-5 us under a lock, so a conventional logger
+  would invalidate the benchmark. Hence a
+  **compile-time floor** that removes lower call sites entirely, so their arguments are
+  never evaluated; a runtime level behind one relaxed atomic load; a **fixed stack
+  buffer**, no allocation and no iostreams; and one `write(2)` per line, no mutex, so
+  concurrent workers interleave whole lines.
+
+- **Three subjects lead every message**, because a line you cannot attribute is a line
+  that costs a reader time: `ClientConnection#42(fd=17,cid=3)`,
+  `UpstreamConnection#8(fd=7)`, `Request#123`. The instance number is process-unique
+  and never reused, unlike the fd, which the kernel recycles the moment a connection
+  closes. Objects get a print method through a free `log_put` found by ADL, which is
+  how a class becomes loggable without dragging iostreams onto the event loop. Every
+  line also names its thread (`worker/2`), not a fifteen-digit `pthread_self`.
+
+- **Per-request tracing at DEBUG**: the request line, which upstream served it and
+  whether that upstream came from the pool, and the response status with byte count and
+  keep-alive. Connection accept and close carry the live client count; upstream
+  acquisition carries the pool depth.
+
+- **A `Sink` seam.** The built-in sink writes to stderr.
+
+- **Error causes.** `*_error_respond` now takes a reason, at all 28 sites: `request
+  framing`, `request translate`, `malformed credential`, `no upstream (connect failed)`,
+  `upstream connect refused`, `upstream write failed, retry exhausted`, `upstream EOF,
+  retry exhausted`, `upstream response head framing`, `upstream response framing`,
+  `response translate`, `upstream idle timeout`. The level is derived from the code and
+  never chosen per site: 4xx is the client's fault and is DEBUG, 5xx is ours or the
+  provider's and is WARN. Backwards, and you either drown in 4xx noise at scale or miss
+  an outage.
+
+- **TLS handshake failures.** `Session::last_error()` was consumed in zero places in
+  shipped code, so a failure produced a closed socket and no diagnostic. The three most
+  likely first-deployment failures are now distinguishable at a glance: plaintext sent
+  to a TLS listener (`http request`), a client that does not trust the certificate
+  (`tlsv1 alert unknown ca`), and success. The strings are OpenSSL reason codes and
+  carry no key material.
+
+- **Every parameterised boundary says when it is hit**, tagged `CAP` or `TIMEOUT` so
+  one grep finds them all, and each carries the measured value against the limit so
+  "barely over" is distinguishable from "wildly over": the upstream pool cap, the
+  io_uring 8 MiB stream cap, epoll back-pressure (with its matching resume, since a log
+  that opens an episode and never closes it reads as still stuck), io_uring
+  provided-buffer exhaustion, the three timeouts, and the stale-pooled-connection retry.
+
+  **All of these are WARN**, including the ones handled gracefully. Grading by
+  consequence was wrong: at the default `info` floor a DEBUG line is compiled out, so
+  epoll back-pressure would have been invisible in production while the io_uring stream
+  drop stayed visible. Same event class, two backends, one log.
+
+### Changed
+
+- The five startup `fprintf` lines are now log lines. Usage and argument errors keep
+  `fprintf` deliberately: they happen before the log level is known and their audience
+  is a shell, not a log pipeline.
+- **One assignment point for the request sequencer.** `x-llmbridge-seq` used to fetch
+  its own value; both it and the log lines now read `Connection::req_seq`, assigned once
+  when the request frames, so a log line and a response header cannot name different
+  requests.
 
 Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting an
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and

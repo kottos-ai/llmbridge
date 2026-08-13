@@ -169,6 +169,34 @@ Gemini) and forwards **only** that; no other client header crosses into the rebu
 upstream request. Certificate and hostname verification are always on and cannot be
 disabled.
 
+### Logging
+
+The gateway logs to stderr. `--log-level trace|debug|info|warn|error|off` (default
+`info`), or `runtime.log_level` in a config file.
+
+```
+2026-08-13T15:05:40.315Z WARN  worker/0 gateway.cpp:2881 CAP stream buffer exceeded,
+    dropping the stream ClientConnection#1(fd=6,cid=1) buffered=8389260 limit=8388608
+```
+
+Three subjects lead every message so a line can be attributed at a glance:
+`ClientConnection#N`, `UpstreamConnection#N`, `Request#N`. The instance number is
+process-unique and never reused, unlike the file descriptor, which the kernel recycles
+as soon as a connection closes. Each line also names the worker thread.
+
+`DEBUG` carries the per-request trace (request line, chosen upstream and whether it
+came from the pool, response status), and **is compiled out by default** so the
+published latency numbers are measured on exactly what ships. Build with
+`-DLLMBRIDGE_LOG_LEVEL=debug` to compile it in; raising `--log-level` at runtime cannot
+resurrect a line the build omitted.
+
+`WARN` is reserved for things an operator should act on: every error with its cause,
+TLS handshake failures with the OpenSSL reason, and **every configured limit when it is
+hit** (pool cap, the 8 MiB streaming cap, back-pressure, buffer exhaustion, the three
+timeouts), each carrying the measured value against the limit.
+
+No credential appears at any level. Header names and lengths are logged, never values.
+
 ### Configuration file
 
 Everything above is also settable from a JSON file, which is where this is heading:

@@ -216,6 +216,47 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
+## Logging
+
+A logger in a process that sells a latency number is a hazard, not a convenience.
+Twenty interesting events per request at ~84k RPS is 1.7M records/second against a
+budget of 41-80 us added p99 for the entire request; one `fprintf` costs 1-5 us and
+takes a lock. Twenty of those exceed the whole published figure, so the wrong design
+here invalidates the benchmark.
+
+What follows from that:
+
+- **Two gates.** A compile-time floor (`-DLLMBRIDGE_LOG_LEVEL=`, default `info`)
+  removes lower call sites entirely, so their arguments are never even evaluated and a
+  Release build carries no per-request logging code at all. A runtime level then gates
+  what remains, as one relaxed atomic load and a predictable branch.
+- **No allocation and no iostreams.** Lines are built in a fixed stack buffer and
+  truncate; they never grow. `operator<<` would mean locales, virtual dispatch and
+  allocation on the event loop; objects instead define a free `log_put` found by ADL,
+  which reads the same at the call site and costs none of it.
+- **One `write(2)` per line, no mutex**, so concurrent workers interleave whole lines
+  instead of fragments.
+- **A `Sink` seam.** The built-in sink writes to stderr, which is right for a sidecar.
+
+**Identity is the point.** A log line nobody can attribute is worth nothing, so three
+subjects lead every message: `ClientConnection#N`, `UpstreamConnection#N`, `Request#N`.
+The instance number comes from a process-wide monotonic counter and is never reused;
+the file descriptor is printed too, because it is what `ss`, `lsof` and `strace` show,
+but it is a correlator and not an identity: the kernel hands fd 6 to the next
+connection the moment the last one closes, and to either side of the proxy.
+`Request#N` is the same sequencer value that `x-llmbridge-seq` reports, assigned once
+when the request frames, so a log line and a response header cannot disagree.
+
+**Levels carry a rule.** 4xx is the client's fault and is DEBUG; 5xx, timeouts and
+truncations are ours or the provider's and are WARN. Every configured limit logs at
+WARN when hit, including limits handled gracefully, because at the default floor a
+DEBUG line does not exist in the binary: grading by consequence would have made epoll
+back-pressure invisible in production while the io_uring stream drop stayed visible,
+which is the backend divergence this codebase works hardest to avoid.
+
+**No credential at any level.** Header names and lengths, never values. `SECURITY.md`
+promises credentials are never logged, and the call sites are where that is kept.
+
 ## Configuration (`--config FILE`)
 
 Flags remain the primary interface and `bench/*.sh` drives the daemon with eight of

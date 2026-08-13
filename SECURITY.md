@@ -113,7 +113,11 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
   confusing parse failure. TLS renegotiation is disabled.
 - **Credentials are never logged**, never placed in an error body, metric or stats
   output, and the pooled upstream request buffer is scrubbed on release instead of
-  merely cleared.
+  merely cleared. The logger records header names and lengths, never values, and no
+  log level changes that: raising the level adds detail about the request, never its
+  credential. The one request field that is logged verbatim is the start line
+  (`POST /v1/chat/completions HTTP/1.1`), which is cut at the first CR and capped, so
+  no header can reach it.
 - **Client headers are not echoed.** A translated request is rebuilt from an explicit
   whitelist, so cookies, tracing headers and anything else a client sends do not reach
   the provider.
