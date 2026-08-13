@@ -225,6 +225,11 @@ namespace llmbridge
         // must not hold a slot forever. Once a request has framed the peer has
         // proved it speaks the protocol, and ordinary keep-alive rules apply.
         int64_t ts_accepted = 0;
+        // CLIENT conns: when this connection last completed a request. Distinct from
+        // ts_accepted, which never moves: the setup deadline reaps a client that never
+        // framed anything, and this reaps one that framed something long ago and then
+        // sat on the descriptor. Not part of the t0-t6 scheme; it is per CONNECTION.
+        int64_t ts_client_activity = 0;
         bool ever_framed = false;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
@@ -343,7 +348,7 @@ namespace llmbridge
         bool stream_keep_alive = false;
 
         // Upstream conns only: when this connection entered the idle pool. Idle
-        // keep-alives are reaped after kIdleUpstreamNs. Providers drop them on
+        // keep-alives are reaped after _pool_idle_ns (--pool-idle). Providers drop them on
         // their own schedule, and a pooled corpse costs a retry to discover.
         int64_t ts_pooled = 0;
 
@@ -423,6 +428,7 @@ namespace llmbridge
         // never reads grow us without bound?", which is answerable only by a number.
         uint64_t tls_buffered_peak = 0;
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
+        uint64_t client_idle_timeouts = 0;  // established clients dropped after going quiet
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
                                             // first request (stall, or a client
                                             // speaking the wrong protocol at us)
@@ -444,7 +450,7 @@ namespace llmbridge
         // a streaming gateway pools roughly one upstream per concurrent stream, so
         // without a bound it is an fd leak in slow motion (4k streams => 4k idle fds
         // pinned indefinitely). Excess conns are closed instead of pooled, and idle
-        // entries are reaped after kIdleUpstreamNs on the loop's periodic tick.
+        // entries are reaped after _pool_idle_ns on the loop's periodic tick.
         //
         // SIZE THIS GENEROUSLY. The cap must exceed the number of upstreams in flight
         // at peak, or it stops being a bound and becomes a reuse *killer*: once the
@@ -458,7 +464,13 @@ namespace llmbridge
         // The real reclaim mechanism is the idle timeout, not the cap: the cap only
         // has to stop pathological growth, so err high.
         static constexpr size_t kMaxIdleUpstreams = 8192;
-        static constexpr int64_t kIdleUpstreamNs = 30LL * 1000 * 1000 * 1000; // 30 s
+        // How long a POOLED upstream may sit unused before it is closed. 30 s is a
+        // compromise for one upstream and one worker; it is the wrong number as soon
+        // as either multiplies. Traffic divides across N workers (each has its own
+        // pool) and, once routing lands, across M upstreams, so each pool sees ~1/(N*M)
+        // of the requests and crosses this line far more often. Every crossing costs
+        // the next request a full reconnect. Hence a knob, not a constant.
+        static constexpr int64_t kDefaultPoolIdleNs = 30LL * 1000 * 1000 * 1000; // 30 s
         // How long a client may stay connected without completing one request.
         // Covers a TLS handshake that never finishes, a half-sent request, and a
         // client speaking the wrong protocol (TLS at a plaintext listener frames
@@ -466,6 +478,11 @@ namespace llmbridge
         // client on a cold TLS handshake is a real thing, and this only has to
         // bound the hold, never be tight.
         static constexpr int64_t kClientSetupNs = 30LL * 1000 * 1000 * 1000; // 30 s
+        // An ESTABLISHED client that goes quiet. Deliberately enormous: this is a
+        // descriptor bound for an exposed listener, never a load-balancing device.
+        // Anything short would charge a reconnecting client a fresh TCP+TLS handshake
+        // to solve a problem the client cannot see. 0 disables it.
+        static constexpr int64_t kDefaultClientIdleNs = 3LL * 24 * 3600 * 1000 * 1000 * 1000;
 
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
@@ -493,6 +510,10 @@ namespace llmbridge
 
         // Test seam. Production never calls this; the default is kClientSetupNs.
         void set_client_setup_ns(int64_t ns) noexcept { _client_setup_ns = ns; }
+        /// Test seam, same contract as set_client_setup_ns: call BEFORE run().
+        void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
+        /// Test seam, same contract: call BEFORE run(). 0 disables pool reaping.
+        void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
 
         // Test seam: does any POOLED upstream still hold `needle` in its request
         // buffer? A pooled connection idles for up to 30 s and is then handed to
@@ -721,6 +742,8 @@ namespace llmbridge
         // test. An untested deadline on an internet-facing listener is the same as
         // no deadline, because nothing would tell us when it stopped working.
         int64_t _client_setup_ns = kClientSetupNs;
+        int64_t _client_idle_ns = kDefaultClientIdleNs;
+        int64_t _pool_idle_ns = kDefaultPoolIdleNs;
         TranslateMode _translate;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout

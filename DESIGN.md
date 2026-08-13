@@ -216,6 +216,33 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
+## Configuration (`--config FILE`)
+
+Flags remain the primary interface and `bench/*.sh` drives the daemon with eight of
+them, so the file is **additive**: it is read first and every flag overwrites it.
+Precedence is not positional, a flag wins wherever it sits, and `--config` twice is an
+error instead of one file silently winning.
+
+It exists because the next feature does not fit in flags. Multi-upstream routing needs
+an ordered list with per-upstream fields (host, TLS, SNI, dialect, route tag), and flat
+flags cannot express that without inventing a mini-language with none of the tooling
+and worse errors. The shape is grouped (`listen`, `upstream`, `timeouts`, `runtime`) so
+`upstream` can become an array without disturbing the rest.
+
+Parsed with `provider/json.hpp`, the same hand-rolled parser the translator uses, so
+the file adds **no dependency**. That parser is a zero-copy DOM over `string_view`, so
+`ConfigFile` copies every value out and owns `std::string`; a field holding a view
+would be a use-after-free the moment the buffer went away, and a test clobbers the
+input buffer before reading the values back to keep that honest.
+
+**Unknown keys are a startup error.** This is the same discipline as the framing code:
+a config parser that skips a misspelled `listen_tls` fails open, and unlike a command
+line there is no `ps` output to catch it. Wrong types, bad enum values and
+out-of-range numbers are refused the same way, each naming the key. Keys beginning
+with `_` are comments, which is what makes strictness affordable in a format that has
+none. `app/llmbridge.example.json` documents every key at its default value, and a
+test pins those values against the constants so the example cannot drift.
+
 ## TLS on both legs (`-DLLMBRIDGE_TLS=ON`)
 
 Off by default. The default build stays **zero-dependency** end to end; enabling TLS

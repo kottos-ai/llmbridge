@@ -142,6 +142,11 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
 - **A slow client can hold memory.** Streaming output is bounded per connection (the
   upstream read is paused on one backend, the buffer capped at 8 MiB on the other),
   but that bound is per connection, not global.
+- **No per-client quota or rate limit.** Connection setup is bounded (30 s to frame a
+  first request) and an established client that goes quiet is closed after
+  `--client-idle`, three days by default, so a descriptor cannot be held forever. That
+  is a resource bound, not a fairness mechanism: nothing limits how much a single
+  client may send.
 
 ## Security best practices for users
 

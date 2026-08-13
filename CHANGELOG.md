@@ -14,6 +14,54 @@ Next up: **Anthropic-in mode** (clients that speak the Anthropic API, fronting a
 OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, and
 `cache_control`.
 
+## [0.12.0]. 2026-08-12
+
+### Added
+
+- **`--client-idle SECONDS`**, closing an established client connection that has gone
+  quiet. Default three days; `0` disables it. The existing 30 s setup deadline only
+  reaps connections that never framed a request, because `ever_framed` latches on the
+  first one, so before this a client could send a single request and then hold a file
+  descriptor indefinitely. It is a **descriptor bound for an exposed listener, not a
+  load-balancing device**: a short window would charge a reconnecting client a fresh
+  TCP+TLS handshake to solve a problem the client cannot observe. Requests and streams
+  in flight are never reaped, and `stats.client_idle_timeouts` counts what was.
+- **`--config FILE`**, an optional JSON configuration file. Fourteen flags is
+  uncomfortable and the fifteenth is impossible: multi-upstream routing needs an
+  ordered list with per-upstream fields, which flat flags cannot express without
+  inventing a mini-language. The shape is grouped (`listen`, `upstream`, `timeouts`,
+  `runtime`) so `upstream` can become an array later without disturbing the rest.
+  Every flag still works and **the CLI overrides the file**, so nothing that drives
+  the daemon today has to change. Annotated example in `app/llmbridge.example.json`.
+
+  **Unknown keys are a startup error, never ignored.** A config parser that skips a
+  misspelled `listen_tls` fails open in exactly the shape fixed in 0.11.0, and a file
+  has no `ps` output to catch it. Wrong types, bad enum values and out-of-range
+  numbers are refused the same way, each naming the offending key. Keys beginning
+  with `_` are comments, since JSON has none and the file is edited by hand.
+
+- **`--pool-idle SECONDS`**, how long a pooled upstream may sit unused before it is
+  closed. Previously a hardcoded 30 s. That is a reasonable compromise for one upstream
+  and one worker, and the wrong number as soon as either multiplies: every worker keeps
+  its own pool, so offered traffic divides across them, each pool crosses the idle line
+  more often, and every crossing costs the next request a full reconnect and handshake.
+  Default unchanged at 30 s; `0` disables reaping.
+
+### Changed
+
+- **The three TLS startup refusals now name both surfaces.** They named only flags,
+  such as `--tls-cert/--tls-key given without --listen-tls`, which an operator using a
+  config file never passed. They now name the config keys as well.
+
+### Fixed
+
+- **The installed package reported the wrong version.** `project(llmbridge VERSION ...)`
+  was left at `0.10.1` when 0.11.0 was tagged, and that value feeds
+  `write_basic_package_version_file`, so `find_package(llmbridge 0.11 REQUIRED)` against
+  a 0.11.0 install would have failed. The consumer job in CI calls `find_package` with
+  no version, which is why nothing caught it; `scripts/check_conventions.py` now fails
+  the build when the CMake version and the newest CHANGELOG entry disagree.
+
 ## [0.11.0]. 2026-08-12
 
 **Inbound TLS.** The gateway now terminates the client's TLS as well as originating

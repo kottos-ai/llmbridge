@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "config.hpp"
 #include "gateway/gateway.hpp"
 #include "net/upstream.hpp"
 
@@ -62,6 +63,8 @@ static int run(int argc, char** argv)
     double warmup = 0;
     // Seconds of upstream silence before a request/stream is aborted (0 = off).
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
+    double client_idle = static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9;
+    double pool_idle = static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9;
     int workers = 1;
     bool timing_headers = false;
     // Inbound TLS. ONE LISTENER, ONE MODE: --listen-tls makes the single listener
@@ -72,10 +75,77 @@ static int run(int argc, char** argv)
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
+    // --config is applied FIRST and flags overwrite it, so the CLI always wins and a
+    // one-off override needs no file edit. bench/*.sh drives this daemon with eight
+    // flags and must keep working, so the file is additive, never a replacement.
+    // --config is applied FIRST and flags overwrite it, so the CLI always wins and a
+    // one-off override needs no file edit. Precedence is NOT positional: a flag wins
+    // whether it sits before or after --config. bench/*.sh drives this daemon with
+    // eight flags and must keep working, so the file is additive, never a replacement.
+    //
+    // Argument validation runs before any I/O, so `--config a --config b` reports the
+    // duplicate instead of whichever file happened to be unreadable first.
+    const char* config_path = nullptr;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string_view(argv[i]) != "--config") continue;
+        if (i + 1 >= argc)
+        {
+            std::fprintf(stderr, "llmbridge: --config needs a path\n");
+            return 2;
+        }
+        // Refuse a second --config instead of quietly using the first. Silently
+        // discarding the operator's later file is the same fail-open shape the parser
+        // refuses for unknown keys, and it is invisible from the outside.
+        if (config_path)
+        {
+            std::fprintf(stderr,
+                         "llmbridge: --config given twice (%s and %s); pass it once\n",
+                         config_path, argv[i + 1]);
+            return 2;
+        }
+        config_path = argv[i + 1];
+    }
+
+    if (config_path)
+    {
+        llmbridge::app::ConfigFile cfg;
+        std::string cfg_err;
+        if (!llmbridge::app::load_config(config_path, cfg, cfg_err))
+        {
+            // Fail closed and name the key. A config that half-applies is how an
+            // operator ends up believing a setting took effect when it did not.
+            std::fprintf(stderr, "llmbridge: %s\n", cfg_err.c_str());
+            return 2;
+        }
+        if (cfg.has_listen_port) listen_port = cfg.listen_port;
+        if (cfg.has_listen_tls) listen_tls = cfg.listen_tls;
+        if (!cfg.tls_cert.empty()) tls_cert = cfg.tls_cert;
+        if (!cfg.tls_key.empty()) tls_key = cfg.tls_key;
+        if (!cfg.upstream_url.empty()) upstream_arg = cfg.upstream_url;
+        if (!cfg.translate_mode.empty())
+            translate = cfg.translate_mode == "anthropic" ? llmbridge::TranslateMode::Anthropic
+                        : cfg.translate_mode == "gemini"  ? llmbridge::TranslateMode::Gemini
+                        : cfg.translate_mode == "cohere"  ? llmbridge::TranslateMode::Cohere
+                                                          : llmbridge::TranslateMode::None;
+        if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
+        if (cfg.has_client_idle_s) client_idle = cfg.client_idle_s;
+        if (cfg.has_pool_idle_s) pool_idle = cfg.pool_idle_s;
+        if (!cfg.io.empty())
+            io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
+                 : cfg.io == "uring" ? llmbridge::IoBackend::Uring
+                                     : llmbridge::IoBackend::Auto;
+        if (cfg.has_workers) workers = cfg.workers;
+        if (cfg.has_timing_headers) timing_headers = cfg.timing_headers;
+        if (cfg.has_duration_s) duration = static_cast<int>(cfg.duration_s);
+        if (cfg.has_warmup_s) warmup = cfg.warmup_s;
+    }
+
     for (int i = 1; i < argc; ++i)
     {
         const std::string_view a = argv[i];
         auto nextarg = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
+        if (a == "--config") { (void)nextarg(); continue; } // already applied above
         if (a == "--listen")
         {
             if (const char* v = nextarg()) listen_port = static_cast<uint16_t>(std::atoi(v));
@@ -87,6 +157,8 @@ static int run(int argc, char** argv)
         else if (a == "--duration") { if (const char* v = nextarg()) duration = std::atoi(v); }
         else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
+        else if (a == "--client-idle")      { if (const char* v = nextarg()) client_idle = std::atof(v); }
+        else if (a == "--pool-idle")        { if (const char* v = nextarg()) pool_idle = std::atof(v); }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--timing-headers") timing_headers = true;
         else if (a == "--listen-tls") listen_tls = true;
@@ -119,9 +191,9 @@ static int run(int argc, char** argv)
                         "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--translate none|anthropic|gemini|cohere] "
-                        "[--upstream-timeout SECONDS] "
+                        "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
-                        "[--io auto|epoll|uring] [--workers N] [--timing-headers]\n", argv[0]);
+                        "[--io auto|epoll|uring] [--workers N] [--timing-headers] [--config FILE]\n", argv[0]);
             return 0;
         }
     }
@@ -129,14 +201,16 @@ static int run(int argc, char** argv)
 
     if (listen_tls && (tls_cert.empty() || tls_key.empty()))
     {
-        std::fprintf(stderr, "llmbridge: --listen-tls needs --tls-cert and --tls-key\n");
+        std::fprintf(stderr, "llmbridge: a TLS listener needs a certificate and a key "
+                             "(--tls-cert/--tls-key, or listen.cert/listen.key in a config file)\n");
         return 2;
     }
     if (!listen_tls && (!tls_cert.empty() || !tls_key.empty()))
     {
         // A certificate given without --listen-tls means the operator believes the
         // listener is encrypted when it is not. Refuse instead of ignoring it.
-        std::fprintf(stderr, "llmbridge: --tls-cert/--tls-key given without --listen-tls\n");
+        std::fprintf(stderr, "llmbridge: a certificate/key was given without enabling the "
+                             "TLS listener (--listen-tls, or listen.tls in a config file)\n");
         return 2;
     }
 #ifndef LLMBRIDGE_HAVE_TLS
@@ -146,9 +220,10 @@ static int run(int argc, char** argv)
         // without this the flag is accepted, the listener serves plaintext, and the
         // operator has every client credential on the wire believing otherwise. The
         // upstream leg refuses the mirror case a few lines down.
-        std::fprintf(stderr, "llmbridge: --listen-tls requires a TLS build. "
-                             "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
-                             "Refusing to serve plaintext on a listener asked to be TLS.\n");
+        std::fprintf(stderr, "llmbridge: a TLS listener (--listen-tls, or listen.tls in a "
+                             "config file) requires a TLS build. Reconfigure with "
+                             "-DLLMBRIDGE_TLS=ON (needs OpenSSL). Refusing to serve plaintext "
+                             "on a listener asked to be TLS.\n");
         return 2;
     }
 #endif
@@ -219,9 +294,13 @@ static int run(int argc, char** argv)
         tls.client_tls = listen_tls;
         tls.cert_file = tls_cert;
         tls.key_file = tls_key;
-        gateways.push_back(std::make_unique<llmbridge::Gateway>(
+        auto gw = std::make_unique<llmbridge::Gateway>(
             listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
-            timing_headers));
+            timing_headers);
+        // Before run(): the loop thread reads it, so setting it later is a data race.
+        gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
+        gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));
+        gateways.push_back(std::move(gw));
     }
     g_gateways = &gateways;
 
@@ -251,6 +330,7 @@ static int run(int argc, char** argv)
         agg.errors += s.errors;
         agg.upstream_timeouts += s.upstream_timeouts;
         agg.client_setup_timeouts += s.client_setup_timeouts;
+        agg.client_idle_timeouts += s.client_idle_timeouts;
         agg.stream_pauses += s.stream_pauses;
         agg.uring_enobufs += s.uring_enobufs;
         agg.upstream_conns_opened += s.upstream_conns_opened;
@@ -267,9 +347,11 @@ static int run(int argc, char** argv)
     }
     std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
-    std::fprintf(stderr, "timeouts=%llu  client_setup_timeouts=%llu  stream_pauses=%llu  uring_enobufs=%llu\n",
+    std::fprintf(stderr, "timeouts=%llu  client_setup_timeouts=%llu  client_idle_timeouts=%llu  "
+                 "stream_pauses=%llu  uring_enobufs=%llu\n",
                  (unsigned long long)agg.upstream_timeouts,
-                 (unsigned long long)agg.client_setup_timeouts, (unsigned long long)agg.stream_pauses,
+                 (unsigned long long)agg.client_setup_timeouts,
+                 (unsigned long long)agg.client_idle_timeouts, (unsigned long long)agg.stream_pauses,
                  (unsigned long long)agg.uring_enobufs);
     std::fprintf(stderr,
                  "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu  "

@@ -1,8 +1,14 @@
 # app: the runnable llmbridge gateway daemon. The gateway logic
 # lives in the `gateway` library module; this is just the CLI/signal shell.
 
-add_executable(llmbridge main.cpp)
-target_link_libraries(llmbridge PRIVATE gateway)
+add_executable(llmbridge main.cpp config.cpp)
+target_link_libraries(llmbridge PRIVATE gateway provider)
+target_include_directories(llmbridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# The config parser as a library too, so it can be tested without running main().
+add_library(llmbridge_config STATIC config.cpp)
+target_link_libraries(llmbridge_config PUBLIC provider)
+target_include_directories(llmbridge_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Install the daemon (so `cmake --install` puts `llmbridge` on PATH). Top-level only.
 if (PROJECT_IS_TOP_LEVEL)
@@ -23,20 +29,38 @@ if (LLMBRIDGE_BUILD_TESTS)
     endfunction()
 
     llmbridge_cli_refuses(CliRefusesListenTlsWithoutCert
-            "--listen-tls needs --tls-cert and --tls-key"
+            "a TLS listener needs a certificate and a key"
             --listen 0 --upstream 127.0.0.1:9 --listen-tls)
+    llmbridge_cli_refuses(CliRefusesConfigWithoutPath
+            "--config needs a path"
+            --config)
+    llmbridge_cli_refuses(CliRefusesDuplicateConfig
+            "given twice"
+            --config /nonexistent/a.json --config /nonexistent/b.json)
+    llmbridge_cli_refuses(CliRefusesUnreadableConfig
+            "cannot read"
+            --config /nonexistent/llmbridge.json)
     llmbridge_cli_refuses(CliRefusesCertWithoutListenTls
-            "--tls-cert/--tls-key given without --listen-tls"
+            "certificate/key was given without enabling the"
             --listen 0 --upstream 127.0.0.1:9 --tls-cert /nonexistent --tls-key /nonexistent)
 
     if (NOT LLMBRIDGE_TLS)
         # Both fail-open cases a non-TLS build must refuse instead of downgrading.
         llmbridge_cli_refuses(CliRefusesListenTlsWithoutTlsBuild
-                "--listen-tls requires a TLS build"
+                "requires a TLS build"
                 --listen 0 --upstream 127.0.0.1:9 --listen-tls
                 --tls-cert /nonexistent --tls-key /nonexistent)
         llmbridge_cli_refuses(CliRefusesHttpsUpstreamWithoutTlsBuild
                 "https:// upstream requires a TLS build"
                 --listen 0 --upstream https://example.invalid)
     endif ()
+endif ()
+
+if (LLMBRIDGE_BUILD_TESTS)
+    include(GoogleTest)
+    add_executable(app_config_test tests/config_test.cpp)
+    target_link_libraries(app_config_test PRIVATE llmbridge_config gateway GTest::gtest_main)
+    target_compile_definitions(app_config_test PRIVATE
+            LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json")
+    gtest_discover_tests(app_config_test)
 endif ()

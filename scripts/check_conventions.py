@@ -286,6 +286,28 @@ def main():
               f"types; the extractor is broken, not the code.", file=sys.stderr)
         return 2
 
+    # ------------------------------------------------- release version agreement
+    # project(VERSION) feeds write_basic_package_version_file, so a stale value makes
+    # find_package(llmbridge <ver> REQUIRED) fail against a correct install. It went
+    # unnoticed through the 0.11.0 tag: the consumer job calls find_package with NO
+    # version, so nothing compared them. Derived from the CHANGELOG, not from a
+    # second hand-maintained constant, because two places to update is how it drifted.
+    cml = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    m = re.search(r"project\(\s*llmbridge\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)", cml)
+    if not m:
+        failures.append("CMakeLists.txt: VERSION: no project(llmbridge VERSION x.y.z) found")
+    else:
+        cmake_ver = m.group(1)
+        chg = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        rel = re.findall(r"^## \[([0-9]+\.[0-9]+\.[0-9]+)\]", chg, re.M)
+        if not rel:
+            failures.append("CHANGELOG.md: VERSION: no released `## [x.y.z]` heading found")
+        elif rel[0] != cmake_ver:
+            failures.append(
+                f"CMakeLists.txt: VERSION: project() says {cmake_ver} but the newest "
+                f"CHANGELOG entry is {rel[0]}; the installed "
+                f"llmbridgeConfigVersion.cmake would lie to consumers")
+
     # ---------------------------------------------------------------- report
     if failures:
         print(f"convention check FAILED ({len(failures)} violation"
@@ -298,7 +320,7 @@ def main():
     twins = sum(1 for n in spans if n.startswith("ep_") and "ur_" + n[3:] in spans)
     print(f"convention check OK: {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
           f"0 crossings, 0 unmarked, namespaces mirror directories, "
-          f"LATENCY.md stamp refs resolve, "
+          f"LATENCY.md stamp refs resolve, release version agrees, "
           f"{n_consts} constants + {n_types} types correctly cased")
     return 0
 

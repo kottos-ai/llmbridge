@@ -104,7 +104,7 @@ namespace llmbridge
         // detected platform primitive instead of a compiler trick.
         //
         // Scope is deliberately narrow: the only place a credential OUTLIVES its
-        // request is a pooled upstream, which idles up to kIdleUpstreamNs (30 s)
+        // request is a pooled upstream, which idles up to _pool_idle_ns (30 s default)
         // holding the request that carried the key. Transient buffers are
         // overwritten microseconds later and are not worth a hot-path memset.
         // Measured: 2.4 ns for a typical ~96 B request buffer, once per request
@@ -1215,6 +1215,7 @@ namespace llmbridge
             c->is_client = true;
             c->id = _next_client_id++;
             c->ts_accepted = now_ns();
+        c->ts_client_activity = c->ts_accepted;
             c->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
             if (_tls.client_tls && !tls_attach_client(c))
@@ -1302,6 +1303,7 @@ namespace llmbridge
         c->peer = u;
         u->peer = c;
         c->ever_framed = true;        // past the setup deadline for good
+        c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
@@ -1726,7 +1728,7 @@ namespace llmbridge
         for (size_t i = 0; i < _idle_upstreams.size();)
         {
             Connection* u = _idle_upstreams[i];
-            if (u->ts_pooled != 0 && now - u->ts_pooled > kIdleUpstreamNs)
+            if (_pool_idle_ns > 0 && u->ts_pooled != 0 && now - u->ts_pooled > _pool_idle_ns)
             {
                 _idle_upstreams.erase(_idle_upstreams.begin() + static_cast<long>(i));
 #ifdef LLMBRIDGE_HAVE_URING
@@ -1761,6 +1763,32 @@ namespace llmbridge
                 if (uring) { ur_close(c); continue; }
 #endif
                 ep_close_client(c);
+            }
+        }
+
+        // An ESTABLISHED client that has gone quiet. Separate from the setup deadline
+        // above, which only reaps connections that never framed anything: once
+        // ever_framed latches, that check stops applying for the connection's life, so
+        // without this a client could send one request and then hold a descriptor
+        // forever. Skipped while a request or stream is in flight, because a slow
+        // provider is not an idle client.
+        if (_client_idle_ns > 0)
+        {
+            std::vector<Connection*> quiet;
+            for (auto& [id, c] : _clients)
+            {
+                if (c->doomed || !c->ever_framed || c->ts_client_activity == 0) continue;
+                if (c->peer != nullptr || c->streaming) continue; // in flight
+                if (now - c->ts_client_activity > _client_idle_ns) quiet.push_back(c);
+            }
+            for (Connection* c : quiet)
+            {
+                ++_stats.client_idle_timeouts;
+#ifdef LLMBRIDGE_HAVE_URING
+                if (uring) ur_close(c);
+                else
+#endif
+                    ep_close_client(c);
             }
         }
 
@@ -2225,6 +2253,7 @@ namespace llmbridge
         c->is_client = true;
         c->id = _next_client_id++;
         c->ts_accepted = now_ns();
+        c->ts_client_activity = c->ts_accepted;
         c->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (_tls.client_tls && !tls_attach_client(c))
@@ -2412,6 +2441,7 @@ namespace llmbridge
         c->peer = u;
         u->peer = c;
         c->ever_framed = true;        // past the setup deadline for good
+        c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->ts_req_built = now_ns();   // end of OUR request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake

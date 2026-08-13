@@ -1,0 +1,55 @@
+{
+  "_what": "Every value below is the BUILT-IN DEFAULT, so this file changes nothing if you pass it as-is. It is a reference for what exists and what it is set to, not a deployment you should copy unedited.",
+  "_optional": "Every key is optional. An absent key leaves the default alone, so a real config is usually three or four lines.",
+  "_precedence": "The file is read first and command-line flags overwrite it. Precedence is NOT positional: a flag wins whether it appears before or after --config. Passing --config twice is an error.",
+  "_strict": "Unknown keys are a startup ERROR, never ignored: a silently-skipped typo is how an operator ends up believing a setting took effect. Wrong types, bad enum values and out-of-range numbers are refused the same way. Keys beginning with _ are comments.",
+  "_secrets": "Paths only. Never put a token or a provider API key in this file. Provider credentials travel per request, from the client.",
+  "_pinned": "app/tests/config_test.cpp asserts these values equal the constants in the code, so this file cannot drift from the defaults it claims to document.",
+
+  "listen": {
+    "_port": "The one listening port. With workers > 1 every worker binds it with SO_REUSEPORT.",
+    "port": 8088,
+
+    "_tls": "TLS-only listener. ONE LISTENER, ONE MODE: there is no second plaintext port, so 'am I exposed in the clear?' has one answer. Needs a TLS build (-DLLMBRIDGE_TLS=ON). Setting this true REQUIRES cert and key below; setting it false requires them ABSENT, because a certificate with no TLS listener is the shape where an operator believes the port is encrypted and it is not.",
+    "tls": false,
+
+    "_cert": "Certificate chain, PEM. Omitted by default because tls is false. Example: /etc/llmbridge/cert.pem",
+    "_key": "Private key, PEM, and it must not be readable beyond its owner (chmod 600) or startup refuses it. Example: /etc/llmbridge/key.pem"
+  },
+
+  "upstream": {
+    "_url": "IP:PORT, HOST:PORT, or http(s)://HOST[:PORT]. https:// needs a TLS build and verifies both the chain and the hostname, with no way to disable it. A non-loopback plaintext upstream warns at startup, because a forwarded credential would cross the network in the clear.",
+    "url": "127.0.0.1:9001",
+
+    "_translate": "none | anthropic | gemini | cohere. 'none' is byte passthrough, no body translation.",
+    "translate": "none"
+  },
+
+  "timeouts": {
+    "_upstream_s": "Upstream silence before a request or stream is aborted. 0 disables.",
+    "upstream_s": 120,
+
+    "_client_idle_s": "An established client that goes quiet loses its descriptor. Three days by default. This is a descriptor bound for an exposed listener, NOT a load-balancing device: a short window charges a reconnecting client a fresh TCP+TLS handshake to solve a problem the client cannot see. Requests and streams in flight are never reaped. 0 disables.",
+    "client_idle_s": 259200,
+
+    "_pool_idle_s": "How long a pooled upstream connection may sit unused before it is closed. Every worker keeps its OWN pool, so offered traffic divides across them, each pool crosses this line more often, and every crossing costs the next request a full reconnect and TLS handshake. Raise it when running several workers, or once routing spreads traffic across several upstreams. 0 disables reaping.",
+    "pool_idle_s": 30
+  },
+
+  "runtime": {
+    "_io": "auto | epoll | uring. auto prefers io_uring and falls back to epoll when it is unavailable.",
+    "io": "auto",
+
+    "_workers": "Shared-nothing event loops, one thread each, all binding the same port with SO_REUSEPORT. The kernel picks a worker per CONNECTION by hashing the 4-tuple, so a single keep-alive client stays on one worker for that connection's life; a client wanting to spread across workers opens several connections.",
+    "workers": 1,
+
+    "_timing_headers": "Per-request x-llmbridge-* response headers splitting the request into disjoint spans. Metadata only, no prompt or completion text. Defined precisely in LATENCY.md.",
+    "timing_headers": false,
+
+    "_duration_s": "Self-stop after N seconds and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
+    "duration_s": 0,
+
+    "_warmup_s": "Exclude the first N seconds from the histograms.",
+    "warmup_s": 0
+  }
+}

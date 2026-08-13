@@ -169,6 +169,29 @@ Gemini) and forwards **only** that; no other client header crosses into the rebu
 upstream request. Certificate and hostname verification are always on and cannot be
 disabled.
 
+### Configuration file
+
+Everything above is also settable from a JSON file, which is where this is heading:
+multi-upstream routing needs an ordered list with per-upstream fields, and flat flags
+cannot express that.
+
+```sh
+llmbridge --config /etc/llmbridge/llmbridge.json
+```
+
+An annotated example is in [`app/llmbridge.example.json`](app/llmbridge.example.json). Three
+properties worth knowing:
+
+- **Flags still work and override the file**, so a one-off change needs no edit.
+  Precedence is not positional: a flag wins whether it appears before or after
+  `--config`. Passing `--config` twice is refused instead of silently using one.
+- **Unknown keys are a startup error.** A misspelled setting that is silently ignored
+  is how you end up believing a value took effect when it did not, and a file has no
+  command line to inspect. Wrong types and out-of-range values are refused the same
+  way, each naming the key.
+- **Paths, never secrets.** `cert` and `key` are filenames. Do not put provider API
+  keys in it; those travel per request, from the client.
+
 ### Inbound TLS: terminating the client's connection
 
 The same build also terminates TLS for clients, so the gateway can be a remote

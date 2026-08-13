@@ -463,7 +463,8 @@ namespace
                    TranslateMode translate = TranslateMode::None,
                    llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll,
                    int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs,
-                   unsigned uring_buf_count = 0, bool timing_headers = false)
+                   unsigned uring_buf_count = 0, bool timing_headers = false,
+                   int64_t client_idle_ns = -1, int64_t pool_idle_ns = -1)
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
@@ -472,6 +473,10 @@ namespace
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
                                             upstream_idle_ns, llmbridge::TlsConfig{}, timing_headers);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
+            // Applied BEFORE the loop thread exists. Setting it afterwards writes
+            // state sweep_idle reads, which is a genuine data race TSan reports.
+            if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
+            if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
             _proxy_port = _gw->bound_port();
             _gt = std::thread([this] { _gw->run(); });
         }
@@ -514,6 +519,132 @@ TEST_F(ProxyIT, SingleRequestRoundTrip)
 // a complete response can be framed while our request SEND is still outstanding.
 // Releasing the upstream then scrubs and re-uses a buffer the transport has not
 // finished with. Under io_uring that buffer is the target of a live SQE.
+// An established client that goes quiet must eventually lose its descriptor. The
+// setup deadline does not cover this: ever_framed latches on the first request and
+// that check stops applying for the connection's life, so before this a client could
+// send one request and then hold an fd forever. That is a descriptor bound for an
+// exposed listener, NOT a load-balancing device: the default is three days, because
+// anything short charges a reconnecting client a fresh TCP+TLS handshake to solve a
+// problem the client cannot see.
+// --pool-idle: how long a pooled upstream may sit unused before being closed. The
+// 30 s default is a compromise for one upstream and one worker, and it is the wrong
+// number as soon as either multiplies: each worker has its own pool, so traffic
+// divides, each pool crosses the line more often, and every crossing costs the next
+// request a full reconnect. Hence a knob.
+class ProxyPoolIdle : public ProxyIT,
+                      public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyPoolIdle, ShortWindowReapsThePooledUpstream)
+{
+    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+          -1, 200 * 1000 * 1000LL); // 200 ms pool window
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request()));
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // 6x the window
+    shutdown();
+    EXPECT_EQ(_gw->pooled_upstream_count(), 0u) << "the idle upstream was not reaped";
+}
+
+// The control, and it is what makes the test above mean anything: with the default
+// window the same connection is still pooled at the same instant, so the reaping is
+// attributable to the flag and not to the connection dying on its own.
+TEST_P(ProxyPoolIdle, DefaultWindowKeepsItPooled)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request()));
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    shutdown();
+    EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "reaped far inside the 30 s default";
+}
+
+// 0 disables reaping outright, for a deployment that would rather hold connections
+// than pay reconnects.
+TEST_P(ProxyPoolIdle, ZeroDisablesPoolReaping)
+{
+    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+          -1, 0);
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request()));
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    shutdown();
+    EXPECT_EQ(_gw->pooled_upstream_count(), 1u);
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyPoolIdle,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
+class ProxyClientIdle : public ProxyIT,
+                        public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyClientIdle, QuietEstablishedClientIsReaped)
+{
+    // 300 ms, applied before the loop thread starts; see start().
+    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+          300 * 1000 * 1000LL);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200); // now established
+    // ... and then say nothing at all.
+    EXPECT_TRUE(c.wait_closed(5000)) << "a quiet established client kept its descriptor";
+
+    shutdown();
+    EXPECT_GE(_gw->stats().client_idle_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().client_setup_timeouts, 0u) << "wrong reaper fired";
+}
+
+// The half that matters more: it must not fire on a client that is still being served.
+// A slow provider is not an idle client, and reaping mid-request would turn somebody
+// else's latency into our dropped connection.
+TEST_P(ProxyClientIdle, InFlightRequestIsNotReaped)
+{
+    _backend.set_stall(1); // read the request, never reply
+    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+          300 * 1000 * 1000LL);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_TRUE(c.send(make_request())); // establish, then a request that hangs
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200)); // 4x the deadline
+
+    shutdown();
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u)
+        << "a client waiting on a slow provider was reaped as idle";
+}
+
+// And it must be disableable, because a loopback sidecar has no reason to pay for it.
+TEST_P(ProxyClientIdle, ZeroDisablesTheReaper)
+{
+    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false, 0);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+
+    shutdown();
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u);
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyClientIdle,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
 class ProxyEarlyResponse : public ProxyIT,
                            public ::testing::WithParamInterface<llmbridge::IoBackend> {};
 TEST_P(ProxyEarlyResponse, PooledUpstreamStaysUsable)
