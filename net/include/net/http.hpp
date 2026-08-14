@@ -56,8 +56,13 @@ namespace llmbridge::net::http
             return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
         }
 
-        // Case-insensitive: does the header line starting at `line` begin with
-        // `name` (which must be given lower-case, including the trailing ':')?
+        // Case-insensitive PREFIX test: `name` must be lower-case, and callers that
+        // mean a header name must include the ':' themselves, or `x-tenant` matches
+        // the line `x-tenant-spoof:`. That is why this is `detail::` and why
+        // find_header() below does not use it: an exact header lookup is the thing
+        // callers actually want, and this primitive is one colon away from being a
+        // header-forgery hole. It is also used on VALUES (`close`), which is why it
+        // cannot simply require a colon itself.
         inline bool line_is(std::string_view line, std::string_view name) noexcept
         {
             if (line.size() < name.size()) return false;
@@ -163,16 +168,36 @@ namespace llmbridge::net::http
     // `name` must be LOWERCASE and INCLUDE the trailing colon ("x-api-key:"),
     // same convention as the framer's own header matching, and the colon is what
     // stops "x-api-key-2:" from prefix-matching "x-api-key".
+    /// Value of header `name`, empty when absent. A view into `headers`.
+    ///
+    /// Write the name however reads best: `"authorization"`, `"Authorization"` and
+    /// `"authorization:"` all do the same thing.
+    ///
+    /// It used to take the name WITH a trailing colon, compare it as a bare prefix
+    /// and never lower-case it, so both spellings above failed silently and
+    /// `find_header(h, "x-tenant")` returned the value of a client-supplied
+    /// `x-tenant-spoof:` line. Nothing in production called it, so nothing was
+    /// exploitable; what it was, was a hole waiting for its first caller, and the
+    /// first caller was going to be code deciding whether a request is authorised.
     inline std::string_view find_header(std::string_view headers, std::string_view name) noexcept
     {
+        if (!name.empty() && name.back() == ':') name.remove_suffix(1);
+        if (name.empty()) return {};
         size_t start = 0;
         while (start < headers.size())
         {
             size_t eol = headers.find("\r\n", start);
             if (eol == std::string_view::npos) eol = headers.size();
             const std::string_view line = headers.substr(start, eol - start);
-            if (detail::line_is(line, name))
-                return detail::ltrim(line.substr(name.size()));
+            // The colon must be exactly where the name ends: that is what makes this
+            // an exact field-name match and not a prefix match.
+            if (line.size() > name.size() && line[name.size()] == ':')
+            {
+                bool same = true;
+                for (size_t i = 0; i < name.size() && same; ++i)
+                    same = detail::lc(line[i]) == detail::lc(name[i]);
+                if (same) return detail::ltrim(line.substr(name.size() + 1));
+            }
             start = eol + 2;
         }
         return {};

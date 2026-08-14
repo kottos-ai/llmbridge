@@ -470,8 +470,11 @@ namespace
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
             else up_port = free_port(); // nothing listening -> connection refused
 
+            // `_policy` is a member: start() already takes nine positional args and a
+            // tenth is how a caller silently passes the wrong one. Set before start().
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
-                                            upstream_idle_ns, llmbridge::TlsConfig{}, timing_headers);
+                                            upstream_idle_ns, llmbridge::TlsConfig{}, timing_headers,
+                                            _policy);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
             // Applied BEFORE the loop thread exists. Setting it afterwards writes
             // state sweep_idle reads, which is a genuine data race TSan reports.
@@ -495,6 +498,7 @@ namespace
         std::thread _gt;
         uint16_t _proxy_port = 0;
         bool _shut = false;
+        llmbridge::Policy* _policy = nullptr; // null = stock build, no seam consulted
     };
 } // namespace
 
@@ -3275,3 +3279,178 @@ INSTANTIATE_TEST_SUITE_P(
         return std::string(std::get<0>(i.param) == llmbridge::IoBackend::Epoll ? "epoll" : "uring") +
                "_chunk" + std::to_string(std::get<1>(i.param));
     });
+
+// ─── The policy seam (gateway/policy.hpp) ────────────────────────────────────
+//
+// Here instead of in a policy_test.cpp of its own, against this directory's
+// "one executable per concern" rule, because the seam is only observable
+// through a running proxy: the assertions that matter are "the client got a
+// 401" and "the upstream saw nothing", and both need ProxyIT. Duplicating the
+// harness to satisfy a naming rule would risk the two copies drifting.
+namespace
+{
+    // Records what it was asked and answers however the test says.
+    class RecordingPolicy final : public llmbridge::Policy
+    {
+    public:
+        explicit RecordingPolicy(llmbridge::Decision d) : _d(d) {}
+
+        llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
+        {
+            ++calls;
+            // Copy, never retain: `head` dies with the call, and the assertions run
+            // after the loop thread is joined.
+            seen_head.assign(f.head.data(), f.head.size());
+            // Mixed case AND no colon: the two spellings find_header used to fail
+            // silently on. A policy reads headers exactly like this.
+            const std::string_view auth = llmbridge::net::http::find_header(f.head, "Authorization");
+            seen_auth.assign(auth.data(), auth.size());
+            const std::string_view spoofable = llmbridge::net::http::find_header(f.head, "x-tenant");
+            seen_spoofable.assign(spoofable.data(), spoofable.size());
+            seen_body_bytes = f.body_bytes;
+            return _d;
+        }
+
+        std::atomic<int> calls{0};
+        std::string seen_head, seen_auth, seen_spoofable;
+        size_t seen_body_bytes = 0;
+
+    private:
+        llmbridge::Decision _d;
+    };
+
+    class ProxyPolicy : public ProxyIT,
+                        public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+} // namespace
+
+// The stock build: no policy, nothing consulted. This fails if "default deny" is
+// ever read as "deny when absent", which would brick every OSS deployment.
+TEST_P(ProxyPolicy, NoPolicyInstalledForwardsEverything)
+{
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().requests, 1u);
+    EXPECT_EQ(_gw->stats().policy_denied, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 1);
+}
+
+TEST_P(ProxyPolicy, AllowForwardsUnchanged)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp;
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.calls.load(), 1) << "the seam was not consulted";
+    EXPECT_EQ(_gw->stats().policy_denied, 0u);
+    EXPECT_EQ(_backend.requests_seen(), 1);
+}
+
+// The one that matters. A refusal must be terminal. Asserting only "the client
+// got a 401" would pass even if the request had ALSO gone to the provider.
+TEST_P(ProxyPolicy, DenyAnswersTheClientAndContactsNoUpstream)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 401, .reason = "no token"}};
+    _policy = &pol;
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("401 Unauthorized"), std::string::npos) << resp;
+    EXPECT_NE(resp.find("authentication_error"), std::string::npos) << resp;
+    // The reason is for the operator's log. Telling a failed caller which rule
+    // refused them is free reconnaissance.
+    EXPECT_EQ(resp.find("no token"), std::string::npos) << "the deny reason reached the client";
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.calls.load(), 1);
+    EXPECT_EQ(_gw->stats().policy_denied, 1u);
+    EXPECT_EQ(_gw->stats().requests, 0u) << "a refused request was counted as served";
+    EXPECT_EQ(_backend.requests_seen(), 0) << "a denied request reached the upstream";
+    EXPECT_TRUE(_backend.last_request().empty());
+}
+
+// The shape a bug produces: a forgotten branch, a default construction on an
+// error path. It must refuse.
+TEST_P(ProxyPolicy, ValueInitialisedDecisionRefuses)
+{
+    RecordingPolicy pol{llmbridge::Decision{}};
+    _policy = &pol;
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_EQ(resp.find("200 OK"), std::string::npos) << "a zeroed Decision was forwarded: " << resp;
+    EXPECT_NE(resp.find("401"), std::string::npos) << resp;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().policy_denied, 1u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// An unrenderable status must not become a misleading reply, and must not become
+// an ALLOW either. This path used to emit "502 Bad Gateway" for an auth refusal.
+TEST_P(ProxyPolicy, OutOfRangeDenyStatusStillRefuses)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 9000, .reason = "bad status"}};
+    _policy = &pol;
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("403 Forbidden"), std::string::npos) << resp;
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().policy_denied, 1u);
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// The facts have to be usable, or the seam is a boolean with extra steps.
+TEST_P(ProxyPolicy, FactsCarryTheHeadersAndTheBodySize)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, TranslateMode::None, GetParam());
+    const std::string body = "{\"hello\":\"world\"}";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // `x-tenant-spoof` is the forgery a bare-prefix match would accept as
+    // `x-tenant`. There is no genuine `x-tenant` header here, so a policy asking
+    // for one must come back empty.
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer kb_live_TESTVALUE\r\n"
+                       "x-tenant-spoof: attacker\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    ASSERT_EQ(pol.calls.load(), 1);
+    // Case-insensitive lookup, as HTTP requires: the client sent "Authorization".
+    EXPECT_EQ(pol.seen_auth, "Bearer kb_live_TESTVALUE");
+    EXPECT_EQ(pol.seen_spoofable, "")
+        << "x-tenant-spoof was accepted as x-tenant: a client can forge a trusted field";
+    EXPECT_EQ(pol.seen_body_bytes, body.size());
+    // Metadata only: the head ends at the blank line, so the body is unreachable.
+    EXPECT_EQ(pol.seen_head.find("hello"), std::string::npos)
+        << "the request body was visible to the policy";
+    EXPECT_NE(pol.seen_head.rfind("\r\n\r\n"), std::string::npos) << pol.seen_head;
+    EXPECT_EQ(pol.seen_head.size(), pol.seen_head.rfind("\r\n\r\n") + 4);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyPolicy,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));

@@ -490,17 +490,43 @@ namespace llmbridge
             }
         }
 
+        /// Reason phrase, error type and client-facing message for a status.
+        ///
+        /// Was three ternaries over 400 and 504 with everything else falling through
+        /// to 502. Fine while those were the only codes in the tree, wrong once a
+        /// policy could pick one: a 401 went out as "bad gateway: upstream failure",
+        /// blaming the provider for our own refusal.
+        ///
+        /// The message is generic per status and never names the rule that refused.
+        /// The client gets the status; the reason goes to the log.
+        struct ErrorShape
+        {
+            const char* line;
+            const char* type;
+            const char* msg;
+        };
+        ErrorShape error_shape(int code)
+        {
+            switch (code)
+            {
+                case 400: return {"HTTP/1.1 400 Bad Request", "invalid_request_error", "malformed request"};
+                case 401: return {"HTTP/1.1 401 Unauthorized", "authentication_error", "unauthorized"};
+                case 403: return {"HTTP/1.1 403 Forbidden", "permission_error", "forbidden"};
+                case 404: return {"HTTP/1.1 404 Not Found", "invalid_request_error", "not found"};
+                case 413: return {"HTTP/1.1 413 Content Too Large", "invalid_request_error", "request too large"};
+                case 429: return {"HTTP/1.1 429 Too Many Requests", "rate_limit_error", "rate limit exceeded"};
+                case 503: return {"HTTP/1.1 503 Service Unavailable", "service_error", "service unavailable"};
+                case 504: return {"HTTP/1.1 504 Gateway Timeout", "timeout_error", "upstream timed out"};
+                // Anything unlisted keeps the historical fallback. It is reachable
+                // only from our own call sites, all of which pass a code above; the
+                // policy seam validates its status before it gets here.
+                default: return {"HTTP/1.1 502 Bad Gateway", "upstream_error", "bad gateway: upstream failure"};
+            }
+        }
+
         std::string build_error(int code)
         {
-            const char* line = code == 400   ? "HTTP/1.1 400 Bad Request"
-                               : code == 504 ? "HTTP/1.1 504 Gateway Timeout"
-                                             : "HTTP/1.1 502 Bad Gateway";
-            const char* type = code == 400   ? "invalid_request_error"
-                               : code == 504 ? "timeout_error"
-                                             : "upstream_error";
-            const char* msg = code == 400   ? "malformed request"
-                              : code == 504 ? "upstream timed out"
-                                            : "bad gateway: upstream failure";
+            const auto [line, type, msg] = error_shape(code);
             std::string body = std::string("{\"error\":{\"message\":\"") + msg + "\",\"type\":\"" + type + "\"}}";
             std::string out;
             out.reserve(body.size() + 128);
@@ -629,11 +655,12 @@ namespace llmbridge
 
     Gateway::Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                      int64_t warmup_ns, TranslateMode translate, IoBackend io,
-                     int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers)
+                     int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
+                     Policy* policy)
         : _listen_port(listen_port), _upstream_ip(std::move(upstream_ip)),
           _upstream_port(upstream_port), _warmup_ns(warmup_ns), _translate(translate), _io(io),
           _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls)),
-          _timing_headers(timing_headers)
+          _timing_headers(timing_headers), _policy(policy)
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         if (_tls.upstream_tls)
@@ -1416,7 +1443,37 @@ namespace llmbridge
         // rbuf, so a log placed after it prints an empty request line and a stale seq.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
+        // THE POLICY SEAM, one call site per backend. Here because framing has
+        // succeeded but nothing is translated, no credential mapped and no upstream
+        // acquired, so a refusal reaches no provider.
+        if (_policy)
+        {
+            const Decision d = policy_decision(c, m);
+            if (!d.allow) { ep_error_respond(c, d.deny_status, d.reason); return; }
+        }
         ep_forward(c);
+    }
+
+    Decision Gateway::policy_decision(const Connection* c, const net::http::Message& m) noexcept
+    {
+        // Head only. The body is deliberately unreachable from RequestFacts: this is
+        // the line where "metadata only, no prompt text" is either true or not.
+        const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len};
+
+        Decision d = _policy->decide(facts);
+        if (d.allow) return d;
+
+        // A status the responder cannot render would emit a misleading reply, so
+        // substitute and say so loudly. The refusal still stands: fail closed.
+        if (d.deny_status < 400 || d.deny_status > 599)
+        {
+            LB_WARN(ReqId{c->req_seq}, " policy returned out-of-range status ", d.deny_status,
+                    " (", d.reason, "); refusing with 403");
+            d.deny_status = 403;
+        }
+        // Never log `facts`: the head carries the client's Authorization.
+        ++_stats.policy_denied;
+        return d;
     }
 
     void Gateway::ep_forward(Connection* c) noexcept
@@ -2623,6 +2680,12 @@ namespace llmbridge
         // See the epoll mirror: assigned here, before forward touches rbuf.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
+        // The policy seam; see the epoll mirror for why it sits exactly here.
+        if (_policy)
+        {
+            const Decision d = policy_decision(c, m);
+            if (!d.allow) { ur_error_respond(c, d.deny_status, d.reason); return; }
+        }
         ur_forward(c);
     }
 

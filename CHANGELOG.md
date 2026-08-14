@@ -8,6 +8,46 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.14.0]. 2026-08-13
+
+**The policy seam.** One hook, called once per framed request, answering the question
+llmbridge does not answer for itself: may this request proceed? The gateway still
+authenticates nobody and meters nobody.
+
+
+### Added
+
+- **`gateway/policy.hpp`**: `Policy`, `RequestFacts`, `Decision`. Supplied at `Gateway`
+  construction, non-owning, `const` member so there is no setter to race. Called at one
+  site per backend, after framing and before translation, credential mapping or
+  upstream acquisition, so a refusal reaches no provider.
+- **Two opposite meanings of "default".** No policy installed, which is every stock
+  build, means no call is made and the request is forwarded: absent, not permissive. A
+  policy that returns a value-initialised `Decision` gets a refusal, because that shape
+  is what a forgotten branch produces.
+- **`Stats::policy_denied`**, a subset of `errors` and not a sibling of it.
+
+### Fixed
+
+- **`build_error()` rendered every status except 400 and 504 as `502 Bad Gateway`.**
+  Harmless while those were the only codes in the tree, wrong once a policy could pick
+  one: a 401 would have gone out as "bad gateway: upstream failure", blaming the
+  provider for our own refusal. Now a table (400, 401, 403, 404, 413, 429, 503, 504)
+  with the 502 fallback kept. A deny status outside 400-599 still refuses, with 403
+  substituted and a WARN.
+- **`net::http::find_header` matches header names exactly.** It wanted a trailing
+  colon, compared the name as a bare prefix and never lower-cased it, so
+  `"Authorization"` matched nothing (an auth check reading every request as
+  unauthenticated) and `"x-tenant"` returned a client-sent `x-tenant-spoof:` value. No
+  production caller existed, so nothing was exploitable; the policy seam would have been
+  the first. Names are now written without a colon, with the colon spelling still
+  accepted.
+
+### Known gaps
+
+- `Decision` selects no upstream, and `RequestFacts` exposes no model name. Both arrive
+  with the upstream table; a field the gateway ignores would be a lie.
+
 ## [0.13.0]. 2026-08-13
 
 **Logging.** The gateway said almost nothing about itself: five `fprintf` lines at
