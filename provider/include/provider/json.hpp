@@ -208,18 +208,47 @@ namespace llmbridge::provider::json
                 return v;
             }
 
+            /// RFC 8259 grammar: `-? int frac? exp?`, walked in that order.
+            ///
+            /// It used to consume any run of [0-9+-.eE] and call the result a Number,
+            /// which accepted `1e`, `--1`, `1.2.3`, `+1`, `.5` and `00`, none of them
+            /// JSON. The consequence was not an injection (the character set is closed,
+            /// so a span can never carry a quote or a brace and cannot break out of the
+            /// JSON it is re-emitted into) but every consumer had to re-validate: a
+            /// `strtod` on `1e` fails, and one that forgets the check gets 0.
+            ///
+            /// Leading zeros are refused because RFC 8259 refuses them, and because a
+            /// reader who writes `08` usually means octal and never gets it.
             Value parse_number()
             {
-                size_t start = i;
-                while (i < s.size())
+                const size_t start = i;
+                const auto digit = [&] { return i < s.size() && s[i] >= '0' && s[i] <= '9'; };
+                const auto digits = [&] {
+                    const size_t from = i;
+                    while (digit()) ++i;
+                    return i > from;
+                };
+
+                if (i < s.size() && s[i] == '-') ++i;   // optional sign, minus only
+                if (!digit()) { ok = false; return {}; }
+                if (s[i] == '0') ++i;                   // a leading zero stands alone
+                else digits();
+
+                if (i < s.size() && s[i] == '.')        // frac: at least one digit
                 {
-                    char c = s[i];
-                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') ++i;
-                    else break;
+                    ++i;
+                    if (!digits()) { ok = false; return {}; }
                 }
-                Value v; v.type = Value::Type::Number;
+                if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) // exp: sign optional
+                {
+                    ++i;
+                    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+                    if (!digits()) { ok = false; return {}; }
+                }
+
+                Value v;
+                v.type = Value::Type::Number;
                 v.sv = s.substr(start, i - start);
-                if (v.sv.empty()) ok = false;
                 return v;
             }
 

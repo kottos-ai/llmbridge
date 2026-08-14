@@ -8,6 +8,37 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.14.2]. 2026-08-14
+
+**The JSON number scanner accepted things that are not numbers.** It consumed any run
+of `[0-9+-.eE]` and called the result a `Number`, so `1e`, `--1`, `1.2.3`, `+1`, `.5`
+and `00` all parsed. Found while chasing an uncovered branch in a consumer's config
+parser: the branch existed because the parser needed it to.
+
+PATCH, and the reason is worth recording because it is arguable. Input earlier
+versions accepted is now refused, which is the shape that made **0.9.0 a MINOR**. The
+difference claimed here is that none of it was ever valid JSON, so no correct client
+is affected. If that reasoning does not hold, this is 0.15.0.
+
+### Fixed
+
+- **`parse_number` follows RFC 8259 §6**: `-? int frac? exp?`, with a leading zero
+  standing alone, at least one digit after `.`, and at least one after `e`/`E`.
+- **What this was NOT.** No injection was possible: the old character set is closed, so
+  a number span could never carry a quote, comma or brace, and re-emitting one could
+  not break out of the JSON around it. What it did was push validation onto every
+  consumer, since `strtod("1e")` fails and a consumer that forgets the check gets 0.
+  llmbridge's own config carried that guard; a second consumer's did too, which is how
+  this surfaced.
+- **User-visible effect**: a request body containing a malformed number is now refused
+  with a 400 naming a bad request, where before it was forwarded for the provider to
+  reject. The gateway's error is the more useful of the two.
+
+### Verified
+
+31 shapes checked against the RFC grammar, five mutations of the new scanner all
+caught, and 90 seconds of libFuzzer on the JSON parser with ASan and UBSan, clean.
+
 ## [0.14.1]. 2026-08-14
 
 **Passthrough echoed every client header to the provider.** DESIGN.md and CLAUDE.md

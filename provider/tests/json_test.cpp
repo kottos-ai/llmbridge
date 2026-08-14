@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <deque>
+#include <cstdlib>
 #include <string>
 
 using llmbridge::provider::json::Value;
@@ -337,4 +338,79 @@ TEST(JsonStrictness, IllegalStringInAKeyIsAlsoRejected)
     // Keys go through the same scanner and are re-emitted the same way.
     EXPECT_FALSE(parses("{\"a\nb\":1}"));
     EXPECT_FALSE(parses(R"({"a\qb":1})"));
+}
+
+// ── Number grammar (RFC 8259 §6) ─────────────────────────────────────────────
+//
+// The scanner used to consume any run of [0-9+-.eE] and call it a Number, so `1e`,
+// `--1`, `1.2.3`, `+1`, `.5` and `00` all parsed. That was never an injection, since
+// the character set is closed and a span cannot carry a quote or a brace, but it
+// pushed validation onto every consumer: `strtod("1e")` fails, and a consumer that
+// forgets the check silently gets 0.
+
+namespace
+{
+    /// Named for the thing under test, since `parses(doc)` already exists above and
+    /// takes a whole document.
+    bool number_parses(const std::string& number)
+    {
+        bool ok = false;
+        (void)llmbridge::provider::json::parse("{\"n\":" + number + "}", ok);
+        return ok;
+    }
+} // namespace
+
+TEST(JsonNumbers, EveryLegalShapeParses)
+{
+    for (const char* n : {"0", "-0", "1", "-1", "12345", "1.5", "-1.5", "0.5",
+                          "1e5", "1E5", "1e+5", "1e-5", "1.5e-5", "1E+5", "1e999"})
+        EXPECT_TRUE(number_parses(n)) << "rejected a valid JSON number: " << n;
+}
+
+TEST(JsonNumbers, MalformedShapesAreRejected)
+{
+    // Every one of these parsed before, and each is one a hand-written config or a
+    // provider response could plausibly contain.
+    for (const char* n : {"1e", "1e+", "1e-", "-", "--1", "1-2", "1.2.3", "+1", ".5",
+                          "1.", ".", "-.", "1e5e5", "1e+-5", "1..2", "-e5"})
+        EXPECT_FALSE(number_parses(n)) << "accepted a malformed number: " << n;
+}
+
+// RFC 8259 forbids a leading zero, and so does this: a reader who writes 08 means
+// octal and would not get it.
+TEST(JsonNumbers, LeadingZerosAreRejected)
+{
+    for (const char* n : {"00", "01", "-01", "0123"}) EXPECT_FALSE(number_parses(n)) << n;
+    EXPECT_TRUE(number_parses("0"));
+    EXPECT_TRUE(number_parses("0.1"));
+    EXPECT_TRUE(number_parses("0e1"));
+}
+
+// A number ends where its grammar ends, so the character after it must still be
+// framed by the object. Trailing junk is a parse error, not a longer number.
+TEST(JsonNumbers, ANumberDoesNotSwallowWhatFollowsIt)
+{
+    bool ok = false;
+    const auto v = llmbridge::provider::json::parse(R"({"a":1,"b":2})", ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(v.find("a")->sv, "1");
+    EXPECT_EQ(v.find("b")->sv, "2");
+    EXPECT_FALSE(number_parses("1x"));
+    EXPECT_FALSE(number_parses("1 2"));
+}
+
+// Anything that DOES parse must survive strtod, because that is what every consumer
+// does with it. This is the property the old scanner broke.
+TEST(JsonNumbers, WhatParsesAlsoConvertsWithStrtod)
+{
+    for (const char* n : {"0", "-0", "12345", "1.5", "-1.5e-5", "1e999", "0.0001"})
+    {
+        bool ok = false;
+        const auto v = llmbridge::provider::json::parse(std::string("{\"n\":") + n + "}", ok);
+        ASSERT_TRUE(ok) << n;
+        const std::string txt(v.find("n")->sv);
+        char* end = nullptr;
+        (void)std::strtod(txt.c_str(), &end);
+        EXPECT_EQ(*end, '\0') << "parsed as a Number but strtod stopped early: " << n;
+    }
 }
