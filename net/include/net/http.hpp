@@ -189,6 +189,12 @@ namespace llmbridge::net::http
             size_t eol = headers.find("\r\n", start);
             if (eol == std::string_view::npos) eol = headers.size();
             const std::string_view line = headers.substr(start, eol - start);
+            // STOP AT THE BLANK LINE. Every caller passes exactly a header block today,
+            // so this changes nothing for them; it exists because the one that does not
+            // hands an attacker a free header. A credential written into the BODY was
+            // otherwise found and honoured, which is a header the client controls
+            // entirely and no framing check ever sees.
+            if (line.empty()) return {};
             // The colon must be exactly where the name ends: that is what makes this
             // an exact field-name match and not a prefix match.
             if (line.size() > name.size() && line[name.size()] == ':')

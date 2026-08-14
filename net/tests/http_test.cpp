@@ -518,6 +518,16 @@ TEST(FindHeader, CrlfEndsTheValue)
     EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "k");
 }
 
+// A blank line ends the header block. Anything after it is the BODY, which the
+// client controls completely, so finding a credential there would let a caller
+// forge any header simply by writing it below the blank line.
+TEST(FindHeader, StopsAtTheBlankLineSoTheBodyIsNotSearched)
+{
+    const std::string_view m = "Host: x\r\n\r\nAuthorization: Bearer forged\r\n";
+    EXPECT_TRUE(llmbridge::net::http::find_header(m, "authorization").empty());
+    EXPECT_EQ(llmbridge::net::http::find_header(m, "host"), "x");
+}
+
 // Documents the SHARP EDGE deliberately: a bare CR does NOT terminate a line, so
 // it survives inside the value. Callers must validate before re-emitting; this
 // test exists so nobody "fixes" the comment back to claiming otherwise.
