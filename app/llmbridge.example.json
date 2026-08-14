@@ -22,7 +22,10 @@
     "url": "127.0.0.1:9001",
 
     "_translate": "none | anthropic | gemini | cohere. 'none' is byte passthrough, no body translation.",
-    "translate": "none"
+    "translate": "none",
+
+    "_strip_headers": "Header names removed from every request before it is forwarded, matched case-insensitively and exactly. Empty by default, which leaves passthrough a single memcpy. Use it when a client header must not reach a third-party provider: an internal routing header, or an identity token meant for THIS gateway and nobody else. Translating modes already rebuild from a whitelist; this also stops a stripped Authorization being promoted to the provider credential.",
+    "strip_headers": []
   },
 
   "timeouts": {

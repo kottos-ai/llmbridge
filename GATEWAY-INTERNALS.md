@@ -68,6 +68,20 @@ Its meaning shifts with the transport, and this is a real trap:
 So on a TLS connection `woff >= wbuf.size()` means "fully encrypted", never
 "fully sent". Ask `tls_wbuf_flushed()` for the second question.
 
+
+### 2b. `woff`, whose meaning shifts with the transport
+
+| transport | what `woff` counts |
+|---|---|
+| plaintext | bytes actually written to the socket |
+| TLS | bytes fed into the Session, which is NOT bytes on the wire. Wire progress is `tls_out_off`, and `woff` can reach `wbuf.size()` while nothing has left the machine |
+
+The write path deliberately does **not** clear `wbuf` when `woff` catches up.
+Callers do, at points they choose, and that is what keeps an upstream request
+available for a resend when a pooled connection turns out to be dead. See
+`ep_retry_upstream` / `ur_retry_upstream`, which resend only when the connection
+came from the pool and no response byte has arrived.
+
 ## 3. Request lifecycle, common to both backends
 
 ```
@@ -196,6 +210,41 @@ client, epoll applies back-pressure by pausing the upstream read; io_uring bound
 `wpending` and drops the stream past the cap. Know which one you are reasoning
 about before quoting streaming behaviour to a customer.
 
+
+### 5b. The two `inflight` flags, and who owns each
+
+Both live on `Connection` and both are io_uring-only. They are not the same
+thing and confusing them has cost real bugs.
+
+**`int inflight`**: submitted-but-uncompleted SQEs referencing this connection.
+One protocol with `doomed` (section 7): doomed says we want the object gone,
+inflight says whether the kernel agrees yet.
+
+| | where |
+|---|---|
+| incremented | the three `ur_submit_*` functions, each at its tail immediately before `return true`, so an early return cannot leak a slot and strand the object forever |
+| decremented | exactly one place, `ur_on_cqe()`, and only when the completion is NOT armed: a multishot op carrying `F_MORE` is still outstanding and has not released its slot |
+| read | `ur_maybe_free()`, the only thing allowed to conclude that freeing is safe |
+
+Multishot recv lands data in a shared provided-buffer pool, so there is no
+per-connection recv buffer to account for.
+
+**`bool send_inflight`**: an SQE referencing this connection's *send* buffer is
+outstanding. Two concurrent SENDs on one fd would interleave, and an SQE is
+immutable once submitted, so the buffer it points at must not move while this is
+set.
+
+| | where |
+|---|---|
+| set | only `ur_submit_send()`, the only place a send SQE is submitted |
+| cleared | `ur_on_send()` on completion, and `ur_release_upstream()` when per-request state is reset |
+| read | anyone about to touch a send buffer, to decide whether to wait |
+
+**Callers must never set it.** Two of them used to, under two different rules,
+and `ur_stream_flush()` setting it before calling `ur_tls_flush()` (whose first
+line refuses to run when it is already set) meant the first SSE flush on a TLS
+connection did nothing at all. The stream then hung forever, on io_uring only.
+
 ## 6. Streaming (SSE)
 
 Entered when the provider answers `200` with `content-type: text/event-stream`.
@@ -231,6 +280,31 @@ Three flags carry the state, and their meanings are precise:
 `stream_ended` also gates `finalize_stream`. Without it the gateway resumes
 reading from an upstream that will never speak again, and the client socket is
 held until the idle sweep.
+
+
+### 6b. `stream_ended`, and the difference a client can see
+
+It becomes true two ways, and only one of them is a finished answer:
+
+| | what happened | `close_after_resp` |
+|---|---|---|
+| **clean** | `stream_step()` saw the end of the body and the SSE translator emitted its terminal `[DONE]` | false |
+| **truncated** | the stream is being aborted, so NO `[DONE]` is emitted, deliberately: a client must see a cut-off stream instead of a fabricated clean finish. Always via `stream_truncate()` | true |
+
+So `stream_ended && close_after_resp` is the truncated case. That pairing is the
+difference between a client believing it received the whole answer and knowing
+it did not, so read it, never infer it.
+
+### 6c. The one place the backends deliberately differ
+
+Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
+back-pressure. **io_uring** instead bounds `wpending` with `kStreamBufCap` and
+drops the stream past the cap. Know which you are reasoning about before quoting
+streaming behaviour to a customer.
+
+`read_paused` is epoll's half and is owned entirely by `ep_pause_read` /
+`ep_resume_read`, the only writers, both guarding on the current value. io_uring
+never touches it, and the `ep_` prefix is what keeps that true.
 
 ## 7. Connection lifetime, and why the two backends free differently
 
@@ -322,6 +396,31 @@ on a fresh connection, and the client never sees the blip. `wbuf` is deliberatel
 NOT cleared by the write path for exactly this reason, so the request survives to
 be resent.
 
+
+### 8b. Sizing `kMaxIdleUpstreams`, and why it is 8192
+
+The pool was unbounded until streaming reuse landed. A streaming gateway pools
+roughly one upstream per concurrent stream, so without a bound it is an fd leak
+in slow motion: 4k streams means 4k idle descriptors pinned indefinitely.
+
+**Size it generously.** The cap must exceed the number of upstreams in flight at
+peak, or it stops being a bound and becomes a reuse killer: once the pool is
+full, every release closes its connection and the next request must reconnect.
+
+A first cut of 256 did exactly that, and cost the non-streaming path **2.4x its
+throughput**:
+
+| pool cap | RPS at a 90k target |
+|---|---|
+| 256 | 32,210 |
+| 8192 | 77,282 |
+| no pool at all | 78,445 |
+
+The gateway was opening more upstream connections than it served requests.
+git-bisected. **Do not lower this without re-running `./bench/saturate.sh` with
+`BACKENDS=4`.** The real reclaim mechanism is the idle timeout, not the cap; the
+cap only has to stop pathological growth, so err high.
+
 ## 9. Scrub and clear: what a pooled connection must not carry
 
 A pooled connection idles for up to 30 seconds and is then handed to **whichever
@@ -380,6 +479,30 @@ The same four calls serve both directions and both backends. Only the handshake
 role differs (`SSL_set_accept_state` against `SSL_set_connect_state`) and what is
 verified: the client leg presents a certificate and verifies nobody, the upstream
 leg verifies the provider's chain AND its hostname, with no way to disable it.
+
+
+### 10b. Two offsets, two questions
+
+For a TLS connection, `wbuf` (plaintext) is not what gets written; the plaintext
+stays intact there so a stale pooled connection can be retried.
+
+| field | answers |
+|---|---|
+| `woff` | plaintext handed to the TRANSPORT. For TLS that means fed into the Session, which has not necessarily left the machine |
+| `tls_out_off` | ciphertext that actually reached the socket |
+
+So `woff >= wbuf.size()` means "fully encrypted", never "fully sent". Ask
+`tls_wbuf_flushed()` for the second question.
+
+A transport-agnostic wrapper over the two was tried and reverted: every caller
+already sits inside a TLS-only branch, so it resolved to `tls_wbuf_flushed()` at
+every site and read as a safety net while changing nothing.
+
+### 10c. Why the TLS helpers take `c` and not `u`
+
+They are no-op-safe building blocks shared by both backends. Since inbound TLS
+landed they run on client connections too, and `u` means upstream everywhere else
+in the file. Direction is read from `c->is_client`, never assumed.
 
 ## 11. Where each rule is enforced
 

@@ -8,45 +8,33 @@
 // Optional JSON configuration for the gateway daemon (`--config FILE`).
 //
 // WHY IT EXISTS. Fourteen flags is uncomfortable; the fifteenth is impossible.
-// Multi-upstream routing needs an ordered list with per-upstream fields (host, TLS,
-// SNI, dialect, route tag), and that cannot be expressed in flat flags without
-// inventing a mini-language with none of the tooling and worse errors. The grouped
-// shape below exists so `upstream` can become an array later without disturbing
-// anything else.
+// Multi-upstream routing needs an ordered list with per-upstream fields, which flat
+// flags cannot express without inventing a mini-language. The grouped shape below
+// lets `upstream` become an array later without disturbing anything else.
 //
-// THE CONTRACT, and the first rule is the load-bearing one:
+// THE CONTRACT:
+//   1. UNKNOWN KEYS, wrong types and out-of-range values are STARTUP ERRORS. A
+//      parser that skips a misspelled `listen_tls` fails open in the shape this
+//      project has already been bitten by: `--listen-tls` on a non-TLS build was
+//      accepted and ignored, serving plaintext while the operator believed otherwise.
+//   2. Keys beginning with `_` are comments. JSON has none and an edited file needs them.
+//   3. PATHS, NEVER SECRETS, or the file becomes a credential store on disk.
+//   4. The CLI wins, so a one-off override needs no edit.
 //
-//   1. UNKNOWN KEYS ARE A STARTUP ERROR, never ignored. A config parser that skips a
-//      misspelled `listen_tls` fails open in exactly the shape this project has
-//      already been bitten by: `--listen-tls` on a non-TLS build was accepted and
-//      ignored, serving plaintext while the operator believed otherwise. A file has
-//      no `ps` output to catch that, so it must refuse instead of guess. Wrong types
-//      and out-of-range values are errors for the same reason.
-//   2. Keys beginning with `_` are comments and are ignored. JSON has none, and an
-//      operator-edited file needs them.
-//   3. PATHS, NEVER SECRETS. `cert` and `key` are paths. Tokens and provider keys
-//      must never become config values, or the file becomes a credential store on
-//      disk, which cuts against the standing no-credential-store constraint.
-//   4. The CLI wins. The file is read first and flags overwrite it, so a one-off
-//      override needs no edit. `bench/*.sh` drives the daemon with eight flags and
-//      must keep working.
-//
-// LIFETIME, and this is a real footgun. `provider::json` is a ZERO-COPY DOM: every
-// string in the parsed `Value` is a `string_view` into the input buffer. Parsing a
-// temporary and returning views into it is a use-after-free. `Config` therefore owns
-// the file bytes in `raw` and every `std::string` field below is COPIED out during
-// parsing, so a caller can drop the Config's DOM and keep the values.
+// LIFETIME FOOTGUN. `provider::json` is a ZERO-COPY DOM: every string in a parsed
+// `Value` points into the input buffer. So `Config` owns the file bytes in `raw` and
+// every field below is COPIED out during parsing.
 
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace llmbridge::app
 {
-    /// Everything `--config` can set. Defaults here are never consulted: the caller
-    /// seeds an instance from its own defaults, and only keys PRESENT in the file are
-    /// overwritten, so an absent key means "leave the caller's value alone".
+    /// Everything `--config` can set. Defaults here are never consulted: only keys
+    /// PRESENT in the file are overwritten, so absent means "leave the caller's value".
     struct ConfigFile
     {
         // listen
@@ -59,6 +47,7 @@ namespace llmbridge::app
 
         // upstream
         std::string upstream_url;    // empty = absent
+        std::vector<std::string> strip_headers; // dropped from upstream requests
         std::string translate_mode;  // "none" | "anthropic" | "gemini" | "cohere"
 
         // timeouts, all in seconds
@@ -82,13 +71,9 @@ namespace llmbridge::app
         double warmup_s = 0;
     };
 
-    /// Parse `text` (the whole file) into `out`.
-    ///
-    /// Returns true on success. On failure returns false and sets `err` to a single
-    /// line naming the offending key or value, because "config error" with no key is
-    /// the message an operator cannot act on.
-    ///
-    /// `text` need not outlive the call: every value is copied into `out`.
+    /// Parse `text` into `out`. On failure sets `err` to one line NAMING the offending
+    /// key: "config error" with no key is a message an operator cannot act on. `text`
+    /// need not outlive the call; every value is copied.
     bool parse_config(std::string_view text, ConfigFile& out, std::string& err);
 
     /// Read `path` and parse it. Same contract; `err` also covers an unreadable file.
