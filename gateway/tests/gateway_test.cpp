@@ -474,7 +474,7 @@ namespace
             // tenth is how a caller silently passes the wrong one. Set before start().
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate, backend,
                                             upstream_idle_ns, llmbridge::TlsConfig{}, timing_headers,
-                                            _policy);
+                                            _policy, _strip_headers);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
             // Applied BEFORE the loop thread exists. Setting it afterwards writes
             // state sweep_idle reads, which is a genuine data race TSan reports.
@@ -499,6 +499,7 @@ namespace
         uint16_t _proxy_port = 0;
         bool _shut = false;
         llmbridge::Policy* _policy = nullptr; // null = stock build, no seam consulted
+        std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
     };
 } // namespace
 
@@ -907,6 +908,7 @@ INSTANTIATE_TEST_SUITE_P(Dialects, ProxyTranslateMode,
 // ── Auth-header passthrough (translate modes rebuild the upstream request,
 //     so credentials must be explicitly mapped across the dialect boundary) ────
 class ProxyAuth : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+class ProxyStrip : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
 
 TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
 {
@@ -923,6 +925,143 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     // Anthropic's required version header is pinned when the client has none.
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
 }
+
+// BYOK, the shape the hosted pilot uses: Authorization carries a KOTTOS tenant
+// token that a policy reads, x-api-key carries the customer's own provider key.
+// x-api-key must win, or the tenant token goes to the provider as a credential:
+// a guaranteed 401, and our token handed to a third party.
+TEST_P(ProxyAuth, XApiKeyWinsOverBearerSoATenantTokenNeverReachesTheProvider)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
+                                                 "x-api-key: sk-ant-REAL\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find("x-api-key: sk-ant-REAL\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("kb_live_TENANT"), std::string::npos)
+        << "the tenant token was forwarded to the provider: " << up;
+}
+
+// The sharp edge that comes with it. Passthrough forwards the client's bytes
+// verbatim, so BOTH headers cross and the tenant token does reach the upstream.
+// A tenant token is therefore only safe in a TRANSLATING mode, where the request
+// is rebuilt from a whitelist. Asserted so nobody points the pilot at an
+// OpenAI-compatible venue (no translation) and leaks it.
+TEST_P(ProxyAuth, PassthroughForwardsEveryHeaderIncludingATenantToken)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
+                                                 "x-api-key: sk-ant-REAL\r\n")));
+    (void)c.recv_response();
+    EXPECT_NE(_backend.last_request().find("kb_live_TENANT"), std::string::npos)
+        << "if this ever fails, passthrough started rebuilding requests and the "
+           "tenant-token guidance above can be relaxed";
+}
+
+// ── Stripping headers off the upstream request ───────────────────────────────
+//
+// A hosted deployment puts its OWN tenant token in Authorization. Without this,
+// passthrough copies it to the provider verbatim and the translating path maps it
+// onto x-api-key, so a third party ends up holding our credential.
+
+TEST_P(ProxyStrip, PassthroughDropsTheNamedHeader)
+{
+    _strip_headers = {"Authorization"}; // mixed case on purpose: names are normalised
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
+                                                 "x-api-key: sk-ant-REAL\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("kb_live_TENANT"), std::string::npos) << up;
+    EXPECT_NE(up.find("x-api-key: sk-ant-REAL"), std::string::npos) << up;
+    EXPECT_NE(up.find("POST /v1/chat/completions"), std::string::npos) << "request line lost";
+}
+
+// The case the strip list exists for. With no x-api-key to win the contest, the
+// tenant token WOULD become the provider credential. Stripping has to happen
+// before credential mapping, not just before the copy.
+TEST_P(ProxyStrip, TranslatedRequestNeverMapsAStrippedTokenOntoTheProviderKey)
+{
+    _strip_headers = {"authorization"};
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("kb_live_TENANT"), std::string::npos) << up;
+    EXPECT_EQ(up.find("x-api-key:"), std::string::npos)
+        << "the tenant token was promoted to the provider credential: " << up;
+}
+
+// Body and framing must survive untouched: a wrong Content-Length here would
+// desync the shared upstream connection for the NEXT client.
+TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
+{
+    _strip_headers = {"x-drop-me"};
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    const std::string body = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"xyz\"}]}";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "X-Drop-Me: secret\r\nX-Keep-Me: kept\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("secret"), std::string::npos) << up;
+    EXPECT_NE(up.find("X-Keep-Me: kept"), std::string::npos) << up;
+    EXPECT_NE(up.find("Content-Length: " + std::to_string(body.size())), std::string::npos) << up;
+    ASSERT_GE(up.size(), body.size());
+    EXPECT_EQ(up.substr(up.size() - body.size()), body) << up;
+}
+
+// The stock build must keep the single-memcpy passthrough, byte for byte.
+TEST_P(ProxyStrip, EmptyListLeavesTheRequestUntouched)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    const std::string req = openai_request_hdrs("hi", "Authorization: Bearer keep\r\n"
+                                                      "X-Odd-Header: v\r\n");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(req));
+    (void)c.recv_response();
+    EXPECT_EQ(_backend.last_request(), req) << "passthrough is no longer byte-exact";
+}
+
+// The colon appended to every strip name is what makes the match exact. Without
+// it, "x-drop" eats "x-dropper", and nothing stops a name matching the request
+// line either. Both are one deleted line away.
+TEST_P(ProxyStrip, StrippingIsExactNotAPrefix)
+{
+    _strip_headers = {"x-drop"};
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "X-Drop: gone\r\nX-Dropper: kept\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("gone"), std::string::npos) << up;
+    EXPECT_NE(up.find("X-Dropper: kept"), std::string::npos)
+        << "a longer header name was stripped by prefix: " << up;
+    EXPECT_NE(up.find("POST /v1/chat/completions"), std::string::npos) << "request line lost";
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStrip,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
 
 // ── Content-Length disagreeing with the actual body ─────────────────────────
 //

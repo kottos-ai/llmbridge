@@ -109,6 +109,10 @@ static int run(int argc, char** argv)
         config_path = argv[i + 1];
     }
 
+    // Config-only, with no flag equivalent: a list does not fit a flag without
+    // inventing a separator, which is the argument that put --config in first.
+    std::vector<std::string> strip_headers;
+
     if (config_path)
     {
         llmbridge::app::ConfigFile cfg;
@@ -125,6 +129,7 @@ static int run(int argc, char** argv)
         if (!cfg.tls_cert.empty()) tls_cert = cfg.tls_cert;
         if (!cfg.tls_key.empty()) tls_key = cfg.tls_key;
         if (!cfg.upstream_url.empty()) upstream_arg = cfg.upstream_url;
+        strip_headers = cfg.strip_headers;
         if (!cfg.translate_mode.empty())
             translate = cfg.translate_mode == "anthropic" ? llmbridge::TranslateMode::Anthropic
                         : cfg.translate_mode == "gemini"  ? llmbridge::TranslateMode::Gemini
@@ -311,7 +316,7 @@ static int run(int argc, char** argv)
         tls.key_file = tls_key;
         auto gw = std::make_unique<llmbridge::Gateway>(
             listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
-            timing_headers);
+            timing_headers, nullptr, strip_headers);
         // Before run(): the loop thread reads it, so setting it later is a data race.
         gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));

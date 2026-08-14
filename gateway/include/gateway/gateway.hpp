@@ -7,15 +7,16 @@
 
 #pragma once
 
-// Gateway: the whole llmbridge proxy in one self-contained class. A single-
-// threaded, non-blocking epoll event loop: accept clients, frame requests,
-// (optionally) translate the provider dialect, forward over a keep-alive
-// upstream pool, read the response, translate back, write to the client. No
-// framework, no external dependencies: just net (sockets + HTTP framing) and
-// provider (dialect translation).
+// Gateway: the whole llmbridge proxy in one class. A single-threaded, non-blocking
+// event loop (epoll or io_uring): accept, frame, optionally translate the provider
+// dialect, forward over a keep-alive upstream pool, read back, translate, reply.
 //
-// Per-request added latency (the headline metric). LATENCY.md is the normative
-// definition of every number below; this is the summary. Seven stamps:
+// How it works inside, and the questions a reader actually has (which buffer holds
+// what, who may free a connection on each backend, how pooling and the two TLS legs
+// fit together): GATEWAY-INTERNALS.md.
+//
+// Per-request added latency, the headline metric. LATENCY.md is NORMATIVE for every
+// number below; change a stamp and that document changes with it.
 //
 //   t0 ts_req_recvd   client request fully framed
 //   t1 ts_req_built   upstream request built (nothing sent yet)
@@ -25,16 +26,12 @@
 //   t5                response built, client write begins
 //   t6                response fully flushed
 //
-//   added = (t1-t0) + (t3-t2)   request path: our compute + the upstream write
-//         + (t4 -> t6)          response path: translate back + write + flush
+//   added = (t1-t0) + (t3-t2) + (t4 -> t6)
 //
-// Excluded on purpose: the provider's own time (t3->t4), and the TCP connect +
-// TLS handshake (t1->t2, recorded separately as Stats::connect). Without the
-// gateway the client's own stack pays that same handshake, so it cancels in the
-// subtraction that defines "added", see LATENCY.md §1. An earlier version
-// folded connect into the request path, which was harmless against a warm pooled
-// mock and badly wrong against a cold real provider. A live single-request run
-// reported 52.66 ms of "request path" that was 99.9% handshake.
+// Excluded on purpose: the provider's own time (t3->t4) and the TCP+TLS handshake
+// (t1->t2, recorded separately as Stats::connect), because the client's own stack
+// pays that same handshake without us, so it cancels. Folding connect in once made a
+// live single-request run report 52.66 ms of "request path" that was 99.9% handshake.
 
 #include <netinet/in.h>
 
@@ -148,36 +145,14 @@ namespace llmbridge
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
-        // Closed, but not yet freed. The DEFERRAL RULE DIFFERS BY BACKEND, and the
-        // old one-line comment described only the epoll half:
-        //
-        //   epoll     freed at the end of the current event batch. The deferral
-        //             exists because one event can close a pair, and a later event
-        //             in the SAME batch would then dereference a freed pointer.
-        //             `inflight` is never incremented here, so the free is
-        //             unconditional.
-        //   io_uring  freed when `inflight` reaches 0, which may be several loop
-        //             iterations later. A submitted SQE references this object, and
-        //             the kernel does not care that we decided to close.
-        //
-        // `doomed` and `inflight` are therefore ONE protocol on io_uring, not two
-        // independent fields: doomed says we want it gone, inflight says whether the
-        // kernel agrees yet. Freeing on the first without checking the second is a
-        // use-after-free in a process holding customer credentials.
-        //
-        // The two UNCONDITIONAL frees, in the epoll batch loop and the destructor,
-        // are safe for reasons worth writing down, because a guard was added there
-        // and then removed once these were established:
-        //   epoll     never increments `inflight`, so it is always 0
-        //   io_uring  run_uring() ends with `while (_uring_inflight > 0)`, draining
-        //             to zero before it returns. _uring_inflight moves in lockstep
-        //             with every conn's `inflight` (both bumped at the three submit
-        //             sites, both dropped at the single completion site), so a zero
-        //             total means every per-conn count is zero too.
-        // Both are structural guarantees enforced in one place each, which is why a
-        // runtime check there was unreachable and untestable. Contrast
-        // tls_invariant_ok(), whose precondition is re-established by hand at six
-        // call sites and which is therefore kept.
+        // Closed, not yet freed. THE DEFERRAL RULE DIFFERS BY BACKEND: epoll frees at
+        // the end of the event batch, io_uring only once `inflight` hits 0, because a
+        // submitted SQE still references this object. So on io_uring `doomed` and
+        // `inflight` are ONE protocol: doomed says we want it gone, inflight says
+        // whether the kernel agrees. Freeing on the first alone is a use-after-free in
+        // a process holding customer credentials.
+        // Full rules, including why the two unconditional frees are safe without a
+        // guard: GATEWAY-INTERNALS.md section 7.
         bool doomed = false;
         bool close_after_resp = false; // client-only: this is an error reply, so close once it flushes
 
@@ -188,52 +163,23 @@ namespace llmbridge
         // (see net::http::ResponseDecoder; the shared-scratch form was quadratic).
         net::http::ResponseDecoder rdec;
 
-        // THE BUFFERS. `r` and `w` are named from the GATEWAY's point of view on
-        // THIS socket: rbuf is what we read from the peer, wbuf is what we write
-        // to it. So the same field name holds the REQUEST on one connection and
-        // the RESPONSE on the other, and which is which depends on `is_client`.
-        // That is the single most confusing thing about this struct, so here is
-        // one request crossing all four buffers:
-        //
-        //     client                      gateway                      provider
-        //       |                                                         |
-        //       |  request                                                |
-        //       |------------> c->rbuf --[frame, translate]--> u->wbuf    |
-        //       |                                                 |-------|-->
-        //       |                                                         |
-        //       |                                                response |
-        //       |  c->wbuf <--[translate back]-- u->rbuf <-----------------|
-        //       |<------------|                                           |
-        //
-        //   c->rbuf   bytes the CLIENT sent us      (the request)
-        //   u->wbuf   bytes we send the PROVIDER    (the request, translated)
-        //   u->rbuf   bytes the PROVIDER sent us    (the response)
-        //   c->wbuf   bytes we send the CLIENT      (the response, translated)
-        //
-        // Both buffers are PLAINTEXT on both legs, always, whether or not TLS is
-        // in use. TLS interposes at the socket edge only.
-        //
-        // There are five buffers on a Connection in total. The other three are
-        // declared further down with their own notes, listed here so the full set
-        // is visible in one place:
-        //   tls_out    ciphertext heading for the socket (TLS conns only)
-        //   wpending   io_uring streaming staging area, because wbuf must not move
-        //              while a SEND SQE points into it
-        //   rdec       chunked-decode state, not a byte buffer
+        // THE BUFFERS, named from the GATEWAY's point of view on THIS socket: rbuf is
+        // what we read from the peer, wbuf what we write to it. So the same field name
+        // holds the REQUEST on a client conn and the RESPONSE on an upstream one, which
+        // is the most confusing thing about this struct.
+        //   c->rbuf request in   u->wbuf request out
+        //   u->rbuf response in  c->wbuf response out
+        // Always PLAINTEXT on both legs; TLS interposes at the socket edge only. The
+        // other three buffers (tls_out, wpending, rdec) are declared below. Diagram and
+        // full ownership rules: GATEWAY-INTERNALS.md section 2.
         std::string rbuf;
         std::string wbuf;
 
-        // How much of wbuf has been dealt with. Its meaning shifts with the
-        // transport, which is a real trap:
-        //   plaintext:  bytes actually written to the socket
-        //   TLS:        bytes fed into the Session, which is NOT the same as bytes
-        //               on the wire. The wire progress is tls_out_off. woff can
-        //               reach wbuf.size() while nothing has left the machine yet.
-        // The WRITE PATH deliberately does not clear wbuf when woff catches up;
-        // callers do, at points they choose. That is what keeps an upstream
-        // request available for a resend when a pooled connection turns out to be
-        // dead (see ep_retry_upstream / ur_retry_upstream, which resend only when
-        // the connection came from the pool and no response byte has arrived).
+        // How much of wbuf has been dealt with. MEANING SHIFTS WITH THE TRANSPORT:
+        // plaintext counts bytes on the socket, TLS counts bytes fed into the Session,
+        // which is not the same thing (wire progress is tls_out_off). The write path
+        // deliberately never clears wbuf, which is what keeps a request resendable on a
+        // dead pooled connection. GATEWAY-INTERNALS.md section 2b.
         size_t woff = 0;
 
         // Client conns: when we accepted it, and whether it has ever produced a
@@ -275,21 +221,9 @@ namespace llmbridge
         // bytes received). The idle-timeout sweep measures against this.
         int64_t ts_up_activity = 0;
 
-        // io_uring backend only: submitted-but-uncompleted SQEs referencing this
-        // conn. See `doomed` above: the two are one protocol.
-        //
-        // OWNERSHIP:
-        //   INCREMENTED by the three ur_submit_* functions, each at its tail,
-        //              immediately before `return true`, so an early return cannot
-        //              leak a slot and strand the object forever
-        //   DECREMENTED in exactly one place, ur_on_cqe(), and only when the
-        //              completion is NOT armed: a multishot op carrying F_MORE is
-        //              still outstanding and has not released its slot
-        //   READ       by ur_maybe_free(), which is the only thing allowed to
-        //              conclude that freeing is safe
-        //
-        // (Multishot recv lands data in a shared provided-buffer pool, so there is
-        // no per-connection recv buffer to worry about.)
+        // io_uring only: submitted-but-uncompleted SQEs referencing this conn. One
+        // protocol with `doomed` above. Ownership rules (three writers, one reader,
+        // and why each sits where it does): GATEWAY-INTERNALS.md section 5b.
         int inflight = 0;
         // io_uring stale-connection handling: was this upstream reused from the
         // keep-alive pool (so a failure before any response is retry-eligible), and
@@ -307,30 +241,14 @@ namespace llmbridge
         bool streaming = false;
         bool stream_chunked = false; // upstream body uses chunked transfer-encoding
 
-        // No further stream output will be produced. It becomes true TWO ways, and
-        // the old comment here ("final [DONE] emitted") described only the first:
-        //
-        //   clean      stream_step() saw the end of the body and the SSE translator
-        //              emitted its terminal [DONE]. close_after_resp stays false.
-        //   truncated  the stream is being aborted, so NO [DONE] is emitted, on
-        //              purpose: a client must see a cut-off stream instead of a
-        //              fabricated clean finish. Always via stream_truncate().
-        //
-        // So `stream_ended && close_after_resp` is the truncated case and
-        // `stream_ended && !close_after_resp` the clean one. That pairing is the
-        // difference between a client believing it got the whole answer and knowing
-        // it did not, which makes it worth stating here and never inferring.
+        // No further stream output will be produced. TWO WAYS, and the pair with
+        // close_after_resp tells them apart: set means truncated (no [DONE], so the
+        // client can see it was cut off), clear means clean. GATEWAY-INTERNALS.md 6b.
         bool stream_ended = false;
 
-        // Epoll only, and it is the ONE place the two backends deliberately behave
-        // differently: under a slow client epoll pauses upstream EPOLLIN and applies
-        // back-pressure, while the io_uring pump instead bounds wpending with
-        // kStreamBufCap and drops the stream past the cap. Know which one you are
-        // reasoning about before quoting streaming behaviour to a customer.
-        //
-        // Owned entirely by ep_pause_read / ep_resume_read, which are the only
-        // writers and both guard on the current value. io_uring never touches it,
-        // and the ep_ prefix is what keeps that true.
+        // Epoll only, and THE one place the backends deliberately differ: epoll applies
+        // back-pressure to a slow client, io_uring drops the stream past kStreamBufCap.
+        // Written only by ep_pause_read / ep_resume_read. GATEWAY-INTERNALS.md 6c.
         bool read_paused = false;
         bool wants_usage = false;    // client set stream_options.include_usage
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
@@ -340,24 +258,10 @@ namespace llmbridge
         // never reallocated under the kernel's feet.
         std::string wpending;
 
-        // io_uring: an SQE referencing this connection's send buffer is
-        // outstanding. Two concurrent SENDs on one fd would interleave, and an
-        // SQE is immutable once submitted, so the buffer it points at must not
-        // move while this is set.
-        //
-        // OWNERSHIP, and it is worth stating because getting it wrong cost a
-        // silently hung stream:
-        //   SET    only by ur_submit_send(), the only place an SQE is submitted
-        //   CLEARED only by ur_on_send() on completion, and by
-        //           ur_release_upstream() when per-request state is reset
-        //   READ   by anyone about to touch a send buffer, to decide whether to
-        //          wait
-        //
-        // Callers must never set it. Two of them used to, under two different
-        // rules, and ur_stream_flush() setting it before calling into
-        // ur_tls_flush() (whose first line refuses to run when it is already set)
-        // meant the first SSE flush on a TLS connection did nothing at all. The
-        // stream then hung forever, on io_uring only.
+        // io_uring: an SQE referencing this connection's SEND buffer is outstanding,
+        // so that buffer must not move (an SQE is immutable once submitted). CALLERS
+        // MUST NEVER SET IT; two once did, and one of them hung every TLS stream.
+        // Ownership: GATEWAY-INTERNALS.md section 5b.
         bool send_inflight = false;
         // Upstream said keep-alive on the streaming response, so the connection may
         // be pooled once the body's terminal chunk has been consumed. Held on the
@@ -374,28 +278,10 @@ namespace llmbridge
         // The Session outlives requests: it stays attached across keep-alive pool
         // cycles, so a pooled reuse pays no second handshake.
         std::unique_ptr<net::tls::Session> tls;
-        // Ciphertext awaiting the socket. wbuf (plaintext) is NOT what gets
-        // written for a TLS conn. For these, `woff` counts plaintext bytes fed
-        // into the Session, and tls_out/tls_out_off track the encrypted write.
-        // The request's plaintext stays intact in wbuf for stale-conn retry.
-        //
-        // TWO OFFSETS, TWO QUESTIONS, and confusing them is the trap here:
-        //
-        //   woff         how much of wbuf has been HANDED TO THE TRANSPORT
-        //                  plaintext: bytes written to the socket
-        //                  TLS:       bytes fed into the Session, which have NOT
-        //                             necessarily left the machine
-        //   tls_out_off  how much ciphertext has actually reached the socket
-        //
-        // So on a TLS connection `woff >= wbuf.size()` means "fully encrypted",
-        // never "fully sent". Ask tls_wbuf_flushed() for the second question.
-        //
-        // Every existing `woff` comparison is plaintext-only and sits after a TLS
-        // early return, which is correct but invisible at the line itself. A
-        // transport-agnostic wrapper was tried and reverted: every caller is
-        // already inside a TLS-only branch, so its plaintext half was unreachable
-        // and it resolved to tls_wbuf_flushed() at every site. It read like a
-        // safety net while changing nothing, which is worse than no wrapper.
+        // Ciphertext awaiting the socket; wbuf keeps the plaintext for stale-conn
+        // retry. TWO OFFSETS, TWO QUESTIONS: woff is plaintext into the Session,
+        // tls_out_off is ciphertext onto the wire, so `woff >= wbuf.size()` means
+        // "fully encrypted", never "fully sent". GATEWAY-INTERNALS.md 10b.
         std::string tls_out;
         size_t tls_out_off = 0;
 #endif
@@ -407,9 +293,8 @@ namespace llmbridge
     /// those hold the customer's request, including its credential.
     inline void log_put(net::log::Line& l, const Connection& c)
     {
-        // The class NAME is the subject, so a line says what it is about before it
-        // says anything else: ClientConnection#3(fd=6,cid=2) against
-        // UpstreamConnection#2(fd=7). One grep separates the two halves of the proxy.
+        // The class name leads, so one grep separates the two halves of the proxy:
+        // ClientConnection#3(fd=6,cid=2) against UpstreamConnection#2(fd=7).
         l.put(net::log::Id{c.is_client ? "ClientConnection" : "UpstreamConnection", c.log_inst});
         l.put("(fd=");
         l.put(static_cast<int64_t>(c.fd));
@@ -445,19 +330,13 @@ namespace llmbridge
         // ~52.6 ms was the handshake and ~60 us was the gateway.
         Histogram overhead;  // req_path + resp_path: everything the gateway does
         Histogram req_path;  // framing/translate/auth PLUS the write() to the upstream
-        // TCP + TLS handshake only; ~one bucket width on a pooled conn, see below.
-        //
-        // NOT the default range, and the sizing is a compromise between two
-        // failures. The default (20 ns over 2.62 ms) is sized for the sub-ms
-        // overhead claim, but LATENCY.md documents a cold handshake at 50-80 ms, so
-        // every cold sample landed in overflow, where percentile() returns the
-        // running max: p50, p99 and max became one clamped number wearing three
-        // labels. Widening the BUCKET instead of the count would have been worse:
-        // percentile() reports a bucket's UPPER edge (conservative, so our own
-        // overhead is never under-reported), which means a pooled connection that
-        // paid no handshake reads as one bucket width. At 10 us that invents 10 us
-        // of cost that did not happen. 1 us over 262 ms keeps that artifact below
-        // the noise while covering any real handshake. 2 MB per worker.
+        // TCP + TLS handshake only, and NOT the default range. The default (20 ns over
+        // 2.62 ms) is sized for the sub-ms overhead claim, but a cold handshake is
+        // 50-80 ms and landed every sample in overflow, where percentile() returns the
+        // running max and p50/p99/max become one number wearing three labels. Widening
+        // the bucket instead would be worse: percentile() reports a bucket's UPPER
+        // edge, so a pooled conn that paid no handshake would read as one bucket width
+        // of invented cost. 1 us over 262 ms keeps that below the noise. 2 MB/worker.
         Histogram connect{1'000, 262'144};
         // INBOUND handshake: accept -> client handshake done. Unlike `connect`,
         // this one exists ONLY because the gateway is in the path, so the
@@ -501,23 +380,11 @@ namespace llmbridge
         // and, once streaming, to the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
 
-        // Keep-alive pool bounds. The pool was unbounded until streaming reuse landed;
-        // a streaming gateway pools roughly one upstream per concurrent stream, so
-        // without a bound it is an fd leak in slow motion (4k streams => 4k idle fds
-        // pinned indefinitely). Excess conns are closed instead of pooled, and idle
-        // entries are reaped after _pool_idle_ns on the loop's periodic tick.
-        //
-        // SIZE THIS GENEROUSLY. The cap must exceed the number of upstreams in flight
-        // at peak, or it stops being a bound and becomes a reuse *killer*: once the
-        // pool is full every release closes its connection, so the next request must
-        // reconnect. A first cut of 256 did exactly that and cost the non-streaming
-        // path 2.4x its throughput (90k RPS target: 32,210 achieved at 256 versus
-        // 77,282 at 8192 and 78,445 before the pool existed); the gateway was opening
-        // more upstream connections than it served requests. git-bisected; do not lower
-        // this without re-running ./bench/saturate.sh with BACKENDS=4.
-        //
-        // The real reclaim mechanism is the idle timeout, not the cap: the cap only
-        // has to stop pathological growth, so err high.
+        // Keep-alive pool bound: without one, a streaming gateway pins roughly one idle
+        // fd per concurrent stream forever. SIZE IT GENEROUSLY. Too small and it stops
+        // bounding and starts killing reuse; 256 cost the non-streaming path 2.4x its
+        // throughput, git-bisected. Do not lower it without re-running
+        // ./bench/saturate.sh with BACKENDS=4. Numbers: GATEWAY-INTERNALS.md 8b.
         static constexpr size_t kMaxIdleUpstreams = 8192;
         // How long a POOLED upstream may sit unused before it is closed. 30 s is a
         // compromise for one upstream and one worker; it is the wrong number as soon
@@ -546,7 +413,7 @@ namespace llmbridge
                 IoBackend io = IoBackend::Auto,
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
                 TlsConfig tls = {}, bool timing_headers = false,
-                Policy* policy = nullptr);
+                Policy* policy = nullptr, std::vector<std::string> strip_headers = {});
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -573,16 +440,12 @@ namespace llmbridge
         /// Test seam, same contract: call BEFORE run(). 0 disables pool reaping.
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
 
-        // Test seam: does any POOLED upstream still hold `needle` in its request
-        // buffer? A pooled connection idles for up to 30 s and is then handed to
-        // whichever client asks next, so a credential left in that buffer outlives
-        // the request that supplied it.
-        //
-        // It answers yes or no and NEVER returns or logs buffer contents, which is
-        // the only shape a credential-adjacent accessor should have. It exists
-        // because a mutation sweep showed secure_clear() could be deleted with no
-        // test noticing, and the invariant is not observable from outside the
-        // process by any other means.
+        // Test seam: does any POOLED upstream still hold `needle`? A pooled conn is
+        // handed to whichever client asks next, so a credential left in its buffer
+        // outlives the request that supplied it. Yes/no only, NEVER returning or
+        // logging buffer contents, which is the only shape a credential-adjacent
+        // accessor may have. Exists because a mutation sweep showed secure_clear()
+        // could be deleted with no test noticing.
         [[nodiscard]] bool pooled_buffer_contains(std::string_view needle) const noexcept;
         // Test seam. Like stats(), this reads state owned by the loop thread, so it
         // is valid only once that thread has been joined. Reading it live is a data
@@ -600,23 +463,12 @@ namespace llmbridge
         void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
 
     private:
-        // NAMING: the backend a method belongs to is part of its name:
-        //   ep_*   epoll-only    (reachable only from run_epoll)
-        //   ur_*   io_uring-only (reachable only from run_uring)
-        //   plain  shared by both loops. sweep_idle, the tls_* pump helpers
-        //
-        // A call that crosses the prefixes is a bug: neither backend's teardown,
-        // write-arming or completion handling is valid in the other. The payoff is
-        // that the check is a grep instead of a call-graph walk
-        //   grep -n 'ur_[a-z_]*(' gateway.cpp | grep ep_
-        // Exactly one crossing existed when this convention was introduced
-        // (ur_forward calling the epoll error responder); it had been invisible for
-        // as long as the epoll half of the class was unprefixed. Twins share a verb
-        // so the counterpart is greppable: ep_stream_flush / ur_stream_flush.
-        //
-        // The uring prefix is ur_, not u_, because `u` is the parameter name for an
-        // upstream connection and `void u_tls_kick_send(Connection* u)` used both
-        // meanings at once. See DESIGN.md "Naming conventions".
+        // NAMING: ep_* is epoll-only, ur_* is io_uring-only, unprefixed is shared. A
+        // call crossing the prefixes is a bug, because neither backend's teardown,
+        // write-arming or completion handling is valid in the other. Exactly one such
+        // crossing existed when the convention landed, invisible while the epoll half
+        // was unprefixed. scripts/check_conventions.py enforces it; the rationale is in
+        // DESIGN.md "Naming conventions".
         void ep_add_read(Connection* c) noexcept;
         void ep_arm_write(Connection* c) noexcept;
         void ep_disarm_write(Connection* c) noexcept;
@@ -684,23 +536,17 @@ namespace llmbridge
         // across both backends used to write them out by hand.
         void stream_truncate(Connection* client) noexcept;
         bool upstream_is_tls(const Connection* u) const noexcept;
-        // True when the request in this upstream's wbuf has left the machine on
-        // every transport it uses. A pooled upstream MUST satisfy this: the recv is
-        // armed before the send, so a provider that answers early (a 413/401 on the
-        // headers of a large body) can hand us a complete response while our request
-        // is still half-written. Release then scrubs wbuf and offers the connection
-        // to the next client, which under io_uring rewrites a buffer a live SQE
-        // points at, and on either backend leaves a truncated request on the wire.
-        // Reachability is not theoretical: ProxyEarlyResponse reproduces it on both
-        // backends, where the next client's request was silently dropped.
+        // Has this upstream's request left the machine on every transport it uses? A
+        // pooled upstream MUST satisfy this. Recv is armed before send, so a provider
+        // answering early can complete a response while our request is half-written;
+        // pooling it then truncates the next client's request, and under io_uring
+        // rewrites a buffer a live SQE points at. ProxyEarlyResponse reproduces it.
         bool upstream_request_sent(const Connection* u) const noexcept;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         // ── TLS plumbing, BOTH directions ───────────────────────────────────
-        // These are no-op-safe building blocks shared by the two backends. The
-        // parameter is `c` and not `u` on purpose: since inbound TLS landed these
-        // run on client connections too, and `u` means upstream everywhere else in
-        // this file. Direction is read from `c->is_client`, never assumed.
+        // No-op-safe helpers shared by both backends. The parameter is `c`, not `u`:
+        // these run on client conns too. GATEWAY-INTERNALS.md 10c.
         //
         // Attach a Session in CLIENT role to an upstream conn (SNI and hostname
         // from _tls.sni_host). False on failure, treated like a connect refusal.
@@ -820,6 +666,10 @@ namespace llmbridge
         // `const` so there is no setter: swapping this while the loop runs would be
         // a data race on the request path. See policy.hpp.
         Policy* const _policy = nullptr;
+        // Header names dropped from every upstream request, lower-cased with the
+        // colon so they can be compared against a raw line. Empty in a stock build,
+        // where the passthrough copy stays a single memcpy.
+        std::vector<std::string> _strip_headers;
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
         // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a

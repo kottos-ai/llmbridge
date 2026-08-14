@@ -8,6 +8,47 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.14.1]. 2026-08-14
+
+**Passthrough echoed every client header to the provider.** DESIGN.md and CLAUDE.md
+have said "rebuild, do not echo" since the 0.8.1 security sweep, and the translating
+path does exactly that. `TranslateMode::None` never did: it copied the client's bytes
+verbatim, headers included, so an internal routing header, or a token meant for this
+gateway alone, reached a third party unchanged.
+
+PATCH: a defect fix. It ships one new config key because that is the only way to name
+the headers, and the default (none) leaves every existing deployment byte-identical.
+
+### Fixed
+
+- **`upstream.strip_headers`**, header names removed from every upstream request,
+  matched case-insensitively and exactly, so `x-drop` does not also eat `x-dropper`.
+  Applied in two places, and the second is the one that matters: the passthrough copy,
+  and the credential scan, so a stripped `Authorization` is never promoted onto the
+  provider key.
+
+### Cost
+
+Measured with a microbenchmark of the copy itself, seven interleaved rounds, min of
+each, on the reference laptop and not a cold host. Treat it as an order of
+magnitude, not a published figure:
+
+| body | plain copy | with one header stripped |
+|---|---|---|
+| 1 KB | 42 ns | 128 ns |
+| 4 KB | 70 ns | 159 ns |
+| 16 KB | 242 ns | 341 ns |
+
+**About +90 ns per request, flat in body size**, because the extra work is a scan of
+the header block and not of the body. Against the 41-80 us added p99 this repo claims,
+that is roughly 0.2% of the budget, and only for deployments that set the key. An empty
+list keeps the single memcpy and the whole path unchanged.
+
+Kept lines are copied in runs, not line by line, which is worth ~45 ns of that:
+one memcpy when nothing matches, two when one header does. Translating modes pay
+nothing measurable, since they already rebuild the request and only gain a few string
+compares in the credential scan.
+
 ## [0.14.0]. 2026-08-13
 
 **The policy seam.** One hook, called once per framed request, answering the question

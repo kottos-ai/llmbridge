@@ -249,6 +249,19 @@ lookup helper; `net::http::find_header(facts.head, name)` is the safe one.
 Not in the seam yet: `Decision` selects no upstream, and `RequestFacts` exposes no model
 name. Both arrive with the upstream table.
 
+### Dropping headers before they leave (`upstream.strip_headers`)
+
+A policy decides; it cannot rewrite. So the companion to the seam is a list of header
+names removed from every upstream request, matched case-insensitively and exactly. It
+applies in two places, and the second is easy to miss: the passthrough copy, and the
+credential scan, so a stripped `Authorization` is never promoted onto the provider key.
+
+Empty by default, which keeps passthrough a single memcpy. It exists because
+`TranslateMode::None` forwarded the client's bytes verbatim, headers included, which is
+the "echo" this repo's own rule forbids: a header meant for this gateway, or an internal
+routing header, reached a third-party provider. Translating modes were never affected;
+they rebuild from a whitelist already.
+
 ## Logging
 
 A logger in a process that sells a latency number is a hazard, not a convenience.

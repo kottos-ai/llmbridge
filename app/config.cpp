@@ -91,6 +91,28 @@ namespace llmbridge::app
         /// parser's `sv` is a view into the input and is still JSON-escaped; config
         /// values are paths, URLs and enum words, none of which may contain an escape,
         /// so a backslash is refused instead of silently mis-decoded.
+        /// Array of non-empty strings. Rejects a bare string, because "authorization"
+        /// where ["authorization"] was meant is the kind of typo that must not quietly
+        /// become a no-op on a header the operator believes is being dropped.
+        bool want_str_array(const json::Value& g, std::string_view grp, std::string_view key,
+                            std::vector<std::string>& out, std::string& err)
+        {
+            const json::Value* v = g.find(key);
+            if (!v) return true;
+            const std::string where = std::string(grp) + "." + std::string(key);
+            if (!v->is_array()) return fail(err, "config: \"" + where + "\" must be an array of strings");
+            for (const json::Value& e : v->arr)
+            {
+                if (e.type != json::Value::Type::String)
+                    return fail(err, "config: \"" + where + "\" must contain only strings");
+                if (e.sv.empty()) return fail(err, "config: \"" + where + "\" must not contain an empty string");
+                if (e.sv.find('\\') != std::string_view::npos)
+                    return fail(err, "config: \"" + where + "\" must not contain a backslash escape");
+                out.emplace_back(e.sv);
+            }
+            return true;
+        }
+
         bool want_str(const json::Value& g, std::string_view grp, std::string_view key,
                       std::string& out, std::string& err)
         {
@@ -149,9 +171,10 @@ namespace llmbridge::app
         if (const json::Value* g = root.find("upstream"))
         {
             if (!g->is_object()) return fail(err, "config: \"upstream\" must be an object");
-            if (!only(*g, "upstream", {"url", "translate"}, err)) return false;
+            if (!only(*g, "upstream", {"url", "translate", "strip_headers"}, err)) return false;
             if (!want_str(*g, "upstream", "url", out.upstream_url, err)) return false;
             if (!want_str(*g, "upstream", "translate", out.translate_mode, err)) return false;
+            if (!want_str_array(*g, "upstream", "strip_headers", out.strip_headers, err)) return false;
             if (!one_of(out.translate_mode, "upstream", "translate",
                         {"none", "anthropic", "gemini", "cohere"}, err))
                 return false;

@@ -29,7 +29,8 @@ TEST(Config, FullFileAppliesEveryGroup)
     const std::string text = R"({
       "_note": "comments are keys beginning with underscore",
       "listen":   { "port": 8443, "tls": true, "cert": "/c.pem", "key": "/k.pem" },
-      "upstream": { "url": "https://api.anthropic.com", "translate": "anthropic" },
+      "upstream": { "url": "https://api.anthropic.com", "translate": "anthropic",
+                    "strip_headers": ["authorization", "X-Internal"] },
       "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
                     "duration_s": 12, "warmup_s": 2, "log_level": "debug" }
@@ -56,6 +57,10 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_TRUE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 12);
     EXPECT_DOUBLE_EQ(c.warmup_s, 2);
+    ASSERT_EQ(c.strip_headers.size(), 2u);
+    EXPECT_EQ(c.strip_headers[0], "authorization");
+    EXPECT_EQ(c.strip_headers[1], "X-Internal"); // normalised by the Gateway, not here
+
 }
 
 // The values must survive the DOM they were parsed from. provider::json is
@@ -110,6 +115,11 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(R"({"listen":{"tls":"yes"}})", "true or false"),
         std::make_pair(R"({"listen":{"port":"8443"}})", "must be a number"),
         std::make_pair(R"({"upstream":{"url":443}})", "must be a string"),
+        // A bare string where a list was meant must NOT quietly become a no-op on a
+        // header the operator believes is being dropped.
+        std::make_pair(R"({"upstream":{"strip_headers":"authorization"}})", "array of strings"),
+        std::make_pair(R"({"upstream":{"strip_headers":[1]}})", "only strings"),
+        std::make_pair(R"({"upstream":{"strip_headers":[""]}})", "empty string"),
         std::make_pair(R"({"listen":"8443"})", "must be an object"),
         // bad enum values, and the message lists what is allowed
         std::make_pair(R"({"upstream":{"translate":"claude"}})", "must be one of"),
