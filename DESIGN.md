@@ -216,6 +216,39 @@ and on the response, content / finish-reason / usage.
   Phase-B item. (The framer's `Error` status is what triggers the close; it is honored
   in both backends.)
 
+## The policy seam (`gateway/policy.hpp`)
+
+One hook, one question: **may this request proceed?** llmbridge answers it for nobody.
+It authenticates no client and has no tenant concept, which is a design position, not a
+missing feature: a gateway that authenticates clients is multi-tenant infrastructure,
+and this is a proxy.
+
+```cpp
+class Policy {
+  public:
+    virtual ~Policy() = default;
+    virtual Decision decide(const RequestFacts&) noexcept = 0;
+};
+```
+
+Supplied at `Gateway` construction, non-owning, stored `const` so there is no setter to
+race. Called at one site per backend, after framing and before translation, credential
+mapping or upstream acquisition, so a refusal reaches no provider.
+
+Two separate defaults, answering different questions. `Gateway`'s policy pointer is
+null in a stock build, so no call is made and the request forwards: absent, not
+permissive. `Decision::allow` is false, so a zeroed decision returned from a forgotten
+branch in someone's policy refuses instead of forwarding.
+
+`RequestFacts` carries the request line, the headers and the framed body size, and no
+route to the body: "metadata only, no prompt text" is a property of the type instead of
+a promise. It does carry the client credential, since `Authorization` is in the head, so
+nothing derived from it may be logged and the views die with the call. It exposes no
+lookup helper; `net::http::find_header(facts.head, name)` is the safe one.
+
+Not in the seam yet: `Decision` selects no upstream, and `RequestFacts` exposes no model
+name. Both arrive with the upstream table.
+
 ## Logging
 
 A logger in a process that sells a latency number is a hazard, not a convenience.
@@ -422,24 +455,33 @@ configuration (`BACKENDS=4`, governor, sysctls) changes the result as much as th
 
 ## What this repo does NOT do (yet)
 
-Stated plainly so there are no surprises:
+Checked against the tree on 2026-08-13, not against memory. Everything below was
+verified by grep before it was written down.
 
-- **Streaming (SSE) is supported** for OpenAI ⇄ Anthropic only. Gemini/Cohere streaming
-  is Phase B. A streamed client response is close-delimited.
-- **No TLS, no provider auth, no per-provider URL routing.** Translate mode targets a
-  local/mock/already-proxied upstream; it can't call `api.anthropic.com` directly yet
-  (Phase C). This is also why the benchmark runs against a mock.
-- **No tool calling, vision, `cache_control`, or Bedrock** yet (Phase B).
-- **No language bindings** yet (Python/Go/Rust planned)
-- **No routing, matching, pricing, or observability**, by design; that's the separate
-  commercial layer, not open source.
+- **Streaming is OpenAI ⇄ Anthropic only.** Gemini and Cohere translate
+  non-streaming requests and responses. A streamed client response is close-delimited.
+- **No Anthropic-in mode.** The client must speak OpenAI. The only SSE translator is
+  `AnthropicToOpenAiSse`; the mirror has to synthesise Anthropic's richer envelope from
+  OpenAI's flatter chunks and is not written.
+- **No vision, no `cache_control`.** Tool calling is done, streaming and not.
+- **No Bedrock, Vertex or Azure.** The dialects are close or identical; what is missing
+  is auth (SigV4, OAuth) and, for Bedrock streaming, a binary event-stream decoder.
+- **No language bindings.** Python, Go and Rust are planned.
+- **No routing, matching, pricing or observability**, by design; that is the separate
+  commercial layer. What is here is the seam they hang off: a `Policy` hook that decides
+  whether a request proceeds, with no policy in the box.
+
+Shipped since earlier revisions of this list said otherwise: **TLS on both legs**
+(`-DLLMBRIDGE_TLS=ON`, `--upstream https://...`, `--listen-tls`), **provider auth
+passthrough**, and **tool calling**. The benchmark still runs against a mock, for
+reproducibility, not because a real provider is unreachable.
 
 ## Roadmap
 
-- **Phase B:** tool calling, vision, `cache_control`, streaming for Gemini/Cohere,
-  **Anthropic-in mode** (client speaks Anthropic, upstream OpenAI-compatible; the
-  harder direction: Anthropic's richer event envelope must be synthesised from OpenAI's
-  flatter chunks), language bindings. (Streaming SSE and structured HTTP error responses have landed:
-  the transport/dialect step is shared by both backends, upstream provider errors are
-  relayed with their own status code, and an upstream idle timeout bounds stalls.)
-- **Phase C:** TLS, provider auth + per-provider endpoint routing, separate-host benchmark.
+Derived from `git tag` and CHANGELOG.md, which are the source of truth when this
+disagrees with them.
+
+- **Next:** AWS SigV4 signing, to reach Bedrock as an upstream.
+- **Then:** Anthropic-in mode; streaming for Gemini and Cohere.
+- **Later:** vision and `cache_control`; Python, Go and Rust bindings.
+- **v1.0.0:** API stability, only after six months of public use.

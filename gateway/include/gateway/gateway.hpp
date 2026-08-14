@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "gateway/metrics.hpp"
+#include "gateway/policy.hpp"
 #include "net/http.hpp"
 #include "net/log.hpp"
 #include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
@@ -483,6 +484,11 @@ namespace llmbridge
                                             // speaking the wrong protocol at us)
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
         uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
+        // Requests an installed Policy refused; 0 in a stock build. A SUBSET of
+        // `errors`, not a sibling: the refusal goes out through the same responder, so
+        // both counters move. Denials climbing while `errors - denials` stays flat is
+        // a brute-force attempt, not an outage.
+        uint64_t policy_denied = 0;
     };
 
     class Gateway
@@ -533,11 +539,14 @@ namespace llmbridge
         // to solve a problem the client cannot see. 0 disables it.
         static constexpr int64_t kDefaultClientIdleNs = 3LL * 24 * 3600 * 1000 * 1000 * 1000;
 
+        // `policy` is non-owning and must outlive the Gateway; null (the default)
+        // means none is consulted. Last parameter so no existing call changes meaning.
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
                 int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
                 IoBackend io = IoBackend::Auto,
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
-                TlsConfig tls = {}, bool timing_headers = false);
+                TlsConfig tls = {}, bool timing_headers = false,
+                Policy* policy = nullptr);
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -633,6 +642,12 @@ namespace llmbridge
         void ep_stream_on_upstream_eof(Connection* u) noexcept; // upstream closed: finish the stream
         void ep_stream_flush(Connection* client) noexcept;      // write buffered SSE, apply backpressure
         void ep_finalize_stream(Connection* client) noexcept;   // stream done: tear down + count
+
+        // Ask the installed policy about a freshly framed request. Unprefixed: the
+        // question has nothing to do with the event loop. Callers must treat
+        // `allow == false` as terminal and reply with their own ep_/ur_ responder.
+        // Only called when a policy exists; the caller checks first.
+        Decision policy_decision(const Connection* c, const net::http::Message& m) noexcept;
 
         // Abort any request whose upstream has been silent for longer than
         // _upstream_idle_ns. Runs on the loop's existing periodic tick (epoll's
@@ -802,6 +817,9 @@ namespace llmbridge
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls; // BOTH legs; each flag inits its own context in the ctor
         bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
+        // `const` so there is no setter: swapping this while the loop runs would be
+        // a data race on the request path. See policy.hpp.
+        Policy* const _policy = nullptr;
         std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
         // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a

@@ -453,33 +453,69 @@ TEST(HttpQuirk, LargePaddingHeaderUnderCapIsNotError)
 TEST(FindHeader, CaseInsensitiveNameLookupTrimsValue)
 {
     const std::string_view h = "Host: x\r\nX-API-Key:   sk-123\r\nContent-Length: 4\r\n";
-    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "sk-123");
-    EXPECT_EQ(llmbridge::net::http::find_header(h, "host:"), "x");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "sk-123");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "host"), "x");
+}
+
+// The name is lower-cased too, not just the line. Before this, a caller writing the
+// header the way the RFC spells it got an empty value and, in an auth check, read
+// every request as unauthenticated.
+TEST(FindHeader, NameIsLowerCasedSoAnySpellingWorks)
+{
+    const std::string_view h = "Host: x\r\nAuthorization: Bearer t\r\n";
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "Authorization"), "Bearer t");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "AUTHORIZATION"), "Bearer t");
+    // The old spelling, with the colon, still works: no caller silently breaks.
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "authorization:"), "Bearer t");
 }
 
 TEST(FindHeader, MissingHeaderIsEmpty)
 {
-    EXPECT_TRUE(llmbridge::net::http::find_header("Host: x\r\n", "authorization:").empty());
-    EXPECT_TRUE(llmbridge::net::http::find_header("", "authorization:").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("Host: x\r\n", "authorization").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("", "authorization").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("Host: x\r\n", "").empty());
+    EXPECT_TRUE(llmbridge::net::http::find_header("Host: x\r\n", ":").empty());
 }
 
 TEST(FindHeader, FirstOccurrenceWinsOnDuplicates)
 {
     // Anti-smuggling: duplicated credentials must resolve deterministically.
     const std::string_view h = "x-api-key: first\r\nx-api-key: second\r\n";
-    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "first");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "first");
 }
 
-TEST(FindHeader, ColonInNameStopsPrefixConfusion)
+// THE ONE THIS FUNCTION WAS REWRITTEN FOR. The colon has to sit exactly where the
+// name ends, or a client can name a header `x-tenant-spoof:` and have it answer a
+// lookup for `x-tenant`. Whoever asks the question is deciding authorisation, so
+// the forged field is a privilege the client granted itself.
+TEST(FindHeader, LongerHeaderNameCannotImpersonateAShorterOne)
 {
-    const std::string_view h = "x-api-key-2: wrong\r\nx-api-key: right\r\n";
-    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "right");
+    const std::string_view h = "x-tenant-spoof: attacker\r\nHost: x\r\n";
+    EXPECT_TRUE(llmbridge::net::http::find_header(h, "x-tenant").empty());
+
+    const std::string_view both = "x-api-key-2: wrong\r\nx-api-key: right\r\n";
+    EXPECT_EQ(llmbridge::net::http::find_header(both, "x-api-key"), "right");
+}
+
+// A header line with no colon at all matches nothing, including the request line,
+// which is why passing a whole head (request line included) is safe.
+TEST(FindHeader, LinesWithoutAColonNeverMatch)
+{
+    const std::string_view h = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n";
+    EXPECT_TRUE(llmbridge::net::http::find_header(h, "POST /v1/chat/completions HTTP/1.1").empty());
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "host"), "x");
+}
+
+TEST(FindHeader, EmptyValueIsEmptyNotAbsent)
+{
+    const std::string_view h = "x-api-key:\r\nHost: x\r\n";
+    EXPECT_TRUE(llmbridge::net::http::find_header(h, "x-api-key").empty());
 }
 
 TEST(FindHeader, CrlfEndsTheValue)
 {
     const std::string_view h = "x-api-key: k\r\nX-Evil: 1\r\n";
-    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key:"), "k");
+    EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "k");
 }
 
 // Documents the SHARP EDGE deliberately: a bare CR does NOT terminate a line, so
@@ -488,7 +524,7 @@ TEST(FindHeader, CrlfEndsTheValue)
 TEST(FindHeader, BareCrSurvivesInsideValueSoCallersMustValidate)
 {
     const std::string_view h = "x-api-key: k\rX-Smuggled: 1\r\nHost: a\r\n";
-    const auto v = llmbridge::net::http::find_header(h, "x-api-key:");
+    const auto v = llmbridge::net::http::find_header(h, "x-api-key");
     EXPECT_NE(v.find('\r'), std::string_view::npos)
         << "if this ever passes, find_header changed and gateway validation may be stale";
 }
