@@ -17,6 +17,9 @@
     "_key": "Private key, PEM, and it must not be readable beyond its owner (chmod 600) or startup refuses it. Example: /etc/llmbridge/key.pem"
   },
 
+  "_upstream_table": "An OBJECT for one venue, as below, or an ARRAY of the same object for several. With an array, a policy installed by a consuming program selects the index per request; llmbridge itself always uses the first, because choosing needs measurements it does not collect. Order is the contract: the index a policy returns is a position in this list. strip_headers is gateway-wide and is read from the object form only.",
+  "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"translate\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"translate\": \"none\"} ]",
+
   "upstream": {
     "_url": "IP:PORT, HOST:PORT, or http(s)://HOST[:PORT]. https:// needs a TLS build and verifies both the chain and the hostname, with no way to disable it. A non-loopback plaintext upstream warns at startup, because a forwarded credential would cross the network in the clear.",
     "url": "127.0.0.1:9001",

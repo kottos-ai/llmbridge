@@ -45,8 +45,9 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_TRUE(c.listen_tls);
     EXPECT_EQ(c.tls_cert, "/c.pem");
     EXPECT_EQ(c.tls_key, "/k.pem");
-    EXPECT_EQ(c.upstream_url, "https://api.anthropic.com");
-    EXPECT_EQ(c.translate_mode, "anthropic");
+    ASSERT_EQ(c.upstreams.size(), 1u); // the object form is one entry
+    EXPECT_EQ(c.upstreams[0].url, "https://api.anthropic.com");
+    EXPECT_EQ(c.upstreams[0].translate, "anthropic");
     EXPECT_TRUE(c.has_upstream_s);
     EXPECT_DOUBLE_EQ(c.upstream_s, 90);
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
@@ -76,7 +77,8 @@ TEST(Config, ValuesOutliveTheParsedBuffer)
         ASSERT_TRUE(parse_config(scratch, c, err)) << err;
         scratch.assign(4096, 'x'); // clobber the buffer the DOM pointed into
     }
-    EXPECT_EQ(c.upstream_url, "https://example.invalid/v1");
+    ASSERT_EQ(c.upstreams.size(), 1u);
+    EXPECT_EQ(c.upstreams[0].url, "https://example.invalid/v1");
 }
 
 // An absent key must leave the caller's default alone, which is what makes
@@ -90,7 +92,45 @@ TEST(Config, AbsentKeysAreNotApplied)
     EXPECT_FALSE(c.has_listen_tls);
     EXPECT_FALSE(c.has_workers);
     EXPECT_TRUE(c.tls_cert.empty());
-    EXPECT_TRUE(c.upstream_url.empty());
+    EXPECT_TRUE(c.upstreams.empty());
+}
+
+// ── The upstream TABLE ───────────────────────────────────────────────────────
+//
+// `upstream` accepts an object (one venue, what nearly every deployment writes) or
+// an array of the same object. The array is what lets a policy route, and the object
+// form must keep meaning exactly one entry so no existing config changes behaviour.
+
+TEST(Config, UpstreamArrayBecomesATableInOrder)
+{
+    const char* text = R"({
+      "upstream": [ { "url": "127.0.0.1:9001", "translate": "anthropic" },
+                    { "url": "127.0.0.1:9002", "translate": "none" },
+                    { "url": "https://api.anthropic.com", "translate": "anthropic" } ]
+    })";
+    ConfigFile c;
+    std::string err;
+    ASSERT_TRUE(parse_config(text, c, err)) << err;
+    ASSERT_EQ(c.upstreams.size(), 3u);
+    EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
+    EXPECT_EQ(c.upstreams[1].url, "127.0.0.1:9002");
+    EXPECT_EQ(c.upstreams[2].url, "https://api.anthropic.com");
+    // ORDER IS THE CONTRACT: a policy selects by index, so a table that reorders
+    // silently sends requests to the wrong venue.
+    EXPECT_EQ(c.upstreams[1].translate, "none");
+    EXPECT_EQ(c.upstreams[2].translate, "anthropic");
+}
+
+TEST(Config, EachEntryValidatesLikeTheObjectForm)
+{
+    ConfigFile c;
+    std::string err;
+    // A misspelling inside an array entry must fail exactly as it does in an object.
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","translat":"none"}]})", c, err));
+    EXPECT_NE(err.find("translat"), std::string::npos) << err;
+    err.clear();
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","translate":"claude"}]})", c, err));
+    EXPECT_NE(err.find("must be one of"), std::string::npos) << err;
 }
 
 class ConfigReject : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
@@ -115,6 +155,12 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(R"({"listen":{"tls":"yes"}})", "true or false"),
         std::make_pair(R"({"listen":{"port":"8443"}})", "must be a number"),
         std::make_pair(R"({"upstream":{"url":443}})", "must be a string"),
+        // The array form: empty is a config with nowhere to send anything, and a
+        // non-object entry is a typo that must not silently become one venue.
+        std::make_pair(R"({"upstream":[]})", "must not be an empty array"),
+        std::make_pair(R"({"upstream":[1,2]})", "must be an object"),
+        std::make_pair(R"({"upstream":[{"translate":"none"},{"url":"x:1"}]})", "needs a url"),
+        std::make_pair(R"({"upstream":"127.0.0.1:9001"})", "object or an array"),
         // A bare string where a list was meant must NOT quietly become a no-op on a
         // header the operator believes is being dropped.
         std::make_pair(R"({"upstream":{"strip_headers":"authorization"}})", "array of strings"),
@@ -170,8 +216,9 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_FALSE(c.listen_tls);
     EXPECT_TRUE(c.tls_cert.empty()) << "a certificate with tls:false is refused at startup";
     EXPECT_TRUE(c.tls_key.empty());
-    EXPECT_EQ(c.upstream_url, "127.0.0.1:9001");
-    EXPECT_EQ(c.translate_mode, "none");
+    ASSERT_EQ(c.upstreams.size(), 1u);
+    EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
+    EXPECT_EQ(c.upstreams[0].translate, "none");
     EXPECT_DOUBLE_EQ(c.upstream_s,
                      static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9);
     EXPECT_DOUBLE_EQ(c.client_idle_s,

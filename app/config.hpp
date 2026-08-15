@@ -46,9 +46,14 @@ namespace llmbridge::app
         std::string tls_key;
 
         // upstream
-        std::string upstream_url;    // empty = absent
+        /// One entry per venue, in the order the file lists them; a policy selects by index.
+        struct UpstreamEntry
+        {
+            std::string url;       // IP:PORT, HOST:PORT or http(s)://HOST[:PORT]
+            std::string translate; // "none" | "anthropic" | "gemini" | "cohere"
+        };
+        std::vector<UpstreamEntry> upstreams;
         std::vector<std::string> strip_headers; // dropped from upstream requests
-        std::string translate_mode;  // "none" | "anthropic" | "gemini" | "cohere"
 
         // timeouts, all in seconds
         bool has_upstream_s = false;

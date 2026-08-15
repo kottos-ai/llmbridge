@@ -34,6 +34,13 @@ namespace llmbridge
         bool allow = false;
         /// Must be 400-599; the gateway substitutes 403 for anything else and warns.
         int deny_status = 401;
+        /// Which upstream serves this request, as an index into the gateway's table.
+        /// Out of range (including the -1 default) means the FIRST upstream, so a
+        /// policy that only authenticates need not know the table exists.
+        ///
+        /// Ignored when `allow` is false: a refused request reaches no venue.
+        int upstream_index = -1;
+
         /// Logged, never sent to the client. Must outlive the call, and must not carry
         /// credential material.
         const char* reason = "policy denied";
