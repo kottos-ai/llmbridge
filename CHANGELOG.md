@@ -8,6 +8,81 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.15.0]. 2026-08-15
+
+**Several upstreams, chosen per request.** The gateway held one upstream, resolved at
+startup, so the policy seam could decide only whether a request proceeded and never
+where it went. It now holds an ordered table and `Decision::upstream_index` selects
+from it. llmbridge still chooses nothing itself: picking a venue needs measurements it
+does not collect, so a stock build always uses the first entry.
+
+MINOR: new functionality, and a behaviour change in the CONFIG FILE, called out below.
+The C++ API is additive: the single-upstream constructor still exists and delegates.
+
+### Added
+
+- **`Gateway::Upstream`** and a constructor taking `std::vector<Upstream>`. Each venue
+  carries its own address, TLS setting, SNI host and DIALECT, which is what makes
+  cross-venue routing possible at all: one request is rebuilt for Anthropic while the
+  next is forwarded to an OpenAI-compatible host, decided per request.
+- **`Decision::upstream_index`**, promised in 0.14.0's "known gaps" and deliberately
+  withheld until the table existed, because a field the gateway ignored would have been
+  a lie. Unset (-1) or out of range means the first upstream, so a policy that only
+  authenticates never learns the table exists.
+- **`upstream` may be an ARRAY** in the config file. The object form is unchanged and
+  means exactly one entry, which is the additive migration DESIGN.md promised when
+  `--config` shipped ahead of the table.
+
+### Changed
+
+- **One keep-alive pool per venue.** A connection to one provider is never handed to a
+  request bound for another; that would put the request, and its credential, on a
+  socket to the wrong company. Retries after a stale pooled connection stay on the same
+  venue for the same reason.
+- **Pool fragmentation is now N workers times M venues.** Each pool sees ~1/(N*M) of
+  the traffic and crosses the idle line far more often, and every crossing costs the
+  next request a reconnect and a TLS handshake. `--pool-idle` defaults to 30 s, chosen
+  when there was one pool; measure before trusting it with a table.
+- **Startup logs the table**, one line per venue with its dialect, replacing the single
+  `upstream=` line.
+
+- **`Policy::on_failure(FailureFacts) -> Retry`**, so a caller can react when a venue
+  does not answer: a refused connect, a failed write, an EOF before the response, an
+  idle timeout. Twelve sites across both backends. **The default never retries**, so a
+  stock build, and any policy that ignores failures, answers 502 exactly as before.
+- **A failover REBUILDS the request** for the new venue, never resends it: the bytes
+  queued for the venue that failed were translated for its API, so resending them would
+  put an Anthropic Messages body on an OpenAI-compatible host. The client's original
+  request is kept only when a policy is installed AND the table has more than one entry,
+  so a stock or single-upstream build copies nothing.
+- **`Stats::upstream_failovers`**, apart from `upstream_retries`: one says a provider
+  dropped an idle keep-alive, the other says a provider is not answering.
+
+### Not included, and deliberately
+
+- **No failover POLICY.** llmbridge forms no opinion about which venue is healthy,
+  because health is measured and it measures nothing. Ordering, ejection thresholds and
+  cooldown belong to the caller.
+- **A venue that DID answer, with something unparseable, does not reach the hook.**
+  Retrying elsewhere would mask a real incompatibility as a transient blip.
+- **Streaming fails over only before its first byte reaches the client.** After that the
+  stream is truncated honestly: no LLM API can resume mid-stream, so a reconnect would
+  replay tokens the client already has. Three further bounds, none of them policy: three
+  venues per request, the failed venue may not be renamed, and nothing is re-sent once
+  any byte has gone out.
+
+### Verified
+
+Eight routing tests on BOTH backends, and five mutations of the routing logic all
+caught: the policy's index ignored, pools shared across venues, release into the wrong
+pool, an out-of-range index left unclamped, and a retry rerouted to another venue.
+
+That last one survived three attempts. The first two tests reached the retry path but
+could not observe where the retried connection LANDED, because the mock closed every
+connection and the contaminated one was evicted before anything could draw it. Catching
+it needed a mock that kills only its first connection, so the retried one survives to
+be pooled, and a following request to the other venue to expose it.
+
 ## [0.14.2]. 2026-08-14
 
 **The JSON number scanner accepted things that are not numbers.** It consumed any run

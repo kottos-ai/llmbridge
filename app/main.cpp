@@ -41,6 +41,16 @@
 
 namespace
 {
+    /// "anthropic" | "gemini" | "cohere" | anything else -> None. Both the config
+    /// parser and --translate validate the string, so an unknown one cannot arrive.
+    llmbridge::TranslateMode translate_from(const std::string& s)
+    {
+        return s == "anthropic" ? llmbridge::TranslateMode::Anthropic
+               : s == "gemini"  ? llmbridge::TranslateMode::Gemini
+               : s == "cohere"  ? llmbridge::TranslateMode::Cohere
+                                : llmbridge::TranslateMode::None;
+    }
+
     std::vector<std::unique_ptr<llmbridge::Gateway>>* g_gateways = nullptr;
     void on_signal(int) noexcept
     {
@@ -112,6 +122,8 @@ static int run(int argc, char** argv)
     // Config-only, with no flag equivalent: a list does not fit a flag without
     // inventing a separator, which is the argument that put --config in first.
     std::vector<std::string> strip_headers;
+    // Venues past the first, from a config file only.
+    std::vector<llmbridge::app::ConfigFile::UpstreamEntry> extra_upstreams;
 
     if (config_path)
     {
@@ -128,13 +140,16 @@ static int run(int argc, char** argv)
         if (cfg.has_listen_tls) listen_tls = cfg.listen_tls;
         if (!cfg.tls_cert.empty()) tls_cert = cfg.tls_cert;
         if (!cfg.tls_key.empty()) tls_key = cfg.tls_key;
-        if (!cfg.upstream_url.empty()) upstream_arg = cfg.upstream_url;
         strip_headers = cfg.strip_headers;
-        if (!cfg.translate_mode.empty())
-            translate = cfg.translate_mode == "anthropic" ? llmbridge::TranslateMode::Anthropic
-                        : cfg.translate_mode == "gemini"  ? llmbridge::TranslateMode::Gemini
-                        : cfg.translate_mode == "cohere"  ? llmbridge::TranslateMode::Cohere
-                                                          : llmbridge::TranslateMode::None;
+        // Entry 0 feeds the flags, so --upstream and --translate keep overriding a
+        // one-upstream file exactly as before. Entries beyond the first can only come
+        // from a file, since a list has no flag spelling.
+        if (!cfg.upstreams.empty())
+        {
+            if (!cfg.upstreams[0].url.empty()) upstream_arg = cfg.upstreams[0].url;
+            if (!cfg.upstreams[0].translate.empty()) translate = translate_from(cfg.upstreams[0].translate);
+            extra_upstreams.assign(cfg.upstreams.begin() + 1, cfg.upstreams.end());
+        }
         if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
         if (cfg.has_client_idle_s) client_idle = cfg.client_idle_s;
         if (cfg.has_pool_idle_s) pool_idle = cfg.pool_idle_s;
@@ -282,7 +297,7 @@ static int run(int argc, char** argv)
     const uint16_t upstream_port = up.port;
     if (ips.size() > 1)
         std::fprintf(stderr, "llmbridge: %s resolved to %zu addresses; using %s "
-                             "(failover across the rest lands with the failover PR)\n",
+                             "(list several venues under \"upstream\" to reach the rest)\n",
                      up.host.c_str(), ips.size(), upstream_ip.c_str());
 
     // Credentials over plaintext: the gateway forwards the client's provider key
@@ -295,6 +310,40 @@ static int run(int argc, char** argv)
             LB_WARN("upstream is plaintext HTTP and not loopback; any client credential "
                     "forwarded to it travels UNENCRYPTED, use https:// for a real provider. "
                     "host=", up.host, " port=", upstream_port);
+    }
+
+    // The table the workers index. Entry 0 is what the flags describe; the rest are
+    // parsed and resolved identically, because a venue reached only from a file must
+    // fail as loudly at startup as one named on the command line.
+    std::vector<llmbridge::Upstream> upstream_table;
+    upstream_table.push_back(
+        llmbridge::Upstream{upstream_ip, upstream_port, up.tls, up.host, translate, {}});
+    for (const auto& e : extra_upstreams)
+    {
+        const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
+        if (!s2.ok())
+        {
+            std::fprintf(stderr, "llmbridge: bad upstream '%s': %s\n", e.url.c_str(),
+                         s2.error.c_str());
+            return 2;
+        }
+#ifndef LLMBRIDGE_HAVE_TLS
+        if (s2.tls)
+        {
+            std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build.\n");
+            return 2;
+        }
+#endif
+        std::string e2;
+        const std::vector<std::string> ips2 = llmbridge::net::resolve_host_ipv4(s2.host, &e2);
+        if (ips2.empty())
+        {
+            std::fprintf(stderr, "llmbridge: cannot resolve upstream host '%s': %s\n",
+                         s2.host.c_str(), e2.c_str());
+            return 2;
+        }
+        upstream_table.push_back(llmbridge::Upstream{ips2.front(), s2.port, s2.tls, s2.host,
+                                                     translate_from(e.translate), {}});
     }
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -315,8 +364,8 @@ static int run(int argc, char** argv)
         tls.cert_file = tls_cert;
         tls.key_file = tls_key;
         auto gw = std::make_unique<llmbridge::Gateway>(
-            listen_port, upstream_ip, upstream_port, warmup_ns, translate, io, up_timeout_ns, tls,
-            timing_headers, nullptr, strip_headers);
+            listen_port, upstream_table, warmup_ns, io, up_timeout_ns, tls, timing_headers,
+            nullptr, strip_headers);
         // Before run(): the loop thread reads it, so setting it later is a data race.
         gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));

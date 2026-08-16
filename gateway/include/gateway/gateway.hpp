@@ -102,6 +102,23 @@ namespace llmbridge
         std::string key_file;  // PEM key, mode 600 or startup refuses it
     };
 
+    /// One place a request can be sent. The gateway holds an ordered table and a POLICY
+    /// picks the index per request; llmbridge never chooses, because choosing needs
+    /// measurements it does not collect. The DIALECT lives here because it is what makes
+    /// cross-venue routing possible: one request is rebuilt for Anthropic while the next
+    /// is forwarded to an OpenAI-compatible host.
+    struct Upstream
+    {
+        std::string ip;       ///< resolved at startup; the table is not re-resolved
+        uint16_t port = 0;
+        bool tls = false;     ///< originate TLS to this venue
+        std::string sni_host; ///< DNS name for SNI and hostname verification, and the
+                              ///< Host header. Empty for the bare IP:PORT form.
+        TranslateMode translate = TranslateMode::None;
+
+        std::string host_hdr; ///< derived at construction; see host_header_for()
+    };
+
     // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.
     // (Phase 0: the selection is plumbed and probed; the io_uring loop itself
     // arrives in Phase 1, so today every choice runs the epoll loop.)
@@ -127,6 +144,19 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        /// CLIENT only: the original request, kept so a failover can REBUILD it for
+        /// another venue. The upstream's wbuf cannot be resent, because it was
+        /// translated for the dialect of the venue that failed. Empty in a stock build
+        /// and with one upstream, so nobody pays for a copy they cannot use.
+        std::string failover_req;
+        int failover_attempts = 0; ///< venues already tried for the request in flight
+
+        /// Index into the upstream table, -1 when none applies. TWO READINGS that agree
+        /// by construction: on an UPSTREAM connection the venue this socket talks to, so
+        /// release finds the right pool; on a CLIENT connection the venue serving the
+        /// request in flight, which is how the response leg knows the dialect after the
+        /// upstream went back to its pool.
+        int upstream_slot = -1;
         // Log identity, distinct from `id` below: `id` is the client-map KEY and is 0
         // on every upstream, so it cannot name an upstream in a log line. This one is
         // process-unique for every Connection of either kind and never changes, which
@@ -368,6 +398,10 @@ namespace llmbridge
         // both counters move. Denials climbing while `errors - denials` stays flat is
         // a brute-force attempt, not an outage.
         uint64_t policy_denied = 0;
+        /// Re-dispatched to another venue after a failure; 0 unless a policy opts in.
+        /// Apart from `upstream_retries`, which is the SAME venue on a fresh connection:
+        /// one says a provider dropped an idle keep-alive, this says it is not answering.
+        uint64_t upstream_failovers = 0;
     };
 
     class Gateway
@@ -414,6 +448,13 @@ namespace llmbridge
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
                 TlsConfig tls = {}, bool timing_headers = false,
                 Policy* policy = nullptr, std::vector<std::string> strip_headers = {});
+
+        /// Several upstreams, chosen per request by the installed policy. Must not be
+        /// empty, and is fixed for the process lifetime because the pools and every live
+        /// `upstream_slot` index it. `tls` here is the INBOUND leg only.
+        Gateway(uint16_t listen_port, std::vector<Upstream> upstreams, int64_t warmup_ns,
+                IoBackend io, int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
+                Policy* policy, std::vector<std::string> strip_headers);
         ~Gateway();
 
         Gateway(const Gateway&) = delete;
@@ -450,9 +491,20 @@ namespace llmbridge
         // Test seam. Like stats(), this reads state owned by the loop thread, so it
         // is valid only once that thread has been joined. Reading it live is a data
         // race, which TSan reports; production obeys this, see app/main.cpp.
+        /// Summed across every upstream: callers ask "did anything get pooled".
         [[nodiscard]] size_t pooled_upstream_count() const noexcept
         {
-            return _idle_upstreams.size();
+            size_t n = 0;
+            for (const auto& pool : _idle_upstreams) n += pool.size();
+            return n;
+        }
+
+        // Test seam: the SNI/verify host recorded for an upstream. Exists to pin the
+        // single-upstream constructor against a read-after-move that once emptied it.
+        [[nodiscard]] std::string_view upstream_sni_host(size_t i) const noexcept
+        {
+            return i < _upstreams.size() ? std::string_view(_upstreams[i].sni_host)
+                                         : std::string_view{};
         }
 
         // Size of the io_uring provided-buffer pool (power of two), or 0 for the default.
@@ -501,13 +553,44 @@ namespace llmbridge
         // Only called when a policy exists; the caller checks first.
         Decision policy_decision(const Connection* c, const net::http::Message& m) noexcept;
 
+        /// Ask the policy for another venue and re-dispatch there. TRUE when the
+        /// request was re-sent, in which case the caller must not also answer the
+        /// client. Twins because the teardown and forward they call are backend-specific.
+        bool ep_upstream_failed(Connection* client, int status, const char* why) noexcept;
+        bool ur_upstream_failed(Connection* client, int status, const char* why) noexcept;
+
+        /// Shared half: may this be re-dispatched, and where? No teardown happens here.
+        [[nodiscard]] Retry failover_target(Connection* client, int status,
+                                            const char* why) noexcept;
+
+        /// At most this many venues per request: a policy that always names another
+        /// would otherwise walk the table, making one dead provider a latency multiplier.
+        static constexpr int kMaxFailoverAttempts = 3;
+
+        /// The venue a connection is bound to; see Connection::upstream_slot.
+        [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept
+        {
+            const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
+            return _upstreams[i < _upstreams.size() ? i : 0];
+        }
+
+        /// One shared SSL_CTX covers every venue: it holds the trust store, while SNI
+        /// and the verified hostname are per-connection.
+        [[nodiscard]] bool any_upstream_tls() const noexcept
+        {
+            for (const Upstream& u : _upstreams)
+                if (u.tls) return true;
+            return false;
+        }
+
         // Abort any request whose upstream has been silent for longer than
         // _upstream_idle_ns. Runs on the loop's existing periodic tick (epoll's
         // epoll_wait timeout / io_uring's timer CQE), so it costs nothing extra.
         // `uring` selects the matching teardown primitives.
         void sweep_idle(bool uring) noexcept;
 
-        Connection* ep_acquire_upstream() noexcept;
+        /// `slot` indexes the upstream table; the pool it draws from is that venue's.
+        Connection* ep_acquire_upstream(int slot) noexcept;
         void ep_release_upstream(Connection* u) noexcept;
         // Epoll: a pooled upstream failed before any response (provider dropped the
         // idle keep-alive). Resend the request once on a fresh connection.
@@ -627,7 +710,7 @@ namespace llmbridge
         void ur_stream_on_upstream_eof(Connection* u) noexcept;
         void ur_stream_flush(Connection* client) noexcept; // send pending bytes, or finalize
         void ur_finalize_stream(Connection* client) noexcept;
-        Connection* ur_acquire_upstream() noexcept;
+        Connection* ur_acquire_upstream(int slot) noexcept;
         void ur_release_upstream(Connection* u) noexcept;
         // A pooled upstream failed before sending any response (it was almost
         // certainly closed idle by the provider). Resend the request once on a
@@ -640,15 +723,20 @@ namespace llmbridge
 
         net::uring::Ring _ring;
         net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
-        sockaddr_in _upstream_addr{};
+        /// One resolved address per upstream, in table order. An SQE holds a POINTER
+        /// to the entry for the life of the connect, so this vector is sized once at
+        /// startup and never resized: a reallocation would leave the kernel reading
+        /// freed memory.
+        std::vector<sockaddr_in> _upstream_addrs;
         struct __kernel_timespec _uring_ts{};
         long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
         bool _draining = false;   // post-stop: completions just decrement, no re-arm
 #endif
 
         uint16_t _listen_port;
-        std::string _upstream_ip;
-        uint16_t _upstream_port;
+        /// The table. Never empty: the single-upstream constructor builds one entry, so
+        /// every path below can index it without a special case.
+        std::vector<Upstream> _upstreams;
         int64_t _warmup_ns;
         // Defaults to kClientSetupNs. Settable ONLY so tests can pick a deadline
         // they can wait for: at 30 seconds the behaviour was unverifiable, and a
@@ -658,7 +746,6 @@ namespace llmbridge
         int64_t _client_setup_ns = kClientSetupNs;
         int64_t _client_idle_ns = kDefaultClientIdleNs;
         int64_t _pool_idle_ns = kDefaultPoolIdleNs;
-        TranslateMode _translate;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls; // BOTH legs; each flag inits its own context in the ctor
@@ -670,7 +757,6 @@ namespace llmbridge
         // colon so they can be compared against a raw line. Empty in a stock build,
         // where the passthrough copy stays a single memcpy.
         std::vector<std::string> _strip_headers;
-        std::string _upstream_host_hdr;    // Host: value for rebuilt upstream requests
         // Decode buffer for CHUNKED upstream responses (see net::http::parse_response).
         // One per loop, not per connection: the loop is single-threaded and a
         // response is framed and consumed entirely within one event, so there is no
@@ -696,7 +782,7 @@ namespace llmbridge
         Connection* _listen_conn = nullptr;
 
         std::unordered_map<uint64_t, Connection*> _clients;
-        std::vector<Connection*> _idle_upstreams;
+        std::vector<std::vector<Connection*>> _idle_upstreams; ///< one pool per upstream
         uint64_t _next_client_id = 1;
         std::vector<Connection*> _doomed; // closed mid-batch, freed after the batch
 

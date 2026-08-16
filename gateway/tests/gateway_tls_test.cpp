@@ -51,6 +51,12 @@
 using llmbridge::Gateway;
 using llmbridge::TlsConfig;
 using llmbridge::TranslateMode;
+using llmbridge::Upstream;
+using llmbridge::Policy;
+using llmbridge::Decision;
+using llmbridge::RequestFacts;
+using llmbridge::FailureFacts;
+using llmbridge::Retry;
 
 namespace
 {
@@ -60,7 +66,7 @@ namespace
     {
         EVP_PKEY* key{nullptr};
         X509* crt{nullptr};
-        SelfSigned()
+        explicit SelfSigned(const char* cn = kHost)
         {
             key = EVP_RSA_gen(2048);
             crt = X509_new();
@@ -70,9 +76,9 @@ namespace
             X509_set_pubkey(crt, key);
             X509_NAME* nm = X509_get_subject_name(crt);
             X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                                       reinterpret_cast<const unsigned char*>(kHost), -1, -1, 0);
+                                       reinterpret_cast<const unsigned char*>(cn), -1, -1, 0);
             X509_set_issuer_name(crt, nm);
-            const std::string san = std::string("DNS:") + kHost;
+            const std::string san = std::string("DNS:") + cn;
             X509_EXTENSION* ext =
                 X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, san.c_str());
             X509_add_ext(crt, ext, -1);
@@ -1011,6 +1017,234 @@ TEST_P(GatewayTls, UpstreamClosingMidHandshakeYields502)
     ASSERT_FALSE(r.empty()) << "expected 502, got hang/close";
     EXPECT_EQ(Client::status_of(r), 502);
 }
+
+// ---------------------------------------------------------------------------
+// Cross-venue upstream TLS: each venue must be verified against ITS OWN hostname.
+//
+// tls_attach_upstream once passed the global TlsConfig::sni_host for every venue,
+// so init_client drove both SNI and SSL_set1_host from the FIRST venue's name.
+// The consequence is a valid-cert-wrong-server hole across the table: a request
+// translated and credentialed for venue 1's dialect is sent on a socket whose
+// certificate was only ever checked against venue 0's name. These tests fail
+// against that code and pass against the per-venue fix.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    constexpr const char* kHostTwo = "venue-two.test";
+
+    /// Concatenate two self-signed leaves into one trust bundle, so the gateway's
+    /// single upstream context trusts BOTH venues. Without this the second venue
+    /// would fail for lack of a trust anchor, masking the hostname question.
+    std::string write_ca_bundle(const SelfSigned& a, const SelfSigned& b)
+    {
+        const std::string pa = a.write_pem(), pb = b.write_pem();
+        std::string path = std::string(::testing::TempDir()) + "llmbridge_gw_bundle_" +
+                           std::to_string(static_cast<long>(::getpid())) + "_" +
+                           std::to_string(reinterpret_cast<uintptr_t>(&a)) + ".pem";
+        std::ofstream out(path, std::ios::binary);
+        std::ifstream fa(pa, std::ios::binary), fb(pb, std::ios::binary);
+        out << fa.rdbuf() << "\n" << fb.rdbuf();
+        return path;
+    }
+
+    /// A port with nothing listening: bind, read the number back, close. Used to make
+    /// a venue fail its connect deterministically.
+    uint16_t closed_port()
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        socklen_t len = sizeof(a);
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::close(fd);
+        return ntohs(a.sin_port);
+    }
+
+    class PinnedPolicy final : public Policy
+    {
+      public:
+        explicit PinnedPolicy(int idx) : _idx(idx) {}
+        Decision decide(const RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = _idx};
+        }
+      private:
+        int _idx;
+    };
+
+    /// Starts on `first`, moves to `next` once. Failover matters most on the TLS leg,
+    /// where a retry must build a NEW session against the NEW venue's hostname; reusing
+    /// the failed venue's SNI would either fail verification or, far worse, accept it.
+    class TlsFailoverPolicy final : public Policy
+    {
+      public:
+        TlsFailoverPolicy(int first, int next) : _first(first), _next(next) {}
+        Decision decide(const RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = _first};
+        }
+        Retry on_failure(const FailureFacts& f) noexcept override
+        {
+            ++failures;
+            return f.attempt == 0 ? Retry{true, _next} : Retry{};
+        }
+        int failures = 0;
+      private:
+        int _first, _next;
+    };
+} // namespace
+
+class GatewayCrossVenueTls : public ::testing::TestWithParam<llmbridge::IoBackend>
+{
+  protected:
+    // venue_one_cert lets a test hand venue 1 the WRONG identity (venue 0's), to
+    // prove per-venue verification actually discriminates instead of passing
+    // everything. Default gives each venue its matching cert.
+    void start(int route_to, bool venue_one_serves_its_own_cert = true)
+    {
+        _b0.start(_id0, "json");
+        _b1.start(venue_one_serves_its_own_cert ? _id1 : _id0, "json");
+        TlsConfig tls;
+        tls.ca_file = write_ca_bundle(_id0, _id1); // trust both leaves
+        std::vector<Upstream> table = {
+            Upstream{"127.0.0.1", _b0.port(), true, kHost, TranslateMode::None, {}},
+            Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+        };
+        _policy = std::make_unique<PinnedPolicy>(route_to);
+        _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
+                                        Gateway::kDefaultUpstreamIdleNs, tls, false,
+                                        _policy.get(), std::vector<std::string>{});
+        _port = _gw->bound_port();
+        _gt = std::thread([this] { _gw->run(); });
+    }
+
+    void TearDown() override
+    {
+        if (_gw) _gw->request_stop();
+        if (_gt.joinable()) _gt.join();
+        _b0.stop();
+        _b1.stop();
+    }
+
+    SelfSigned _id0{kHost};
+    SelfSigned _id1{kHostTwo};
+    TlsBackend _b0, _b1;
+    std::unique_ptr<PinnedPolicy> _policy;
+    std::unique_ptr<Gateway> _gw;
+    std::thread _gt;
+    uint16_t _port{0};
+};
+
+// Route to venue 1, which presents ITS OWN valid cert for venue-two.test. With the
+// bug the gateway verifies against venue 0's name (provider.test) and the handshake
+// fails, surfacing as a 502; the fix verifies against venue-two.test and it is 200.
+TEST_P(GatewayCrossVenueTls, SecondVenueIsVerifiedAgainstItsOwnHostname)
+{
+    start(/*route_to=*/1);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty()) << "no response routing to venue 1";
+    EXPECT_EQ(Client::status_of(r), 200)
+        << "venue 1 rejected despite a valid cert for its own name: the gateway "
+        << "verified it against another venue's hostname. " << r.substr(0, 200);
+    EXPECT_EQ(_b1.handshakes(), 1) << "venue 1 was never actually reached";
+    EXPECT_EQ(_b0.handshakes(), 0) << "request leaked to venue 0";
+}
+
+// The negative control that makes the test above meaningful: venue 1 serves venue
+// 0's cert (wrong for venue-two.test). Correct per-venue verification MUST reject
+// it. If this passed, the check would be verifying against nothing.
+TEST_P(GatewayCrossVenueTls, SecondVenueWithTheWrongCertIsRejected)
+{
+    start(/*route_to=*/1, /*venue_one_serves_its_own_cert=*/false);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    // Fails closed: a rejected upstream handshake is a 5xx, never a 200.
+    EXPECT_NE(Client::status_of(r), 200)
+        << "venue 1 presenting venue 0's certificate was ACCEPTED; hostname "
+        << "verification is not discriminating per venue. " << r.substr(0, 200);
+}
+
+// FAILOVER ON THE TLS LEG. Venue 0 is a closed port, so the connect fails before any
+// handshake; the policy names venue 1, and the retry must build a fresh session and
+// verify against VENUE 1's hostname. Carrying the failed venue's SNI would either
+// reject a healthy provider or, far worse, accept the wrong one.
+TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
+{
+    _b1.start(_id1, "json");
+    TlsConfig tls;
+    tls.ca_file = write_ca_bundle(_id0, _id1);
+    const uint16_t dead = closed_port();
+    std::vector<Upstream> table = {
+        Upstream{"127.0.0.1", dead, true, kHost, TranslateMode::None, {}},
+        Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+    };
+    TlsFailoverPolicy pol(0, 1);
+    _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
+                                    Gateway::kDefaultUpstreamIdleNs, tls, false, &pol,
+                                    std::vector<std::string>{});
+    _port = _gw->bound_port();
+    _gt = std::thread([this] { _gw->run(); });
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 200)
+        << "TLS failover did not reach the healthy venue: " << r.substr(0, 200);
+    c.close();
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+    EXPECT_EQ(pol.failures, 1);
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_b1.handshakes(), 1) << "the retry never completed a handshake with venue 1";
+}
+
+// The negative control. Venue 1 serves venue 0's certificate, so the FAILOVER target
+// must be rejected exactly as a directly-routed one is. Without this, a failover could
+// be the hole that skips verification.
+TEST_P(GatewayCrossVenueTls, AFailoverTargetIsStillVerified)
+{
+    _b1.start(_id0, "json"); // wrong identity for kHostTwo
+    TlsConfig tls;
+    tls.ca_file = write_ca_bundle(_id0, _id1);
+    const uint16_t dead = closed_port();
+    std::vector<Upstream> table = {
+        Upstream{"127.0.0.1", dead, true, kHost, TranslateMode::None, {}},
+        Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+    };
+    TlsFailoverPolicy pol(0, 1);
+    _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
+                                    Gateway::kDefaultUpstreamIdleNs, tls, false, &pol,
+                                    std::vector<std::string>{});
+    _port = _gw->bound_port();
+    _gt = std::thread([this] { _gw->run(); });
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    EXPECT_NE(Client::status_of(r), 200)
+        << "a failover target with the WRONG certificate was accepted: " << r.substr(0, 200);
+    c.close();
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, GatewayCrossVenueTls,
+                         ::testing::Values(llmbridge::IoBackend::Epoll
+#ifdef LLMBRIDGE_HAVE_URING
+                                           ,
+                                           llmbridge::IoBackend::Uring
+#endif
+                                           ));
 
 INSTANTIATE_TEST_SUITE_P(Backends, GatewayTls,
                          ::testing::Values(llmbridge::IoBackend::Epoll

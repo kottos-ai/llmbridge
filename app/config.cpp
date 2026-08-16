@@ -170,14 +170,39 @@ namespace llmbridge::app
 
         if (const json::Value* g = root.find("upstream"))
         {
-            if (!g->is_object()) return fail(err, "config: \"upstream\" must be an object");
-            if (!only(*g, "upstream", {"url", "translate", "strip_headers"}, err)) return false;
-            if (!want_str(*g, "upstream", "url", out.upstream_url, err)) return false;
-            if (!want_str(*g, "upstream", "translate", out.translate_mode, err)) return false;
-            if (!want_str_array(*g, "upstream", "strip_headers", out.strip_headers, err)) return false;
-            if (!one_of(out.translate_mode, "upstream", "translate",
-                        {"none", "anthropic", "gemini", "cohere"}, err))
+            // OBJECT OR ARRAY. The object form is the one-upstream shorthand and is
+            // what almost every deployment writes; the array is the same object
+            // repeated, so nothing moves when a config grows a second venue. This is
+            // the migration DESIGN.md promised when `--config` shipped ahead of the
+            // upstream table: additive, not a rewrite.
+            if (!g->is_object() && !g->is_array())
+                return fail(err, "config: \"upstream\" must be an object or an array of them");
+
+            // strip_headers is gateway-wide, not per venue, so it is read from the
+            // object form only. An array config sets it at the top level.
+            if (g->is_object() &&
+                !want_str_array(*g, "upstream", "strip_headers", out.strip_headers, err))
                 return false;
+
+            const std::vector<json::Value> one{*g};
+            const std::vector<json::Value>& entries = g->is_array() ? g->arr : one;
+            if (g->is_array() && entries.empty())
+                return fail(err, "config: \"upstream\" must not be an empty array");
+            for (const json::Value& e : entries)
+            {
+                if (!e.is_object())
+                    return fail(err, "config: each entry in \"upstream\" must be an object");
+                if (!only(e, "upstream", {"url", "translate", "strip_headers"}, err)) return false;
+                ConfigFile::UpstreamEntry ue;
+                if (!want_str(e, "upstream", "url", ue.url, err)) return false;
+                if (!want_str(e, "upstream", "translate", ue.translate, err)) return false;
+                if (!one_of(ue.translate, "upstream", "translate",
+                            {"none", "anthropic", "gemini", "cohere"}, err))
+                    return false;
+                if (ue.url.empty() && entries.size() > 1)
+                    return fail(err, "config: every entry in an \"upstream\" array needs a url");
+                out.upstreams.push_back(std::move(ue));
+            }
         }
 
         if (const json::Value* g = root.find("timeouts"))

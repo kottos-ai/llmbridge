@@ -246,8 +246,41 @@ a promise. It does carry the client credential, since `Authorization` is in the 
 nothing derived from it may be logged and the views die with the call. It exposes no
 lookup helper; `net::http::find_header(facts.head, name)` is the safe one.
 
-Not in the seam yet: `Decision` selects no upstream, and `RequestFacts` exposes no model
-name. Both arrive with the upstream table.
+### Selecting a venue
+
+`Decision::upstream_index` picks one entry from the gateway's upstream table. The table
+is fixed at construction and every venue carries its own address, TLS setting and
+DIALECT, so routing Claude to Anthropic and a Llama to an OpenAI-compatible host means
+one request is rebuilt and the other forwarded, decided per request.
+
+Two rules make the single-upstream gateway a special case of this one, not a different
+thing. An index that is unset (-1) or past the end of the table means the
+FIRST upstream, so a policy that only authenticates never learns the table exists. And
+**pools are per venue**: a keep-alive connection to one provider is never handed to a
+request bound for another, because that would put the request, and its credential, on a
+socket to the wrong company. A retry after a stale pooled connection stays on the same
+venue for the same reason.
+
+The cost is fragmentation: N workers times M venues pools, each seeing ~1/(N*M) of the
+traffic and crossing the idle line far more often, and every crossing costs the next
+request a reconnect and a TLS handshake. That is what `--pool-idle` exists to tune, and
+its 30 s default was chosen when there was one pool.
+
+### When a venue fails
+
+`Policy::on_failure` fires when a venue did not answer and the client has seen nothing.
+It may name another; the request is then REBUILT for that venue's dialect, since the
+bytes queued for the failed one were translated for its API.
+
+A venue that DID answer, unparseably, never reaches the hook: retrying would mask an
+incompatibility as a blip. Bounds, none of them policy: three venues per request, the
+failed venue may not be renamed, and nothing is re-sent once a byte reached the client.
+
+**Streaming fails over only before its first byte.** After that the stream is truncated
+honestly, because no LLM API can resume mid-stream and a reconnect would replay tokens
+the client already has.
+
+Still not in the seam: `RequestFacts` exposes no model name.
 
 ### Dropping headers before they leave (`upstream.strip_headers`)
 
@@ -479,10 +512,11 @@ verified by grep before it was written down.
 - **No vision, no `cache_control`.** Tool calling is done, streaming and not.
 - **No Bedrock, Vertex or Azure.** The dialects are close or identical; what is missing
   is auth (SigV4, OAuth) and, for Bedrock streaming, a binary event-stream decoder.
+- **No failover POLICY.** `Policy::on_failure` is the mechanism; the default never
+  retries.
 - **No language bindings.** Python, Go and Rust are planned.
-- **No routing, matching, pricing or observability**, by design; that is the separate
-  commercial layer. What is here is the seam they hang off: a `Policy` hook that decides
-  whether a request proceeds, with no policy in the box.
+- **No routing POLICY, no matching, pricing or observability**, by design; that is the
+  separate commercial layer.
 
 Shipped since earlier revisions of this list said otherwise: **TLS on both legs**
 (`-DLLMBRIDGE_TLS=ON`, `--upstream https://...`, `--listen-tls`), **provider auth
