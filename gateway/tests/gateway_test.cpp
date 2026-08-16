@@ -3842,6 +3842,378 @@ TEST_P(ProxyRoute, SingleUpstreamConstructorKeepsSniHost)
     EXPECT_TRUE(gw.upstream_sni_host(5).empty());
 }
 
+// ── Failover: the policy reacts to a venue that did not answer ───────────────
+//
+// llmbridge supplies the mechanism only. It never decides that a venue is unhealthy,
+// because health is measured and it measures nothing; the DEFAULT on_failure never
+// retries, so a policy that ignores failures behaves exactly as before the hook.
+
+namespace
+{
+    /// Sends everything to `first`, and on failure moves to the next venue in a list.
+    /// The simplest possible failover, which is the point: all of it is the caller's.
+    class FailoverPolicy final : public llmbridge::Policy
+    {
+      public:
+        FailoverPolicy(int first, std::vector<int> order) : _first(first), _order(std::move(order)) {}
+
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = _first};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            failures.fetch_add(1, std::memory_order_relaxed);
+            last_reason.store(f.reason, std::memory_order_relaxed);
+            last_failed.store(f.upstream_index, std::memory_order_relaxed);
+            if (f.attempt >= static_cast<int>(_order.size())) return {};
+            return {.retry = true, .upstream_index = _order[static_cast<size_t>(f.attempt)]};
+        }
+
+        // Atomic: production shares ONE policy across every worker, so these are
+        // written from several loop threads at once. TSan reports the alternative.
+        std::atomic<int> failures{0};
+        std::atomic<int> last_failed{-1};
+        std::atomic<const char*> last_reason{""};
+
+      private:
+        int _first;
+        std::vector<int> _order;
+    };
+
+    /// Never retries, which is the default a stock policy inherits.
+    class NoFailoverPolicy final : public llmbridge::Policy
+    {
+      public:
+        explicit NoFailoverPolicy(int idx) : _idx(idx) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = _idx};
+        }
+      private:
+        int _idx;
+    };
+} // namespace
+
+// THE FEATURE. Venue 0 is a closed port, so the connect fails; the policy names venue
+// 1 and the client is served without ever seeing the failure.
+TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port(); // nothing listening: connect refused
+    FailoverPolicy pol(0, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp;
+    EXPECT_NE(resp.find("bravo"), std::string::npos) << "the healthy venue did not serve it";
+    c.close();
+    shutdown();
+
+    EXPECT_EQ(pol.failures.load(), 1) << "the policy was not told about the failure";
+    EXPECT_EQ(pol.last_failed.load(), 0) << "the policy was told the wrong venue failed";
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(good.seen(), 1);
+    good.stop();
+}
+
+// THE DEFAULT. A policy that does not override on_failure must behave exactly as the
+// gateway did before the hook existed: the client sees the error.
+TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 0u);
+    EXPECT_EQ(good.seen(), 0) << "the healthy venue was used without the policy asking";
+    good.stop();
+}
+
+// A chain must be BOUNDED. A policy that always names another venue would otherwise
+// walk the table on every failure, turning one dead provider into a latency multiplier.
+TEST_P(ProxyRoute, TheFailoverChainIsBounded)
+{
+    const uint16_t d1 = free_port(), d2 = free_port(), d3 = free_port(), d4 = free_port();
+    FailoverPolicy pol(0, {1, 2, 3}); // every one of them is dead
+    start({{"127.0.0.1", d1, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", d2, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", d3, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", d4, false, "", TranslateMode::None, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_LE(_gw->stats().upstream_failovers, 2u) << "the chain was not bounded";
+}
+
+// Naming the venue that just failed is the one answer that cannot help, and is how a
+// policy accidentally writes an infinite loop. Refused, and the client gets the error.
+TEST_P(ProxyRoute, RetryingTheSameVenueIsRefused)
+{
+    const uint16_t dead = free_port();
+    NamedBackend good;
+    good.start("bravo");
+    FailoverPolicy pol(0, {0}); // "retry venue 0", which is the one that failed
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("502"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 0u);
+    good.stop();
+}
+
+// THE ONE THAT MAKES IT MORE THAN A RECONNECT. Failing over to a venue with a
+// DIFFERENT dialect means the request must be REBUILT, not resent: the bytes queued
+// for the first venue were translated for its API. Venue 0 is a dead Anthropic
+// endpoint, venue 1 an OpenAI-compatible one, so the retry must arrive untranslated.
+TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
+{
+    TestBackend plain;
+    plain.set_response(http_ok(R"({"id":"x","object":"chat.completion","choices":[]})"));
+    plain.start();
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(0, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
+           {"127.0.0.1", plain.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const std::string up = plain.last_request();
+    // Passthrough: the client's own OpenAI request, NOT the /v1/messages rebuild that
+    // was queued for the venue that failed.
+    EXPECT_NE(up.find("POST /v1/chat/completions"), std::string::npos) << up;
+    EXPECT_EQ(up.find("/v1/messages"), std::string::npos)
+        << "the retry carried the FAILED venue's translation: " << up;
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    plain.stop();
+}
+
+// The DEFAULT on_failure must never retry. Pinned to venue 1 (dead) with venue 0
+// healthy, so a default that returned "retry venue 0" would quietly succeed; the
+// earlier version of this test pinned to venue 0 and could not tell the difference.
+TEST_P(ProxyRoute, TheDefaultOnFailureNeverRetries)
+{
+    NamedBackend healthy;
+    healthy.start("alpha");
+    const uint16_t dead = free_port();
+    NoFailoverPolicy pol(1);
+    start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
+           {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("502"), std::string::npos)
+        << "the base-class on_failure retried when it must not";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 0u);
+    EXPECT_EQ(healthy.seen(), 0) << "a healthy venue was used without the policy asking";
+    healthy.stop();
+}
+
+// The policy must be told WHICH venue failed, or its health tracking attributes the
+// outage to the wrong provider and ejects the innocent one.
+TEST_P(ProxyRoute, ThePolicyIsToldWhichVenueFailed)
+{
+    NamedBackend healthy;
+    healthy.start("alpha");
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(1, {0}); // start on venue 1, which is dead
+    start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
+           {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.last_failed.load(), 1) << "the policy was told the wrong venue failed";
+    healthy.stop();
+}
+
+// Two requests on ONE keep-alive connection, both failing over. Without a reset
+// between them the second reuses the FIRST request's saved bytes, so the provider is
+// asked the first question twice and the client gets an answer to a question it did
+// not ask. Distinct bodies are what makes that visible.
+TEST_P(ProxyRoute, EachRequestGetsItsOwnFailoverBudgetAndBytes)
+{
+    TestBackend good;
+    good.set_response(http_ok(R"({"ok":true})"));
+    good.start();
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(0, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request("FIRST-BODY")));
+    EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos) << "request 1";
+    ASSERT_TRUE(c.send(make_request("SECOND-BODY")));
+    EXPECT_NE(c.recv_response().find("200 OK"), std::string::npos) << "request 2";
+    c.close();
+    shutdown();
+
+    // The SECOND request must have carried its own body upstream.
+    const std::string up = good.last_request();
+    EXPECT_NE(up.find("SECOND-BODY"), std::string::npos)
+        << "the second failover resent the FIRST request: " << up;
+    EXPECT_EQ(up.find("FIRST-BODY"), std::string::npos) << up;
+    EXPECT_EQ(_gw->stats().upstream_failovers, 2u) << "each request should fail over once";
+    good.stop();
+}
+
+// The reachable half of the "client saw bytes" guard. A response still draining to
+// the client must not be followed by a re-sent request's response: the client would
+// receive two answers on one connection and frame them as one.
+TEST_P(ProxyRoute, AStreamingClientIsNeverFailedOver)
+{
+    // A streaming client never reaches the failover path at all: every call site
+    // diverts it first. Asserted end to end so that if a future site forgets to,
+    // this test says so before a customer sees a duplicated answer.
+    TestBackend sse;
+    sse.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                     "Cache-Control: no-cache\r\n\r\n"
+                     "event: message_start\ndata: {\"type\":\"message_start\","
+                     "\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":"
+                     "{\"input_tokens\":1,\"output_tokens\":0}}}\n\n");
+    sse.set_stall(2); // half a response, then hold the connection open forever
+    sse.start();
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(0, {1});
+    _gw = std::make_unique<Gateway>(
+        0, std::vector<llmbridge::Upstream>{
+               {"127.0.0.1", sse.port(), false, "", TranslateMode::Anthropic, ""},
+               {"127.0.0.1", dead, false, "", TranslateMode::None, ""}},
+        0, GetParam(), 200'000'000LL /* 200 ms idle */, llmbridge::TlsConfig{}, false, &pol,
+        std::vector<std::string>{});
+    _port = _gw->bound_port();
+    _th = std::thread([this] { _gw->run(); });
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_request("hi", /*keep_alive=*/true) + ""));
+    // Give the idle timeout time to fire while the stream is open.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 0u)
+        << "a client mid-stream was failed over, which duplicates its answer";
+    sse.stop();
+}
+
+// STREAMING, BEFORE THE FIRST BYTE. A streaming request that cannot even reach its
+// venue is an ordinary failure: nothing has been sent to the client, so it fails over
+// and the client gets a complete stream from the healthy venue. This is the case that
+// matters for a voice agent, where a provider blip before the first token is the
+// difference between a pause and a dropped call.
+TEST_P(ProxyRoute, AStreamingRequestFailsOverBeforeItsFirstByte)
+{
+    TestBackend sse;
+    sse.set_response(sse_chunked_response(64));
+    sse.start();
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(0, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
+           {"127.0.0.1", sse.port(), false, "", TranslateMode::Anthropic, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed st = parse_streamed(c.recv_all());
+    EXPECT_TRUE(st.sse_headers) << "no stream reached the client";
+    EXPECT_EQ(st.content, "Hello, world") << "the stream did not complete after the failover";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(pol.failures.load(), 1);
+    sse.stop();
+}
+
+// MULTITHREADING. Production runs one Gateway per worker, all sharing ONE policy, so
+// the hook is called concurrently from several loop threads. The gateway adds no
+// locking around the seam by design, which makes this the shape a data race would
+// appear in; run it under TSan and the counters below must still add up exactly.
+TEST_P(ProxyRoute, ConcurrentWorkersShareOnePolicyAndAllFailOver)
+{
+    constexpr int kWorkers = 4;
+    constexpr int kPerWorker = 25;
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    FailoverPolicy pol(0, {1});
+
+    std::vector<std::unique_ptr<Gateway>> gws;
+    std::vector<std::thread> loops;
+    std::vector<uint16_t> ports;
+    for (int i = 0; i < kWorkers; ++i)
+    {
+        // Separate listeners, not SO_REUSEPORT: the point here is one POLICY
+        // shared by several loop threads, and separate ports make which worker served
+        // a request irrelevant instead of racy.
+        gws.push_back(std::make_unique<Gateway>(
+            uint16_t{0},
+            std::vector<llmbridge::Upstream>{
+                {"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+                {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}},
+            int64_t{0}, GetParam(), Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{},
+            false, &pol, std::vector<std::string>{}));
+        ports.push_back(gws.back()->bound_port());
+    }
+    for (auto& g : gws) loops.emplace_back([&g] { g->run(); });
+
+    std::atomic<int> served{0};
+    std::vector<std::thread> clients;
+    for (int w = 0; w < kWorkers; ++w)
+        clients.emplace_back([&, w] {
+            for (int i = 0; i < kPerWorker; ++i)
+            {
+                Client c;
+                if (!c.connect(ports[static_cast<size_t>(w)])) continue;
+                if (!c.send(make_request())) continue;
+                if (c.recv_response().find("bravo") != std::string::npos) served.fetch_add(1);
+                c.close();
+            }
+        });
+    for (auto& t : clients) t.join();
+    for (auto& g : gws) g->request_stop();
+    for (auto& t : loops) t.join();
+
+    EXPECT_EQ(served.load(), kWorkers * kPerWorker) << "some requests were not failed over";
+    EXPECT_EQ(pol.failures.load(), kWorkers * kPerWorker) << "the policy missed a failure";
+    uint64_t total = 0;
+    for (const auto& g : gws) total += g->stats().upstream_failovers;
+    EXPECT_EQ(total, static_cast<uint64_t>(kWorkers * kPerWorker));
+    EXPECT_EQ(good.seen(), kWorkers * kPerWorker);
+    good.stop();
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRoute,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),

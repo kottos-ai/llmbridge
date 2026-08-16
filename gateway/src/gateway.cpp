@@ -1248,6 +1248,25 @@ namespace llmbridge
         }
     } // namespace
 
+    bool Gateway::ep_upstream_failed(Connection* client, int status, const char* why) noexcept
+    {
+        const Retry r = failover_target(client, status, why);
+        if (!r.retry) return false;
+
+        LB_WARN(ReqId{client->req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
+                " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
+        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
+        ++client->failover_attempts;
+        client->upstream_slot = r.upstream_index;
+        // Put the ORIGINAL request back at the front of rbuf. ep_forward rebuilds it for
+        // the new venue's dialect and erases exactly these bytes again, so a pipelined
+        // request already queued behind it keeps its place.
+        client->rbuf.insert(0, client->failover_req);
+        ++_stats.upstream_failovers;
+        ep_forward(client);
+        return true;
+    }
+
     Connection* Gateway::ep_acquire_upstream(int slot) noexcept
     {
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
@@ -1537,6 +1556,11 @@ namespace llmbridge
         // and status lines below quote it, and ep_forward erases the request out of
         // rbuf, so a log placed after it prints an empty request line and a stale seq.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+        // A new request: the previous one's saved copy and failover budget are spent.
+        // Cleared HERE, at the one place a request begins, and not at the many
+        // places one can end.
+        c->failover_req.clear();
+        c->failover_attempts = 0;
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // THE POLICY SEAM, one call site per backend. Here because framing has
         // succeeded but nothing is translated, no credential mapped and no upstream
@@ -1584,6 +1608,47 @@ namespace llmbridge
         return d;
     }
 
+    Retry Gateway::failover_target(Connection* client, int status, const char* why) noexcept
+    {
+        // Every precondition here is about SAFETY, not policy. Re-sending a request the
+        // client has already begun receiving would duplicate output; re-sending one we
+        // no longer hold is impossible; and an unbounded chain turns one dead provider
+        // into a latency multiplier.
+        if (!_policy || _upstreams.size() < 2) return {};
+        if (!client || client->doomed) return {};
+        // NOTHING MAY HAVE REACHED THE CLIENT, or a re-send duplicates output.
+        //
+        // The `streaming` half is UNREACHABLE today and is kept deliberately: all six
+        // call sites already divert a streaming client to abort_pair or
+        // stream_on_upstream_eof before they get here, so no test can distinguish it
+        // from `true`. It stays for the same reason tls_invariant_ok() does, six call
+        // sites must each keep being right for it to remain unreachable, and the cost
+        // of being wrong is a client receiving one answer twice. The `wbuf` half IS
+        // reachable: a pipelined earlier response can still be draining.
+        if (client->streaming || !client->wbuf.empty()) return {};
+        if (client->failover_req.empty()) return {};
+        if (client->failover_attempts >= kMaxFailoverAttempts - 1) return {};
+
+        const FailureFacts f{client->upstream_slot, status, why, client->failover_attempts};
+        const Retry r = _policy->on_failure(f);
+        if (!r.retry) return {};
+        if (r.upstream_index < 0 || static_cast<size_t>(r.upstream_index) >= _upstreams.size())
+        {
+            LB_WARN(ReqId{client->req_seq}, " failover to out-of-range upstream ",
+                    static_cast<int64_t>(r.upstream_index), "; giving up");
+            return {};
+        }
+        // Sending it back to the venue that just failed is the one answer that cannot
+        // help, and it is how a policy accidentally writes an infinite loop.
+        if (r.upstream_index == client->upstream_slot)
+        {
+            LB_WARN(ReqId{client->req_seq}, " failover named the venue that just failed; "
+                                            "giving up");
+            return {};
+        }
+        return r;
+    }
+
     void Gateway::ep_forward(Connection* c) noexcept
     {
         // The venue was chosen by the policy (or defaulted to 0) before this ran; it is
@@ -1620,12 +1685,22 @@ namespace llmbridge
         }
 
         Connection* u = ep_acquire_upstream(c->upstream_slot);
-        if (!u) { ep_error_respond(c, 502, "no upstream (connect failed)"); return; }
+        if (!u)
+        {
+            if (!ep_upstream_failed(c, 502, "no upstream (connect failed)"))
+                ep_error_respond(c, 502, "no upstream (connect failed)");
+            return;
+        }
 
         LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
                  " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
         u->wbuf = std::move(upstream_bytes);
         u->woff = 0;
+        // Keep the ORIGINAL bytes when a failover could use them: the rebuilt request
+        // above was translated for THIS venue's dialect, so it cannot be resent to a
+        // different one. One copy per in-flight request, and only where it can pay off.
+        if (_policy && _upstreams.size() > 1 && c->failover_req.empty())
+            c->failover_req.assign(c->rbuf, 0, c->msg.total_len);
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
@@ -1651,7 +1726,7 @@ namespace llmbridge
                 bool done = false;
                 if (!ep_tls_flush(u, &done))
                 {
-                    if (!ep_retry_upstream(u)) ep_error_respond(c, 502, "upstream write failed, retry exhausted");
+                    if (!ep_retry_upstream(u) && !ep_upstream_failed(c, 502, "upstream write failed")) ep_error_respond(c, 502, "upstream write failed, retry exhausted");
                     return;
                 }
                 if (done && tls_wbuf_flushed(u)) c->ts_up_sent = now_ns();
@@ -1659,7 +1734,7 @@ namespace llmbridge
             }
 #endif
             bool done = false;
-            if (!ep_pump_write(u, &done)) { if (!ep_retry_upstream(u)) ep_error_respond(c, 502, "upstream write failed, retry exhausted"); return; }
+            if (!ep_pump_write(u, &done)) { if (!ep_retry_upstream(u) && !ep_upstream_failed(c, 502, "upstream write failed")) ep_error_respond(c, 502, "upstream write failed, retry exhausted"); return; }
             if (done) c->ts_up_sent = now_ns(); // request fully sent (end of request path)
             else ep_arm_write(u);               // socket full; finish on writability
         }
@@ -1679,7 +1754,7 @@ namespace llmbridge
                 Connection* client = u->peer;
                 u->peer = nullptr;
                 ep_close_upstream(u);
-                if (client) { client->peer = nullptr; ep_error_respond(client, 502, "upstream connect refused"); }
+                if (client) { client->peer = nullptr; if (!ep_upstream_failed(client, 502, "upstream connect refused")) ep_error_respond(client, 502, "upstream connect refused"); }
                 else ++_stats.errors;
                 return;
             }
@@ -1701,7 +1776,7 @@ namespace llmbridge
             bool tdone = false;
             if (!ep_tls_flush(u, &tdone))
             {
-                if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
+                if (u->peer) { if (!ep_retry_upstream(u) && !ep_upstream_failed(u->peer, 502, "upstream write failed")) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
                 else ep_close_upstream(u);
                 return;
             }
@@ -1715,7 +1790,7 @@ namespace llmbridge
         bool done = false;
         if (!ep_pump_write(u, &done))
         {
-            if (u->peer) { if (!ep_retry_upstream(u)) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
+            if (u->peer) { if (!ep_retry_upstream(u) && !ep_upstream_failed(u->peer, 502, "upstream write failed")) ep_error_respond(u->peer, 502, "upstream write failed, retry exhausted"); }
             else ep_close_upstream(u);
             return;
         }
@@ -1748,7 +1823,7 @@ namespace llmbridge
 #endif
             if (client && client->streaming) { ep_stream_on_upstream_eof(u); return; }
             if (client == nullptr) ep_close_upstream(u); // idle pooled conn dropped (eviction)
-            else if (!ep_retry_upstream(u)) ep_error_respond(client, 502, "upstream EOF, retry exhausted");
+            else if (!ep_retry_upstream(u) && !ep_upstream_failed(client, 502, "upstream EOF")) ep_error_respond(client, 502, "upstream EOF, retry exhausted");
             return;
         }
         if (client == nullptr) return; // stray bytes on an idle pooled conn
@@ -2176,14 +2251,14 @@ namespace llmbridge
             if (uring)
             {
                 if (streaming) ur_abort_pair(c);
-                else ur_error_respond(c, 504, "upstream idle timeout");
+                else if (!ur_upstream_failed(c, 504, "upstream idle timeout")) ur_error_respond(c, 504, "upstream idle timeout");
                 continue;
             }
 #else
             (void)uring;
 #endif
             if (streaming) ep_abort_pair(c);
-            else ep_error_respond(c, 504, "upstream idle timeout");
+            else if (!ep_upstream_failed(c, 504, "upstream idle timeout")) ep_error_respond(c, 504, "upstream idle timeout");
         }
     }
 
@@ -2417,6 +2492,22 @@ namespace llmbridge
         }
 #endif
         ur_submit_send(c);
+    }
+
+    bool Gateway::ur_upstream_failed(Connection* client, int status, const char* why) noexcept
+    {
+        const Retry r = failover_target(client, status, why);
+        if (!r.retry) return false;
+
+        LB_WARN(ReqId{client->req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
+                " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
+        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
+        ++client->failover_attempts;
+        client->upstream_slot = r.upstream_index;
+        client->rbuf.insert(0, client->failover_req); // see the epoll mirror
+        ++_stats.upstream_failovers;
+        ur_forward(client);
+        return true;
     }
 
     Connection* Gateway::ur_acquire_upstream(int slot) noexcept
@@ -2711,7 +2802,7 @@ namespace llmbridge
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
             else if (c->peer && c->peer->streaming) ur_stream_on_upstream_eof(c); // stream end, not a failure
             else if (!ur_retry_upstream(c))
-            { if (c->peer) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); else ur_close(c); }
+            { if (c->peer) { if (!ur_upstream_failed(c->peer, 502, "upstream EOF")) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); } else ur_close(c); }
             return;
         }
 
@@ -2745,7 +2836,7 @@ namespace llmbridge
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); return; }
             if (!ur_retry_upstream(c))
             {
-                if (c->peer) ur_error_respond(c->peer, 502, "upstream write failed, retry exhausted");
+                if (c->peer && !ur_upstream_failed(c->peer, 502, "upstream write failed")) ur_error_respond(c->peer, 502, "upstream write failed, retry exhausted");
                 else ur_close(c);
             }
             return;
@@ -2813,6 +2904,11 @@ namespace llmbridge
         c->ts_req_recvd = now_ns();
         // See the epoll mirror: assigned here, before forward touches rbuf.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+        // A new request: the previous one's saved copy and failover budget are spent.
+        // Cleared HERE, at the one place a request begins, and not at the many
+        // places one can end.
+        c->failover_req.clear();
+        c->failover_attempts = 0;
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam; see the epoll mirror for why it sits exactly here.
         // Default to the first upstream, so a build with no policy, and a policy that
@@ -2873,12 +2969,22 @@ namespace llmbridge
         }
 
         Connection* u = ur_acquire_upstream(c->upstream_slot);
-        if (!u) { ur_error_respond(c, 502, "no upstream (connect failed)"); return; }
+        if (!u)
+        {
+            if (!ur_upstream_failed(c, 502, "no upstream (connect failed)"))
+                ur_error_respond(c, 502, "no upstream (connect failed)");
+            return;
+        }
 
         LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
                  " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
         u->wbuf = std::move(upstream_bytes);
         u->woff = 0;
+        // Keep the ORIGINAL bytes when a failover could use them: the rebuilt request
+        // above was translated for THIS venue's dialect, so it cannot be resent to a
+        // different one. One copy per in-flight request, and only where it can pay off.
+        if (_policy && _upstreams.size() > 1 && c->failover_req.empty())
+            c->failover_req.assign(c->rbuf, 0, c->msg.total_len);
         c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
@@ -2907,7 +3013,7 @@ namespace llmbridge
             Connection* cl = u->peer;
             u->peer = nullptr;
             ur_close(u);
-            if (cl) { cl->peer = nullptr; ur_error_respond(cl, 502, "upstream connect refused"); }
+            if (cl) { cl->peer = nullptr; if (!ur_upstream_failed(cl, 502, "upstream connect refused")) ur_error_respond(cl, 502, "upstream connect refused"); }
             else ++_stats.errors;
             return;
         }
@@ -3011,7 +3117,7 @@ namespace llmbridge
         {
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
             else if (!ur_retry_upstream(c))
-            { if (c->peer) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); else ur_close(c); }
+            { if (c->peer) { if (!ur_upstream_failed(c->peer, 502, "upstream EOF")) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); } else ur_close(c); }
             return;
         }
         // This send completed, so no SQE references the buffer right now. Cleared

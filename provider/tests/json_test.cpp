@@ -406,7 +406,11 @@ TEST(JsonNumbers, WhatParsesAlsoConvertsWithStrtod)
     for (const char* n : {"0", "-0", "12345", "1.5", "-1.5e-5", "1e999", "0.0001"})
     {
         bool ok = false;
-        const auto v = llmbridge::provider::json::parse(std::string("{\"n\":") + n + "}", ok);
+        // NAMED, not a temporary. The DOM is zero-copy, so `v.sv` points into this
+        // buffer; parsing a temporary leaves every view dangling the moment the full
+        // expression ends. ASan calls it stack-use-after-scope, and it found this.
+        const std::string doc = std::string("{\"n\":") + n + "}";
+        const auto v = llmbridge::provider::json::parse(doc, ok);
         ASSERT_TRUE(ok) << n;
         const std::string txt(v.find("n")->sv);
         char* end = nullptr;

@@ -266,6 +266,20 @@ traffic and crossing the idle line far more often, and every crossing costs the 
 request a reconnect and a TLS handshake. That is what `--pool-idle` exists to tune, and
 its 30 s default was chosen when there was one pool.
 
+### When a venue fails
+
+`Policy::on_failure` fires when a venue did not answer and the client has seen nothing.
+It may name another; the request is then REBUILT for that venue's dialect, since the
+bytes queued for the failed one were translated for its API.
+
+A venue that DID answer, unparseably, never reaches the hook: retrying would mask an
+incompatibility as a blip. Bounds, none of them policy: three venues per request, the
+failed venue may not be renamed, and nothing is re-sent once a byte reached the client.
+
+**Streaming fails over only before its first byte.** After that the stream is truncated
+honestly, because no LLM API can resume mid-stream and a reconnect would replay tokens
+the client already has.
+
 Still not in the seam: `RequestFacts` exposes no model name.
 
 ### Dropping headers before they leave (`upstream.strip_headers`)
@@ -498,7 +512,8 @@ verified by grep before it was written down.
 - **No vision, no `cache_control`.** Tool calling is done, streaming and not.
 - **No Bedrock, Vertex or Azure.** The dialects are close or identical; what is missing
   is auth (SigV4, OAuth) and, for Bedrock streaming, a binary event-stream decoder.
-- **No failover.** A request that fails is answered with a 502 or 504.
+- **No failover POLICY.** `Policy::on_failure` is the mechanism; the default never
+  retries.
 - **No language bindings.** Python, Go and Rust are planned.
 - **No routing POLICY, no matching, pricing or observability**, by design; that is the
   separate commercial layer.
@@ -513,8 +528,7 @@ reproducibility, not because a real provider is unreachable.
 Derived from `git tag` and CHANGELOG.md, which are the source of truth when this
 disagrees with them.
 
-- **Next:** a failure hook, so a caller's policy can react when a venue fails.
-- **Then:** AWS SigV4 signing, to reach Bedrock as an upstream.
-- **After that:** Anthropic-in mode; streaming for Gemini and Cohere.
+- **Next:** AWS SigV4 signing, to reach Bedrock as an upstream.
+- **Then:** Anthropic-in mode; streaming for Gemini and Cohere.
 - **Later:** vision and `cache_control`; Python, Go and Rust bindings.
 - **v1.0.0:** API stability, only after six months of public use.

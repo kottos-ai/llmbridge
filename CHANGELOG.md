@@ -46,13 +46,30 @@ The C++ API is additive: the single-upstream constructor still exists and delega
 - **Startup logs the table**, one line per venue with its dialect, replacing the single
   `upstream=` line.
 
+- **`Policy::on_failure(FailureFacts) -> Retry`**, so a caller can react when a venue
+  does not answer: a refused connect, a failed write, an EOF before the response, an
+  idle timeout. Twelve sites across both backends. **The default never retries**, so a
+  stock build, and any policy that ignores failures, answers 502 exactly as before.
+- **A failover REBUILDS the request** for the new venue, never resends it: the bytes
+  queued for the venue that failed were translated for its API, so resending them would
+  put an Anthropic Messages body on an OpenAI-compatible host. The client's original
+  request is kept only when a policy is installed AND the table has more than one entry,
+  so a stock or single-upstream build copies nothing.
+- **`Stats::upstream_failovers`**, apart from `upstream_retries`: one says a provider
+  dropped an idle keep-alive, the other says a provider is not answering.
+
 ### Not included, and deliberately
 
-- **No failover.** A failed request is answered with a 502 or 504; nothing retries it
-  on another venue. The policy is consulted once, at framing, so nothing outside the
-  gateway learns a request failed. A failure hook is the next piece of mechanism; the
-  health tracking, ejection and ordering that would sit on top of it are out of scope
-  for this repository (decided 2026-08-15).
+- **No failover POLICY.** llmbridge forms no opinion about which venue is healthy,
+  because health is measured and it measures nothing. Ordering, ejection thresholds and
+  cooldown belong to the caller.
+- **A venue that DID answer, with something unparseable, does not reach the hook.**
+  Retrying elsewhere would mask a real incompatibility as a transient blip.
+- **Streaming fails over only before its first byte reaches the client.** After that the
+  stream is truncated honestly: no LLM API can resume mid-stream, so a reconnect would
+  replay tokens the client already has. Three further bounds, none of them policy: three
+  venues per request, the failed venue may not be renamed, and nothing is re-sent once
+  any byte has gone out.
 
 ### Verified
 

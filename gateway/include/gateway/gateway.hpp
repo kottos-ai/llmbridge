@@ -144,6 +144,13 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        /// CLIENT only: the original request, kept so a failover can REBUILD it for
+        /// another venue. The upstream's wbuf cannot be resent, because it was
+        /// translated for the dialect of the venue that failed. Empty in a stock build
+        /// and with one upstream, so nobody pays for a copy they cannot use.
+        std::string failover_req;
+        int failover_attempts = 0; ///< venues already tried for the request in flight
+
         /// Index into the upstream table, -1 when none applies. TWO READINGS that agree
         /// by construction: on an UPSTREAM connection the venue this socket talks to, so
         /// release finds the right pool; on a CLIENT connection the venue serving the
@@ -391,6 +398,10 @@ namespace llmbridge
         // both counters move. Denials climbing while `errors - denials` stays flat is
         // a brute-force attempt, not an outage.
         uint64_t policy_denied = 0;
+        /// Re-dispatched to another venue after a failure; 0 unless a policy opts in.
+        /// Apart from `upstream_retries`, which is the SAME venue on a fresh connection:
+        /// one says a provider dropped an idle keep-alive, this says it is not answering.
+        uint64_t upstream_failovers = 0;
     };
 
     class Gateway
@@ -541,6 +552,20 @@ namespace llmbridge
         // `allow == false` as terminal and reply with their own ep_/ur_ responder.
         // Only called when a policy exists; the caller checks first.
         Decision policy_decision(const Connection* c, const net::http::Message& m) noexcept;
+
+        /// Ask the policy for another venue and re-dispatch there. TRUE when the
+        /// request was re-sent, in which case the caller must not also answer the
+        /// client. Twins because the teardown and forward they call are backend-specific.
+        bool ep_upstream_failed(Connection* client, int status, const char* why) noexcept;
+        bool ur_upstream_failed(Connection* client, int status, const char* why) noexcept;
+
+        /// Shared half: may this be re-dispatched, and where? No teardown happens here.
+        [[nodiscard]] Retry failover_target(Connection* client, int status,
+                                            const char* why) noexcept;
+
+        /// At most this many venues per request: a policy that always names another
+        /// would otherwise walk the table, making one dead provider a latency multiplier.
+        static constexpr int kMaxFailoverAttempts = 3;
 
         /// The venue a connection is bound to; see Connection::upstream_slot.
         [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept
