@@ -286,6 +286,51 @@ def main():
               f"types; the extractor is broken, not the code.", file=sys.stderr)
         return 2
 
+    # ---------------------------------------------------------------- 5b
+    # Constant backend prefixes, the same claim the ep_/ur_ method prefixes make:
+    # kEp* is epoll's, kUr* is io_uring's, bare means shared. Worth enforcing because
+    # the two backends bound memory by DIFFERENT means (epoll pauses reads, io_uring
+    # drops past kUrStreamBufCap), so a constant read as shared invites a fix on the
+    # wrong side, which is this codebase's most likely defect.
+    #
+    # Only contradictions are reported: a prefixed constant used from the other
+    # backend, or a bare one used exclusively by one. A constant used only from free
+    # functions or file scope has no evidence either way and is left alone.
+    gw = ROOT / "gateway" / "src" / "gateway.cpp"
+    gtext = strip_comments(gw.read_text(encoding="utf-8"))
+    glines = gtext.splitlines()
+    spans = method_spans(gtext)
+    hdr = strip_comments((ROOT / "gateway" / "include" / "gateway" / "gateway.hpp")
+                         .read_text(encoding="utf-8"))
+    consts = set(const_re.findall(hdr)) | set(const_re.findall(gtext))
+    consts = {c for c in consts if re.fullmatch(r"k[A-Z]\w*", c)}
+    n_checked = 0
+    for name in sorted(consts):
+        used = set()
+        for i, line in enumerate(glines):
+            if "constexpr" in line or not re.search(r"\b%s\b" % name, line):
+                continue
+            for fname, (_, first, last) in spans.items():
+                if first <= i <= last:
+                    b = backend_reach(fname)
+                    if b:
+                        used.add(b)
+        n_checked += 1
+        want = "ep" if name.startswith("kEp") else "ur" if name.startswith("kUr") else None
+        if want and used - {want}:
+            failures.append(
+                f"gateway.cpp: BACKEND: constant `{name}` claims {want} but is used from "
+                f"{sorted(used - {want})}; rename it or stop crossing")
+        elif not want and len(used) == 1:
+            b = used.pop()
+            failures.append(
+                f"gateway.cpp: BACKEND: constant `{name}` is used only from {b}_ methods; "
+                f"name it k{b.capitalize()}{name[1:]} so the side is readable")
+    if n_checked < 15:
+        print(f"error: backend-prefix check inspected only {n_checked} constants; "
+              f"the extractor is broken, not the code.", file=sys.stderr)
+        return 2
+
     # ------------------------------------------------- release version agreement
     # project(VERSION) feeds write_basic_package_version_file, so a stale value makes
     # find_package(llmbridge <ver> REQUIRED) fail against a correct install. It went
@@ -321,7 +366,8 @@ def main():
     print(f"convention check OK: {len(spans)} Gateway methods, {twins} ep_/ur_ twin pairs, "
           f"0 crossings, 0 unmarked, namespaces mirror directories, "
           f"LATENCY.md stamp refs resolve, release version agrees, "
-          f"{n_consts} constants + {n_types} types correctly cased")
+          f"{n_consts} constants + {n_types} types correctly cased, "
+          f"{n_checked} constant backend prefixes agree with use")
     return 0
 
 

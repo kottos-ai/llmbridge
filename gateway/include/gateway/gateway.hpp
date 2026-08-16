@@ -277,7 +277,7 @@ namespace llmbridge
         bool stream_ended = false;
 
         // Epoll only, and THE one place the backends deliberately differ: epoll applies
-        // back-pressure to a slow client, io_uring drops the stream past kStreamBufCap.
+        // back-pressure to a slow client, io_uring drops the stream past kUrStreamBufCap.
         // Written only by ep_pause_read / ep_resume_read. GATEWAY-INTERNALS.md 6c.
         bool read_paused = false;
         bool wants_usage = false;    // client set stream_options.include_usage
@@ -382,9 +382,13 @@ namespace llmbridge
         uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
         uint64_t upstream_reused = 0;   // requests served on a pooled keep-alive conn
         uint64_t upstream_unsent = 0;   // response beat our request out; conn closed, not pooled
-        // Peak ciphertext staged for ONE connection: tls_out plus whatever is still
-        // in the write BIO. Measurement seam for the question "can a client that
-        // never reads grow us without bound?", which is answerable only by a number.
+        // Peak UNSENT ciphertext staged for one connection: the part of tls_out not
+        // yet written, plus whatever is still in the write BIO. Measurement seam for
+        // "can a client that never reads grow us without bound?".
+        //
+        // It used to count tls_out.size(), which includes the prefix already handed to
+        // the kernel, so the number grew with total bytes streamed instead of with the
+        // backlog. That made a real unbounded-growth bug look like an erratic metric.
         uint64_t tls_buffered_peak = 0;
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
         uint64_t client_idle_timeouts = 0;  // established clients dropped after going quiet
@@ -566,6 +570,19 @@ namespace llmbridge
         /// At most this many venues per request: a policy that always names another
         /// would otherwise walk the table, making one dead provider a latency multiplier.
         static constexpr int kMaxFailoverAttempts = 3;
+
+        /// Most bytes ONE readable event may pull off a socket. This is epoll's
+        /// equivalent of io_uring's 4 KB provided buffer, and the reason the two
+        /// backends bound memory by different means.
+        ///
+        /// io_uring hands back at most one buffer per completion, so its 8 MiB stream
+        /// cap is re-checked every 4 KB and genuinely binds. ep_drain_read loops to
+        /// EAGAIN, so a cap in the pump is checked once per event, AFTER an unbounded
+        /// pull: against a provider writing as fast as we read, one event staged 33 MB
+        /// for a client that never read. A cap cannot fix that; only a read budget can.
+        /// Level-triggered epoll re-notifies, so stopping early costs one wakeup and
+        /// lets back-pressure engage between events.
+        static constexpr size_t kEpMaxReadPerEvent = 1 << 20; // 1 MiB
 
         /// The venue a connection is bound to; see Connection::upstream_slot.
         [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept
@@ -773,7 +790,7 @@ namespace llmbridge
         net::tls::Context _tls_upstream_ctx; // upstream leg; our role is TLS client
         net::tls::Context _tls_client_ctx;   // client leg;   our role is TLS server
 #endif
-        unsigned _uring_buf_count = 0;     // 0 = kBufCount default (test hook only)
+        unsigned _uring_buf_count = 0;     // 0 = kUrBufCount default (test hook only)
         int64_t _last_sweep_ns = 0;
         bool _uring_active = false;
 

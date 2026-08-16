@@ -83,7 +83,7 @@ TOPICS = [
 #                  surrogate-pair astral chars, CJK, Thai, maths alphabets
 #   long           multi-paragraph answers (~1-3 KB)
 #   backend_stress deliberately large answers (~4-16 KB). io_uring reads into a
-#                  provided-buffer ring of kBufSize=4096, so anything past 4 KB
+#                  provided-buffer ring of kUrBufSize=4096, so anything past 4 KB
 #                  spans multiple buffers and must be reassembled; epoll just
 #                  grows rbuf. This is the axis on which the two backends differ,
 #                  so it is where a one-sided bug would hide.
@@ -316,7 +316,7 @@ def main():
     ap.add_argument("--workers", type=int, default=12)
     # The backend_stress answers come back at ~15 KB and are 55% of the fixture, so
     # the committed corpus caps them. 6144 = 1.5x the io_uring provided-buffer size
-    # (kBufSize = 4096), which is what those entries exist to cross. The property
+    # (kUrBufSize = 4096), which is what those entries exist to cross. The property
     # survives the cap. Applied at WRITE time to every record, so re-running this
     # script reproduces the committed file instead of silently restoring 4.25 MB.
     ap.add_argument("--max-answer-bytes", type=int, default=0,

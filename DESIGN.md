@@ -59,13 +59,22 @@ Two rules make this worth the verbosity:
    `stream_flush` on one side and `u_stream_kick` on the other, so a grep for the
    counterpart returned nothing and the pairing had to be rediscovered by reading.
 
+**Constants carry the same claim, capitalised:** `kEpMaxReadPerEvent` is epoll's,
+`kUrStreamBufCap` is io_uring's, and a bare `kInitialBuf` is shared. This earns its
+keep because the two backends bound memory by different means: epoll pauses its
+upstream read when a client write goes partial, io_uring has no pause path at all and
+drops the stream past `kUrStreamBufCap`. A constant that reads as shared invites a fix
+on the wrong side, and a one-sided fix usually lands on the side that does not ship.
+
 The uring prefix is `ur_`, not `u_`, because `u` is the conventional parameter name
 for an *upstream* connection. `void u_tls_kick_send(Connection* u)` used both
 meanings of `u` in one signature.
 
 **This is enforced, not merely documented.** `scripts/check_conventions.py` runs as the
-first CI job (no compiler, ~90 ms) and fails the build on five things: a call crossing
-the prefixes; an **unprefixed** method reachable from only one backend; a header whose
+first CI job (no compiler, ~90 ms) and fails the build on six things: a call crossing
+the prefixes; an **unprefixed** method reachable from only one backend; a constant whose
+backend prefix disagrees with where it is used (a `kUr*` read from an `ep_` method, or a
+bare one used solely by one side); a header whose
 namespace does not mirror its directory; and a stale attribution in LATENCY.md's stamp
 table (each timing stamp names the function that assigns it, and that function must
 exist and must actually assign it); and an identifier whose casing breaks the rules

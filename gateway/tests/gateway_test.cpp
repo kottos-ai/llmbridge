@@ -2830,7 +2830,7 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
     // epoll implements backpressure by pausing upstream reads; io_uring instead
-    // bounds the buffer (kStreamBufCap), so only assert the counter on epoll.
+    // bounds the buffer (kUrStreamBufCap), so only assert the counter on epoll.
     if (GetParam() == llmbridge::IoBackend::Epoll)
     {
             EXPECT_GT(_gw->stats().stream_pauses, 0u) << "slow client should have paused upstream reads";

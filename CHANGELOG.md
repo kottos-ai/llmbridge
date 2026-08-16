@@ -8,6 +8,61 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.15.1]. 2026-08-16
+
+**One client that never reads could make the gateway hold 228 MB.** It looked like a
+flaky test: `ClientThatNeverReadsCannotGrowUsWithoutBound` failed occasionally under
+parallel CI load and passed on rerun. It was not flaky. It was an unbounded-growth bug
+that the test caught only when the machine was loaded enough to expose it.
+
+PATCH: a fix and a measurement correction, no API change.
+
+### Fixed
+
+- **`ep_drain_read` had no byte budget.** It looped until EAGAIN, so against a provider
+  that writes as fast as we read, ONE readable event pulled as much as the loop could
+  keep up with. That plaintext became `wbuf`, then ciphertext, then staged memory.
+  Bounded to `kEpMaxReadPerEvent` (1 MiB) per event; epoll is level-triggered, so the
+  remainder re-notifies and back-pressure engages between events, which is what the
+  epoll path is supposed to do.
+  The obvious symmetry fix, giving epoll the 8 MiB cap io_uring already had, was tried
+  and **rejected on measurement**: it changed nothing. io_uring's cap works because a
+  completion hands back at most one 4 KB buffer, so the cap is re-checked every 4 KB.
+  An epoll pump checks once per event, after the drain has already happened, so a cap
+  bounds nothing that the pull did not already stage. The budget is not a second
+  mechanism next to the cap; it is epoll's equivalent of that 4 KB buffer.
+- **`Stats::tls_buffered_peak` counted the wrong thing.** It measured `tls_out.size()`,
+  which includes the prefix already handed to the kernel, so it grew with total
+  throughput, not with backlog. Now the UNSENT backlog: unwritten ciphertext plus
+  the write BIO. This is why the symptom read as an erratic metric.
+
+### Measured
+
+Four builds, 5 runs each, under 12 busy cores, watching process RSS because the counter
+itself was one of the suspects:
+
+| epoll build | peak process RSS over 5 runs |
+|---|---|
+| neither mechanism | 51, 50, **213**, 50, 49 MB |
+| 8 MiB cap only | **204**, **115**, **222**, **222**, 48 MB |
+| 1 MiB read budget only | 48, 57, 55, 49, 48 MB |
+| both | 49, 56, 57, 57, 57 MB |
+
+The cap alone is no better than nothing, and adds nothing on top of the budget: ten
+further runs of budget-only against both put every reported peak at or below 1036 KB in
+each arm. So the shipped fix is the budget, and epoll carries no stream cap.
+
+The io_uring cap was then put through the same check, and it stays: it is that backend's
+only bound. Its multishot recv is armed for the upstream's life and there is no uring
+pause path, so a stalled client throttles nothing. It fires once in this test (epoll's
+fired zero times), and removing it stages the entire 32 MiB flood: peak RSS 67 MB with
+it and 99 MB without, 5 runs each, no overlap.
+
+The test's bound is tightened from 12 MiB to 4 MiB, and it now also asserts the peak is
+non-zero so a broken flood cannot make the bound vacuous. It remains a smoke test: it
+catches the unbounded version 2 runs in 6 under load, 1 in 6 idle, because the bug needs
+the loop to fall behind. The RSS A/B is the evidence, and the test says so.
+
 ## [0.15.0]. 2026-08-15
 
 **Several upstreams, chosen per request.** The gateway held one upstream, resolved at

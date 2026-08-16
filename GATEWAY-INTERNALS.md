@@ -170,7 +170,7 @@ recv into a shared provided-buffer ring.
       +-- IORING_OP_ASYNC_CANCEL       ----+--> (control, not counted)
 ```
 
-Buffer ring: `kBufCount = 4096` buffers of `kBufSize = 4096` bytes. Multishot
+Buffer ring: `kUrBufCount = 4096` buffers of `kUrBufSize = 4096` bytes. Multishot
 recv lands data in the ring instead of a per-connection buffer, so the kernel
 picks the buffer and we recycle it after copying out.
 
@@ -202,7 +202,7 @@ connection did nothing and the stream hung forever, on io_uring only.
 
 `wbuf` is what a SEND SQE points at, so it must not move while that send is in
 flight. Newly translated stream output therefore accumulates in `wpending` and is
-moved into `wbuf` only when no send is outstanding. Past `kStreamBufCap` (8 MiB)
+moved into `wbuf` only when no send is outstanding. Past `kUrStreamBufCap` (8 MiB)
 the stream is dropped.
 
 **This is the one place the two backends deliberately differ.** Under a slow
@@ -298,7 +298,7 @@ it did not, so read it, never infer it.
 ### 6c. The one place the backends deliberately differ
 
 Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
-back-pressure. **io_uring** instead bounds `wpending` with `kStreamBufCap` and
+back-pressure. **io_uring** instead bounds `wpending` with `kUrStreamBufCap` and
 drops the stream past the cap. Know which you are reasoning about before quoting
 streaming behaviour to a customer.
 

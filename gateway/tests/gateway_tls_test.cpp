@@ -1470,9 +1470,31 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     const uint64_t peak = _gw->stats().tls_buffered_peak;
     std::fprintf(stderr, "MEASURED tls_buffered_peak = %llu bytes\n",
                  static_cast<unsigned long long>(peak));
-    // The stream cap is 8 MiB; allow generous slack for one record and the BIO.
-    EXPECT_LT(peak, 12u * 1024 * 1024)
+    // The DESIGN bound: one event stages at most kEpMaxReadPerEvent (1 MiB) plus a TLS
+    // record, and the next event cannot start until the client's write makes progress,
+    // because a partial write pauses the upstream read.
+    //
+    // The old bound was 12 MiB and it passed BY LUCK. Back-pressure only engaged after
+    // a pump, and the drain loop had no byte budget, so one readable event could pull
+    // as much as a local flooder could supply: measured 100 KB idle and 33 MB on a
+    // loaded machine, which read as a flaky test and was an unbounded-growth bug.
+    // Measured after the fix, stable across runs and under 12 busy cores:
+    // ~1.06 MB on epoll, ~283 KB on io_uring.
+    // 4 MiB: above the ~1.4 MiB one event can stage (kEpMaxReadPerEvent plus a TLS
+    // record) and far below what the unbounded version reached.
+    //
+    // HONEST LIMIT OF THIS TEST: it detects the unbounded version only SOMETIMES,
+    // because that bug needs the event loop to fall behind a flooding provider, which
+    // depends on machine load. Measured against the pre-fix code: 2 failures in 6 runs
+    // under 12 busy cores, 1 in 6 idle. Shrinking the client's receive window did not
+    // help. What actually proved the fix was a 5-run A/B on process RSS, recorded in
+    // the CHANGELOG: 228 MB peak before, 58 MB after. Treat this as a smoke test.
+    EXPECT_LT(peak, 4u * 1024 * 1024)
         << "staged " << peak << " bytes for one non-reading client";
+    // Not vacuous: a peak of zero would mean the flood never flowed, and the bound
+    // above would be measuring nothing. TheFloodControlActuallyDelivers is the other
+    // half of that argument.
+    EXPECT_GT(peak, 0u) << "nothing was ever staged, so the bound proves nothing";
 }
 
 // The control for the test above, and it is not optional. A peak of ~1 KiB is the

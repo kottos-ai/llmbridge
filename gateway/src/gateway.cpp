@@ -104,7 +104,7 @@ namespace llmbridge
     namespace
     {
         constexpr size_t kInitialBuf = 4096;
-        constexpr int kMaxEvents = 1024;
+        constexpr int kEpMaxEvents = 1024;
         constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
 
         // Build a minimal HTTP/1.1 message (start line + JSON body) for a
@@ -903,12 +903,18 @@ namespace llmbridge
     bool Gateway::ep_drain_read(Connection* c) noexcept
     {
         char tmp[16384];
+        size_t pulled = 0;
         for (;;)
         {
             ssize_t n = ::read(c->fd, tmp, sizeof(tmp));
             if (n > 0)
             {
                 c->rbuf.append(tmp, static_cast<size_t>(n));
+                pulled += static_cast<size_t>(n);
+                // Level-triggered: whatever is left re-notifies. Stopping here is what
+                // lets back-pressure engage between events instead of after an
+                // unbounded burst. See kEpMaxReadPerEvent.
+                if (pulled >= kEpMaxReadPerEvent) return true;
                 if (static_cast<size_t>(n) < sizeof(tmp)) return true;
                 continue;
             }
@@ -1081,8 +1087,11 @@ namespace llmbridge
         size_t n;
         while ((n = u->tls->pull_ciphertext({buf, sizeof buf})) > 0)
             u->tls_out.append(reinterpret_cast<const char*>(buf), n);
-        const uint64_t staged = u->tls_out.size() + u->tls->pending_output_bytes();
-        if (staged > _stats.tls_buffered_peak) _stats.tls_buffered_peak = staged;
+        // UNSENT only: tls_out keeps the prefix already written until a full drain
+        // clears it, so counting size() measured total throughput, not backlog.
+        const uint64_t unsent = static_cast<uint64_t>(u->tls_out.size() - u->tls_out_off) +
+                                u->tls->pending_output_bytes();
+        if (unsent > _stats.tls_buffered_peak) _stats.tls_buffered_peak = unsent;
     }
 
     void Gateway::tls_push_wbuf(Connection* u) noexcept
@@ -1192,12 +1201,15 @@ namespace llmbridge
     bool Gateway::ep_tls_drain_read(Connection* u) noexcept
     {
         char tmp[16384];
+        size_t pulled = 0;
         for (;;)
         {
             const ssize_t n = ::read(u->fd, tmp, sizeof tmp);
             if (n > 0)
             {
                 if (!tls_feed(u, tmp, static_cast<size_t>(n))) return false;
+                pulled += static_cast<size_t>(n);
+                if (pulled >= kEpMaxReadPerEvent) break; // see ep_drain_read
                 if (static_cast<size_t>(n) < sizeof tmp) break;
                 continue;
             }
@@ -2273,12 +2285,12 @@ namespace llmbridge
     int Gateway::run_epoll()
     {
         _t_start = now_ns();
-        epoll_event events[kMaxEvents];
+        epoll_event events[kEpMaxEvents];
 
         while (!_stop)
         {
             // kPollTickMs timeout so request_stop() is observed within a tick.
-            int n = ::epoll_wait(_epfd, events, kMaxEvents, kPollTickMs);
+            int n = ::epoll_wait(_epfd, events, kEpMaxEvents, kPollTickMs);
             if (n < 0) { if (errno == EINTR) continue; break; }
             for (int i = 0; i < n; ++i)
             {
@@ -2321,23 +2333,28 @@ namespace llmbridge
     namespace
     {
         enum UOp : uint64_t { UAccept = 0, URecv = 1, USend = 2, UConnect = 3, UTimer = 4, UCancel = 5 };
-        constexpr uint64_t kTagMask = 7;
+        constexpr uint64_t kUrTagMask = 7;
         inline uint64_t make_ud(Connection* c, UOp op) { return reinterpret_cast<uintptr_t>(c) | op; }
-        inline Connection* ud_conn(uint64_t d) { return reinterpret_cast<Connection*>(d & ~kTagMask); }
-        inline UOp ud_op(uint64_t d) { return static_cast<UOp>(d & kTagMask); }
+        inline Connection* ud_conn(uint64_t d) { return reinterpret_cast<Connection*>(d & ~kUrTagMask); }
+        inline UOp ud_op(uint64_t d) { return static_cast<UOp>(d & kUrTagMask); }
 
-        constexpr unsigned kRingDepth = 4096;
+        constexpr unsigned kUrRingDepth = 4096;
         // Provided-buffer pool for multishot recv: plenty so a connection always has
         // a buffer to land in (we recycle each immediately after copying it out).
-        constexpr unsigned kBufGroup = 1;
-        constexpr unsigned kBufCount = 4096; // power of two
-        constexpr unsigned kBufSize = 4096;
+        constexpr unsigned kUrBufGroup = 1;
+        constexpr unsigned kUrBufCount = 4096; // power of two
+        constexpr unsigned kUrBufSize = 4096;
 
         // Cap on buffered SSE output for one stream. SSE is model-rate-limited, so
         // this only trips for a pathologically slow client, instead of buffer
-        // without bound we drop that stream. (The epoll pump instead pauses reads;
-        // for a model-rate stream the cap is equivalent in practice.)
-        constexpr size_t kStreamBufCap = 8 << 20; // 8 MiB
+        // without bound we drop that stream.
+        //
+        // It is the ONLY bound this backend has: the multishot recv stays armed for the
+        // upstream's life and there is no uring pause path, so a stalled client throttles
+        // nothing. Measured against a 32 MiB flood to a client that never reads: peak RSS
+        // 67 MB with the cap, 99 MB without, i.e. the whole flood staged. epoll needs no
+        // equivalent because a partial client write pauses its upstream read.
+        constexpr size_t kUrStreamBufCap = 8 << 20; // 8 MiB
     } // namespace
 
     bool Gateway::ur_next_sqe(io_uring_sqe** out) noexcept
@@ -2382,7 +2399,7 @@ namespace llmbridge
         s->addr = 0;
         s->len = 0;
         s->flags |= IOSQE_BUFFER_SELECT;
-        s->buf_group = kBufGroup;
+        s->buf_group = kUrBufGroup;
         s->ioprio |= IORING_RECV_MULTISHOT;
         s->user_data = make_ud(c, URecv);
         ++c->inflight;
@@ -2779,13 +2796,13 @@ namespace llmbridge
         // stream end.
         //
         // Measured scope, so nobody mistakes this for a fix to a live bug: on this kernel
-        // (7.0) with kBufCount=4096, `uring_enobufs` stayed at **0** even at 8192
+        // (7.0) with kUrBufCount=4096, `uring_enobufs` stayed at **0** even at 8192
         // concurrent streams (16384 armed recvs, 4x the pool). The kernel ends the
         // multishot with res>0 and F_MORE clear under pool pressure, which the re-arm at
         // the bottom of this function already handles. So this is DEFENSIVE hardening for
         // a path that is reachable by contract but was never observed in practice; it is
         // NOT the explanation for io_uring's high-concurrency tail latency (that was
-        // hypothesised from the kBufCount correlation and disproved by this counter).
+        // hypothesised from the kUrBufCount correlation and disproved by this counter).
         // The regression test forces the condition by shrinking the pool.
         if (res == -ENOBUFS)
         {
@@ -3279,11 +3296,11 @@ namespace llmbridge
             ur_stream_flush(client);
             return;
         }
-        if (client->wpending.size() + client->wbuf.size() > kStreamBufCap)
+        if (client->wpending.size() + client->wbuf.size() > kUrStreamBufCap)
         {
             LB_WARN("CAP stream buffer exceeded, dropping the stream ", *client,
                     " buffered=", client->wpending.size() + client->wbuf.size(),
-                    " limit=", static_cast<uint64_t>(kStreamBufCap),
+                    " limit=", static_cast<uint64_t>(kUrStreamBufCap),
                     " (the client is slower than the provider)");
             ur_abort_pair(client);
             return;
@@ -3348,13 +3365,13 @@ namespace llmbridge
 #if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
         flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
 #endif
-        if (!_ring.init(kRingDepth, flags) && !_ring.init(kRingDepth, 0))
+        if (!_ring.init(kUrRingDepth, flags) && !_ring.init(kUrRingDepth, 0))
         {
             LB_WARN("io_uring init failed; falling back to epoll");
             return run_epoll();
         }
-        const unsigned bufcount = _uring_buf_count ? _uring_buf_count : kBufCount;
-        if (!_bufring.init(_ring, kBufGroup, bufcount, kBufSize))
+        const unsigned bufcount = _uring_buf_count ? _uring_buf_count : kUrBufCount;
+        if (!_bufring.init(_ring, kUrBufGroup, bufcount, kUrBufSize))
         {
             LB_WARN("io_uring provided-buffer ring unavailable; falling back to epoll");
             return run_epoll();

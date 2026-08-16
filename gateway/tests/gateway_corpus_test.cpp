@@ -62,7 +62,7 @@
 //      this path independently (DESIGN.md, "Naming conventions"), so a fix to one
 //      is not a fix to the other and every case here runs twice. The
 //      backend_stress answers exist because io_uring reassembles reads across a
-//      provided-buffer ring of kBufSize = 4096 while epoll grows a single buffer,
+//      provided-buffer ring of kUrBufSize = 4096 while epoll grows a single buffer,
 //      and on the streaming path io_uring accumulates into `wpending` where epoll
 //      pauses reads, so answers past a few KB exercise code that is NOT shared.
 //
@@ -953,7 +953,7 @@ TEST_P(CorpusIT, StreamedThousandQuestionsAcrossHundredClients)
 }
 
 // Large answers are where the two backends genuinely differ: io_uring reassembles
-// across a provided-buffer ring (kBufSize = 4096) while epoll grows one buffer, and
+// across a provided-buffer ring (kUrBufSize = 4096) while epoll grows one buffer, and
 // on the streaming path io_uring accumulates in `wpending` where epoll pauses reads.
 // Anything past a few KB therefore exercises code that is NOT shared.
 TEST_P(CorpusIT, LargeAnswersCrossBufferBoundariesOnBothPaths)
