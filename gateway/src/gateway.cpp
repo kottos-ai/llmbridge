@@ -1573,6 +1573,7 @@ namespace llmbridge
         // places one can end.
         c->failover_req.clear();
         c->failover_attempts = 0;
+        c->policy_tag = 0;
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // THE POLICY SEAM, one call site per backend. Here because framing has
         // succeeded but nothing is translated, no credential mapped and no upstream
@@ -1598,14 +1599,18 @@ namespace llmbridge
         ep_forward(c);
     }
 
-    Decision Gateway::policy_decision(const Connection* c, const net::http::Message& m) noexcept
+    Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
     {
         // Head only. The body is deliberately unreachable from RequestFacts: this is
         // the line where "metadata only, no prompt text" is either true or not.
         const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len};
 
         Decision d = _policy->decide(facts);
-        if (d.allow) return d;
+        if (d.allow)
+        {
+            c->policy_tag = d.tag; // handed back verbatim in FailureFacts
+            return d;
+        }
 
         // A status the responder cannot render would emit a misleading reply, so
         // substitute and say so loudly. The refusal still stands: fail closed.
@@ -1641,7 +1646,8 @@ namespace llmbridge
         if (client->failover_req.empty()) return {};
         if (client->failover_attempts >= kMaxFailoverAttempts - 1) return {};
 
-        const FailureFacts f{client->upstream_slot, status, why, client->failover_attempts};
+        const FailureFacts f{client->upstream_slot, status, why, client->failover_attempts,
+                             client->policy_tag};
         const Retry r = _policy->on_failure(f);
         if (!r.retry) return {};
         if (r.upstream_index < 0 || static_cast<size_t>(r.upstream_index) >= _upstreams.size())
@@ -2926,6 +2932,7 @@ namespace llmbridge
         // places one can end.
         c->failover_req.clear();
         c->failover_attempts = 0;
+        c->policy_tag = 0;
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam; see the epoll mirror for why it sits exactly here.
         // Default to the first upstream, so a build with no policy, and a policy that

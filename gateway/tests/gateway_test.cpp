@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <ctime>
@@ -4211,6 +4212,169 @@ TEST_P(ProxyRoute, ConcurrentWorkersShareOnePolicyAndAllFailOver)
     for (const auto& g : gws) total += g->stats().upstream_failovers;
     EXPECT_EQ(total, static_cast<uint64_t>(kWorkers * kPerWorker));
     EXPECT_EQ(good.seen(), kWorkers * kPerWorker);
+    good.stop();
+}
+
+// ── Decision::tag -> FailureFacts::tag ───────────────────────────────────────
+
+namespace
+{
+    class TaggingPolicy final : public llmbridge::Policy
+    {
+      public:
+        static constexpr uint64_t kTagBase = 0xC0FFEE00u;
+
+        TaggingPolicy(std::vector<int> venue_of_request, std::vector<int> retry_order)
+            : _venues(std::move(venue_of_request)), _retry(std::move(retry_order))
+        {
+        }
+
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            const int n = _decides.fetch_add(1, std::memory_order_relaxed);
+            const size_t i = std::min(static_cast<size_t>(n), _venues.size() - 1);
+            return {.allow = true, .upstream_index = _venues[i], .tag = kTagBase + n};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            const int n = _failures.fetch_add(1, std::memory_order_relaxed);
+            if (n < static_cast<int>(kMaxSeen)) seen_tags[static_cast<size_t>(n)] = f.tag;
+            if (f.attempt >= static_cast<int>(_retry.size())) return {};
+            return {.retry = true, .upstream_index = _retry[static_cast<size_t>(f.attempt)]};
+        }
+
+        int failures() const noexcept { return _failures.load(std::memory_order_relaxed); }
+
+        static constexpr size_t kMaxSeen = 8;
+        std::array<std::atomic<uint64_t>, kMaxSeen> seen_tags{};
+
+      private:
+        std::vector<int> _venues, _retry;
+        std::atomic<int> _decides{0};
+        std::atomic<int> _failures{0};
+    };
+
+    /// Leaves Decision::tag at its default and records what the failure carries.
+    class TagRecordingPolicy final : public llmbridge::Policy
+    {
+      public:
+        TagRecordingPolicy(int first, int retry_on) : _first(first), _retry_on(retry_on) {}
+
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = _first};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            seen_tag.store(f.tag, std::memory_order_relaxed);
+            return {.retry = true, .upstream_index = _retry_on};
+        }
+
+        std::atomic<uint64_t> seen_tag{~0ull}; ///< poisoned, so "never called" is visible
+
+      private:
+        int _first, _retry_on;
+    };
+} // namespace
+
+// THE ROUND TRIP. decide() tags the request, the venue refuses the connect, and
+// on_failure() must receive that exact value.
+TEST_P(ProxyRoute, TheTagSetAtDecideArrivesAtTheFailure)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    TaggingPolicy pol({0}, {1}); // venue 0 is dead; retry on venue 1
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+
+    ASSERT_EQ(pol.failures(), 1);
+    EXPECT_EQ(pol.seen_tags[0].load(), TaggingPolicy::kTagBase + 0);
+    good.stop();
+}
+
+// One request, several failures: attempt 0 and attempt 1 are the SAME decision, so
+// they must carry the same tag. A tag that mutated across the chain would resolve
+// the second failure against the wrong routing context.
+TEST_P(ProxyRoute, TheTagIsStableAcrossTheFailoverChain)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead1 = free_port(), dead2 = free_port();
+    TaggingPolicy pol({0}, {1, 2}); // dead -> dead -> healthy
+    start({{"127.0.0.1", dead1, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", dead2, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+
+    ASSERT_EQ(pol.failures(), 2);
+    EXPECT_EQ(pol.seen_tags[0].load(), TaggingPolicy::kTagBase + 0);
+    EXPECT_EQ(pol.seen_tags[1].load(), TaggingPolicy::kTagBase + 0)
+        << "attempt 1 carried a different tag from attempt 0 of the same request";
+    good.stop();
+}
+
+// Two requests on ONE keep-alive connection. The second decision's tag must replace
+// the first, or a failure on request 2 is resolved against request 1's context: the
+// same staleness bug the per-request failover reset already guards for the bytes.
+TEST_P(ProxyRoute, AKeepAliveConnectionCarriesEachRequestsOwnTag)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    // Request 0 -> venue 1 (healthy, no failure). Request 1 -> venue 0 (dead).
+    TaggingPolicy pol({1, 0}, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+
+    ASSERT_EQ(pol.failures(), 1) << "only the second request's venue was dead";
+    EXPECT_EQ(pol.seen_tags[0].load(), TaggingPolicy::kTagBase + 1)
+        << "the failure carried the FIRST request's tag";
+    good.stop();
+}
+
+// The default. FailoverPolicy never sets Decision::tag, so the failure must read 0:
+// a stale or invented value here would send every existing policy a meaning it never
+// wrote.
+TEST_P(ProxyRoute, APolicyThatNeverTagsSeesZeroAtTheFailure)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    TagRecordingPolicy pol(0, 1);
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+
+    EXPECT_EQ(pol.seen_tag.load(), 0u);
     good.stop();
 }
 

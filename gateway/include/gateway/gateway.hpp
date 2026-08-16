@@ -150,6 +150,7 @@ namespace llmbridge
         /// and with one upstream, so nobody pays for a copy they cannot use.
         std::string failover_req;
         int failover_attempts = 0; ///< venues already tried for the request in flight
+        uint64_t policy_tag = 0;   ///< Decision::tag of the request in flight; see policy.hpp
 
         /// Index into the upstream table, -1 when none applies. TWO READINGS that agree
         /// by construction: on an UPSTREAM connection the venue this socket talks to, so
@@ -555,7 +556,7 @@ namespace llmbridge
         // question has nothing to do with the event loop. Callers must treat
         // `allow == false` as terminal and reply with their own ep_/ur_ responder.
         // Only called when a policy exists; the caller checks first.
-        Decision policy_decision(const Connection* c, const net::http::Message& m) noexcept;
+        Decision policy_decision(Connection* c, const net::http::Message& m) noexcept;
 
         /// Ask the policy for another venue and re-dispatch there. TRUE when the
         /// request was re-sent, in which case the caller must not also answer the

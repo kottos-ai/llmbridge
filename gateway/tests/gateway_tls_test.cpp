@@ -1084,14 +1084,17 @@ namespace
         TlsFailoverPolicy(int first, int next) : _first(first), _next(next) {}
         Decision decide(const RequestFacts&) noexcept override
         {
-            return {.allow = true, .upstream_index = _first};
+            return {.allow = true, .upstream_index = _first, .tag = kTag};
         }
         Retry on_failure(const FailureFacts& f) noexcept override
         {
             ++failures;
+            seen_tag = f.tag;
             return f.attempt == 0 ? Retry{true, _next} : Retry{};
         }
+        static constexpr uint64_t kTag = 0xF00DFACEu;
         int failures = 0;
+        uint64_t seen_tag = 0;
       private:
         int _first, _next;
     };
@@ -1203,6 +1206,9 @@ TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();
     EXPECT_EQ(pol.failures, 1);
+    // The Decision::tag round trip on the TLS path: the failed connect here is a TLS
+    // venue, so the tag has to survive the session teardown the retry causes.
+    EXPECT_EQ(pol.seen_tag, TlsFailoverPolicy::kTag);
     EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
     EXPECT_EQ(_b1.handshakes(), 1) << "the retry never completed a handshake with venue 1";
 }

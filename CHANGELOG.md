@@ -8,6 +8,22 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.16.0]. 2026-08-16
+
+**An tag from the decision to the failure.** `Decision::tag` is stored with the
+request and handed back verbatim as `FailureFacts::tag`.
+
+MINOR: additive API, no behaviour change for existing policies (both fields default
+to 0, and a policy that never sets the tag reads 0 at the failure).
+
+### Added
+
+- `Decision::tag` and `FailureFacts::tag` (`uint64_t`, default 0).
+- The tag is per request: reset where the failover budget is, overwritten by every
+  `decide()`, and stable across a multi-attempt failover chain. Tests cover the round
+  trip on both backends, plaintext and TLS, keep-alive replacement between requests,
+  chain stability, and the zero default.
+
 ## [0.15.1]. 2026-08-16
 
 **One client that never reads could make the gateway hold 228 MB.** It looked like a

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 #include "net/http.hpp"
@@ -44,6 +45,7 @@ namespace llmbridge
         /// Logged, never sent to the client. Must outlive the call, and must not carry
         /// credential material.
         const char* reason = "policy denied";
+        uint64_t tag = 0;
     };
 
     /// A venue failed before the client saw a single byte. Handed to the policy so it
@@ -59,6 +61,7 @@ namespace llmbridge
         int status = 502;        ///< what the client gets if nothing is retried
         const char* reason = ""; ///< the gateway's short literal for the failure
         int attempt = 0;         ///< venues already tried for this request, 0 on the first
+        uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
     };
 
     /// What to do about it. Value-initialised means give up and let the client see the
