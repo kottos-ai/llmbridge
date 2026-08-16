@@ -1355,7 +1355,10 @@ TEST_P(GatewayTls, ClientVanishesMidHandshake)
         // Half a ClientHello, then gone: a send of our handshake reply may well be
         // in flight when the peer disappears.
         const char partial[] = "\x16\x03\x01\x00\x2f\x01";
-        ::write(c.fd(), partial, sizeof partial - 1);
+        // Best-effort by design: the peer is about to vanish, so a short write is the
+        // scenario, not an error. `(void)!` is how this repo discards a
+        // warn_unused_result write; GCC rejects a bare (void) cast.
+        (void)!::write(c.fd(), partial, sizeof partial - 1);
         c.close();
     }
     // Survival check: the gateway still serves.
@@ -1638,10 +1641,16 @@ TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
         TlsClient c;
         ASSERT_TRUE(c.connect(_port, _ca_path));
         ASSERT_TRUE(c.handshake());
-        ASSERT_TRUE(c.send(kReq));           // two requests on the SECOND session, so
-        if (i == 1) ASSERT_TRUE(c.send(kReq)); // samples cannot be per-request
+        ASSERT_TRUE(c.send(kReq)); // two requests on the SECOND session, so samples
+        if (i == 1)                // cannot be per-request
+        {
+            ASSERT_TRUE(c.send(kReq)); // braced: ASSERT_* expands to an if/else, and an
+        }                              // unbraced body is a dangling else under GCC
         ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
-        if (i == 1) ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
+        if (i == 1)
+        {
+            ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
+        }
     }
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();

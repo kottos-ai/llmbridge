@@ -59,6 +59,30 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # TLS with GCC. The matrix above builds without TLS, and the two sanitizer jobs
+  # below build WITH it but only under clang, so gateway_tls_test.cpp had no GCC
+  # coverage at all. The compilers disagree about that file: GCC rejects a dangling
+  # else and an ignored warn_unused_result write that clang accepts, and three such
+  # errors sat in the tree undetected.
+  build-test-tls:
+    name: build & test · g++ · TLS
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install g++-14 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y g++-14 libssl-dev
+      - name: Configure (Release, TLS on, tests on)
+        run: >
+          cmake -B build-tls -DCMAKE_BUILD_TYPE=Release -DLLMBRIDGE_BUILD_TESTS=ON
+          -DLLMBRIDGE_WERROR=ON -DLLMBRIDGE_TLS=ON
+      - name: Build
+        run: cmake --build build-tls -j
+      - name: Test
+        run: ctest --test-dir build-tls --output-on-failure
+
   # macOS builds the EMBEDDABLE LIBRARY only, which is the portable half and the whole
   # "drop it into your binary" story. The gateway is Linux-only by design (epoll and
   # io_uring), so this job deliberately does not build it; that is the supported

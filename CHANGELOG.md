@@ -71,6 +71,15 @@ The C++ API is additive: the single-upstream constructor still exists and delega
   venues per request, the failed venue may not be renamed, and nothing is re-sent once
   any byte has gone out.
 
+### Also
+
+- **A GCC + TLS build leg**, in CI and in the pre-commit script. `gateway_tls_test.cpp`
+  is compiled only when TLS is on, and every TLS build here used clang, so that file
+  had no GCC coverage at all. Three errors were sitting in it: two dangling elses (an
+  `ASSERT_*` expands to an if/else, so an unbraced body under `if` is ambiguous) and an
+  ignored `warn_unused_result` write. Clang accepts all three; GCC refuses them. Fixed,
+  and the leg is what stops them coming back.
+
 ### Verified
 
 Eight routing tests on BOTH backends, and five mutations of the routing logic all

@@ -11,6 +11,13 @@ add_library(net STATIC
         src/log.cpp
 )
 target_include_directories(net PUBLIC include)
+# PUBLIC, so ANYTHING linking net compiles against the same floor. The root sets this
+# with add_compile_definitions, which reaches llmbridge's own directory scope and no
+# further: a consumer that pulls llmbridge in with add_subdirectory (FetchContent does)
+# silently kept the default, so `-DLLMBRIDGE_LOG_LEVEL=debug` compiled out every
+# LB_DEBUG in the consumer's own code while enabling llmbridge's. The floor is a
+# property of the logger, so it travels with the target that owns it.
+target_compile_definitions(net PUBLIC LLMBRIDGE_LOG_COMPILE_LEVEL=${_lb_log})
 target_compile_features(net PUBLIC cxx_std_20)
 
 # io_uring backend (Phase 0 scaffolding): compile the raw wrapper only where the
