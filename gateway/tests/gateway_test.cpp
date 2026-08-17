@@ -1045,8 +1045,11 @@ TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
     EXPECT_EQ(up.substr(up.size() - body.size()), body) << up;
 }
 
-// The stock build must keep the single-memcpy passthrough, byte for byte.
-TEST_P(ProxyStrip, EmptyListLeavesTheRequestUntouched)
+// With nothing to strip, byte-forward changes exactly ONE header: Host, which must
+// name the venue this request is being sent to and not the name the client used for
+// us. Everything else, including headers the gateway has no opinion about, survives
+// untouched.
+TEST_P(ProxyStrip, EmptyListChangesOnlyTheHost)
 {
     _backend.set_response(http_ok("{}"));
     start(0, true, TranslateMode::None, GetParam());
@@ -1056,7 +1059,48 @@ TEST_P(ProxyStrip, EmptyListLeavesTheRequestUntouched)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(req));
     (void)c.recv_response();
-    EXPECT_EQ(_backend.last_request(), req) << "passthrough is no longer byte-exact";
+    const std::string up = _backend.last_request();
+    const std::string expect_host = "Host: 127.0.0.1:" + std::to_string(_backend.port());
+    EXPECT_NE(up.find(expect_host), std::string::npos)
+        << "Host must name the venue, not the client's idea of us: " << up;
+    EXPECT_EQ(up.find("Host: x"), std::string::npos) << "the client's Host was forwarded";
+    // One Host, however many arrive, and nothing else touched.
+    EXPECT_EQ(up.find("Host:"), up.rfind("Host:")) << "more than one Host went upstream";
+    EXPECT_NE(up.find("Authorization: Bearer keep"), std::string::npos) << up;
+    EXPECT_NE(up.find("X-Odd-Header: v"), std::string::npos) << up;
+    // The body is whatever the client sent, unchanged: compare it against the tail
+    // of the request that went in, never against a guess at its last bytes.
+    const size_t body_at = req.find("\r\n\r\n");
+    ASSERT_NE(body_at, std::string::npos);
+    const std::string body = req.substr(body_at + 4);
+    EXPECT_EQ(up.substr(up.size() - body.size()), body) << "the body was altered: " << up;
+}
+
+// THE REASON BYTE-FORWARD REWRITES HOST. This path sends the request to a different
+// origin than the client addressed, so forwarding the client's Host names a host the
+// provider was never asked about: a CDN-fronted or multi-vhost provider misroutes it
+// or refuses it. The translating path has always emitted the venue's Host; this makes
+// byte-forward agree. Several client Hosts still collapse to exactly one upstream.
+TEST_P(ProxyStrip, ByteForwardHostNamesTheVenueNotTheClient)
+{
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    // Two Host lines, the shape a confused client or a smuggling attempt produces.
+    const std::string req = openai_request_hdrs("hi", "Host: someone-elses-name\r\n");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(req));
+    (void)c.recv_response();
+
+    const std::string up = _backend.last_request();
+    const std::string expect = "Host: 127.0.0.1:" + std::to_string(_backend.port());
+    EXPECT_NE(up.find(expect), std::string::npos) << "Host does not name the venue: " << up;
+    EXPECT_EQ(up.find("someone-elses-name"), std::string::npos)
+        << "a client-supplied Host reached the provider: " << up;
+    EXPECT_EQ(up.find("Host: x"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Host:"), up.rfind("Host:")) << "more than one Host went upstream";
+    // It belongs directly after the request line, where a reader looks for it.
+    EXPECT_EQ(up.find(expect), up.find("\r\n") + 2) << up;
 }
 
 // The colon appended to every strip name is what makes the match exact. Without
@@ -1593,7 +1637,11 @@ TEST_P(ProxySize, LargeRequestForwardedIntact)
     const std::string req = make_request(big);
     ASSERT_TRUE(c.send(req));
     ASSERT_NE(c.recv_response().find("200 OK"), std::string::npos);
-    EXPECT_EQ(_backend.last_request(), req); // byte-exact passthrough
+    // Byte-exact except the rewritten Host, which is one short line: the body is what
+    // this case is about, and it must arrive whole at every size.
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.substr(up.size() - big.size()), big) << "the body did not arrive intact";
+    EXPECT_NE(up.find("Host: 127.0.0.1:"), std::string::npos) << "Host was not rewritten";
     c.close();
     shutdown();
 }
@@ -1850,8 +1898,12 @@ TEST_P(ProxyBackend, LargeResponseAndRequest)
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string req = make_request(std::string(64 * 1024, 'Q'));
     ASSERT_TRUE(c.send(req));
-    EXPECT_EQ(body_of(c.recv_response()), big);   // large response intact
-    EXPECT_EQ(_backend.last_request(), req);       // large request forwarded intact
+    EXPECT_EQ(body_of(c.recv_response()), big); // large response intact
+    // Large request intact: byte-forward rewrites Host and nothing else, so the
+    // comparison is against the body sent, not the whole framed request.
+    const std::string sent_body(64 * 1024, 'Q');
+    EXPECT_EQ(_backend.last_request().substr(_backend.last_request().size() - sent_body.size()),
+              sent_body);
     c.close();
     shutdown();
 }
@@ -2075,10 +2127,13 @@ TEST_P(ProxyBackend, VeryLargeBodyMultiOp)
     start(0, true, TranslateMode::None, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
-    const std::string req = make_request(std::string(512 * 1024, 'Q'));
+    const std::string sent_body(512 * 1024, 'Q');
+    const std::string req = make_request(sent_body);
     ASSERT_TRUE(c.send(req));
     EXPECT_EQ(body_of(c.recv_response()), big);
-    EXPECT_EQ(_backend.last_request(), req);
+    // Body intact across many recv/send operations; Host is the one rewritten header.
+    EXPECT_EQ(_backend.last_request().substr(_backend.last_request().size() - sent_body.size()),
+              sent_body);
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
