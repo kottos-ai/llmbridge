@@ -8,6 +8,31 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.17.0]. 2026-08-16
+
+**An optional per-request metadata sink.** `RequestSink` (gateway/sink.hpp) receives
+one `RequestRecord` per completed request on the loop thread: the monotonic stamps,
+a wall clock taken at framing, status, serving venue, attempts, the policy tag,
+token counts where the provider reported them, and up to two request-header values
+the integrator asked to capture. Streams and gateway-generated error replies emit
+too, because a record of successes only cannot answer "why was this slow".
+
+MINOR: additive API. A build that never calls `set_request_sink` pays one
+predicted-false branch per request and nothing else.
+
+### Added
+
+- `RequestSink`, `RequestRecord`, `Gateway::set_request_sink(sink, capture)`. Header
+  values are copied at framing, bounded to `kSinkCaptureBytes`, because the request
+  buffer is reused long before completion; the record's views die with the call.
+- Emitted at every completion on both backends: non-streaming replies, finished and
+  truncated streams including SSE translator's token counts, and error replies the
+  gateway generated itself (stamps unset, `error_reply` set).
+- Tests on both backends: capture round-trip, per-request capture on keep-alive,
+  bounded over-long values, failover attribution (the record names the venue that
+  SERVED), stream token counts, and error replies. Mutation-checked: removing the
+  framing-time capture or the stream emit fails the suite.
+
 ## [0.16.0]. 2026-08-16
 
 **An tag from the decision to the failure.** `Decision::tag` is stored with the

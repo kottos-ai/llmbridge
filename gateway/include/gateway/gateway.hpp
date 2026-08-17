@@ -44,6 +44,7 @@
 
 #include "gateway/metrics.hpp"
 #include "gateway/policy.hpp"
+#include "gateway/sink.hpp"
 #include "net/http.hpp"
 #include "net/log.hpp"
 #include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
@@ -151,6 +152,11 @@ namespace llmbridge
         std::string failover_req;
         int failover_attempts = 0; ///< venues already tried for the request in flight
         uint64_t policy_tag = 0;   ///< Decision::tag of the request in flight; see policy.hpp
+        /// Sink capture: bounded header copies plus the wall clock at
+        /// framing, taken then because the request buffer is reused by completion.
+        int64_t wall_t0 = 0;
+        char sink_cap[kSinkCaptureMax][kSinkCaptureBytes];
+        uint8_t sink_cap_len[kSinkCaptureMax] = {};
 
         /// Index into the upstream table, -1 when none applies. TWO READINGS that agree
         /// by construction: on an UPSTREAM connection the venue this socket talks to, so
@@ -485,6 +491,10 @@ namespace llmbridge
         void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
         /// Test seam, same contract: call BEFORE run(). 0 disables pool reaping.
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
+        /// Optional per-request metadata sink (sink.hpp). Non-owning; call BEFORE
+        /// run(). `capture` names up to kSinkCaptureMax request headers whose values
+        /// are copied (bounded) and handed back in RequestRecord::captured.
+        void set_request_sink(RequestSink* sink, std::vector<std::string> capture);
 
         // Test seam: does any POOLED upstream still hold `needle`? A pooled conn is
         // handed to whichever client asks next, so a credential left in its buffer
@@ -557,6 +567,12 @@ namespace llmbridge
         // `allow == false` as terminal and reply with their own ep_/ur_ responder.
         // Only called when a policy exists; the caller checks first.
         Decision policy_decision(Connection* c, const net::http::Message& m) noexcept;
+
+        /// Sink plumbing, unprefixed because both loops share it verbatim.
+        /// sink_capture runs at framing (bounded header copies + wall clock);
+        /// sink_emit at every completion, streams and error replies included.
+        void sink_capture(Connection* c) noexcept;
+        void sink_emit(Connection* c, int status, bool streamed) noexcept;
 
         /// Ask the policy for another venue and re-dispatch there. TRUE when the
         /// request was re-sent, in which case the caller must not also answer the
@@ -771,6 +787,9 @@ namespace llmbridge
         // `const` so there is no setter: swapping this while the loop runs would be
         // a data race on the request path. See policy.hpp.
         Policy* const _policy = nullptr;
+        RequestSink* _sink = nullptr;
+        std::vector<std::string> _sink_capture_names; ///< lowercased, no colon
+        uint8_t _active_backend = 0;                  ///< 1 epoll, 2 io_uring; set by run
         // Header names dropped from every upstream request, lower-cased with the
         // colon so they can be compared against a raw line. Empty in a stock build,
         // where the passthrough copy stays a single memcpy.
