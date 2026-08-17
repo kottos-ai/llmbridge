@@ -1574,6 +1574,7 @@ namespace llmbridge
         c->failover_req.clear();
         c->failover_attempts = 0;
         c->policy_tag = 0;
+        if (_sink) sink_capture(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // THE POLICY SEAM, one call site per backend. Here because framing has
         // succeeded but nothing is translated, no credential mapped and no upstream
@@ -1597,6 +1598,80 @@ namespace llmbridge
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
         }
         ep_forward(c);
+    }
+
+    void Gateway::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
+    {
+        _sink = sink;
+        _sink_capture_names.clear();
+        for (std::string& h : capture)
+        {
+            if (_sink_capture_names.size() == kSinkCaptureMax) break;
+            for (char& ch : h)
+                ch = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+            _sink_capture_names.push_back(std::move(h));
+        }
+    }
+
+    void Gateway::sink_capture(Connection* c) noexcept
+    {
+        // The request buffer is reused long before completion, so the sink's header
+        // values are copied now, bounded, and the wall clock (the cross-process
+        // merge key; the ts_* stamps are monotonic) is taken in the same breath.
+        timespec tw{};
+        clock_gettime(CLOCK_REALTIME, &tw);
+        c->wall_t0 = static_cast<int64_t>(tw.tv_sec) * 1000000000 + tw.tv_nsec;
+        const std::string_view head(c->rbuf.data(), c->msg.header_len);
+        for (size_t i = 0; i < kSinkCaptureMax; ++i)
+        {
+            c->sink_cap_len[i] = 0;
+            if (i >= _sink_capture_names.size()) continue;
+            const std::string_view v = net::http::find_header(head, _sink_capture_names[i]);
+            const size_t n = v.size() < kSinkCaptureBytes ? v.size() : kSinkCaptureBytes;
+            std::memcpy(c->sink_cap[i], v.data(), n);
+            c->sink_cap_len[i] = static_cast<uint8_t>(n);
+        }
+    }
+
+    void Gateway::sink_emit(Connection* c, int status, bool streamed) noexcept
+    {
+        RequestRecord r;
+        r.seq = c->req_seq;
+        r.wall_t0_ns = c->wall_t0;
+        r.ts_req_recvd = c->ts_req_recvd;
+        r.ts_req_built = c->ts_req_built;
+        r.ts_wire_ready = c->ts_wire_ready;
+        r.ts_up_sent = c->ts_up_sent;
+        r.ts_up_recvd = c->ts_up_recvd;
+        r.ts_done = now_ns();
+        r.tag = c->policy_tag;
+        r.status = status;
+        r.upstream_index = c->upstream_slot;
+        r.attempts = c->failover_attempts;
+        r.streamed = streamed;
+        r.error_reply = !streamed && c->close_after_resp;
+        r.truncated = streamed && c->close_after_resp;
+        r.translated = upstream_of(c).translate != TranslateMode::None;
+        r.backend = _active_backend;
+        if (streamed && c->sse)
+        {
+            r.tokens_in = c->sse->input_tokens();
+            r.tokens_out = c->sse->output_tokens();
+        }
+        else if (!streamed)
+        {
+            r.tokens_in = static_cast<int32_t>(c->tok_in);
+            r.tokens_out = static_cast<int32_t>(c->tok_out);
+        }
+        for (size_t i = 0; i < kSinkCaptureMax; ++i)
+            r.captured[i] = std::string_view(c->sink_cap[i], c->sink_cap_len[i]);
+        _sink->on_request(r);
+        // Consumed. A framing error never reaches the per-request reset (it fails
+        // before framing succeeds), so without this its 400's record would carry the
+        // PREVIOUS request's captures and tag on a keep-alive connection.
+        c->sink_cap_len[0] = c->sink_cap_len[1] = 0;
+        c->wall_t0 = 0;
+        c->policy_tag = 0;
     }
 
     Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
@@ -2024,6 +2099,7 @@ namespace llmbridge
             }
         }
         ep_disarm_write(c);
+        if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
         LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
                  " keep_alive=", c->msg.keep_alive, " on ", *c);
         c->wbuf.clear(); // response fully sent; ep_pump_write no longer clears it for us
@@ -2150,6 +2226,7 @@ namespace llmbridge
         // Only a stream that terminated cleanly counts as a served request; an
         // aborted one (close_after_resp) was already counted in _stats.errors.
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
+        if (_sink) sink_emit(client, 200, /*streamed=*/true);
         ep_close_client(client);
     }
 
@@ -2291,6 +2368,7 @@ namespace llmbridge
     int Gateway::run_epoll()
     {
         _t_start = now_ns();
+        _active_backend = 1; // also the io_uring fallback path
         epoll_event events[kEpMaxEvents];
 
         while (!_stop)
@@ -2933,6 +3011,7 @@ namespace llmbridge
         c->failover_req.clear();
         c->failover_attempts = 0;
         c->policy_tag = 0;
+        if (_sink) sink_capture(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam; see the epoll mirror for why it sits exactly here.
         // Default to the first upstream, so a build with no policy, and a policy that
@@ -3179,6 +3258,7 @@ namespace llmbridge
             }
             else if (!c->wbuf.empty())
             {
+                if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
                 LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf),
                          " bytes=", c->wbuf.size(), " tokens_in=", c->tok_in,
                          " tokens_out=", c->tok_out, " keep_alive=", c->msg.keep_alive,
@@ -3209,6 +3289,7 @@ namespace llmbridge
         }
         else
         {
+            if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
             LB_DEBUG(ReqId{c->req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
                      " tokens_in=", c->tok_in, " tokens_out=", c->tok_out,
                      " keep_alive=", c->msg.keep_alive, " on ", *c);
@@ -3361,12 +3442,14 @@ namespace llmbridge
                  " on ", *client);
         // Only a cleanly-terminated stream counts as served (see the epoll mirror).
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
+        if (_sink) sink_emit(client, 200, /*streamed=*/true);
         ur_close(client);
     }
 
     int Gateway::run_uring()
     {
         _t_start = now_ns();
+        _active_backend = 2;
 
         unsigned flags = 0;
 #if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)

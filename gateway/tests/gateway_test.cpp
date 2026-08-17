@@ -491,6 +491,7 @@ namespace
                                                 upstream_idle_ns, llmbridge::TlsConfig{},
                                                 timing_headers, _policy, _strip_headers);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
+            if (_sink) _gw->set_request_sink(_sink, _sink_capture);
             // Applied BEFORE the loop thread exists. Setting it afterwards writes
             // state sweep_idle reads, which is a genuine data race TSan reports.
             if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
@@ -514,6 +515,8 @@ namespace
         uint16_t _proxy_port = 0;
         bool _shut = false;
         llmbridge::Policy* _policy = nullptr; // null = stock build, no seam consulted
+        llmbridge::RequestSink* _sink = nullptr; // set before start(), like _policy
+        std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
     };
@@ -3658,11 +3661,14 @@ namespace
 class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
 {
   protected:
-    void start(std::vector<llmbridge::Upstream> table, llmbridge::Policy* pol)
+    void start(std::vector<llmbridge::Upstream> table, llmbridge::Policy* pol,
+               llmbridge::RequestSink* sink = nullptr,
+               std::vector<std::string> capture = {})
     {
         _gw = std::make_unique<Gateway>(0, std::move(table), 0, GetParam(),
                                         Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{},
                                         false, pol, std::vector<std::string>{});
+        if (sink) _gw->set_request_sink(sink, std::move(capture));
         _port = _gw->bound_port();
         _th = std::thread([this] { _gw->run(); });
     }
@@ -4376,6 +4382,275 @@ TEST_P(ProxyRoute, APolicyThatNeverTagsSeesZeroAtTheFailure)
 
     EXPECT_EQ(pol.seen_tag.load(), 0u);
     good.stop();
+}
+
+// ── RequestSink: the completion seam ─────────────────────────────────────────
+//
+// llmbridge measures and hands over; meaning is the sink's business. The claims:
+// every completion emits exactly one record, streams and gateway-generated errors
+// included; captured headers are copied at framing (the buffer is reused by
+// completion); and the stamps, venue, attempts and tag describe the request that
+// actually ran.
+
+namespace
+{
+    class RecordingSink final : public llmbridge::RequestSink
+    {
+      public:
+        void on_request(const llmbridge::RequestRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            Copy c;
+            c.r = r;
+            for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
+                c.cap[i].assign(r.captured[i]); // the views die with the call
+            _records.push_back(std::move(c));
+        }
+        struct Copy
+        {
+            llmbridge::RequestRecord r;
+            std::string cap[llmbridge::kSinkCaptureMax];
+        };
+        std::vector<Copy> records()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _records;
+        }
+
+      private:
+        std::mutex _mu; // records() is read from the test thread after shutdown
+        std::vector<Copy> _records;
+    };
+} // namespace
+
+TEST_P(ProxyRoute, TheSinkSeesACompletedRequestWithItsCapturedHeaders)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+          {"x-kottos-run", "x-kottos-step"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                      "x-kottos-run: run-42\r\nx-kottos-step: extract\r\n"
+                      "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    ASSERT_TRUE(c.send(req));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.wall_t0_ns, 0);
+    EXPECT_GT(r.ts_req_recvd, 0);
+    EXPECT_GE(r.ts_req_built, r.ts_req_recvd);
+    EXPECT_GE(r.ts_wire_ready, r.ts_req_built);
+    EXPECT_GE(r.ts_up_sent, r.ts_wire_ready);
+    EXPECT_GE(r.ts_up_recvd, r.ts_up_sent);
+    EXPECT_GE(r.ts_done, r.ts_up_recvd);
+    EXPECT_EQ(r.status, 200);
+    EXPECT_EQ(r.upstream_index, 0);
+    EXPECT_EQ(r.attempts, 0);
+    EXPECT_FALSE(r.streamed);
+    EXPECT_FALSE(r.error_reply);
+    EXPECT_FALSE(r.translated);
+    EXPECT_EQ(r.backend, GetParam() == llmbridge::IoBackend::Uring ? 2 : 1);
+    EXPECT_EQ(recs[0].cap[0], "run-42");
+    EXPECT_EQ(recs[0].cap[1], "extract");
+}
+
+// The reply the gateway itself generates is a completion too: a tape that only
+// records successes cannot answer "why was this run slow", because the refusals
+// and the failures are the interesting rows.
+TEST_P(ProxyRoute, TheSinkSeesGatewayGeneratedErrorReplies)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    // Deny everything: the reply is ours, no provider is contacted.
+    class DenyPolicy final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = false, .deny_status = 429, .reason = "test"};
+        }
+    } pol;
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("429"), std::string::npos);
+    c.close();
+    shutdown();
+
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.status, 429);
+    EXPECT_TRUE(recs[0].r.error_reply);
+    EXPECT_EQ(recs[0].r.ts_up_sent, 0) << "a refused request has no upstream stamps";
+    EXPECT_EQ(recs[0].cap[0], "");
+}
+
+// After a failover the record must describe the venue that SERVED, the attempts it
+// took, and the tag of the decision, or cost attribution lands on the dead venue.
+TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const uint16_t dead = free_port();
+    RecordingSink sink;
+    TaggingPolicy pol({0}, {1});
+    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
+           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.upstream_index, 1) << "the record blames the dead venue";
+    EXPECT_EQ(recs[0].r.attempts, 1);
+    EXPECT_EQ(recs[0].r.tag, TaggingPolicy::kTagBase + 0);
+    good.stop();
+}
+
+// Two requests on one keep-alive connection: one record each, with each request's
+// OWN captured headers, because the capture is per request, not per connection.
+TEST_P(ProxyRoute, AKeepAliveConnectionEmitsOneRecordPerRequest)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+          {"x-kottos-run"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    for (const char* run : {"run-a", "run-b"})
+    {
+        const std::string body = "{}";
+        std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                          "x-kottos-run: " + std::string(run) + "\r\n"
+                          "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n" + body;
+        ASSERT_TRUE(c.send(req));
+        EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    }
+    c.close();
+    shutdown();
+
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].cap[0], "run-a");
+    EXPECT_EQ(recs[1].cap[0], "run-b");
+    EXPECT_NE(recs[0].r.seq, recs[1].r.seq);
+}
+
+// A malformed request fails BEFORE framing, so it never reaches the per-request
+// capture. Its 400's record must be empty, never the previous request's identity:
+// billing a customer for a stranger's garbage is the bug this test pins.
+TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+          {"x-kottos-run"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    std::string good = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                       "x-kottos-run: run-good\r\n"
+                       "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    ASSERT_TRUE(c.send(good));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    ASSERT_TRUE(c.send("GET /x HTTP/1.1\r\nContent-Length : 0\r\n\r\n")); // malformed
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].cap[0], "run-good");
+    EXPECT_EQ(recs[1].r.status, 400);
+    EXPECT_TRUE(recs[1].r.error_reply);
+    EXPECT_EQ(recs[1].cap[0], "") << "the 400 inherited the previous request's run id";
+    EXPECT_EQ(recs[1].r.tag, 0u) << "the 400 inherited the previous request's tag";
+}
+
+// An over-long header value is truncated at the cap, never overrun and never
+// carried whole: the sink's own consumer decides whether a truncated key is usable.
+TEST_P(ProxyRoute, ACapturedHeaderIsBoundedAtTheCap)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+          {"x-kottos-run"});
+
+    const std::string longv(200, 'r');
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                      "x-kottos-run: " + longv + "\r\n"
+                      "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    ASSERT_TRUE(c.send(req));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].cap[0], std::string(llmbridge::kSinkCaptureBytes, 'r'));
+}
+
+// A finished stream is a completion like any other: one record, streamed flag,
+// the provider's own token counts, and TTFT approximated by t4 (first response
+// byte), which for SSE is the head of the token stream.
+TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    // The tool stream, because it is the mock that carries usage (9 in, 14 out);
+    // the plain text mock has none, and 0 would prove nothing.
+    _backend.set_response(sse_tool_response(4096));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    ASSERT_TRUE(s.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.streamed);
+    EXPECT_FALSE(r.truncated);
+    EXPECT_EQ(r.status, 200);
+    EXPECT_TRUE(r.translated);
+    EXPECT_EQ(r.tokens_in, 9);
+    EXPECT_EQ(r.tokens_out, 14);
+    EXPECT_GE(r.ts_up_recvd, r.ts_up_sent);
+    EXPECT_GE(r.ts_done, r.ts_up_recvd);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRoute,
