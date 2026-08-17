@@ -236,11 +236,20 @@ namespace llmbridge
             return false;
         }
 
-        /// Copy `msg` (one framed request) without the stripped header lines. The
-        /// request line survives because every strip name ends in ':', which a
-        /// request line never matches; StrippingIsExactNotAPrefix locks that in.
+        /// Copy `msg` (one framed request) without the stripped header lines, and
+        /// with `Host` REPLACED by the venue's own. The request line survives because
+        /// every strip name ends in ':', which a request line never matches;
+        /// StrippingIsExactNotAPrefix locks that in.
+        ///
+        /// Rewriting Host is what makes byte-forward a correct reverse proxy: this
+        /// path sends the request to a DIFFERENT origin than the client addressed, and
+        /// HTTP/1.1 wants Host to name the origin being addressed. The translating
+        /// path has always emitted the venue's Host (build_http_request); byte-forward
+        /// passed the client's through, so a provider behind a CDN or serving several
+        /// vhosts saw a name that was never its own.
         std::string request_without(std::string_view msg, size_t header_len,
-                                    const std::vector<std::string>& strip)
+                                    const std::vector<std::string>& strip,
+                                    std::string_view host_hdr)
         {
             // Copy in RUNS, not per line: a flush happens only where a stripped line
             // interrupts the kept ones, so one memcpy when nothing matches and two
@@ -257,7 +266,14 @@ namespace llmbridge
                 if (eol == std::string_view::npos || eol >= header_len) break;
                 const std::string_view line = msg.substr(start, eol - start);
                 if (line.empty()) break; // the blank line closes the block
-                if (header_stripped(line, strip))
+                // Host is dropped here and re-emitted below, so exactly one survives
+                // however many the client sent.
+                const bool is_host =
+                    !host_hdr.empty() && line.size() >= 5 &&
+                    (line[0] == 'H' || line[0] == 'h') && (line[1] == 'o' || line[1] == 'O') &&
+                    (line[2] == 's' || line[2] == 'S') && (line[3] == 't' || line[3] == 'T') &&
+                    line[4] == ':';
+                if (is_host || header_stripped(line, strip))
                 {
                     out.append(msg.substr(run, start - run));
                     run = eol + 2;
@@ -266,6 +282,15 @@ namespace llmbridge
             }
             // The tail carries the remaining headers, the blank line and the body.
             out.append(msg.substr(run));
+            if (!host_hdr.empty())
+            {
+                // After the request line, which is where a Host belongs and where a
+                // reader looks for it. The request line always ends at the first CRLF.
+                const size_t after_start_line = out.find("\r\n");
+                if (after_start_line != std::string::npos)
+                    out.insert(after_start_line + 2,
+                               "Host: " + std::string(host_hdr) + "\r\n");
+            }
             return out;
         }
 
@@ -1771,14 +1796,12 @@ namespace llmbridge
             { ep_error_respond(c, 400, "malformed credential"); return; }
             upstream_bytes = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
         }
-        else if (_strip_headers.empty())
-        {
-            upstream_bytes.assign(c->rbuf.data(), c->msg.total_len);
-        }
         else
         {
+            // Byte-forward still rebuilds, even with nothing to strip: Host must name
+            // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                             c->msg.header_len, _strip_headers);
+                                             c->msg.header_len, _strip_headers, up.host_hdr);
         }
 
         Connection* u = ep_acquire_upstream(c->upstream_slot);
@@ -3065,14 +3088,12 @@ namespace llmbridge
             { ur_error_respond(c, 400, "malformed credential"); return; }
             upstream_bytes = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
         }
-        else if (_strip_headers.empty())
-        {
-            upstream_bytes.assign(c->rbuf.data(), c->msg.total_len);
-        }
         else
         {
+            // Byte-forward still rebuilds, even with nothing to strip: Host must name
+            // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                             c->msg.header_len, _strip_headers);
+                                             c->msg.header_len, _strip_headers, up.host_hdr);
         }
 
         Connection* u = ur_acquire_upstream(c->upstream_slot);

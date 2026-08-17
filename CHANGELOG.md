@@ -8,6 +8,32 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.18.0]. 2026-08-17
+
+**Byte-forward now rewrites `Host` to name the venue.** It is a reverse proxy on that
+path: the request goes to a different origin than the client addressed, and HTTP/1.1
+wants `Host` to name the origin being addressed. The translating path has always
+emitted the venue's `Host`; byte-forward passed the client's straight through, so a
+provider behind a CDN or serving several vhosts saw a name that was never its own.
+
+MINOR, and **this changes bytes on the wire** for `--translate none`: a deployment
+that relied on the client's `Host` reaching the upstream will see the venue's
+instead. That is the fix, not a side effect, but it is called out because pre-1.0
+minor releases may change behaviour and this one does.
+
+### Changed
+
+- Byte-forward rebuilds the request with the venue's `Host` (`Upstream::host_hdr`,
+  the same value the translating path uses), directly after the request line.
+  However many `Host` headers arrive, exactly one goes upstream.
+- The empty-strip-list fast path is gone: byte-forward always rebuilds now, because
+  `Host` has to be replaced whether or not anything is stripped. The rebuild is the
+  same run-copy that stripping already used, measured at +86 to +99 ns and flat in
+  body size.
+- Three tests asserting byte-identical passthrough now assert the body is intact and
+  the Host is the venue's. `EmptyListLeavesTheRequestUntouched` is renamed
+  `EmptyListChangesOnlyTheHost`, which is what it now proves.
+
 ## [0.17.1]. 2026-08-17
 
 **Undefined behaviour on the sink's most common path.** `sink_capture` copied a
