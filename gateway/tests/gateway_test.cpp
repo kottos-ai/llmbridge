@@ -4593,6 +4593,33 @@ TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
     EXPECT_EQ(recs[1].r.tag, 0u) << "the 400 inherited the previous request's tag";
 }
 
+// A request that OMITS a captured header is the common case, and find_header returns
+// a null view for it. Copying 0 bytes from a null pointer is undefined behaviour even
+// though it "works": UBSan flags it, and no test sent such a request until this one.
+TEST_P(ProxyRoute, ACaptureConfiguredButAbsentIsEmptyAndNotUndefined)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+          {"x-kottos-run", "x-kottos-step"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request())); // neither captured header is present
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].cap[0], "");
+    EXPECT_EQ(recs[0].cap[1], "");
+    EXPECT_EQ(recs[0].r.status, 200);
+}
+
 // An over-long header value is truncated at the cap, never overrun and never
 // carried whole: the sink's own consumer decides whether a truncated key is usable.
 TEST_P(ProxyRoute, ACapturedHeaderIsBoundedAtTheCap)

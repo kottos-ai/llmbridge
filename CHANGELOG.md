@@ -8,6 +8,22 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.17.1]. 2026-08-17
+
+**Undefined behaviour on the sink's most common path.** `sink_capture` copied a
+configured-but-ABSENT header with `memcpy(dst, nullptr, 0)`: `find_header` returns a
+null view when the header is missing, and memcpy's arguments are declared non-null
+even for a zero length. Every request that omitted a captured header did it.
+
+PATCH: a fix and the test that was missing, no API change.
+
+### Fixed
+
+- Guard the copy on a non-zero length.  New test
+  (`ACaptureConfiguredButAbsentIsEmptyAndNotUndefined`, both backends) that fails
+  under `-fsanitize=undefined` against the unguarded version, which the sanitizer
+  CI job runs.
+
 ## [0.17.0]. 2026-08-16
 
 **An optional per-request metadata sink.** `RequestSink` (gateway/sink.hpp) receives

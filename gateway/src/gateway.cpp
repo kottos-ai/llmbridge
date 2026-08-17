@@ -1628,7 +1628,11 @@ namespace llmbridge
             if (i >= _sink_capture_names.size()) continue;
             const std::string_view v = net::http::find_header(head, _sink_capture_names[i]);
             const size_t n = v.size() < kSinkCaptureBytes ? v.size() : kSinkCaptureBytes;
-            std::memcpy(c->sink_cap[i], v.data(), n);
+            // Guarded, because an ABSENT header is the common case and find_header
+            // returns a null view for it: memcpy's arguments are declared non-null
+            // even when the length is 0, so the unguarded form is undefined
+            // behaviour.
+            if (n) std::memcpy(c->sink_cap[i], v.data(), n);
             c->sink_cap_len[i] = static_cast<uint8_t>(n);
         }
     }
