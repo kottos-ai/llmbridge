@@ -39,13 +39,13 @@ We do not promise to implement every suggestion, but we do read all of them, and
 
 ### Ask questions
 
-Use [GitHub Discussions](https://github.com/kottosai/llmbridge/discussions) for usage questions, integration help, performance questions, and general conversation. Discussions are public and searchable, so your question helps the next person too.
+Use [GitHub Discussions](https://github.com/kottos-ai/llmbridge/discussions) for usage questions, integration help, performance questions, and general conversation. Discussions are public and searchable, so your question helps the next person too.
 
 For commercial inquiries or anything sensitive, email `hello@kottos.ai`.
 
 ### Share what you're building
 
-We love hearing about projects using `llmbridge`. Drop a note in [Discussions](https://github.com/kottosai/llmbridge/discussions) under the "Show and tell" category. We are especially interested in latency-sensitive use cases (voice agents, agentic loops, trading agents, real-time systems).
+We love hearing about projects using `llmbridge`. Drop a note in [Discussions](https://github.com/kottos-ai/llmbridge/discussions) under the "Show and tell" category. We are especially interested in latency-sensitive use cases (voice agents, agentic loops, trading agents, real-time systems).
 
 ### Fork it
 

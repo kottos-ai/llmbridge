@@ -4,7 +4,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
-[![Build Status](https://github.com/kottosai/llmbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/kottosai/llmbridge/actions)
+[![Build Status](https://github.com/kottos-ai/llmbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/kottos-ai/llmbridge/actions)
 
 ## What it does
 
@@ -318,16 +318,18 @@ against an OpenAI-compatible upstream, is planned, and is the harder direction b
 Anthropic's streaming protocol is richer, so the events must be synthesised instead of
 discarded.
 
-**Planned:** vision / image inputs, `cache_control`,
-AWS Bedrock, streaming for the Gemini / Cohere dialects, Anthropic-in mode, and
-inbound TLS. Embeddings and audio (Whisper / TTS) are out of scope for now.
+**Planned:** vision / image inputs, `cache_control`, streaming for the Gemini / Cohere
+dialects, and Anthropic-in mode. AWS Bedrock and Google Vertex additionally need
+request signing (SigV4, OAuth2), and Azure OpenAI needs query strings in the upstream
+target, which are refused today. Embeddings and audio (Whisper / TTS) are out of scope
+for now.
 
 ## Installation
 
 ### From source (C++)
 
 ```bash
-git clone https://github.com/kottosai/llmbridge.git
+git clone https://github.com/kottos-ai/llmbridge.git
 cd llmbridge
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
