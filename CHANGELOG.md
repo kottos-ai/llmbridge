@@ -8,6 +8,39 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.19.1]. 2026-08-18
+
+Diagnostics only. Nothing new is reachable that was not reachable at 0.19.0: the
+same inputs are refused, with the same exit code and the same text on stderr. PATCH
+for that reason, and because the installed library is untouched. `app/main.cpp` is
+the binary and ships no header.
+
+### Changed
+
+- Every startup refusal in `llmbridge`'s own `main` goes to stderr AND the log now,
+  through one `refuse()` helper, so a message cannot drift between the two. stderr
+  is for an operator running the binary by hand; the log line is what a journal can
+  filter by level and timestamp. **Operators scraping logs will see ERROR lines that
+  did not appear before.** They are additional: no existing output changed.
+- `refuse()` takes a `std::source_location` defaulting to the call site. An
+  `LB_ERROR` inside it stamped every refusal in the binary with the helper's own
+  line number, which is worse than none: it looks like a location and is not one.
+  Verified by running the binary, since a file-local helper in the translation unit
+  holding `main` cannot be linked into a test.
+- A multi-address upstream is an `LB_WARN` instead of a bare `fprintf`. It does not
+  stop startup, so it reads as the warning it is, beside the plaintext-credential
+  warning a few lines below it.
+- A base path carrying a query or fragment says so, instead of reporting the
+  generic "character outside [A-Za-z0-9-._~:/]". Pasting an Azure OpenAI URL is how
+  an operator reaches that rejection, and the generic message named neither the
+  character nor the reason.
+
+Parsers are deliberately unchanged: they report through an out-parameter and log
+nothing. The caller is what knows whether a failure is a startup refusal or a
+rejected config edit, and `kottos-broker --check` needs a parser that can answer a
+question without writing to a journal.
+
+
 ## [0.19.0]. 2026-08-18
 
 **A venue may now carry a base path** (`--upstream https://api.groq.com/openai`).

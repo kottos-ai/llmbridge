@@ -29,6 +29,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,6 +42,29 @@
 
 namespace
 {
+    /// One startup refusal, two destinations, and the exit code the caller returns.
+    ///
+    /// stderr is for the operator running this by hand; the log is for the journal
+    /// when systemd started it, where stderr also lands but without a level or a
+    /// timestamp to filter on. Both, deliberately, and through one function so a
+    /// message cannot drift between them.
+    ///
+    /// `loc` defaults to the CALL SITE, and emits through the same path LB_ERROR
+    /// does. An LB_ERROR inside this function would stamp every refusal in the
+    /// binary with this one line number, which is worse than no line number: it
+    /// looks like a location and is not one.
+    int refuse(const std::string& msg,
+               const std::source_location loc = std::source_location::current())
+    {
+        std::fprintf(stderr, "llmbridge: %s\n", msg.c_str());
+        namespace log = llmbridge::net::log;
+        if constexpr (static_cast<int>(log::Level::Error) >= LLMBRIDGE_LOG_COMPILE_LEVEL)
+            if (log::enabled(log::Level::Error))
+                log::emit(log::Level::Error, loc.file_name(), static_cast<int>(loc.line()),
+                          msg.c_str());
+        return 2;
+    }
+
     /// "anthropic" | "gemini" | "cohere" | anything else -> None. Both the config
     /// parser and --translate validate the string, so an unknown one cannot arrive.
     llmbridge::TranslateMode translate_from(const std::string& s)
@@ -103,18 +127,15 @@ static int run(int argc, char** argv)
         if (std::string_view(argv[i]) != "--config") continue;
         if (i + 1 >= argc)
         {
-            std::fprintf(stderr, "llmbridge: --config needs a path\n");
-            return 2;
+            return refuse("--config needs a path");
         }
         // Refuse a second --config instead of quietly using the first. Silently
         // discarding the operator's later file is the same fail-open shape the parser
         // refuses for unknown keys, and it is invisible from the outside.
         if (config_path)
         {
-            std::fprintf(stderr,
-                         "llmbridge: --config given twice (%s and %s); pass it once\n",
-                         config_path, argv[i + 1]);
-            return 2;
+            return refuse("--config given twice (" + std::string(config_path) + " and " +
+                          argv[i + 1] + "); pass it once");
         }
         config_path = argv[i + 1];
     }
@@ -133,8 +154,7 @@ static int run(int argc, char** argv)
         {
             // Fail closed and name the key. A config that half-applies is how an
             // operator ends up believing a setting took effect when it did not.
-            std::fprintf(stderr, "llmbridge: %s\n", cfg_err.c_str());
-            return 2;
+            return refuse(cfg_err);
         }
         if (cfg.has_listen_port) listen_port = cfg.listen_port;
         if (cfg.has_listen_tls) listen_tls = cfg.listen_tls;
@@ -227,9 +247,8 @@ static int run(int argc, char** argv)
         llmbridge::net::log::Level lv{};
         if (!llmbridge::net::log::level_from_name(log_level, lv))
         {
-            std::fprintf(stderr, "llmbridge: unknown --log-level '%s'; expected one of "
-                                 "trace debug info warn error off\n", log_level.c_str());
-            return 2;
+            return refuse("unknown --log-level '" + log_level +
+                          "'; expected one of trace debug info warn error off");
         }
         llmbridge::net::log::set_level(lv);
     }
@@ -238,17 +257,15 @@ static int run(int argc, char** argv)
 
     if (listen_tls && (tls_cert.empty() || tls_key.empty()))
     {
-        std::fprintf(stderr, "llmbridge: a TLS listener needs a certificate and a key "
-                             "(--tls-cert/--tls-key, or listen.cert/listen.key in a config file)\n");
-        return 2;
+        return refuse("a TLS listener needs a certificate and a key (--tls-cert/--tls-key, "
+                      "or listen.cert/listen.key in a config file)");
     }
     if (!listen_tls && (!tls_cert.empty() || !tls_key.empty()))
     {
         // A certificate given without --listen-tls means the operator believes the
         // listener is encrypted when it is not. Refuse instead of ignoring it.
-        std::fprintf(stderr, "llmbridge: a certificate/key was given without enabling the "
-                             "TLS listener (--listen-tls, or listen.tls in a config file)\n");
-        return 2;
+        return refuse("a certificate/key was given without enabling the TLS listener "
+                      "(--listen-tls, or listen.tls in a config file)");
     }
 #ifndef LLMBRIDGE_HAVE_TLS
     if (listen_tls)
@@ -257,11 +274,9 @@ static int run(int argc, char** argv)
         // without this the flag is accepted, the listener serves plaintext, and the
         // operator has every client credential on the wire believing otherwise. The
         // upstream leg refuses the mirror case a few lines down.
-        std::fprintf(stderr, "llmbridge: a TLS listener (--listen-tls, or listen.tls in a "
-                             "config file) requires a TLS build. Reconfigure with "
-                             "-DLLMBRIDGE_TLS=ON (needs OpenSSL). Refusing to serve plaintext "
-                             "on a listener asked to be TLS.\n");
-        return 2;
+        return refuse("a TLS listener (--listen-tls, or listen.tls in a config file) requires "
+                      "a TLS build. Reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
+                      "Refusing to serve plaintext on a listener asked to be TLS.");
     }
 #endif
 
@@ -272,33 +287,28 @@ static int run(int argc, char** argv)
     const llmbridge::net::UpstreamSpec up = llmbridge::net::parse_upstream(upstream_arg);
     if (!up.ok())
     {
-        std::fprintf(stderr, "llmbridge: bad --upstream '%s': %s\n",
-                     upstream_arg.c_str(), up.error.c_str());
-        return 2;
+        return refuse("bad --upstream '" + upstream_arg + "': " + up.error);
     }
 #ifndef LLMBRIDGE_HAVE_TLS
     if (up.tls)
     {
-        std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build. "
-                             "reconfigure with -DLLMBRIDGE_TLS=ON (needs OpenSSL). "
-                             "Refusing to speak plaintext to a TLS port.\n");
-        return 2;
+        return refuse("https:// upstream requires a TLS build. Reconfigure with "
+                      "-DLLMBRIDGE_TLS=ON (needs OpenSSL). Refusing to speak plaintext to a "
+                      "TLS port.");
     }
 #endif
     std::string resolve_err;
     const std::vector<std::string> ips = llmbridge::net::resolve_host_ipv4(up.host, &resolve_err);
     if (ips.empty())
     {
-        std::fprintf(stderr, "llmbridge: cannot resolve upstream host '%s': %s\n",
-                     up.host.c_str(), resolve_err.c_str());
-        return 2;
+        return refuse("cannot resolve upstream host '" + up.host + "': " + resolve_err);
     }
     const std::string& upstream_ip = ips.front();
     const uint16_t upstream_port = up.port;
     if (ips.size() > 1)
-        std::fprintf(stderr, "llmbridge: %s resolved to %zu addresses; using %s "
-                             "(list several venues under \"upstream\" to reach the rest)\n",
-                     up.host.c_str(), ips.size(), upstream_ip.c_str());
+        LB_WARN(up.host, " resolved to ", static_cast<int64_t>(ips.size()),
+                " addresses; using ", upstream_ip,
+                " (list several venues under \"upstream\" to reach the rest)");
 
     // Credentials over plaintext: the gateway forwards the client's provider key
     // upstream, so a non-TLS upstream that is NOT loopback puts that key on the
@@ -328,24 +338,19 @@ static int run(int argc, char** argv)
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
         if (!s2.ok())
         {
-            std::fprintf(stderr, "llmbridge: bad upstream '%s': %s\n", e.url.c_str(),
-                         s2.error.c_str());
-            return 2;
+            return refuse("bad upstream '" + e.url + "': " + s2.error);
         }
 #ifndef LLMBRIDGE_HAVE_TLS
         if (s2.tls)
         {
-            std::fprintf(stderr, "llmbridge: https:// upstream requires a TLS build.\n");
-            return 2;
+            return refuse("https:// upstream requires a TLS build");
         }
 #endif
         std::string e2;
         const std::vector<std::string> ips2 = llmbridge::net::resolve_host_ipv4(s2.host, &e2);
         if (ips2.empty())
         {
-            std::fprintf(stderr, "llmbridge: cannot resolve upstream host '%s': %s\n",
-                         s2.host.c_str(), e2.c_str());
-            return 2;
+            return refuse("cannot resolve upstream host '" + s2.host + "': " + e2);
         }
         upstream_table.push_back(llmbridge::Upstream{.ip = ips2.front(),
                                                      .port = s2.port,
@@ -464,11 +469,13 @@ int main(int argc, char** argv)
     catch (const std::exception& e)
     {
         std::fprintf(stderr, "llmbridge: %s\n", e.what());
+        LB_ERROR("fatal during startup: ", e.what());
         return 1;
     }
     catch (...)
     {
         std::fprintf(stderr, "llmbridge: unknown fatal error during startup\n");
+        LB_ERROR("unknown fatal error during startup");
         return 1;
     }
 }
