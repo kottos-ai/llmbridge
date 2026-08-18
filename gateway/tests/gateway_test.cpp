@@ -991,7 +991,7 @@ TEST_P(ProxyAuth, PassthroughForwardsEveryHeaderIncludingATenantToken)
 
 TEST_P(ProxyStrip, PassthroughDropsTheNamedHeader)
 {
-    _strip_headers = {"Authorization"}; // mixed case on purpose: names are normalised
+    _strip_headers = {"Authorization"}; // mixed case on purpose: names are normalized
     _backend.set_response(http_ok("{}"));
     start(0, true, TranslateMode::None, GetParam());
     Client c;
@@ -1123,6 +1123,91 @@ TEST_P(ProxyStrip, StrippingIsExactNotAPrefix)
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStrip,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
+// ── venue base path ─────────────────────────────────────────────────────────
+//
+// Several providers serve an OpenAI-compatible API below the root (Groq at
+// /openai, OpenRouter at /api), so a venue may carry a prefix. It is joined in
+// front of whatever target the request would otherwise use, on BOTH legs: the
+// client's own target when forwarding bytes, and ours when translating.
+
+class ProxyBasePath : public ProxyIT,
+                      public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    void start_with_base(const std::string& base, TranslateMode mode)
+    {
+        _backend.start();
+        _upstreams.push_back(llmbridge::Upstream{.ip = "127.0.0.1",
+                                                 .port = _backend.port(),
+                                                 .translate = mode,
+                                                 .base_path = base});
+        start(0, false, TranslateMode::None, GetParam());
+    }
+};
+
+TEST_P(ProxyBasePath, ByteForwardPrefixesTheClientsOwnTarget)
+{
+    _backend.set_response(http_ok("{}"));
+    start_with_base("/openai", TranslateMode::None);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("POST /openai/v1/chat/completions HTTP/1.1\r\n"), 0u) << up;
+}
+
+TEST_P(ProxyBasePath, TranslatePrefixesOurOwnTarget)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start_with_base("/openai", TranslateMode::Anthropic);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-test-123\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("POST /openai/v1/messages HTTP/1.1\r\n"), 0u) << up;
+}
+
+// The regression guard: no base path must leave the target byte-identical, on
+// both legs. This is the configuration every existing deployment runs.
+TEST_P(ProxyBasePath, NoBasePathChangesNothing)
+{
+    _backend.set_response(http_ok("{}"));
+    start_with_base("", TranslateMode::None);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
+    (void)c.recv_response();
+    EXPECT_EQ(_backend.last_request().find("POST /v1/chat/completions HTTP/1.1\r\n"), 0u)
+        << _backend.last_request();
+}
+
+// FAIL CLOSED. An absolute-form target ("POST http://evil/x") is a request we
+// cannot prefix without deciding what it means, and deciding wrongly sends a
+// caller's credential to a host the operator never listed. Refuse, and make sure
+// NOTHING reached the upstream: the pool means the next request on that
+// connection belongs to someone else.
+TEST_P(ProxyBasePath, ANonOriginFormTargetIsRefusedAndNeverForwarded)
+{
+    _backend.set_response(http_ok("{}"));
+    start_with_base("/openai", TranslateMode::None);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"m","messages":[]})";
+    ASSERT_TRUE(c.send("POST http://evil.example/v1/chat/completions HTTP/1.1\r\n"
+                       "Host: proxy\r\nContent-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("400"), std::string::npos) << resp;
+    EXPECT_TRUE(_backend.last_request().empty())
+        << "a request we refused still reached the upstream: " << _backend.last_request();
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyBasePath,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring));
 
@@ -3704,12 +3789,16 @@ namespace
         explicit PinnedPolicy(int idx) : _idx(idx) {}
         llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
         {
-            return {.allow = true, .upstream_index = _idx};
+            return {.allow = true, .upstream_index = _idx.load(std::memory_order_relaxed)};
         }
-        void set(int idx) { _idx = idx; }
+        /// ATOMIC because a test calls this from the main thread while the loop
+        /// thread is serving: a plain int here is a genuine data race and TSan says
+        /// so. Relaxed is enough, since the test synchronises on the response it
+        /// waits for and only the value itself crosses threads.
+        void set(int idx) { _idx.store(idx, std::memory_order_relaxed); }
 
       private:
-        int _idx;
+        std::atomic<int> _idx;
     };
 } // namespace
 

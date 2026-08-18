@@ -14,12 +14,24 @@
 //   HOST:PORT               e.g. mock.internal:9001      -> plain HTTP
 //   http://HOST[:PORT]      default port 80              -> plain HTTP
 //   https://HOST[:PORT]     default port 443             -> TLS
+//   https://HOST/BASE       e.g. https://api.groq.com/openai
+//
+// The BASE PATH is a prefix, not a target: it is joined in front of whatever path
+// this request would otherwise use, so "/openai" + "/v1/chat/completions" reaches
+// "/openai/v1/chat/completions". It exists because several providers serve an
+// OpenAI-compatible API below the root (Groq at /openai, OpenRouter at /api,
+// Fireworks at /inference) and were unreachable without it.
+//
+// A base path is REBUILT, never echoed: it lands in a request line, so anything
+// that could split or retarget that line is refused at parse time, never
+// sanitised. See normalize_base_path in the .cpp for the exact rule.
 //
 // Deliberately rejected, with a reason in `error` instead of a guess:
 //   - userinfo ("https://a@b"), the classic URL-confusion trick where the
 //     eyeball host and the connect host differ
-//   - path/query/fragment beyond a bare "/", because the gateway forwards the CLIENT's
-//     path; silently dropping a base path here would misroute every request
+//   - query and fragment, in any position. Azure OpenAI needs "?api-version=",
+//     which means merging our query with the client's; that is a separate design
+//     question and guessing at it would misroute every request
 //   - IPv6 literals: the transport stack is sockaddr_in/AF_INET end to end;
 //     half-accepting "[::1]:443" would fail later with a worse message
 //   - hosts with characters outside [A-Za-z0-9.-]: the host string is later
@@ -39,6 +51,9 @@ namespace llmbridge::net
     struct UpstreamSpec
     {
         std::string host;   ///< as written. DNS name or IPv4 literal; feeds Host header + SNI
+        /// Normalized base path: empty, or "/..." with no trailing slash. Prefixed
+        /// to the request target; empty means the target is used as-is.
+        std::string path;
         uint16_t port{0};
         bool tls{false};
         std::string error;  ///< non-empty => parse failed, other fields unspecified

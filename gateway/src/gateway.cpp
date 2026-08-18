@@ -247,9 +247,31 @@ namespace llmbridge
         /// path has always emitted the venue's Host (build_http_request); byte-forward
         /// passed the client's through, so a provider behind a CDN or serving several
         /// vhosts saw a name that was never its own.
+        /// Splice `base` in front of the request line's target, in place.
+        ///
+        /// False means the request line is not origin-form (absolute-form, CONNECT's
+        /// authority-form, or simply malformed), and the caller must REFUSE. We do
+        /// not normalize it into one: rewriting a target we do not understand is how
+        /// a proxy sends a request somewhere its operator never listed.
+        bool prefix_target(std::string& req, std::string_view base)
+        {
+            if (base.empty()) return true;
+            const size_t eol = req.find("\r\n");
+            if (eol == std::string::npos) return false;
+            const size_t sp1 = req.find(' ');
+            if (sp1 == std::string::npos || sp1 > eol) return false;
+            const size_t sp2 = req.find(' ', sp1 + 1);
+            if (sp2 == std::string::npos || sp2 > eol) return false;
+            if (sp2 == sp1 + 1 || req[sp1 + 1] != '/') return false;
+            req.insert(sp1 + 1, base);
+            return true;
+        }
+
+        /// Empty return = REFUSE this request, never forward it. Today that is a
+        /// request line prefix_target could not read.
         std::string request_without(std::string_view msg, size_t header_len,
                                     const std::vector<std::string>& strip,
-                                    std::string_view host_hdr)
+                                    std::string_view host_hdr, std::string_view base_path)
         {
             // Copy in RUNS, not per line: a flush happens only where a stripped line
             // interrupts the kept ones, so one memcpy when nothing matches and two
@@ -291,6 +313,7 @@ namespace llmbridge
                     out.insert(after_start_line + 2,
                                "Host: " + std::string(host_hdr) + "\r\n");
             }
+            if (!prefix_target(out, base_path)) return {};
             return out;
         }
 
@@ -399,23 +422,49 @@ namespace llmbridge
         // Translate an OpenAI request body to the upstream dialect, also yielding
         // the upstream start line. Empty return = malformed body. Shared by both
         // event-loop backends.
-        std::string xlate_req(TranslateMode mode, std::string_view body, std::string_view& start_line)
+        std::string xlate_req(TranslateMode mode, std::string_view body,
+                              std::string_view base_path, std::string& start_line_store,
+                              std::string_view& start_line)
         {
+            std::string_view target;
+            std::string out;
             switch (mode)
             {
                 case TranslateMode::Anthropic:
-                    start_line = "POST /v1/messages HTTP/1.1";
-                    return provider::openai_to_anthropic_request(body);
+                    target = "/v1/messages";
+                    out = provider::openai_to_anthropic_request(body);
+                    break;
                 case TranslateMode::Gemini:
-                    start_line = "POST /v1beta/models/gemini:generateContent HTTP/1.1";
-                    return provider::openai_to_gemini_request(body);
+                    target = "/v1beta/models/gemini:generateContent";
+                    out = provider::openai_to_gemini_request(body);
+                    break;
                 case TranslateMode::Cohere:
-                    start_line = "POST /v2/chat HTTP/1.1";
-                    return provider::openai_to_cohere_request(body);
+                    target = "/v2/chat";
+                    out = provider::openai_to_cohere_request(body);
+                    break;
                 case TranslateMode::None:
                     return {};
             }
-            return {};
+            // No base path is the common case and stays allocation-free: the view
+            // points at a literal with static storage.
+            if (base_path.empty())
+            {
+                switch (mode)
+                {
+                    case TranslateMode::Anthropic: start_line = "POST /v1/messages HTTP/1.1"; break;
+                    case TranslateMode::Gemini:
+                        start_line = "POST /v1beta/models/gemini:generateContent HTTP/1.1";
+                        break;
+                    case TranslateMode::Cohere: start_line = "POST /v2/chat HTTP/1.1"; break;
+                    case TranslateMode::None: return {};
+                }
+            }
+            else
+            {
+                start_line_store.assign("POST ").append(base_path).append(target).append(" HTTP/1.1");
+                start_line = start_line_store;
+            }
+            return out;
         }
 
         // ── Timing headers (opt-in: --timing-headers) ───────────────────────
@@ -745,8 +794,11 @@ namespace llmbridge
                      int64_t upstream_idle_ns, TlsConfig tls, bool timing_headers,
                      Policy* policy, std::vector<std::string> strip_headers)
         : Gateway(listen_port,
-                  std::vector<Upstream>{Upstream{std::move(upstream_ip), upstream_port,
-                                                 tls.upstream_tls, tls.sni_host, translate, {}}},
+                  std::vector<Upstream>{Upstream{.ip = std::move(upstream_ip),
+                                                 .port = upstream_port,
+                                                 .tls = tls.upstream_tls,
+                                                 .sni_host = tls.sni_host,
+                                                 .translate = translate}},
                   warmup_ns, io, upstream_idle_ns, tls, timing_headers, policy,
                   std::move(strip_headers))
     {
@@ -764,7 +816,7 @@ namespace llmbridge
         if (_upstreams.empty()) throw std::runtime_error("Gateway: no upstreams configured");
         for (Upstream& u : _upstreams) u.host_hdr = host_header_for(u);
         _idle_upstreams.resize(_upstreams.size());
-        // Normalise once, at construction: lower-case with the colon, so the hot path
+        // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
         for (std::string& h : strip_headers)
         {
@@ -1784,7 +1836,9 @@ namespace llmbridge
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
-            std::string tbody = xlate_req(up.translate, body, start_line);
+            std::string start_line_store;
+            std::string tbody = xlate_req(up.translate, body, up.base_path, start_line_store,
+                                          start_line);
             if (tbody.empty()) { ep_error_respond(c, 400, translate_failure(body)); return; }
             // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
@@ -1801,7 +1855,12 @@ namespace llmbridge
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                             c->msg.header_len, _strip_headers, up.host_hdr);
+                                             c->msg.header_len, _strip_headers, up.host_hdr,
+                                             up.base_path);
+            // Refused, not repaired: a venue with a base path needs an origin-form
+            // target to prefix, and nothing has been sent upstream at this point.
+            if (upstream_bytes.empty())
+            { ep_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
         Connection* u = ep_acquire_upstream(c->upstream_slot);
@@ -3071,7 +3130,9 @@ namespace llmbridge
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             std::string_view start_line;
-            std::string tbody = xlate_req(up.translate, body, start_line);
+            std::string start_line_store;
+            std::string tbody = xlate_req(up.translate, body, up.base_path, start_line_store,
+                                          start_line);
             if (tbody.empty()) { ur_error_respond(c, 400, translate_failure(body)); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
@@ -3093,7 +3154,12 @@ namespace llmbridge
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                             c->msg.header_len, _strip_headers, up.host_hdr);
+                                             c->msg.header_len, _strip_headers, up.host_hdr,
+                                             up.base_path);
+            // Refused, not repaired: a venue with a base path needs an origin-form
+            // target to prefix, and nothing has been sent upstream at this point.
+            if (upstream_bytes.empty())
+            { ur_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
         Connection* u = ur_acquire_upstream(c->upstream_slot);

@@ -110,14 +110,19 @@ namespace llmbridge
     /// is forwarded to an OpenAI-compatible host.
     struct Upstream
     {
-        std::string ip;       ///< resolved at startup; the table is not re-resolved
+        std::string ip{};     ///< resolved at startup; the table is not re-resolved
         uint16_t port = 0;
         bool tls = false;     ///< originate TLS to this venue
-        std::string sni_host; ///< DNS name for SNI and hostname verification, and the
+        std::string sni_host{}; ///< DNS name for SNI and hostname verification, and the
                               ///< Host header. Empty for the bare IP:PORT form.
         TranslateMode translate = TranslateMode::None;
+        /// Prefixed to this venue's request target, for providers serving below the
+        /// root (Groq /openai, OpenRouter /api). Empty, or "/..." with no trailing
+        /// slash; net::parse_upstream is what enforces that, and a request whose own
+        /// target is not origin-form is refused, never prefixed.
+        std::string base_path{};
 
-        std::string host_hdr; ///< derived at construction; see host_header_for()
+        std::string host_hdr{}; ///< derived at construction; see host_header_for()
     };
 
     // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.

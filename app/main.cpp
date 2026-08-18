@@ -317,7 +317,12 @@ static int run(int argc, char** argv)
     // fail as loudly at startup as one named on the command line.
     std::vector<llmbridge::Upstream> upstream_table;
     upstream_table.push_back(
-        llmbridge::Upstream{upstream_ip, upstream_port, up.tls, up.host, translate, {}});
+        llmbridge::Upstream{.ip = upstream_ip,
+                            .port = upstream_port,
+                            .tls = up.tls,
+                            .sni_host = up.host,
+                            .translate = translate,
+                            .base_path = up.path});
     for (const auto& e : extra_upstreams)
     {
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
@@ -342,8 +347,12 @@ static int run(int argc, char** argv)
                          s2.host.c_str(), e2.c_str());
             return 2;
         }
-        upstream_table.push_back(llmbridge::Upstream{ips2.front(), s2.port, s2.tls, s2.host,
-                                                     translate_from(e.translate), {}});
+        upstream_table.push_back(llmbridge::Upstream{.ip = ips2.front(),
+                                                     .port = s2.port,
+                                                     .tls = s2.tls,
+                                                     .sni_host = s2.host,
+                                                     .translate = translate_from(e.translate),
+                                                     .base_path = s2.path});
     }
 
     std::signal(SIGPIPE, SIG_IGN);

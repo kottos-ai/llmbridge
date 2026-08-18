@@ -1113,8 +1113,10 @@ class GatewayCrossVenueTls : public ::testing::TestWithParam<llmbridge::IoBacken
         TlsConfig tls;
         tls.ca_file = write_ca_bundle(_id0, _id1); // trust both leaves
         std::vector<Upstream> table = {
-            Upstream{"127.0.0.1", _b0.port(), true, kHost, TranslateMode::None, {}},
-            Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+            Upstream{.ip = "127.0.0.1", .port = _b0.port(), .tls = true, .sni_host = kHost,
+                 .translate = TranslateMode::None},
+            Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
+                 .translate = TranslateMode::None},
         };
         _policy = std::make_unique<PinnedPolicy>(route_to);
         _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
@@ -1186,8 +1188,10 @@ TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
     tls.ca_file = write_ca_bundle(_id0, _id1);
     const uint16_t dead = closed_port();
     std::vector<Upstream> table = {
-        Upstream{"127.0.0.1", dead, true, kHost, TranslateMode::None, {}},
-        Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+        Upstream{.ip = "127.0.0.1", .port = dead, .tls = true, .sni_host = kHost,
+                 .translate = TranslateMode::None},
+        Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
+                 .translate = TranslateMode::None},
     };
     TlsFailoverPolicy pol(0, 1);
     _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
@@ -1223,8 +1227,10 @@ TEST_P(GatewayCrossVenueTls, AFailoverTargetIsStillVerified)
     tls.ca_file = write_ca_bundle(_id0, _id1);
     const uint16_t dead = closed_port();
     std::vector<Upstream> table = {
-        Upstream{"127.0.0.1", dead, true, kHost, TranslateMode::None, {}},
-        Upstream{"127.0.0.1", _b1.port(), true, kHostTwo, TranslateMode::None, {}},
+        Upstream{.ip = "127.0.0.1", .port = dead, .tls = true, .sni_host = kHost,
+                 .translate = TranslateMode::None},
+        Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
+                 .translate = TranslateMode::None},
     };
     TlsFailoverPolicy pol(0, 1);
     _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),

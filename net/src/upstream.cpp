@@ -22,7 +22,7 @@ namespace llmbridge::net
     {
         /// Charset a host may use before we will put it in a Host header or SNI.
         /// Deliberately stricter than the RFCs: no percent-encoding, no underscores,
-        /// no uppercase-normalisation games, provider hostnames are plain LDH names.
+        /// no uppercase-normalization games, provider hostnames are plain LDH names.
         bool valid_host_chars(std::string_view h) noexcept
         {
             if (h.empty() || h.size() > 253) return false;
@@ -33,9 +33,57 @@ namespace llmbridge::net
                 if (!ok) return false;
             }
             // No empty labels ("a..b") and no leading/trailing dot or hyphen weirdness
-            // that some resolvers "helpfully" normalise.
+            // that some resolvers "helpfully" normalize.
             if (h.front() == '.' || h.back() == '.' || h.front() == '-') return false;
             return h.find("..") == std::string_view::npos;
+        }
+
+        /// Normalize a base path, or report why it cannot be one.
+        ///
+        /// The result is spliced into a request line, so this is the same threat
+        /// model as the Host header: a byte that ends the line or the target lets a
+        /// caller retarget the request, and the upstream pool means the victim can
+        /// be a DIFFERENT client's connection. Hence a whitelist, and a refusal
+        /// instead of a strip.
+        ///
+        /// Rejected for reasons that are not injection: "." and ".." because the
+        /// upstream, not us, would resolve them and the two disagree; "//" because
+        /// an empty segment is where path-confusion bugs live; and "%" because a
+        /// percent-encoded separator is the classic way to smuggle one of the above
+        /// past exactly this kind of check.
+        bool normalize_base_path(std::string_view in, std::string& out, std::string& err)
+        {
+            if (in.empty() || in == "/") return true; // nothing to prefix
+            if (in.front() != '/')
+            {
+                err = "base path '" + std::string(in) + "' must start with '/'";
+                return false;
+            }
+            std::string_view p = in;
+            while (p.size() > 1 && p.back() == '/') p.remove_suffix(1);
+            for (const char c : p)
+            {
+                const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                (c >= '0' && c <= '9') || c == '/' || c == '-' ||
+                                c == '.' || c == '_' || c == '~' || c == ':';
+                if (!ok)
+                {
+                    err = "base path '" + std::string(in) + "' has a character outside "
+                          "[A-Za-z0-9-._~:/]";
+                    return false;
+                }
+            }
+            if (p.find("//") != std::string_view::npos ||
+                p.find("/./") != std::string_view::npos ||
+                p.find("/../") != std::string_view::npos || p == "/." || p == "/.." ||
+                (p.size() >= 2 && p.compare(p.size() - 2, 2, "/.") == 0) ||
+                (p.size() >= 3 && p.compare(p.size() - 3, 3, "/..") == 0))
+            {
+                err = "base path '" + std::string(in) + "' has an empty or dot segment";
+                return false;
+            }
+            out.assign(p);
+            return true;
         }
 
         /// Strict port parse: digits only, 1-65535. atoi's "8080garbage" -> 8080 is
@@ -74,17 +122,22 @@ namespace llmbridge::net
             rest = rest.substr(ss + 3);
         }
 
-        // Path handling: a bare trailing "/" is tolerated (people paste it); anything
-        // more is a base path we would silently drop, so refuse loudly instead.
+        // Split the authority from the base path BEFORE the authority checks, so a
+        // '?' or '#' anywhere in the argument is reported as such instead of being
+        // hidden inside a path that was never inspected.
         if (const size_t slash = rest.find('/'); slash != std::string_view::npos)
         {
-            if (rest.substr(slash) != "/")
+            const std::string_view p = rest.substr(slash);
+            rest = rest.substr(0, slash);
+            if (!have_scheme)
             {
-                spec.error = "path '" + std::string(rest.substr(slash)) +
-                             "' not supported; the gateway forwards the client's own path";
+                // The legacy HOST:PORT form has no scheme, and "host:9001/x" reads
+                // as a path to us and as something else to half the world. Require
+                // the URL form for anything with a path.
+                spec.error = "base path needs the http:// or https:// form";
                 return spec;
             }
-            rest = rest.substr(0, slash);
+            if (!normalize_base_path(p, spec.path, spec.error)) return spec;
         }
 
         if (rest.find('@') != std::string_view::npos)

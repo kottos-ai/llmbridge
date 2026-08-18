@@ -60,7 +60,7 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_DOUBLE_EQ(c.warmup_s, 2);
     ASSERT_EQ(c.strip_headers.size(), 2u);
     EXPECT_EQ(c.strip_headers[0], "authorization");
-    EXPECT_EQ(c.strip_headers[1], "X-Internal"); // normalised by the Gateway, not here
+    EXPECT_EQ(c.strip_headers[1], "X-Internal"); // normalized by the Gateway, not here
 
 }
 

@@ -8,6 +8,62 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.19.0]. 2026-08-18
+
+**A venue may now carry a base path** (`--upstream https://api.groq.com/openai`).
+It is a PREFIX, joined in front of whatever target the request would otherwise use,
+so `/openai` + `/v1/chat/completions` reaches `/openai/v1/chat/completions`. It
+exists because several providers serve an OpenAI-compatible API below the root and
+were unreachable without it: Groq at `/openai` and OpenRouter at `/api` both answer
+on their prefixed path and 404 at the root.
+
+MINOR. Nothing changes for a venue without a base path, and a test asserts the
+target stays byte-identical there.
+
+### Added
+
+- `net::UpstreamSpec::path` and `Upstream::base_path`: a normalized base path,
+  empty or `/...` with no trailing slash. `parse_upstream` accepts one only in the
+  `http(s)://` form, since `host:9001/x` reads as a path here and as something else
+  in half the world's URL parsers.
+- The prefix applies on BOTH legs: the client's own target when forwarding bytes,
+  and ours (`/v1/messages`, `/v2/chat`, Gemini's `generateContent`) when
+  translating. Tested end to end on epoll and io_uring.
+
+### Security
+
+- The base path is spliced into a request line, so it is validated as strictly as a
+  host: a whitelist of `[A-Za-z0-9-._~:/]`, and a REFUSAL instead of a strip for
+  anything else. Control bytes, spaces, `?`, `#`, `%`, `//`, `/./` and `/../` are all
+  rejected at parse time. Percent-encoding is refused precisely because `%2e%2e` and
+  `%2f` are how a dot segment or a separator gets past a check that only looks at
+  literal characters.
+- A request whose own target is not origin-form is **refused with 400 and never
+  forwarded**, on a base-path venue. Prefixing an absolute-form target would mean
+  deciding what it addressed, and deciding wrongly sends a caller's credential to a
+  host the operator never listed. The test asserts nothing reached the upstream, not
+  merely that the bytes differed: the shared pool means the next request on that
+  connection belongs to someone else.
+- Query and fragment stay rejected in every position. Azure OpenAI needs
+  `?api-version=`, which means merging our query with the client's; that is a
+  separate design question and is not guessed at here.
+
+### Fixed
+
+- A data race in the test harness, found by running TSan over the whole suite:
+  `PinnedPolicy::set` wrote a plain `int` from the main thread while the io_uring
+  loop read it in `decide()`. Test-only, and it never produced a wrong result, but
+  it made TSan red on three route tests. The field is atomic now. TSan is not part
+  of `precommit.sh`, which is why it had gone unnoticed since the routing tests
+  landed.
+
+### Known gaps
+
+- No query-string support, so Azure OpenAI is still out of reach.
+- AWS Bedrock and Google Vertex need this AND request signing (SigV4, OAuth2), so
+  the base path alone does not reach them.
+
+
 ## [0.18.0]. 2026-08-17
 
 **Byte-forward now rewrites `Host` to name the venue.** It is a reverse proxy on that
@@ -857,7 +913,7 @@ Anthropic's `partial_json` and OpenAI's `arguments` are both JSON strings whose
 *contents* are JSON text, escaped identically, so fragments pass through **verbatim**
 instead of being decoded and re-encoded. A round trip through the DOM could alter a
 customer's argument bytes; the test asserts fragments reassemble byte-for-byte
-including `1.50`, which a re-serialising implementation would normalise to `1.5`.
+including `1.50`, which a re-serialising implementation would normalize to `1.5`.
 Control bytes are still neutralised on the way out, as for text.
 
 ### Hardening found by pre-merge audit

@@ -711,7 +711,7 @@ TEST(SseTools, ArgumentFragmentsReassembleExactly)
     ASSERT_TRUE(t.feed(blk_args(0, R"({\"city\":)"), out));
     ASSERT_TRUE(t.feed(blk_args(0, R"(\"Paris\",\"n\":1.50})"), out));
     // The fragments must concatenate to the original JSON, byte for byte,
-    // including the 1.50 a re-serialising implementation would normalise to 1.5.
+    // including the 1.50 a re-serialising implementation would normalize to 1.5.
     EXPECT_EQ(reassemble(out, 0), R"({\"city\":\"Paris\",\"n\":1.50})");
 }
 

@@ -66,11 +66,15 @@ TEST(UpstreamParse, BareTrailingSlashTolerated)
 
 // ── rejected forms; each with a specific reason, not a generic failure ──────
 
-TEST(UpstreamParse, RejectsBasePath)
+// Was RejectsBasePath until 0.19.0. A base path is now KEPT and prefixed to the
+// request target, so the case that used to be refused is the Groq/OpenRouter shape.
+TEST(UpstreamParse, KeepsABasePathAndTheAuthorityWithIt)
 {
     const auto s = parse_upstream("https://api.openai.com/v1");
-    EXPECT_FALSE(s.ok());
-    EXPECT_NE(s.error.find("path"), std::string::npos);
+    ASSERT_TRUE(s.ok()) << s.error;
+    EXPECT_EQ(s.host, "api.openai.com");
+    EXPECT_EQ(s.port, 443);
+    EXPECT_EQ(s.path, "/v1");
 }
 
 // https://good.example@evil.example: the eyeball reads "good", the connect goes
@@ -153,4 +157,80 @@ TEST(UpstreamResolve, LocalhostResolvesToLoopback)
     const auto ips = resolve_host_ipv4("localhost", &err);
     ASSERT_FALSE(ips.empty()) << err;
     EXPECT_EQ(ips[0].rfind("127.", 0), 0u) << ips[0];
+}
+
+// ── base path ───────────────────────────────────────────────────────────────
+//
+// A prefix for providers serving an OpenAI-compatible API below the root. It is
+// spliced into a request line, so the rejection cases below matter more than the
+// acceptance ones: the pooled upstream means a target one client can retarget is
+// a target ANOTHER client's request can be sent to.
+
+TEST(ParseUpstream, KeepsABasePath)
+{
+    const auto s = parse_upstream("https://api.groq.com/openai");
+    ASSERT_TRUE(s.ok()) << s.error;
+    EXPECT_EQ(s.host, "api.groq.com");
+    EXPECT_EQ(s.port, 443);
+    EXPECT_TRUE(s.tls);
+    EXPECT_EQ(s.path, "/openai");
+}
+
+TEST(ParseUpstream, ABasePathMayHaveSeveralSegmentsAndAPort)
+{
+    const auto s = parse_upstream("http://host.internal:9001/a/b-c/d_e");
+    ASSERT_TRUE(s.ok()) << s.error;
+    EXPECT_EQ(s.host, "host.internal");
+    EXPECT_EQ(s.port, 9001);
+    EXPECT_EQ(s.path, "/a/b-c/d_e");
+}
+
+TEST(ParseUpstream, DropsATrailingSlashSoTheJoinCannotDoubleIt)
+{
+    EXPECT_EQ(parse_upstream("https://openrouter.ai/api/").path, "/api");
+    EXPECT_EQ(parse_upstream("https://api.anthropic.com/").path, "");
+}
+
+TEST(ParseUpstream, RejectsABasePathWithoutAScheme)
+{
+    // "host:9001/x" reads as a path here and as something else in half the world's
+    // URL parsers, and the legacy form never had one.
+    const auto s = parse_upstream("host.internal:9001/openai");
+    EXPECT_FALSE(s.ok());
+    EXPECT_NE(s.error.find("http"), std::string::npos) << s.error;
+}
+
+// The injection cases. Each of these would end or retarget the request line.
+TEST(ParseUpstream, RejectsControlBytesInABasePath)
+{
+    for (const std::string bad : {"https://h.io/a\rb", "https://h.io/a\nb",
+                                  "https://h.io/a b", "https://h.io/a\tb",
+                                  "https://h.io/a\r\nX-Evil: 1"})
+    {
+        const auto s = parse_upstream(bad);
+        EXPECT_FALSE(s.ok()) << "accepted " << bad << " as path '" << s.path << "'";
+    }
+}
+
+TEST(ParseUpstream, RejectsQueryAndFragmentInABasePath)
+{
+    // Azure OpenAI needs "?api-version=", which means merging our query with the
+    // client's. Refused until that is designed, never guessed at.
+    EXPECT_FALSE(parse_upstream("https://h.io/openai?api-version=2024-02-01").ok());
+    EXPECT_FALSE(parse_upstream("https://h.io/openai#frag").ok());
+}
+
+TEST(ParseUpstream, RejectsDotAndEmptySegments)
+{
+    for (const std::string bad : {"https://h.io/a/../b", "https://h.io/a/./b",
+                                  "https://h.io/a//b", "https://h.io/..", "https://h.io/a/.."})
+        EXPECT_FALSE(parse_upstream(bad).ok()) << "accepted " << bad;
+}
+
+TEST(ParseUpstream, RejectsPercentEncodingInABasePath)
+{
+    // %2e%2e and %2f are how a dot segment or a separator gets past a check that
+    // only looks at literal characters.
+    EXPECT_FALSE(parse_upstream("https://h.io/a/%2e%2e/b").ok());
+    EXPECT_FALSE(parse_upstream("https://h.io/a%2fb").ok());
 }

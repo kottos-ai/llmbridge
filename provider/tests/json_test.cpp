@@ -224,7 +224,7 @@ TEST(RawSpan, ObjectAndArraySpansIncludeTheirBrackets)
 
 TEST(RawSpan, PreservesWhitespaceAndNumberFormatting)
 {
-    // A rebuilt schema could normalise 1.50 -> 1.5 or drop spacing. Byte-for-byte
+    // A rebuilt schema could normalize 1.50 -> 1.5 or drop spacing. Byte-for-byte
     // forwarding must not.
     const std::string src = "{\"p\": { \"n\" : 1.50 , \"e\":1e+3 }}";
     bool ok = false;
