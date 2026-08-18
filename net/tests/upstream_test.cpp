@@ -216,7 +216,10 @@ TEST(ParseUpstream, RejectsQueryAndFragmentInABasePath)
 {
     // Azure OpenAI needs "?api-version=", which means merging our query with the
     // client's. Refused until that is designed, never guessed at.
-    EXPECT_FALSE(parse_upstream("https://h.io/openai?api-version=2024-02-01").ok());
+    // And SAY it is the query, since pasting an Azure URL is how someone gets here.
+    const auto q = parse_upstream("https://h.io/openai?api-version=2024-02-01");
+    EXPECT_FALSE(q.ok());
+    EXPECT_NE(q.error.find("query"), std::string::npos) << q.error;
     EXPECT_FALSE(parse_upstream("https://h.io/openai#frag").ok());
 }
 

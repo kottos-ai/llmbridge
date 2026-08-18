@@ -59,6 +59,16 @@ namespace llmbridge::net
                 err = "base path '" + std::string(in) + "' must start with '/'";
                 return false;
             }
+            // Named separately from the charset check below, because this is the
+            // case an operator hits by pasting an Azure OpenAI URL, and "character
+            // outside [...]" would not tell them which character or why.
+            if (in.find('?') != std::string_view::npos || in.find('#') != std::string_view::npos)
+            {
+                err = "base path '" + std::string(in) +
+                      "' has a query or fragment; not supported, because it would have "
+                      "to be merged with the client's own";
+                return false;
+            }
             std::string_view p = in;
             while (p.size() > 1 && p.back() == '/') p.remove_suffix(1);
             for (const char c : p)
