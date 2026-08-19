@@ -25,9 +25,7 @@ CSV = os.path.join(HERE, "results", "phase-a-comparison.csv")
 
 def chart_outputs(name):
     """Where to write a generated chart. Always bench/results/ (the public OSS
-    README embeds these). Also private/website/assets/ when that site tree is
-    present, so the README copy and the deployed website never drift: one run,
-    no manual copying. Public OSS clones (no private/) just get bench/results/."""
+    README embeds these)."""
     outs = [os.path.join(HERE, "results", name)]
     site = os.path.join(os.path.dirname(HERE), "private", "website")
     if os.path.isdir(site):

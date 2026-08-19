@@ -515,7 +515,6 @@ Documentation drifts; these do not.
 | namespaces mirror directories | same |
 | LATENCY.md's stamp table names real functions | same |
 | constants are `kPascalCase`, types `PascalCase`, `ALL_CAPS` is macros only | same |
-| the invariants above are actually tested | `private/scripts/mutate_check.py` |
 
 The last one matters most and is the newest. A green suite proves nothing it
 checks regressed; it does not prove it checks anything in particular. The

@@ -1352,6 +1352,12 @@ TEST_P(GatewayTls, PlaintextSentToTlsListenerIsRefusedAndNothingIsServed)
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(kReq));
     EXPECT_TRUE(c.recv_response(1500).empty()) << "a plaintext response escaped a TLS listener";
+    // stats() is loop-thread state: gateway.hpp says it is valid only once that
+    // thread has been joined, and reading it live is a data race TSan reports.
+    // The empty response above already means the gateway processed the bytes,
+    // counted the failure and closed the connection; the join makes the READ safe.
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
     EXPECT_EQ(_gw->stats().requests, 0u);
     // The log line for this sits at DEBUG, because a public listener collects
     // scanners and one WARN each buries everything else. The counter is what keeps
