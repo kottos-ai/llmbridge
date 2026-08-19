@@ -407,6 +407,13 @@ namespace llmbridge
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
                                             // first request (stall, or a client
                                             // speaking the wrong protocol at us)
+        /// Inbound handshakes that failed, which on a public listener is mostly
+        /// internet scanners speaking junk at 443. Their log line sits at DEBUG so a
+        /// production build stays readable; this counter is what keeps them VISIBLE.
+        /// A number climbing steadily is background noise; a step change the moment a
+        /// customer tries to connect is their TLS problem, and without this the
+        /// difference would need a debug-floor rebuild to see.
+        uint64_t client_tls_handshake_failures = 0;
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
         uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
         // Requests an installed Policy refused; 0 in a stock build. A SUBSET of

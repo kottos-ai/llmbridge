@@ -1207,8 +1207,25 @@ namespace llmbridge
             // Wrong CA, wrong hostname and a protocol mismatch all looked identical
             // from outside, which is the first thing a new deployment hits. The string
             // is an OpenSSL reason plus a file path; it carries no key material.
-            LB_WARN("TLS failed ", *u, " during=", hs_was_done ? "session" : "handshake",
-                    " err=", u->tls->last_error());
+            //
+            // A CLIENT-side handshake failure on a public listener is almost always an
+            // internet scanner speaking junk TLS, and at WARN it floods the journal and
+            // buries real signal. Log it at DEBUG so a production (info-floor) build
+            // stays quiet and a debug build still surfaces it when diagnosing one real
+            // client. Everything else, an UPSTREAM handshake to a provider or a
+            // mid-session failure on either leg, stays WARN because it is actionable.
+            const bool scanner_noise = u->is_client && !hs_was_done;
+            if (scanner_noise)
+            {
+                ++_stats.client_tls_handshake_failures;
+                // Counted, not merely silenced. The line is noise; the RATE is a
+                // diagnostic, and a customer who cannot handshake shows up as a step
+                // in it, and not as nothing at all.
+                LB_DEBUG("TLS failed ", *u, " during=handshake err=", u->tls->last_error());
+            }
+            else
+                LB_WARN("TLS failed ", *u, " during=", hs_was_done ? "session" : "handshake",
+                        " err=", u->tls->last_error());
             return false;
         }
 
