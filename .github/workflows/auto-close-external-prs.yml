@@ -20,6 +20,7 @@ on:
 jobs:
   close-external-pr:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       pull-requests: write
     steps:
