@@ -1538,6 +1538,8 @@ TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
     ASSERT_TRUE(c.handshake());
     ASSERT_TRUE(c.send(make_req(kStreamBody)));
 
+    // Target 4 MiB, deliberately BELOW the 8 MiB io_uring drop cap
+    // (kUrStreamBufCap).
     size_t total = 0;
     char tmp[65536];
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -1546,10 +1548,10 @@ TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
         const int n = c.read_raw(tmp, sizeof tmp);
         if (n <= 0) break;
         total += static_cast<size_t>(n);
-        if (total > 8u * 1024 * 1024) break; // enough to prove it flows
+        if (total > 4u * 1024 * 1024) break; // enough to prove it flows
     }
     std::fprintf(stderr, "CONTROL delivered %zu bytes to a reading client\n", total);
-    EXPECT_GT(total, 8u * 1024 * 1024);
+    EXPECT_GT(total, 4u * 1024 * 1024);
 }
 
 // 4.8: a connection still in the handshake must not be able to reach the pooled
