@@ -939,6 +939,11 @@ TEST_P(GatewayTls, HostnameMismatchYields502NotPlaintextFallback)
     EXPECT_EQ(Client::status_of(r), 502);
     EXPECT_EQ(_backend.handshakes(), 0);
     EXPECT_EQ(_backend.requests(), 0);
+    // The counter is the INBOUND leg only. An upstream handshake failure is a
+    // provider or trust-store problem, it keeps its WARN, and it must not move this
+    // number: otherwise scanner noise and a broken provider are indistinguishable in
+    // the one metric that exists to separate them.
+    EXPECT_EQ(_gw->stats().client_tls_handshake_failures, 0u);
 }
 
 TEST_P(GatewayTls, ConcurrentTlsStreamsAllComplete)
@@ -1347,8 +1352,20 @@ TEST_P(GatewayTls, PlaintextSentToTlsListenerIsRefusedAndNothingIsServed)
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(kReq));
     EXPECT_TRUE(c.recv_response(1500).empty()) << "a plaintext response escaped a TLS listener";
+    // stats() is loop-thread state: gateway.hpp says it is valid only once that
+    // thread has been joined, and reading it live is a data race TSan reports.
+    // The empty response above already means the gateway processed the bytes,
+    // counted the failure and closed the connection; the join makes the READ safe.
+    _gw->request_stop();
+    if (_gt.joinable()) _gt.join();
     EXPECT_EQ(_gw->stats().requests, 0u);
+    // The log line for this sits at DEBUG, because a public listener collects
+    // scanners and one WARN each buries everything else. The counter is what keeps
+    // it visible: silenced and uncounted would mean a customer who cannot handshake
+    // produces no evidence at all on a production build.
+    EXPECT_EQ(_gw->stats().client_tls_handshake_failures, 1u);
 }
+
 
 // ── 3.8: lifetime. These are the hazards, expressed as tests ────────────────
 //

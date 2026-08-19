@@ -37,7 +37,7 @@ CSV = os.path.join(HERE, "results", "stream-comparison.csv")
 
 
 def chart_outputs(name):
-    """bench/results/ always (the OSS README embeds these); private/website/assets/
+    """bench/results/ always (the OSS README embeds these);
     too when that tree exists, so README and deployed site never drift."""
     outs = [os.path.join(HERE, "results", name)]
     site = os.path.join(os.path.dirname(HERE), "private", "website")

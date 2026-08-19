@@ -8,6 +8,28 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.19.2]. 2026-08-19
+
+Diagnostics only, again, and PATCH for the same reasons as 0.19.1: nothing new is
+reachable and the installed library's API is unchanged.
+
+### Changed
+
+- **A failed INBOUND TLS handshake logs at DEBUG instead of WARN.** On a public
+  listener that is overwhelmingly internet scanners speaking junk at 443, and one
+  WARN each buries every line worth reading. An UPSTREAM handshake failure, and a
+  mid-session failure on either leg, stay at WARN: those are actionable.
+
+### Added
+
+- `Stats::client_tls_handshake_failures`, because silencing a line without counting
+  what it stood for is how a customer who cannot handshake produces no evidence at
+  all on a production build. The rate is the diagnostic: a steady climb is
+  background noise, a step change the moment someone tries to connect is their TLS
+  problem. The counter is the inbound leg ONLY, so scanner noise and a broken
+  provider stay distinguishable, and a test asserts each half.
+
+
 ## [0.19.1]. 2026-08-18
 
 Diagnostics only. Nothing new is reachable that was not reachable at 0.19.0: the

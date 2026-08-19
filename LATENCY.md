@@ -211,7 +211,7 @@ sites.
 
 **How far the head precedes the first token is a property of the provider, and
 for Anthropic it is ~1 ms.** Measured 2026-08-06 with
-`private/demo/sse_client.py`, which stamps the response head separately from
+`sse_client.py`, which stamps the response head separately from
 the first event carrying generated text, 5 samples per arm:
 
 | arm | t_head (median) | first text | gap |

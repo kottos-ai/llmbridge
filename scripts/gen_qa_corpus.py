@@ -20,7 +20,7 @@ em-dashes, accented letters, emoji, code fences. A corpus of "answer_0001" would
 exercise none of it. Every byte of these answers has to survive
 Anthropic-JSON -> parse -> OpenAI-JSON re-serialisation unchanged.
 
-Credential handling (see CLAUDE.md, private/demo): the key is read from a
+Credential handling: the key is read from a
 mode-600 file, passed only in a request header, and never printed, logged, put in
 argv, or written to the output. Use a throwaway key.
 

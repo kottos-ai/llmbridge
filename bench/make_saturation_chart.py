@@ -24,9 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def chart_outputs(name):
-    """Always bench/results/ (the public OSS README embeds these); also
-    private/website/assets/ when that site tree is present, so the README copy
-    and the deployed website never drift. Public OSS clones just get results/."""
+    """Always bench/results/ (the public OSS README embeds these)."""
     outs = [os.path.join(HERE, "results", name)]
     site = os.path.join(os.path.dirname(HERE), "private", "website")
     if os.path.isdir(site):

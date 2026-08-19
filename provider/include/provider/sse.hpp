@@ -70,9 +70,8 @@ namespace llmbridge::provider
         /// Provider-reported token counts seen so far. Input arrives in
         /// `message_start`, output accumulates through `message_delta`, so both are
         /// final only once the stream ends. Exposed because a stream is otherwise
-        /// unmeterable: these were private with no accessor, which
-        /// `private/docs/engineering-schedule.md` already names as the blocker for
-        /// per-request accounting. Reading them costs nothing and changes no state.
+        /// unmeterable: these were private with no accessor. Reading them costs
+        /// nothing and changes no state.
         [[nodiscard]] long long input_tokens() const noexcept { return _in_tok; }
         [[nodiscard]] long long output_tokens() const noexcept { return _out_tok; }
 
