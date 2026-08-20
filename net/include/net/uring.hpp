@@ -129,6 +129,12 @@ namespace llmbridge::net::uring
         [[nodiscard]] unsigned bgid() const noexcept { return _bgid; }
         [[nodiscard]] unsigned buf_size() const noexcept { return _buf_size; }
 
+        // Why the last init() returned false: which step, and the errno the kernel
+        // gave. init() clears both on entry, so a caller reads them only after a
+        // false return. The stage is a static string, never allocated.
+        [[nodiscard]] const char* init_stage() const noexcept { return _init_stage; }
+        [[nodiscard]] int init_errno() const noexcept { return _init_errno; }
+
         // Pointer to buffer `bid`'s bytes (the kernel just filled it on a recv CQE).
         [[nodiscard]] char* data(unsigned bid) noexcept { return _bufs + static_cast<size_t>(bid) * _buf_size; }
 
@@ -148,6 +154,8 @@ namespace llmbridge::net::uring
         unsigned _mask = 0;
         unsigned _buf_size = 0;
         unsigned _tail = 0; // our producer cursor into the buf ring
+        const char* _init_stage = ""; // last init() failure step, for diagnostics
+        int _init_errno = 0;
     };
 } // namespace llmbridge::net::uring
 

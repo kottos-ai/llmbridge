@@ -8,6 +8,21 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.19.3]. 2026-08-20
+
+Diagnostics only, PATCH for the same reason as 0.19.2: the installed `provider` API
+is unchanged; the new accessors sit on `net::BufRing`, which llmbridge does not
+install.
+
+### Added
+
+- **The io_uring provided-buffer ring fallback now reports WHY.** `BufRing::init`
+  records the failing step (`mmap-ring`, `mmap-bufs`, or `register-pbuf-ring`) and
+  the errno, and the gateway prints both when it drops to epoll.
+- `BufRing::init_stage()` and `BufRing::init_errno()`, the accessors the log line
+  reads. On an uninstalled header, so no effect on the shipped API.
+
+
 ## [0.19.2]. 2026-08-19
 
 Diagnostics only, again, and PATCH for the same reasons as 0.19.1: nothing new is

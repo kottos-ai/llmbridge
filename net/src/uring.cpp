@@ -150,7 +150,14 @@ namespace llmbridge::net::uring
 
     bool BufRing::init(Ring& ring, unsigned bgid, unsigned count, unsigned buf_size) noexcept
     {
-        if (count == 0 || (count & (count - 1)) != 0) return false; // must be power of two
+        _init_stage = "";
+        _init_errno = 0;
+        if (count == 0 || (count & (count - 1)) != 0)
+        {
+            _init_stage = "count-not-power-of-two";
+            _init_errno = EINVAL;
+            return false;
+        }
         _ring_fd = ring.ring_fd();
         _bgid = bgid;
         _count = count;
@@ -159,12 +166,25 @@ namespace llmbridge::net::uring
 
         _ring_sz = static_cast<size_t>(count) * sizeof(io_uring_buf);
         _ring = ::mmap(nullptr, _ring_sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        if (_ring == MAP_FAILED) { _ring = nullptr; return false; }
+        if (_ring == MAP_FAILED)
+        {
+            _init_stage = "mmap-ring";
+            _init_errno = errno;
+            _ring = nullptr;
+            return false;
+        }
 
         _bufs_sz = static_cast<size_t>(count) * buf_size;
         _bufs = static_cast<char*>(
             ::mmap(nullptr, _bufs_sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
-        if (_bufs == MAP_FAILED) { _bufs = nullptr; teardown(); return false; }
+        if (_bufs == MAP_FAILED)
+        {
+            _init_stage = "mmap-bufs";
+            _init_errno = errno;
+            _bufs = nullptr;
+            teardown();
+            return false;
+        }
 
         io_uring_buf_reg reg;
         std::memset(&reg, 0, sizeof(reg));
@@ -173,6 +193,8 @@ namespace llmbridge::net::uring
         reg.bgid = static_cast<uint16_t>(bgid);
         if (sys_io_uring_register(_ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1) < 0)
         {
+            _init_stage = "register-pbuf-ring";
+            _init_errno = errno;
             teardown();
             return false;
         }

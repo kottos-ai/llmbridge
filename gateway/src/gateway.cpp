@@ -3571,7 +3571,9 @@ namespace llmbridge
         const unsigned bufcount = _uring_buf_count ? _uring_buf_count : kUrBufCount;
         if (!_bufring.init(_ring, kUrBufGroup, bufcount, kUrBufSize))
         {
-            LB_WARN("io_uring provided-buffer ring unavailable; falling back to epoll");
+            LB_WARN("io_uring provided-buffer ring unavailable (", _bufring.init_stage(),
+                    " errno=", _bufring.init_errno(), " ",
+                    std::strerror(_bufring.init_errno()), "); falling back to epoll");
             return run_epoll();
         }
         // Sized once, never resized: ur_submit_connect hands the kernel a pointer into
