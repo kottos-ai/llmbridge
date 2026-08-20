@@ -74,6 +74,9 @@ namespace llmbridge::provider
         /// nothing and changes no state.
         [[nodiscard]] long long input_tokens() const noexcept { return _in_tok; }
         [[nodiscard]] long long output_tokens() const noexcept { return _out_tok; }
+        /// Input tokens the provider served from cache, from message_start's
+        /// usage.cache_read_input_tokens; 0 when the provider reported none.
+        [[nodiscard]] long long cached_tokens() const noexcept { return _cached_tok; }
 
 
     private:
@@ -124,5 +127,6 @@ namespace llmbridge::provider
         bool _usage_emitted = false;
         long long _in_tok = 0;  // message_start:  usage.input_tokens
         long long _out_tok = 0; // message_delta:  usage.output_tokens (cumulative)
+        long long _cached_tok = 0; // message_start: usage.cache_read_input_tokens
     };
 } // namespace llmbridge::provider

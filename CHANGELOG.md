@@ -8,7 +8,26 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
-## [0.19.3]. 2026-08-20
+## [0.20.0]. 2026-08-20
+
+Prompt-cache token reporting, MINOR because the translated usage now carries a field
+it did not before.
+
+### Added
+
+- **Cache-read tokens surface in the OpenAI usage.** When an Anthropic response
+  reports `usage.cache_read_input_tokens` (the prompt tokens served from cache, at a
+  discount), the translator now emits `usage.prompt_tokens_details.cached_tokens` in
+  the OpenAI shape, on both the non-streaming response and the streaming usage chunk.
+  It is emitted ONLY when the provider reported a non-zero value, so an uncached
+  request produces byte-for-byte the usage object it always did. An OpenAI-compatible
+  upstream that already sends `prompt_tokens_details.cached_tokens` passes through
+  unchanged.
+- `RequestRecord::cached_tokens` and `AnthropicToOpenAiSse::cached_tokens()`, so an
+  embedder can record cache reads per request. On a gateway header,
+  not the installed provider API.
+
+
 
 Diagnostics only, PATCH for the same reason as 0.19.2: the installed `provider` API
 is unchanged; the new accessors sit on `net::BufRing`, which llmbridge does not

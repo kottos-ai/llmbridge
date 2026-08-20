@@ -94,6 +94,14 @@ namespace llmbridge::provider
         out += std::to_string(_out_tok);
         out += ",\"total_tokens\":";
         out += std::to_string(_in_tok + _out_tok);
+        // Only when the provider reported cache reads, so a request that used no cache
+        // emits exactly the object it always did.
+        if (_cached_tok > 0)
+        {
+            out += ",\"prompt_tokens_details\":{\"cached_tokens\":";
+            out += std::to_string(_cached_tok);
+            out += "}";
+        }
         out += "}}\n\n";
         _usage_emitted = true;
     }
@@ -173,6 +181,7 @@ namespace llmbridge::provider
                 {
                     _in_tok = detail::to_ll(u->num_or("input_tokens", "0"));
                     _out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
+                    _cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
                 }
             }
             ensure_created();

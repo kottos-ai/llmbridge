@@ -41,6 +41,7 @@ namespace llmbridge
         int attempts = 0;         ///< failovers before this outcome
         int32_t tokens_in = -1;   ///< streaming only, from the provider's usage; -1 unknown
         int32_t tokens_out = -1;
+        int32_t cached_tokens = -1; ///< input tokens the provider served from cache; -1 unknown
         bool streamed = false;
         bool error_reply = false; ///< the gateway generated the reply; stamps unset
         bool truncated = false;   ///< stream ended without a clean finish

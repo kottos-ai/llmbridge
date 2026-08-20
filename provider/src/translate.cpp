@@ -316,11 +316,12 @@ namespace llmbridge::provider
         const std::string_view sr = v.str_or("stop_reason", "end_turn");
         const char* finish = detail::anthropic_finish_reason(sr);
 
-        long long in_tok = 0, out_tok = 0;
+        long long in_tok = 0, out_tok = 0, cached_tok = 0;
         if (const json::Value* u = v.find("usage"))
         {
             in_tok = detail::to_ll(u->num_or("input_tokens", "0"));
             out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
+            cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
         }
 
         std::string out = "{\"id\":";
@@ -351,7 +352,11 @@ namespace llmbridge::provider
         out += finish;
         out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(in_tok + out_tok) + "}}";
+               ",\"total_tokens\":" + std::to_string(in_tok + out_tok);
+        if (cached_tok > 0)
+            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" +
+                   std::to_string(cached_tok) + "}";
+        out += "}}";
         return out;
     }
 
@@ -575,12 +580,13 @@ namespace llmbridge::provider
         const std::string_view fr = v.str_or("finish_reason", "COMPLETE");
         const char* finish = fr == "MAX_TOKENS" ? "length" : fr == "TOOL_CALL" ? "tool_calls" : "stop";
 
-        long long in_tok = 0, out_tok = 0;
+        long long in_tok = 0, out_tok = 0, cached_tok = 0;
         if (const json::Value* u = v.find("usage"))
             if (const json::Value* t = u->find("tokens"))
             {
                 in_tok = detail::to_ll(t->num_or("input_tokens", "0"));
                 out_tok = detail::to_ll(t->num_or("output_tokens", "0"));
+                cached_tok = detail::to_ll(t->num_or("cache_read_input_tokens", "0"));
             }
 
         std::string out = "{\"id\":";
@@ -596,7 +602,11 @@ namespace llmbridge::provider
         out += finish;
         out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(in_tok + out_tok) + "}}";
+               ",\"total_tokens\":" + std::to_string(in_tok + out_tok);
+        if (cached_tok > 0)
+            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" +
+                   std::to_string(cached_tok) + "}";
+        out += "}}";
         return out;
     }
 } // namespace llmbridge::provider

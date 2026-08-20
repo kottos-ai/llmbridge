@@ -538,12 +538,15 @@ namespace llmbridge
         // of completion text. On no match the headers are simply omitted. The
         // existing rule everywhere in this file is to omit instead of report a
         // number we did not measure.
-        struct BodyUsage { long long in = -1, out = -1; };
+        struct BodyUsage { long long in = -1, out = -1, cached = -1; };
 
         BodyUsage scan_usage(std::string_view body) noexcept
         {
             BodyUsage u;
-            constexpr size_t kTail = 256;
+            // 512, not 256: cached_tokens sits inside prompt_tokens_details, further
+            // from the end than prompt_tokens, and a completion_tokens_details block
+            // can follow it. Still a bounded tail, never a full-body scan.
+            constexpr size_t kTail = 512;
             const std::string_view tail =
                 body.size() > kTail ? body.substr(body.size() - kTail) : body;
             const auto num_after = [&tail](std::string_view key) -> long long {
@@ -562,6 +565,7 @@ namespace llmbridge
             };
             u.in = num_after("\"prompt_tokens\"");
             u.out = num_after("\"completion_tokens\"");
+            u.cached = num_after("\"cached_tokens\"");
             return u;
         }
 
@@ -1755,11 +1759,13 @@ namespace llmbridge
         {
             r.tokens_in = c->sse->input_tokens();
             r.tokens_out = c->sse->output_tokens();
+            r.cached_tokens = static_cast<int32_t>(c->sse->cached_tokens());
         }
         else if (!streamed)
         {
             r.tokens_in = static_cast<int32_t>(c->tok_in);
             r.tokens_out = static_cast<int32_t>(c->tok_out);
+            r.cached_tokens = static_cast<int32_t>(c->tok_cached);
         }
         for (size_t i = 0; i < kSinkCaptureMax; ++i)
             r.captured[i] = std::string_view(c->sink_cap[i], c->sink_cap_len[i]);
@@ -2102,6 +2108,7 @@ namespace llmbridge
                 const BodyUsage bu = scan_usage(tbody);
                 client->tok_in = bu.in;
                 client->tok_out = bu.out;
+                client->tok_cached = bu.cached;
             }
             if (tbody.empty())
             {
@@ -3276,6 +3283,7 @@ namespace llmbridge
                 const BodyUsage bu = scan_usage(tbody);
                 client->tok_in = bu.in;
                 client->tok_out = bu.out;
+                client->tok_cached = bu.cached;
             }
             if (tbody.empty())
             {
