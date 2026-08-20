@@ -281,6 +281,22 @@ TEST(RespXlate, UsageMapsAndSumsTotal)
     EXPECT_EQ(u->num_or("prompt_tokens"), "40");
     EXPECT_EQ(u->num_or("completion_tokens"), "2");
     EXPECT_EQ(u->num_or("total_tokens"), "42");
+    // No cache read reported, so the details object is absent, byte-for-byte the
+    // usage this translator has always produced.
+    EXPECT_EQ(u->find("prompt_tokens_details"), nullptr);
+}
+
+TEST(RespXlate, CacheReadTokensBecomePromptTokensDetails)
+{
+    std::string in = R"({"content":[{"type":"text","text":"x"}],
+        "usage":{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":80}})";
+    Value out = P(anthropic_to_openai_response(in));
+    const Value* u = out.find("usage");
+    ASSERT_NE(u, nullptr);
+    EXPECT_EQ(u->num_or("prompt_tokens"), "100");
+    const Value* det = u->find("prompt_tokens_details");
+    ASSERT_NE(det, nullptr);
+    EXPECT_EQ(det->num_or("cached_tokens"), "80");
 }
 
 class StopReasonMap : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};

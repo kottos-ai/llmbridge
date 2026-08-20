@@ -389,6 +389,39 @@ namespace
     }
 } // namespace
 
+TEST(SseUsage, CacheReadTokensSurfaceInAccessorAndUsageChunk)
+{
+    const char* stream =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"model\":\"claude-3-5-sonnet\","
+        "\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":80}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    AnthropicToOpenAiSse t(kFixedCreated, /*include_usage=*/true);
+    std::string out;
+    t.feed(stream, out);
+    t.finish(out);
+    EXPECT_EQ(t.cached_tokens(), 80);  // the accessor the tape reads
+
+    const auto p = data_payloads(out);
+    Value u = P(p[p.size() - 2]);
+    const Value* usage = u.find("usage");
+    ASSERT_NE(usage, nullptr);
+    const Value* det = usage->find("prompt_tokens_details");
+    ASSERT_NE(det, nullptr);
+    EXPECT_EQ(det->num_or("cached_tokens"), "80");
+}
+
+TEST(SseUsage, NoCacheReadEmitsNoDetails)
+{
+    const auto p = data_payloads(translate_usage(kAnthropicWithUsage, /*include_usage=*/true));
+    ASSERT_GE(p.size(), 2u);
+    Value u = P(p[p.size() - 2]);
+    const Value* usage = u.find("usage");
+    ASSERT_NE(usage, nullptr);
+    EXPECT_EQ(usage->find("prompt_tokens_details"), nullptr);
+}
+
 TEST(SseUsage, EmitsFinalUsageChunkBeforeDone)
 {
     const auto p = data_payloads(translate_usage(kAnthropicWithUsage, /*include_usage=*/true));

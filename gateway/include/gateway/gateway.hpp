@@ -184,6 +184,7 @@ namespace llmbridge
         // content, which is the same rule the recorder and the policy seam follow.
         long long tok_in = -1;
         long long tok_out = -1;
+        long long tok_cached = -1; // non-streaming: prompt_tokens_details.cached_tokens
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
