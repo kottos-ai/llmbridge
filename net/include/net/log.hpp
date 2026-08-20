@@ -73,7 +73,9 @@ namespace llmbridge::net::log
     void set_level(Level) noexcept;
     Level level() noexcept;
 
-    inline std::atomic<uint8_t> g_level_cache{static_cast<uint8_t>(Level::Info)};
+    // Runtime default = the compile floor, so a binary built with the debug floor
+    // EMITS debug without an explicit set_level.
+    inline std::atomic<uint8_t> g_level_cache{static_cast<uint8_t>(LLMBRIDGE_LOG_COMPILE_LEVEL)};
 
     [[nodiscard]] inline bool enabled(Level l) noexcept
     {
