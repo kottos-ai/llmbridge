@@ -8,6 +8,18 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.20.1]. 2026-08-20
+
+A logging default fix, no API change.
+
+### Fixed
+
+- **The runtime log level now defaults to the COMPILE floor**, so a binary built with
+  the debug floor (`-DLLMBRIDGE_LOG_LEVEL=debug`) emits debug without an explicit
+  `set_level`. Before, the runtime default was hardcoded to Info regardless of the
+  compile floor.
+
+
 ## [0.20.0]. 2026-08-20
 
 Prompt-cache token reporting, MINOR because the translated usage now carries a field
