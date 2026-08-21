@@ -34,6 +34,11 @@ if (LLMBRIDGE_TLS)
     add_executable(net_tls_test tls_test.cpp)
     target_link_libraries(net_tls_test PRIVATE net GTest::gtest_main OpenSSL::SSL OpenSSL::Crypto)
     gtest_discover_tests(net_tls_test)
+
+    # SigV4 needs the same OpenSSL, so it lives behind the same gate.
+    add_executable(net_sigv4_test sigv4_test.cpp)
+    target_link_libraries(net_sigv4_test PRIVATE net GTest::gtest_main OpenSSL::Crypto)
+    gtest_discover_tests(net_sigv4_test)
 endif ()
 
 # The logger. Its own target so a private repo can swap the sink without touching

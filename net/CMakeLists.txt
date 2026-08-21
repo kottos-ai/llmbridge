@@ -59,7 +59,7 @@ endif ()
 # CMakeLists so the imported OpenSSL::* targets are visible to sibling dirs, an
 # imported target is directory-scoped, and gateway/tests links it too).
 if (LLMBRIDGE_TLS)
-    target_sources(net PRIVATE src/tls.cpp)
+    target_sources(net PRIVATE src/tls.cpp src/sigv4.cpp)
     target_link_libraries(net PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(net PUBLIC LLMBRIDGE_HAVE_TLS)
     message(STATUS "net: TLS enabled. OpenSSL ${OPENSSL_VERSION}")
