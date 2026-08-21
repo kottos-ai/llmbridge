@@ -90,7 +90,36 @@ namespace llmbridge::net::sigv4
 
     /// RFC 3986 unreserved-set encoding. `encode_slash` false keeps '/' literal,
     /// which is what a path needs and a query value does not.
-    std::string uri_encode(std::string_view s, bool encode_slash);
+    ///
+    /// Inline, and deliberately free of OpenSSL: the gateway builds a Bedrock request
+    /// path with it, and that code compiles in a build with no TLS even though such a
+    /// build cannot reach Bedrock. The alternative was a second copy of an encoder,
+    /// and two encoders that must agree byte for byte is how a signature silently
+    /// stops matching a path.
+    inline std::string uri_encode(std::string_view s, bool encode_slash)
+    {
+        static constexpr char kDigits[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size());
+        for (const char ch : s)
+        {
+            const auto c = static_cast<unsigned char>(ch);
+            const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                              (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                              c == '.' || c == '~' || (c == '/' && !encode_slash);
+            if (safe)
+            {
+                out.push_back(ch);
+            }
+            else
+            {
+                out.push_back('%');
+                out.push_back(kDigits[c >> 4]);
+                out.push_back(kDigits[c & 0x0f]);
+            }
+        }
+        return out;
+    }
 
     /// The canonical URI, from the path as it appears in the request line.
     ///

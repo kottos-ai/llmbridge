@@ -62,6 +62,11 @@ namespace llmbridge
         Anthropic,
         Gemini,
         Cohere,
+        /// Bedrock's Messages endpoint. The BODY is Anthropic's, so the difference is
+        /// the model moving into the path and SigV4 replacing a header swap. Requires
+        /// a TLS build: the signing needs OpenSSL, and the service is HTTPS-only, so
+        /// selecting it without one fails at startup instead of sending unsigned bytes.
+        Bedrock,
     };
 
     // TLS towards the upstream. Declared unconditionally so callers don't need
@@ -123,6 +128,12 @@ namespace llmbridge
         std::string base_path{};
 
         std::string host_hdr{}; ///< derived at construction; see host_header_for()
+
+        /// AWS region for SigV4, derived at construction from the hostname
+        /// (`bedrock-runtime.us-east-1.amazonaws.com` -> `us-east-1`). Empty when the
+        /// name does not carry one, which makes a Bedrock venue refuse every request
+        /// instead of signing with a guess: a wrong region is a 403 with an empty body.
+        std::string aws_region{};
     };
 
     // Event-loop backend. Auto = io_uring when the kernel supports it, else epoll.

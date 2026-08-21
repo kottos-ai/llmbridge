@@ -53,12 +53,6 @@ namespace llmbridge::net::sigv4
             return true;
         }
 
-        bool unreserved(unsigned char c)
-        {
-            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                   (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
-        }
-
         void append_trimmed_lower(std::string& out, std::string_view v)
         {
             size_t b = v.find_first_not_of(" \t");
@@ -68,28 +62,6 @@ namespace llmbridge::net::sigv4
                 out.push_back(static_cast<char>(
                     v[i] >= 'A' && v[i] <= 'Z' ? v[i] - 'A' + 'a' : v[i]));
         }
-    }
-
-    std::string uri_encode(std::string_view s, bool encode_slash)
-    {
-        static constexpr char kDigits[] = "0123456789ABCDEF";
-        std::string out;
-        out.reserve(s.size());
-        for (const char ch : s)
-        {
-            const auto c = static_cast<unsigned char>(ch);
-            if (unreserved(c) || (c == '/' && !encode_slash))
-            {
-                out.push_back(ch);
-            }
-            else
-            {
-                out.push_back('%');
-                out.push_back(kDigits[c >> 4]);
-                out.push_back(kDigits[c & 0x0f]);
-            }
-        }
-        return out;
     }
 
     std::string canonical_uri(std::string_view wire_path)
