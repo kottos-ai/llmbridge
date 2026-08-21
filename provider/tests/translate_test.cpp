@@ -853,3 +853,65 @@ TEST(ToolRoundTrip, ArgumentsSurviveBothDirections)
     EXPECT_EQ(input->num_or("n"), "-1.5e3");
     EXPECT_EQ(llmbridge::provider::json::unescape_string(input->str_or("u")), "café");
 }
+
+// ── Bedrock: the same Messages body, minus the model, plus the version ─────────
+
+TEST(BedrockRequest, DropsModelAndCarriesAnthropicVersion)
+{
+    // Bedrock takes the model id in the PATH, so a `model` in the body is not merely
+    // redundant: it is a field the endpoint does not accept.
+    std::string model;
+    const std::string out = llmbridge::provider::openai_to_bedrock_request(
+        R"({"model":"anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "max_tokens":512,"messages":[{"role":"user","content":"hi"}]})", model);
+
+    EXPECT_EQ(model, "anthropic.claude-3-5-sonnet-20240620-v1:0");
+    EXPECT_EQ(out.find("\"model\""), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("anthropic_version":"bedrock-2023-05-31")"), std::string::npos)
+        << out;
+    EXPECT_NE(out.find(R"("max_tokens":512)"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("messages":)"), std::string::npos) << out;
+}
+
+TEST(BedrockRequest, DiffersFromAnthropicInExactlyTwoFields)
+{
+    // The guard on sharing one message walk between the two dialects. If a change to
+    // tool results, vision or system prompts lands on one and not the other, this is
+    // what catches it, because everything except those two fields must match byte for
+    // byte.
+    constexpr std::string_view kIn = R"({
+        "model":"claude-3-5-sonnet-latest","max_tokens":64,"temperature":0.5,
+        "messages":[{"role":"system","content":"be brief"},
+                    {"role":"user","content":"hi"},
+                    {"role":"assistant","content":"hello"}]})";
+    std::string model;
+    std::string a = llmbridge::provider::openai_to_anthropic_request(kIn);
+    std::string b = llmbridge::provider::openai_to_bedrock_request(kIn, model);
+    ASSERT_FALSE(a.empty());
+    ASSERT_FALSE(b.empty());
+
+    const std::string a_head = R"({"model":"claude-3-5-sonnet-latest")";
+    const std::string b_head = R"({"anthropic_version":"bedrock-2023-05-31")";
+    ASSERT_EQ(a.compare(0, a_head.size(), a_head), 0) << a;
+    ASSERT_EQ(b.compare(0, b_head.size(), b_head), 0) << b;
+    EXPECT_EQ(a.substr(a_head.size()), b.substr(b_head.size()))
+        << "the two bodies diverge somewhere other than the model and the version";
+}
+
+TEST(BedrockRequest, StreamingAndToolsSurviveTheSharedPath)
+{
+    std::string model;
+    const std::string out = llmbridge::provider::openai_to_bedrock_request(
+        R"({"model":"m","stream":true,"messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]})",
+        model);
+    EXPECT_NE(out.find(R"("stream":true)"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("tools":)"), std::string::npos) << out;
+}
+
+TEST(BedrockRequest, RefusesWhatAnthropicRefuses)
+{
+    std::string model = "leftover";
+    EXPECT_TRUE(llmbridge::provider::openai_to_bedrock_request("not json", model).empty());
+    EXPECT_TRUE(llmbridge::provider::openai_to_bedrock_request("[]", model).empty());
+}

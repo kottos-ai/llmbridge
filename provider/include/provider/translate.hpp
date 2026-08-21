@@ -36,6 +36,16 @@ namespace llmbridge::provider
     // ── Anthropic Messages ──────────────────────────────────────────────────
     // OpenAI chat-completion request body  ->  Anthropic Messages request body.
     std::string openai_to_anthropic_request(std::string_view openai_body);
+
+    /// The same Messages body as Bedrock wants it, and the model id it names.
+    ///
+    /// Two differences from Anthropic direct, both required: no `model` field, because
+    /// Bedrock takes the model id in the request PATH, and `anthropic_version` inside
+    /// the JSON, where Anthropic wants a header. `model_out` receives the id so the
+    /// caller can build `/model/{id}/invoke`; it is empty only when the body named no
+    /// model, in which case there is no path to build and the request must be refused.
+    std::string openai_to_bedrock_request(std::string_view openai_body,
+                                          std::string& model_out);
     // Anthropic Messages response body  ->  OpenAI chat-completion response body.
     std::string anthropic_to_openai_response(std::string_view anthropic_body);
 
