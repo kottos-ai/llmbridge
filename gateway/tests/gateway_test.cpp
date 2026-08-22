@@ -199,8 +199,15 @@ namespace
             _last_request.clear();
         }
 
+        // ARMED ONLY WHILE THE LOOP BORROWS SOMETHING THE TEST OWNS; see
+        // ProxyIT::start(). Not a blanket "join before you read": 53 of the 60 read
+        // sites in this file read while the loop runs, the read itself is under _mu,
+        // and a test that lends the loop nothing has nothing that can dangle.
+        void require_join_before_read(bool b) { _needs_join = b; }
+
         std::string last_request()
         {
+            check_joined("last_request");
             std::lock_guard<std::mutex> lk(_mu);
             return _last_request;
         }
@@ -208,6 +215,7 @@ namespace
         // assert a credential appeared in NO request, not merely the most recent.
         std::string all_requests()
         {
+            check_joined("all_requests");
             std::lock_guard<std::mutex> lk(_mu);
             return _all_requests;
         }
@@ -362,6 +370,20 @@ namespace
         std::vector<std::thread> _conns;
         std::mutex _mu;
         std::vector<int> _client_fds;
+
+        // Written and read on the test thread only, so a plain bool is enough.
+        bool _needs_join = false;
+
+        void check_joined(const char* what) const
+        {
+            if (!_needs_join) return;
+            ADD_FAILURE() << what << "() was read while the gateway loop was still "
+                             "running, and this test lends the loop a policy or a sink "
+                             "that its own locals own. Call shutdown() first: the loop "
+                             "is joined there, and TearDown runs it too late, AFTER the "
+                             "locals are destroyed. Non-fatal so the assertions below "
+                             "still report, but fix the ordering, not this line.";
+        }
     };
 
     // Blocking loopback client with response framing.
@@ -516,6 +538,14 @@ namespace
             if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
             if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
             _proxy_port = _gw->bound_port();
+            // ARM THE READ GUARD only when the loop borrows something this test owns.
+            // A policy or a sink is a raw pointer to a TestBody local, and TearDown
+            // joins the loop AFTER those locals are destroyed, so a test that never
+            // calls shutdown() itself frees them out from under a running thread.
+            // That is a use-after-free the ordinary build cannot see; it took the
+            // TSan job to catch it, and only on io_uring, where the deferred free
+            // widens the window. The guard makes it fail everywhere, immediately.
+            _backend.require_join_before_read(_policy != nullptr || _sink != nullptr);
             _gt = std::thread([this] { _gw->run(); });
         }
         void shutdown()
@@ -524,6 +554,7 @@ namespace
             _shut = true;
             if (_gw) _gw->request_stop();
             if (_gt.joinable()) _gt.join();
+            _backend.require_join_before_read(false); // joined: reads are ordered now
             _backend.stop();
         }
         void TearDown() override { shutdown(); }
@@ -5516,6 +5547,11 @@ TEST_P(ProxyModelRewrite, ByteForwardSplicesTheModelAndKeepsTheLengthHonest)
                        "Content-Type: application/json\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
     (void)c.recv_response();
+    // JOIN BEFORE READING, and before this test's locals die. The loop thread owns
+    // everything the request touched, including the policy's model string, and
+    // nothing else orders its last read against the destructors below.
+    c.close();
+    shutdown();
     const std::string up = _backend.last_request();
 
     const std::string sent = body_of(up);
@@ -5549,6 +5585,8 @@ TEST_P(ProxyModelRewrite, ATranslatedVenueGetsTheRewrittenModelToo)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
     (void)c.recv_response();
+    c.close();
+    shutdown();
     const std::string sent = body_of(_backend.last_request());
     EXPECT_NE(sent.find(R"("model":"claude-haiku-4-5")"), std::string::npos) << sent;
 }
@@ -5565,6 +5603,8 @@ TEST_P(ProxyModelRewrite, NoPolicyMeansNoRewrite)
                        "Content-Type: application/json\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
     (void)c.recv_response();
+    c.close();
+    shutdown();
     EXPECT_EQ(body_of(_backend.last_request()), body);
 }
 
@@ -5583,6 +5623,8 @@ TEST_P(ProxyModelRewrite, ARewriteThatCannotBeDoneRefusesInsteadOfSendingTheOldM
                        "Content-Type: application/json\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
     EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    c.close();
+    shutdown();
     EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
 }
 
