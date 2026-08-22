@@ -5357,3 +5357,118 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyAzure,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── The forwarded length is ours, not the client's ────────────────────────────
+class ProxyLength : public ProxyIT,
+                    public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    /// A byte-forwarded request with a hand-built header block, so the test controls
+    /// exactly what Content-Length the client claims.
+    static std::string raw(const std::string& body, const std::string& extra = "")
+    {
+        return "POST /v1/chat/completions HTTP/1.1\r\nHost: client-idea\r\n" + extra +
+               "Content-Type: application/json\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+};
+
+TEST_P(ProxyLength, ExactlyOneContentLengthReachesTheVenue)
+{
+    // Two would be a framing ambiguity the upstream resolves however it likes, which
+    // on a pooled connection is a desync affecting the NEXT client.
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"gpt-4o","messages":[]})";
+    ASSERT_TRUE(c.send(raw(body)));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    size_t n = 0;
+    for (size_t i = up.find("\r\nContent-Length:"); i != std::string::npos;
+         i = up.find("\r\nContent-Length:", i + 1))
+        ++n;
+    EXPECT_EQ(n, 1u) << up;
+    EXPECT_NE(up.find("\r\nContent-Length: " + std::to_string(body.size()) + "\r\n"),
+              std::string::npos)
+        << up;
+}
+
+TEST_P(ProxyLength, TheLengthIsDerivedFromTheBodyAndNotCopied)
+{
+    // The point of the change. Parse what we sent and check the stated length equals
+    // the bytes that followed the blank line, which is the invariant a body edit must
+    // never break.
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"gpt-4o","messages":[{"role":"user","content":"x"}]})";
+    ASSERT_TRUE(c.send(raw(body)));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(up, m),
+              llmbridge::net::http::FrameStatus::Complete)
+        << up;
+    EXPECT_EQ(m.body_len, up.size() - m.header_len);
+    EXPECT_EQ(body_of(up), body);
+}
+
+TEST_P(ProxyLength, AStrippedHeaderDoesNotShiftTheLength)
+{
+    // Stripping shortens the HEADERS, never the body, so the length must not move.
+    _strip_headers = {"x-secret"};
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"m","messages":[]})";
+    ASSERT_TRUE(c.send(raw(body, "x-secret: shhhh\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    EXPECT_EQ(up.find("x-secret"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nContent-Length: " + std::to_string(body.size()) + "\r\n"),
+              std::string::npos)
+        << up;
+    EXPECT_EQ(body_of(up), body);
+}
+
+TEST_P(ProxyLength, ADuplicateLengthIsCollapsedAndNotEchoed)
+{
+    // parse_request accepts an IDENTICAL repeat and collapses it (a conflicting one is
+    // refused as a smuggling vector). Copying the client's header block forwarded both
+    // lines to the venue; deriving emits exactly one. This is the case that tells the
+    // two apart, since for a body we do not edit they otherwise agree.
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"m","messages":[]})";
+    const std::string len = std::to_string(body.size());
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Length: " + len + "\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Length: " + len + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    ASSERT_FALSE(up.empty());
+
+    size_t n = 0;
+    for (size_t i = up.find("\r\nContent-Length:"); i != std::string::npos;
+         i = up.find("\r\nContent-Length:", i + 1))
+        ++n;
+    EXPECT_EQ(n, 1u) << "a duplicate length was echoed to the venue:\n" << up;
+    EXPECT_EQ(body_of(up), body);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyLength,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });

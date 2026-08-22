@@ -273,6 +273,17 @@ namespace llmbridge
 
         /// Empty return = REFUSE this request, never forward it. Today that is a
         /// request line prefix_target could not read.
+        /// Rebuild a byte-forwarded request: strip what the venue must not see, name
+        /// the venue in Host, prefix the base path, and STATE THE BODY LENGTH
+        /// OURSELVES.
+        ///
+        /// The client's `Content-Length` is dropped and re-emitted from the bytes we
+        /// actually forward. Today those are the same number, so this changes nothing
+        /// observable; it is a precondition, not a fix. The moment anything edits a
+        /// forwarded body, a copied length becomes a lie.
+        ///
+        /// Unambiguous because parse_request refuses Transfer-Encoding outright, so
+        /// every request here is either Content-Length framed or has no body at all.
         std::string request_without(std::string_view msg, size_t header_len,
                                     const std::vector<std::string>& strip,
                                     std::string_view host_hdr, std::string_view base_path)
@@ -285,6 +296,7 @@ namespace llmbridge
             // more again.
             std::string out;
             out.reserve(msg.size());
+            bool saw_cl = false;
             size_t start = 0, run = 0;
             while (start < header_len)
             {
@@ -299,7 +311,9 @@ namespace llmbridge
                     (line[0] == 'H' || line[0] == 'h') && (line[1] == 'o' || line[1] == 'O') &&
                     (line[2] == 's' || line[2] == 'S') && (line[3] == 't' || line[3] == 'T') &&
                     line[4] == ':';
-                if (is_host || header_stripped(line, strip))
+                const bool is_cl = net::http::detail::line_is(line, "content-length:");
+                if (is_cl) saw_cl = true;
+                if (is_host || is_cl || header_stripped(line, strip))
                 {
                     out.append(msg.substr(run, start - run));
                     run = eol + 2;
@@ -308,6 +322,17 @@ namespace llmbridge
             }
             // The tail carries the remaining headers, the blank line and the body.
             out.append(msg.substr(run));
+            // Ours, from the body we are actually sending. Emitted when the client
+            // framed a body or there is one to frame; a bodyless request that carried
+            // no length keeps carrying none.
+            const size_t body_len = msg.size() > header_len ? msg.size() - header_len : 0;
+            if (saw_cl || body_len)
+            {
+                const size_t after_start_line = out.find("\r\n");
+                if (after_start_line == std::string::npos) return {};
+                out.insert(after_start_line + 2,
+                           "Content-Length: " + std::to_string(body_len) + "\r\n");
+            }
             if (!host_hdr.empty())
             {
                 // After the request line, which is where a Host belongs and where a
