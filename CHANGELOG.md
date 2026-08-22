@@ -8,6 +8,37 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.26.0]. 2026-08-22
+
+A policy may name the model, not only the venue. MINOR: one new field on `Decision`,
+and a stock build (no policy) puts the client's bytes on the wire unchanged.
+
+### Added
+
+- **`Decision::model`.** The same product is named differently at every venue:
+  `claude-haiku-4-5` at Anthropic, `us.anthropic.claude-haiku-4-5-20251001-v1:0` at
+  Bedrock.
+
+  It sits on the `Decision` and **not on the upstream table**, which was the first
+  design and was wrong: a venue sells many models, so a per-venue model would have
+  forced one venue entry per model and made the table the thing that routes.
+
+  Lifetime is the caller's: the view must stay valid until `decide` returns and the
+  request is framed, which happens in that call stack.
+
+- **`provider::rewrite_model`**, which **splices** the new value over the old in the
+  client's own bytes instead of re-serialising the request. Everything outside the 
+  model string survives byte for byte.
+
+  The rewrite happens **before** translation, so one point serves every dialect: a
+  translated venue emits the model the policy chose, and a byte-forwarded one carries
+  it through untouched.
+
+  This is what 0.25.0 was a precondition for. The spliced body is a different length
+  from the client's, and the `Content-Length` on the wire now describes the bytes
+  actually sent. Tested as such, on both backends: the venue receives the new model,
+  the rest of the body is unchanged, and the framing matches what was written.
+
 ## [0.25.0]. 2026-08-22
 
 `Content-Length` on a byte-forwarded request is stated by the gateway, from the bytes

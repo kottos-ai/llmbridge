@@ -35,6 +35,22 @@ namespace llmbridge::provider
 {
     // ── Anthropic Messages ──────────────────────────────────────────────────
     // OpenAI chat-completion request body  ->  Anthropic Messages request body.
+    /// Replace the top-level `"model"` value in an OpenAI request body, leaving every
+    /// other byte alone. Empty return = REFUSE, never a partial edit.
+    ///
+    /// A SPLICE, not a re-serialisation. The body is forwarded to a venue that already
+    /// speaks this dialect, so re-emitting it from a parse would silently drop any
+    /// field this parser does not model, and providers add fields faster than we
+    /// adopt them. Only the model's value span moves.
+    ///
+    /// The TOP-LEVEL key only. A message whose content happens to contain `"model"` is
+    /// text, and rewriting inside it would corrupt a prompt.
+    ///
+    /// Refuses a replacement carrying a quote, a backslash or a control byte: those
+    /// would need escaping, a model id never contains them, and guessing at the
+    /// escaping of a string that lands in a request body is how an injection starts.
+    std::string rewrite_model(std::string_view openai_body, std::string_view model);
+
     std::string openai_to_anthropic_request(std::string_view openai_body);
 
     /// The same Messages body as Bedrock wants it, and the model id it names.

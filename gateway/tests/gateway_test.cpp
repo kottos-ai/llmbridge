@@ -5472,3 +5472,123 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyLength,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── Model rewriting: the policy decides which model, as it decides which venue ─
+//
+// A venue sells many models, so this cannot live on the upstream table. Which model
+// and which venue are one decision about one request, so they travel together on the
+// Decision. A stock build has no policy, asks for no rewrite, and behaves as before.
+namespace
+{
+    class ModelPolicy final : public llmbridge::Policy
+    {
+      public:
+        explicit ModelPolicy(std::string model) : _model(std::move(model)) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            llmbridge::Decision d;
+            d.allow = true;
+            d.model = _model;   // a view into storage that outlives the call
+            return d;
+        }
+
+      private:
+        std::string _model;
+    };
+} // namespace
+
+class ProxyModelRewrite : public ProxyIT,
+                          public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyModelRewrite, ByteForwardSplicesTheModelAndKeepsTheLengthHonest)
+{
+    ModelPolicy pol("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+    _policy = &pol;
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    const std::string sent = body_of(up);
+    EXPECT_NE(sent.find(R"("model":"us.anthropic.claude-haiku-4-5-20251001-v1:0")"),
+              std::string::npos)
+        << sent;
+    EXPECT_EQ(sent.find("gpt-4o"), std::string::npos) << sent;
+    // Everything else the client sent survives the splice.
+    EXPECT_NE(sent.find(R"("seed":7)"), std::string::npos) << sent;
+
+    // THE POINT OF DOING CONTENT-LENGTH FIRST. The body grew; a copied length would
+    // now be a lie, and on a pooled upstream that is the next client's problem.
+    EXPECT_GT(sent.size(), body.size());
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(up, m),
+              llmbridge::net::http::FrameStatus::Complete)
+        << up;
+    EXPECT_EQ(m.body_len, sent.size());
+    EXPECT_EQ(m.body_len, up.size() - m.header_len);
+}
+
+TEST_P(ProxyModelRewrite, ATranslatedVenueGetsTheRewrittenModelToo)
+{
+    // One rewrite point, before translation, so the Anthropic translator emits the
+    // model the policy chose, not the one the client sent.
+    ModelPolicy pol("claude-haiku-4-5");
+    _policy = &pol;
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    const std::string sent = body_of(_backend.last_request());
+    EXPECT_NE(sent.find(R"("model":"claude-haiku-4-5")"), std::string::npos) << sent;
+}
+
+TEST_P(ProxyModelRewrite, NoPolicyMeansNoRewrite)
+{
+    // The default. A stock build must put the client's bytes on the wire unchanged.
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"gpt-4o","messages":[]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    EXPECT_EQ(body_of(_backend.last_request()), body);
+}
+
+TEST_P(ProxyModelRewrite, ARewriteThatCannotBeDoneRefusesInsteadOfSendingTheOldModel)
+{
+    // Sending the client's model to a venue that does not serve it is a confusing
+    // 404 from the provider; refusing here says what happened.
+    ModelPolicy pol("bad\"model");
+    _policy = &pol;
+    _backend.set_response(http_ok("{}"));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"gpt-4o","messages":[]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyModelRewrite,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });

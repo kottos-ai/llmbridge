@@ -321,6 +321,9 @@ namespace llmbridge
         bool read_paused = false;
         bool wants_usage = false;    // client set stream_options.include_usage
         /// The Anthropic->OpenAI SSE TRANSLATOR, null when the stream needs none.
+        /// What the policy asked this request's `model` to become, empty for none.
+        std::string_view model_override{};
+
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a
         /// translated stream, which gets its counts from the translator, and empty

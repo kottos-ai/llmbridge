@@ -42,6 +42,18 @@ namespace llmbridge
         /// Ignored when `allow` is false: a refused request reaches no venue.
         int upstream_index = -1;
 
+        /// Rewrite the request's `model` to this before sending it. Empty leaves the
+        /// client's untouched, which is what a stock build with no policy always does.
+        ///
+        /// The same product is named differently at each venue: `gpt-4o` at OpenAI, a
+        /// deployment at Azure, `us.anthropic.claude-haiku-4-5-20251001-v1:0` at
+        /// Bedrock. Without this the caller must know which venue it will land on,
+        /// which defeats routing.
+        ///
+        /// Must stay valid until the gateway returns from framing this request; it is
+        /// copied into the outgoing bytes there and never retained.
+        std::string_view model{};
+
         /// Logged, never sent to the client. Must outlive the call, and must not carry
         /// credential material.
         const char* reason = "policy denied";
