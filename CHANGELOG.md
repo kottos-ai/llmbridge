@@ -42,9 +42,25 @@ provider produces it, and carries token counts it did not before.
   set only where a translator existed, which was harmless while that path could not
   stream.
 
+### Changed
+
+- **`Connection::sse` is now `sse_xlate`.** SSE is a transport both dialects speak, so
+  "the SSE object" was the wrong name for an Anthropic-to-OpenAI translator, and it
+  became actively misleading once byte-forwarded streams existed: a null `sse` reads
+  as "not SSE" for a stream that is every bit as much SSE and simply needs no
+  translating. Null now reads as what it means, "forward the provider's events
+  untouched".
+- **One window where there were two.** The bytes retained from a byte-forwarded
+  stream and the bytes searched for a usage block were separate constants, 1024 and
+  512, which had to relate and did not: half the retained buffer was dead and the
+  relationship was invisible. Both are now `kUsageWindow`, sized by what must fit and
+  pinned by a test using a full-size provider usage chunk. This did NOT correct a
+  miscount: measured against a realistic OpenAI usage chunk, the counts sit 267 bytes
+  from the end and the old window reached them.
+
 ### Note
 
-`Connection::sse` is a single `AnthropicToOpenAiSse`, not a category. A third dialect
+`Connection::sse_xlate` is a single `AnthropicToOpenAiSse`, not a category. A third dialect
 that learns to stream owns its own token accounting; `stream_tokens()` says so at the
 one place that decision lands, because falling through to the tail scan would search a
 non-OpenAI stream for an OpenAI usage block and quietly report nothing.

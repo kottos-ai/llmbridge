@@ -4985,6 +4985,45 @@ TEST_P(ProxyForwardStream, WithoutIncludeUsageNothingIsInventedFromNothing)
     EXPECT_EQ(recs[0].r.cached_tokens, -1);
 }
 
+TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
+{
+    // The retained tail is sized by what must FIT. A real OpenAI usage chunk carries
+    // system_fingerprint, service_tier and both *_details blocks, and is followed by
+    // data: [DONE], which puts the counts several hundred bytes from the end. This
+    // pins that sizing against a realistic chunk instead of against arithmetic in a
+    // comment.
+    const std::string events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+        "data: {\"id\":\"chatcmpl-B7xQ2kZvLmNpQrStUvWxYzAbCdEf\","
+        "\"object\":\"chat.completion.chunk\",\"created\":1755800000,"
+        "\"model\":\"gpt-4o-2024-08-06\",\"service_tier\":\"default\","
+        "\"system_fingerprint\":\"fp_a1b2c3d4e5\",\"choices\":[],"
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16,"
+        "\"prompt_tokens_details\":{\"cached_tokens\":7,\"audio_tokens\":0},"
+        "\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0,"
+        "\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}}}\n\n"
+        "data: [DONE]\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(events, 4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, 11);
+    EXPECT_EQ(recs[0].r.tokens_out, 5);
+    EXPECT_EQ(recs[0].r.cached_tokens, 7);
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
