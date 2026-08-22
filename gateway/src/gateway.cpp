@@ -540,15 +540,24 @@ namespace llmbridge
         // number we did not measure.
         struct BodyUsage { long long in = -1, out = -1, cached = -1; };
 
-        BodyUsage scan_usage(std::string_view body) noexcept
+        /// Bytes of a response worth searching for a usage block.
+        ///
+        /// Sized by what must FIT, not by feel. A full OpenAI usage chunk carries
+        /// prompt/completion/total plus `prompt_tokens_details` and
+        /// `completion_tokens_details`, and on a stream it is followed by
+        /// `data: [DONE]`, so the block can sit ~600 bytes from the end. 2 KiB clears
+        /// that with room for fields providers keep adding, and is still a bounded
+        /// tail, never a full-body scan.
+        constexpr size_t kUsageWindow = 2048;
+
+        /// `window` 0 = search all of `body`, for a caller that already bounded it.
+        /// Passing a second, smaller window there is how the retained bytes and the
+        /// searched bytes drift apart and the counts come back -1.
+        BodyUsage scan_usage(std::string_view body, size_t window = kUsageWindow) noexcept
         {
             BodyUsage u;
-            // 512, not 256: cached_tokens sits inside prompt_tokens_details, further
-            // from the end than prompt_tokens, and a completion_tokens_details block
-            // can follow it. Still a bounded tail, never a full-body scan.
-            constexpr size_t kTail = 512;
             const std::string_view tail =
-                body.size() > kTail ? body.substr(body.size() - kTail) : body;
+                (window && body.size() > window) ? body.substr(body.size() - window) : body;
             const auto num_after = [&tail](std::string_view key) -> long long {
                 const size_t k = tail.find(key);
                 if (k == std::string_view::npos) return -1;
@@ -719,6 +728,49 @@ namespace llmbridge
             }
         }
 
+        /// Keep the tail of a byte-forwarded stream, so the final usage chunk can be
+        /// read at the end.
+        ///
+        /// The ANTHROPIC stream translator counts tokens as it parses, so that path
+        /// needs none of this. A byte-forwarded stream is never parsed, so without the
+        /// tail a streamed passthrough request records no tokens at all, which is the
+        /// shape most of a voice workload takes.
+        ///
+        /// Not "translated streams" as a category: `Connection::sse_xlate` is typed
+        /// `AnthropicToOpenAiSse` and is the only SSE translator that exists. Gemini
+        /// and Cohere have none and do not stream here at all. Whoever adds one owns
+        /// its token accounting; stream_tokens() below is where that decision lands.
+        ///
+        /// Bounded and only kept when the client asked for usage: with no
+        /// `stream_options.include_usage` the provider sends no usage chunk, so the
+        /// copy would buy nothing.
+        void stream_note_usage(Connection* client, std::string_view bytes) noexcept
+        {
+            if (!client->wants_usage) return;
+            client->stream_tail.append(bytes);
+            if (client->stream_tail.size() > kUsageWindow)
+                client->stream_tail.erase(0, client->stream_tail.size() - kUsageWindow);
+        }
+
+        /// A finished stream's token counts, from whichever of the two paths carried
+        /// it: the Anthropic translator, or the tail of a byte-forwarded stream.
+        ///
+        /// One function because the sink and the debug log both want them, and a
+        /// number that appears in one but not the other is a bug this file has been
+        /// bitten by before. -1 means not reported, never zero.
+        ///
+        /// TWO PATHS BECAUSE THERE ARE TWO, not because "translated" is a category. A
+        /// third dialect that learns to stream must add its own branch here; falling
+        /// through to the tail scan would search a non-OpenAI stream for an OpenAI
+        /// usage block and quietly report nothing.
+        BodyUsage stream_tokens(const Connection* c) noexcept
+        {
+            if (c->sse_xlate)
+                return {c->sse_xlate->input_tokens(), c->sse_xlate->output_tokens(),
+                        static_cast<long long>(c->sse_xlate->cached_tokens())};
+            return scan_usage(c->stream_tail, 0); // already bounded to kUsageWindow
+        }
+
         // Outcome of one streaming translate step (shared by both backends).
         enum class StreamStep
         {
@@ -748,21 +800,49 @@ namespace llmbridge
                 in.clear();
             }
 
+            // NO TRANSLATOR = BYTE-FORWARD. An OpenAI-compatible venue already speaks
+            // the client's dialect, so the bytes pass through untouched and the
+            // provider's own [DONE] terminates the stream. Until 2026-08-21 this mode
+            // never reached the pump at all: streaming was detected for the Anthropic
+            // path only, so a passthrough stream was framed as a whole body and
+            // delivered at the end.
+            if (!client->sse_xlate)
+            {
+                if (!sse_in.empty())
+                {
+                    stream_note_usage(client, sse_in);
+                    // TTFT on the first payload carrying content, so a role-only
+                    // opening chunk does not claim the token arrived early. The
+                    // quote before `content` keeps `reasoning_content` out of it.
+                    if (client->ts_first_token == 0 &&
+                        sse_in.find("\"content\":\"") != std::string::npos)
+                        client->ts_first_token = now_ns();
+                    out.append(sse_in);
+                }
+                if (((client->stream_chunked && client->chunkdec.done()) || at_eof) &&
+                    !client->stream_ended)
+                {
+                    client->stream_ended = true;
+                    return StreamStep::Ended;
+                }
+                return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
+            }
+
             // Honour the translator's own failure (its DoS caps are sticky): a
             // hostile/broken upstream must tear the stream down, not silently
             // produce nothing while we keep reading it forever.
-            if (!sse_in.empty() && !client->sse->feed(sse_in, out)) return StreamStep::Failed;
+            if (!sse_in.empty() && !client->sse_xlate->feed(sse_in, out)) return StreamStep::Failed;
 
             // TTFT: the first CONTENT token, stamped here because this is the one place
             // both backends translate, and it runs right after the read that carried
             // the bytes.
-            if (client->ts_first_token == 0 && client->sse->content_started())
+            if (client->ts_first_token == 0 && client->sse_xlate->content_started())
                 client->ts_first_token = now_ns();
 
             const bool ended = (client->stream_chunked && client->chunkdec.done()) || at_eof;
             if (ended && !client->stream_ended)
             {
-                if (!client->sse->finish(out)) return StreamStep::Failed;
+                if (!client->sse_xlate->finish(out)) return StreamStep::Failed;
                 client->stream_ended = true;
                 return StreamStep::Ended;
             }
@@ -1072,8 +1152,8 @@ namespace llmbridge
         // "did my stream complete?" afterwards. The abort paths bypass
         // finalize_stream, so its completion line never runs for these.
         LB_WARN(ReqId{client->req_seq}, " stream TRUNCATED (no [DONE] emitted)",
-                " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
-                " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                " tokens_in=", stream_tokens(client).in,
+                " tokens_out=", stream_tokens(client).out,
                 " on ", *client);
         client->stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
@@ -1762,11 +1842,21 @@ namespace llmbridge
         r.truncated = streamed && c->close_after_resp;
         r.translated = upstream_of(c).translate != TranslateMode::None;
         r.backend = _active_backend;
-        if (streamed && c->sse)
+        if (streamed && c->sse_xlate)
         {
-            r.tokens_in = c->sse->input_tokens();
-            r.tokens_out = c->sse->output_tokens();
-            r.cached_tokens = static_cast<int32_t>(c->sse->cached_tokens());
+            r.tokens_in = c->sse_xlate->input_tokens();
+            r.tokens_out = c->sse_xlate->output_tokens();
+            r.cached_tokens = static_cast<int32_t>(c->sse_xlate->cached_tokens());
+        }
+        else if (streamed)
+        {
+            // Byte-forwarded: nothing parsed the events, so the counts come from the
+            // usage chunk kept in the tail. All three stay -1 when the client did not
+            // ask for usage, which is "not reported" and not "zero".
+            const BodyUsage u = stream_tokens(c);
+            r.tokens_in = static_cast<int32_t>(u.in);
+            r.tokens_out = static_cast<int32_t>(u.out);
+            r.cached_tokens = static_cast<int32_t>(u.cached);
         }
         else if (!streamed)
         {
@@ -1882,6 +1972,11 @@ namespace llmbridge
         }
         else
         {
+            // Byte-forward needs this too: it is what decides whether a streamed
+            // response keeps its tail for the usage chunk. Set on the translated path
+            // only until 2026-08-21, when byte-forward could not stream at all.
+            c->wants_usage = provider::openai_wants_stream_usage(
+                std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
@@ -2044,7 +2139,12 @@ namespace llmbridge
         // First response bytes: for the Anthropic translate path, peek the head to
         // decide whole-body vs streaming (text/event-stream). Other modes and
         // non-streaming responses fall through to the whole-body path unchanged.
-        if (upstream_of(u).translate == TranslateMode::Anthropic)
+        // ANTHROPIC (translated) OR NONE (byte-forward). Gemini and Cohere are
+        // non-streaming here, so a stream from one of those would be forwarded in a
+        // dialect the client cannot read; they keep falling through to the whole-body
+        // path until their translators exist.
+        if (upstream_of(u).translate == TranslateMode::Anthropic ||
+            upstream_of(u).translate == TranslateMode::None)
         {
             net::http::ResponseHead h;
             const auto hs = net::http::parse_response_head(u->rbuf, h);
@@ -2236,7 +2336,10 @@ namespace llmbridge
         client->streaming = true;
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
-        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
+        // Only a dialect that needs translating gets a translator. Its absence is
+        // what stream_step reads as "byte-forward", so this is the whole switch.
+        if (upstream_of(u).translate == TranslateMode::Anthropic)
+            client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
             // t4 = provider's first response byte, stamped by the caller.
@@ -2337,8 +2440,8 @@ namespace llmbridge
         // client cannot distinguish from a clean finish by itself.
         LB_DEBUG(ReqId{client->req_seq}, " stream ended ",
                  client->close_after_resp ? "TRUNCATED" : "clean",
-                 " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
-                 " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                 " tokens_in=", stream_tokens(client).in,
+                 " tokens_out=", stream_tokens(client).out,
                  " on ", *client);
         // Only a stream that terminated cleanly counts as a served request; an
         // aborted one (close_after_resp) was already counted in _stats.errors.
@@ -3082,7 +3185,9 @@ namespace llmbridge
             // First response bytes: peek the head (parse_response_head tolerates
             // chunked, unlike parse_request()); a text/event-stream response enters the
             // streaming pump, everything else the whole-body path below.
-            if (upstream_of(c).translate == TranslateMode::Anthropic)
+            // See the epoll mirror: translated or byte-forward, never Gemini/Cohere.
+            if (upstream_of(c).translate == TranslateMode::Anthropic ||
+                upstream_of(c).translate == TranslateMode::None)
             {
                 net::http::ResponseHead h;
                 const auto hs = net::http::parse_response_head(c->rbuf, h);
@@ -3182,6 +3287,11 @@ namespace llmbridge
         }
         else
         {
+            // Byte-forward needs this too: it is what decides whether a streamed
+            // response keeps its tail for the usage chunk. Set on the translated path
+            // only until 2026-08-21, when byte-forward could not stream at all.
+            c->wants_usage = provider::openai_wants_stream_usage(
+                std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
@@ -3471,7 +3581,10 @@ namespace llmbridge
         client->streaming = true;
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
-        client->sse = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
+        // Only a dialect that needs translating gets a translator. Its absence is
+        // what stream_step reads as "byte-forward", so this is the whole switch.
+        if (upstream_of(u).translate == TranslateMode::Anthropic)
+            client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
             // t4 = provider's first response byte, stamped by the caller.
@@ -3560,8 +3673,8 @@ namespace llmbridge
         }
         LB_DEBUG(ReqId{client->req_seq}, " stream ended ",
                  client->close_after_resp ? "TRUNCATED" : "clean",
-                 " tokens_in=", client->sse ? client->sse->input_tokens() : -1,
-                 " tokens_out=", client->sse ? client->sse->output_tokens() : -1,
+                 " tokens_in=", stream_tokens(client).in,
+                 " tokens_out=", stream_tokens(client).out,
                  " on ", *client);
         // Only a cleanly-terminated stream counts as served (see the epoll mirror).
         if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A

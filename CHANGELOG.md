@@ -8,6 +8,64 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.22.0]. 2026-08-21
+
+Byte-forwarded responses stream. MINOR because the default deployment shape behaves
+differently: an OpenAI-compatible venue's SSE response now reaches the client as the
+provider produces it, and carries token counts it did not before.
+
+### Fixed
+
+- **A streamed response from a venue needing no translation was buffered whole.** The
+  streaming pump was entered for the Anthropic path only, so `--translate none` framed
+  a `text/event-stream` response as a whole body and delivered it once complete.
+
+  A stream with no translator now forwards its bytes untouched and lets the provider's
+  own `[DONE]` end it. Both backends, through the shared `stream_step`, so the fix
+  cannot land on one loop.
+
+  **Gemini and Cohere stay on the whole-body path deliberately.** They have no SSE
+  translator, so forwarding their events would hand an OpenAI client a dialect it
+  cannot read. The gate names the two modes that may stream; it does not exclude the
+  two that may not, so a dialect added later is opted in by someone who thought about
+  it.
+
+### Added
+
+- **Token counts on a byte-forwarded stream**, including cache-read tokens. Nothing
+  parses those events, so the counts come from a bounded tail of the stream scanned
+  for the final usage chunk, kept only when the client sent
+  `stream_options.include_usage`. Without it a streamed passthrough request reported
+  no tokens at all, which is most of a voice or agent workload. All three stay -1 when
+  no usage chunk arrives: "not reported", never zero.
+- **`Connection::wants_usage` is set on the byte-forward request path too.** It was
+  set only where a translator existed, which was harmless while that path could not
+  stream.
+
+### Changed
+
+- **`Connection::sse` is now `sse_xlate`.** SSE is a transport both dialects speak, so
+  "the SSE object" was the wrong name for an Anthropic-to-OpenAI translator, and it
+  became actively misleading once byte-forwarded streams existed: a null `sse` reads
+  as "not SSE" for a stream that is every bit as much SSE and simply needs no
+  translating. Null now reads as what it means, "forward the provider's events
+  untouched".
+- **One window where there were two.** The bytes retained from a byte-forwarded
+  stream and the bytes searched for a usage block were separate constants, 1024 and
+  512, which had to relate and did not: half the retained buffer was dead and the
+  relationship was invisible. Both are now `kUsageWindow`, sized by what must fit and
+  pinned by a test using a full-size provider usage chunk. This did NOT correct a
+  miscount: measured against a realistic OpenAI usage chunk, the counts sit 267 bytes
+  from the end and the old window reached them.
+
+### Note
+
+`Connection::sse_xlate` is a single `AnthropicToOpenAiSse`, not a category. A third dialect
+that learns to stream owns its own token accounting; `stream_tokens()` says so at the
+one place that decision lands, because falling through to the tail scan would search a
+non-OpenAI stream for an OpenAI usage block and quietly report nothing.
+
+
 ## [0.21.0]. 2026-08-21
 
 Time to first TOKEN, distinct from time to first byte. MINOR because

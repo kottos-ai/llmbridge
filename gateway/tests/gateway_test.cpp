@@ -449,6 +449,19 @@ namespace
             }
         }
 
+        /// One read. Whatever the gateway has produced SO FAR, which is the only way
+        /// to tell a stream from a buffered response: recv_all cannot distinguish
+        /// "arrived in pieces" from "arrived at the end".
+        std::string recv_some(int timeout_ms = 2000)
+        {
+            if (!_buf.empty()) { std::string out = std::move(_buf); _buf.clear(); return out; }
+            char tmp[8192];
+            pollfd p{_fd, POLLIN, 0};
+            if (::poll(&p, 1, timeout_ms) <= 0) return {};
+            const ssize_t n = ::read(_fd, tmp, sizeof(tmp));
+            return n > 0 ? std::string(tmp, static_cast<size_t>(n)) : std::string{};
+        }
+
         // Returns true if the peer closed within the timeout (read -> 0).
         bool wait_closed(int timeout_ms = 2000)
         {
@@ -4838,3 +4851,182 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyRoute,
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyPolicy,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring));
+
+// ── Byte-forward streaming: an OpenAI-compatible venue needs no translator ─────
+//
+// Until 2026-08-21 the streaming pump was entered for the Anthropic path ONLY, so a
+// passthrough SSE response was framed as a whole body and handed over at the end.
+// Measured against an upstream finishing at 1000 ms, the client's first byte arrived
+// at 1003 ms instead of 200 ms. That is the default deployment shape and the exact
+// workload the latency claim is sold against, so these tests pin both halves: the
+// bytes arrive as they are produced, and they arrive unaltered.
+namespace
+{
+    /// An OpenAI SSE stream: two content chunks, a usage chunk, then [DONE].
+    std::string openai_sse_events()
+    {
+        return "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+               "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+               "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n"
+               "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,"
+               "\"completion_tokens\":5,\"total_tokens\":16,"
+               "\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n"
+               "data: [DONE]\n\n";
+    }
+
+    std::string openai_sse_response(size_t chunk)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(openai_sse_events(), chunk);
+    }
+
+    std::string openai_stream_request_with_usage()
+    {
+        return make_request("{\"model\":\"gpt-4o\",\"stream\":true,"
+                            "\"stream_options\":{\"include_usage\":true},"
+                            "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    }
+} // namespace
+
+class ProxyForwardStream : public ProxyIT,
+                           public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
+{
+    // Byte-for-byte: a venue that already speaks the client's dialect must not have
+    // its stream rewritten, including its own terminal [DONE].
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    const std::string raw = c.recv_all();
+
+    const size_t hdr = raw.find("\r\n\r\n");
+    ASSERT_NE(hdr, std::string::npos) << raw;
+    EXPECT_NE(raw.find("Content-Type: text/event-stream"), std::string::npos) << raw;
+    EXPECT_EQ(raw.substr(hdr + 4), openai_sse_events())
+        << "the forwarded body is not the provider's bytes";
+}
+
+TEST_P(ProxyForwardStream, ItStreamsRatherThanBufferingToTheEnd)
+{
+    // The regression that started this, tested structurally so no clock decides
+    // whether it passes. The upstream trickles its response in 8-byte writes, so the body is still
+    // arriving long after its head has been framed. A streaming gateway answers the
+    // client the moment it sees that head; the whole-body path emits nothing until it
+    // has framed the entire response, so its first write would carry the [DONE] too.
+    _backend.set_trickle(8);
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+
+    const std::string first = c.recv_some();
+    EXPECT_NE(first.find("text/event-stream"), std::string::npos) << first;
+    EXPECT_EQ(first.find("[DONE]"), std::string::npos)
+        << "the whole stream arrived in one read, so it was buffered: " << first;
+    // And it does finish: a stream that starts early must still deliver everything.
+    const std::string rest = c.recv_all();
+    EXPECT_NE((first + rest).find("[DONE]"), std::string::npos);
+}
+
+TEST_P(ProxyForwardStream, TheSinkGetsTheProvidersTokenCountsIncludingCached)
+{
+    // The promise this exists to keep. Nothing parses a byte-forwarded stream, so
+    // without the tail scan a streamed passthrough request reports no tokens at all,
+    // and a cached-token figure is exactly what a design partner asked for.
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.streamed);
+    EXPECT_FALSE(r.translated);
+    EXPECT_EQ(r.tokens_in, 11);
+    EXPECT_EQ(r.tokens_out, 5);
+    EXPECT_EQ(r.cached_tokens, 7);
+    // TTFT is stamped on the first chunk carrying content, so the role-only opening
+    // chunk does not claim the token arrived early.
+    EXPECT_GT(r.ts_first_token, 0);
+    EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+}
+
+TEST_P(ProxyForwardStream, WithoutIncludeUsageNothingIsInventedFromNothing)
+{
+    // No usage chunk means no counts. -1 is "not reported"; zero would be a claim.
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, -1);
+    EXPECT_EQ(recs[0].r.cached_tokens, -1);
+}
+
+TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
+{
+    // The retained tail is sized by what must FIT. A real OpenAI usage chunk carries
+    // system_fingerprint, service_tier and both *_details blocks, and is followed by
+    // data: [DONE], which puts the counts several hundred bytes from the end. This
+    // pins that sizing against a realistic chunk instead of against arithmetic in a
+    // comment.
+    const std::string events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+        "data: {\"id\":\"chatcmpl-B7xQ2kZvLmNpQrStUvWxYzAbCdEf\","
+        "\"object\":\"chat.completion.chunk\",\"created\":1755800000,"
+        "\"model\":\"gpt-4o-2024-08-06\",\"service_tier\":\"default\","
+        "\"system_fingerprint\":\"fp_a1b2c3d4e5\",\"choices\":[],"
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16,"
+        "\"prompt_tokens_details\":{\"cached_tokens\":7,\"audio_tokens\":0},"
+        "\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0,"
+        "\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}}}\n\n"
+        "data: [DONE]\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(events, 4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, 11);
+    EXPECT_EQ(recs[0].r.tokens_out, 5);
+    EXPECT_EQ(recs[0].r.cached_tokens, 7);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
