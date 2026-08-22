@@ -286,7 +286,8 @@ namespace llmbridge
         /// every request here is either Content-Length framed or has no body at all.
         std::string request_without(std::string_view msg, size_t header_len,
                                     const std::vector<std::string>& strip,
-                                    std::string_view host_hdr, std::string_view base_path)
+                                    std::string_view host_hdr, std::string_view base_path,
+                                    std::string_view body_override = {})
         {
             // Copy in RUNS, not per line: a flush happens only where a stripped line
             // interrupts the kept ones, so one memcpy when nothing matches and two
@@ -320,12 +321,17 @@ namespace llmbridge
                 }
                 start = eol + 2;
             }
-            // The tail carries the remaining headers, the blank line and the body.
-            out.append(msg.substr(run));
+            // Headers and blank line, then the body: separately, so a replacement body
+            // can take the original's place and the length below describes what is
+            // actually sent.
+            out.append(msg.substr(run, header_len - run));
+            const std::string_view body =
+                body_override.empty() ? msg.substr(header_len) : body_override;
+            out.append(body);
             // Ours, from the body we are actually sending. Emitted when the client
             // framed a body or there is one to frame; a bodyless request that carried
             // no length keeps carrying none.
-            const size_t body_len = msg.size() > header_len ? msg.size() - header_len : 0;
+            const size_t body_len = body.size();
             if (saw_cl || body_len)
             {
                 const size_t after_start_line = out.find("\r\n");
@@ -619,8 +625,19 @@ namespace llmbridge
         bool build_translated_request(const Upstream& up, std::string_view body,
                                       std::string_view client_hdrs,
                                       const std::vector<std::string>& strip,
-                                      std::string& out, const char*& why)
+                                      std::string& out, const char*& why,
+                                      std::string_view model_override = {})
         {
+            // BEFORE translating, so one rewrite serves every dialect: the Anthropic
+            // and Bedrock translators both read the model out of the body, and Bedrock
+            // then puts it in the request path.
+            std::string rewritten;
+            if (!model_override.empty())
+            {
+                rewritten = provider::rewrite_model(body, model_override);
+                if (rewritten.empty()) { why = "translate"; return false; }
+                body = rewritten;
+            }
             std::string start_line_store;
             std::string_view start_line, target;
             const std::string tbody =
@@ -1990,6 +2007,8 @@ namespace llmbridge
                 LB_WARN(ReqId{c->req_seq}, " policy chose upstream ",
                         static_cast<int64_t>(d.upstream_index), " of ",
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
+            // Valid only through the forward below, which runs in this call stack.
+            c->model_override = d.model;
         }
         ep_forward(c);
     }
@@ -2172,7 +2191,7 @@ namespace llmbridge
             const char* why = "";
             // Either failure => 400, and NOTHING goes upstream.
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
-                                          upstream_bytes, why))
+                                          upstream_bytes, why, c->model_override))
             {
                 if (why[0] == 't') ep_error_respond(c, 400, translate_failure(body));
                 else ep_error_respond(c, 400, "malformed credential");
@@ -2188,9 +2207,21 @@ namespace llmbridge
                 std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
+            // Byte-forward rewrites the model by SPLICING the value, so every other
+            // byte the client sent survives; the derived Content-Length then describes
+            // the spliced body without anyone having to remember to update it.
+            std::string rewritten;
+            if (!c->model_override.empty())
+            {
+                rewritten = provider::rewrite_model(
+                    std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
+                    c->model_override);
+                if (rewritten.empty())
+                { ep_error_respond(c, 400, "cannot rewrite model"); return; }
+            }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,
-                                             up.base_path);
+                                             up.base_path, rewritten);
             // Refused, not repaired: a venue with a base path needs an origin-form
             // target to prefix, and nothing has been sent upstream at this point.
             if (upstream_bytes.empty())
@@ -3464,6 +3495,8 @@ namespace llmbridge
                 LB_WARN(ReqId{c->req_seq}, " policy chose upstream ",
                         static_cast<int64_t>(d.upstream_index), " of ",
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
+            // Valid only through the forward below, which runs in this call stack.
+            c->model_override = d.model;
         }
         ur_forward(c);
     }
@@ -3485,7 +3518,7 @@ namespace llmbridge
             // into a grep; folding both loops onto one builder removes the chance of
             // the next such divergence entirely.)
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
-                                          upstream_bytes, why))
+                                          upstream_bytes, why, c->model_override))
             {
                 if (why[0] == 't') ur_error_respond(c, 400, translate_failure(body));
                 else ur_error_respond(c, 400, "malformed credential");
@@ -3501,9 +3534,21 @@ namespace llmbridge
                 std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
+            // Byte-forward rewrites the model by SPLICING the value, so every other
+            // byte the client sent survives; the derived Content-Length then describes
+            // the spliced body without anyone having to remember to update it.
+            std::string rewritten;
+            if (!c->model_override.empty())
+            {
+                rewritten = provider::rewrite_model(
+                    std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
+                    c->model_override);
+                if (rewritten.empty())
+                { ur_error_respond(c, 400, "cannot rewrite model"); return; }
+            }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,
-                                             up.base_path);
+                                             up.base_path, rewritten);
             // Refused, not repaired: a venue with a base path needs an origin-form
             // target to prefix, and nothing has been sent upstream at this point.
             if (upstream_bytes.empty())

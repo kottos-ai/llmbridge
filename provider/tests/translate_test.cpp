@@ -915,3 +915,73 @@ TEST(BedrockRequest, RefusesWhatAnthropicRefuses)
     EXPECT_TRUE(llmbridge::provider::openai_to_bedrock_request("not json", model).empty());
     EXPECT_TRUE(llmbridge::provider::openai_to_bedrock_request("[]", model).empty());
 }
+
+// ── Model rewriting: a splice, not a re-serialisation ─────────────────────────
+
+TEST(RewriteModel, ReplacesTheValueAndLeavesEveryOtherByteAlone)
+{
+    const std::string in =
+        R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"seed":7})";
+    const std::string out = llmbridge::provider::rewrite_model(in, "llama-3.3-70b");
+    EXPECT_EQ(out,
+              R"({"model":"llama-3.3-70b","messages":[{"role":"user","content":"hi"}],"seed":7})");
+}
+
+TEST(RewriteModel, FieldsWeDoNotModelSurvive)
+{
+    // The whole reason this is a splice. A re-serialisation would drop anything the
+    // parser does not know, and providers add parameters faster than we adopt them.
+    const std::string in =
+        R"({"model":"a","some_future_field":{"nested":[1,2,3]},"logit_bias":{"1":-5},)"
+        R"("messages":[]})";
+    const std::string out = llmbridge::provider::rewrite_model(in, "b");
+    EXPECT_NE(out.find(R"("some_future_field":{"nested":[1,2,3]})"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("logit_bias":{"1":-5})"), std::string::npos) << out;
+    EXPECT_EQ(out.size(), in.size()) << out;  // "a" and "b" are the same length
+}
+
+TEST(RewriteModel, AModelMentionedInsideAPromptIsNotTouched)
+{
+    // The failure that would corrupt a customer's prompt. A naive search for
+    // "model":" would hit the message content first.
+    const std::string in =
+        R"({"messages":[{"role":"user","content":"the \"model\":\"gpt-4o\" field"}],)"
+        R"("model":"gpt-4o"})";
+    const std::string out = llmbridge::provider::rewrite_model(in, "claude-haiku-4-5");
+    EXPECT_NE(out.find(R"(the \"model\":\"gpt-4o\" field)"), std::string::npos) << out;
+    EXPECT_NE(out.find(R"("model":"claude-haiku-4-5")"), std::string::npos) << out;
+    // Exactly one replacement.
+    EXPECT_EQ(out.find("claude-haiku-4-5"), out.rfind("claude-haiku-4-5")) << out;
+}
+
+TEST(RewriteModel, RefusesRatherThanEditingPartially)
+{
+    using llmbridge::provider::rewrite_model;
+    const std::string ok = R"({"model":"a","messages":[]})";
+    EXPECT_TRUE(rewrite_model("not json", "b").empty());
+    EXPECT_TRUE(rewrite_model("[]", "b").empty());
+    EXPECT_TRUE(rewrite_model(R"({"messages":[]})", "b").empty()) << "no model key";
+    EXPECT_TRUE(rewrite_model(R"({"model":7,"messages":[]})", "b").empty()) << "not a string";
+    EXPECT_TRUE(rewrite_model(ok, "").empty()) << "empty replacement";
+    // Anything needing escaping is refused: a model id never contains these, and
+    // guessing at the escaping of a string that lands in a request body is an
+    // injection waiting to happen.
+    EXPECT_TRUE(rewrite_model(ok, "a\"b").empty());
+    EXPECT_TRUE(rewrite_model(ok, "a\\b").empty());
+    EXPECT_TRUE(rewrite_model(ok, "a\nb").empty());
+}
+
+TEST(RewriteModel, TheResultIsStillParseableAndCarriesTheNewModel)
+{
+    // Round trip through the parser, so the edit cannot leave the body syntactically
+    // valid-looking but structurally wrong.
+    const std::string in =
+        R"({"model":"anthropic.claude-haiku-4-5","max_tokens":48,"messages":[]})";
+    const std::string out = llmbridge::provider::rewrite_model(
+        in, "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+    bool ok = false;
+    const auto v = llmbridge::provider::json::parse(out, ok);
+    ASSERT_TRUE(ok) << out;
+    EXPECT_EQ(v.str_or("model"), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
+    EXPECT_EQ(v.num_or("max_tokens"), "48");
+}

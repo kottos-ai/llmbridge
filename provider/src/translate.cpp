@@ -329,6 +329,36 @@ namespace llmbridge::provider
     }
     } // namespace
 
+    std::string rewrite_model(std::string_view openai_body, std::string_view model)
+    {
+        if (model.empty()) return {};
+        for (const char ch : model)
+        {
+            const auto u = static_cast<unsigned char>(ch);
+            if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return {};
+        }
+        bool ok = false;
+        const json::Value v = json::parse(openai_body, ok);
+        if (!ok || !v.is_object()) return {};
+        const json::Value* m = v.find("model");
+        if (!m || !m->is_string()) return {};
+
+        // The parser's string view points INTO the body, so its offsets are the exact
+        // span to replace, quotes excluded. No searching, and no chance of hitting a
+        // "model" that lives inside a prompt.
+        const char* base = openai_body.data();
+        if (m->sv.data() < base || m->sv.data() + m->sv.size() > base + openai_body.size())
+            return {};
+        const size_t at = static_cast<size_t>(m->sv.data() - base);
+
+        std::string out;
+        out.reserve(openai_body.size() + model.size());
+        out.append(openai_body.substr(0, at));
+        out.append(model);
+        out.append(openai_body.substr(at + m->sv.size()));
+        return out;
+    }
+
     std::string openai_to_anthropic_request(std::string_view openai_body)
     {
         return messages_request(openai_body, false, nullptr);
