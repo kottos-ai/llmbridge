@@ -297,6 +297,10 @@ namespace llmbridge
         bool read_paused = false;
         bool wants_usage = false;    // client set stream_options.include_usage
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse; // Anthropic->OpenAI SSE translator
+        /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a
+        /// translated stream, which gets its counts from the translator, and empty
+        /// when the client did not ask for usage. Bounded; see stream_note_usage.
+        std::string stream_tail{};
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`
         // while a client SEND SQE is in flight, so `wbuf` (the SEND's buffer) is
