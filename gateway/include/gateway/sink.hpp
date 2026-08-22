@@ -33,7 +33,8 @@ namespace llmbridge
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
         int64_t ts_up_sent = 0;    ///< t3
-        int64_t ts_up_recvd = 0;   ///< t4
+        int64_t ts_up_recvd = 0;   ///< t4: ttfb
+        int64_t ts_first_token = 0; ///< streaming only: ttft. ts_first_token - ts_up_recvd is prefill
         int64_t ts_done = 0;       ///< reply fully flushed, or the stream finished
         uint64_t tag = 0;         ///< Decision::tag, verbatim
         int status = 0;           ///< as sent to the client

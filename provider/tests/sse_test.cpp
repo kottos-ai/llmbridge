@@ -142,6 +142,38 @@ TEST(Sse, FragmentationIsByteExact)
     EXPECT_EQ(translate_byte_by_byte(kAnthropicText), translate_whole(kAnthropicText));
 }
 
+// content_started() is the TTFT signal: it must stay false through message_start,
+// content_block_start and the role delta, and flip exactly when the first text
+// token is emitted. A gateway stamps its clock the moment this turns true.
+TEST(Sse, ContentStartedLatchesOnFirstToken)
+{
+    AnthropicToOpenAiSse t(kFixedCreated);
+    std::string out;
+    EXPECT_FALSE(t.content_started());
+    t.feed("event: message_start\n"
+           "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\","
+           "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n", out);
+    EXPECT_FALSE(t.content_started()) << "the head/usage is not a token";
+    t.feed("data: {\"type\":\"content_block_start\",\"index\":0,"
+           "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n", out);
+    EXPECT_FALSE(t.content_started()) << "opening a text block emits no token yet";
+    t.feed("data: {\"type\":\"content_block_delta\",\"index\":0,"
+           "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n", out);
+    EXPECT_TRUE(t.content_started()) << "the first text delta is the first token";
+}
+
+// A tool-only reply has no text; its first token is the tool call being opened.
+TEST(Sse, ContentStartedLatchesOnFirstToolCall)
+{
+    AnthropicToOpenAiSse t(kFixedCreated);
+    std::string out;
+    t.feed("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n", out);
+    EXPECT_FALSE(t.content_started());
+    t.feed("data: {\"type\":\"content_block_start\",\"index\":0,"
+           "\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"lookup\"}}\n\n", out);
+    EXPECT_TRUE(t.content_started());
+}
+
 TEST(Sse, MaxTokensMapsToLength)
 {
     const char* s =

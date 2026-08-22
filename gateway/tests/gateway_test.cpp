@@ -4793,8 +4793,8 @@ TEST_P(ProxyRoute, ACapturedHeaderIsBoundedAtTheCap)
 }
 
 // A finished stream is a completion like any other: one record, streamed flag,
-// the provider's own token counts, and TTFT approximated by t4 (first response
-// byte), which for SSE is the head of the token stream.
+// the provider's own token counts, t4 at the response head, and ts_first_token at
+// the first CONTENT token, which for a real stream lands at or after the head.
 TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
 {
     RecordingSink sink;
@@ -4821,7 +4821,11 @@ TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
     EXPECT_EQ(r.tokens_in, 9);
     EXPECT_EQ(r.tokens_out, 14);
     EXPECT_GE(r.ts_up_recvd, r.ts_up_sent);
-    EXPECT_GE(r.ts_done, r.ts_up_recvd);
+    // The first content token is stamped, sits at or after the head (t4), and no
+    // later than the flush. This is the real TTFT the tape's ttft_us reads.
+    EXPECT_GT(r.ts_first_token, 0) << "a stream that produced content must stamp the first token";
+    EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+    EXPECT_GE(r.ts_done, r.ts_first_token);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRoute,

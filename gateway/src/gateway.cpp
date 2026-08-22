@@ -753,6 +753,12 @@ namespace llmbridge
             // produce nothing while we keep reading it forever.
             if (!sse_in.empty() && !client->sse->feed(sse_in, out)) return StreamStep::Failed;
 
+            // TTFT: the first CONTENT token, stamped here because this is the one place
+            // both backends translate, and it runs right after the read that carried
+            // the bytes.
+            if (client->ts_first_token == 0 && client->sse->content_started())
+                client->ts_first_token = now_ns();
+
             const bool ended = (client->stream_chunked && client->chunkdec.done()) || at_eof;
             if (ended && !client->stream_ended)
             {
@@ -1745,6 +1751,7 @@ namespace llmbridge
         r.ts_wire_ready = c->ts_wire_ready;
         r.ts_up_sent = c->ts_up_sent;
         r.ts_up_recvd = c->ts_up_recvd;
+        r.ts_first_token = c->ts_first_token;
         r.ts_done = now_ns();
         r.tag = c->policy_tag;
         r.status = status;

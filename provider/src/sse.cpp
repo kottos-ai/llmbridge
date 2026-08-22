@@ -218,6 +218,7 @@ namespace llmbridge::provider
                 append_sanitized(out, d->str_or("text")); // raw escaped span; control bytes neutralized
                 out += '"';
                 emit_tail(out, nullptr);
+                _content_started = true; // first real token; the role delta above does not count
             }
         }
         else if (type == "message_delta")
@@ -280,6 +281,7 @@ namespace llmbridge::provider
                 _role_emitted = true;
             }
             emit_tool_open(out, ord, b->str_or("id"), b->str_or("name"));
+            _content_started = true; // a tool call is the first token of a tool-only reply
         }
         // content_block_stop / ping / unknown: ignored for the text-only slice
         // (no OpenAI-side output).

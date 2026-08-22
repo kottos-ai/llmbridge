@@ -121,7 +121,7 @@ assigns the stamp attributed to it.
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `ep_on_upstream_readable` / `ur_on_response` |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `ep_finish_client` / `ur_finish_client` |
 
-**One stamp sits outside the scheme, deliberately.** `ts_accepted` is taken when
+**Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
 the client connection is accepted, which is before t0 and on a different clock
 of relevance: t0–t6 describe one REQUEST, and `ts_accepted` belongs to the
 CONNECTION that carries it. It feeds two things and neither is a request
@@ -129,6 +129,15 @@ interval: the client setup deadline in `sweep_idle`, and the `accept(TLS)`
 histogram (§4), stamped where the inbound handshake completes in `tls_feed`. Do
 not add it to the table above; a per-connection stamp in a per-request scheme is
 how `connect-us` came to mean two things.
+
+`ts_first_token` is the second, and it is streaming-only. It is stamped when the
+translator emits the first CONTENT token (`content_started()`), which for a
+stream lands somewhere *after* t4: t4 is the response HEAD, this is the first
+token, and their gap is the provider's prefill. It is not a mainline step,
+because a non-streaming request has no first token at all. It is stamped once, in the shared
+`stream_step`, so both backends inherit it without a twin divergence. Its only
+consumer is the request sink: it cannot ride a response header, because headers
+precede the body and the first token has not arrived when they are written.
 
 Two consequences of that table worth reading off it:
 
@@ -208,6 +217,16 @@ invented by the gateway.
 the provider's response *head* is fully framed. The stamp lands before any
 data chunk is pumped, on both backends, verified in the source at both stamp
 sites.
+
+**The gateway does stamp a real first-token, for the sink not the headers.**
+`ts_first_token` (the `RequestRecord` field of the same name) is taken in
+`stream_step` the moment the translator emits its first content token, so a
+consumer with a sink installed gets both numbers: t4 for the head and
+`ts_first_token` for the token, and their difference is the provider's prefill on
+that request. This is the same event `streamgen` times client-side, now available
+per request to an in-process integrator. It is deliberately absent from the
+response headers, because a stream's headers are written before the first token
+exists.
 
 **How far the head precedes the first token is a property of the provider, and
 for Anthropic it is ~1 ms.** Measured 2026-08-06 with
