@@ -8,6 +8,73 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.24.0]. 2026-08-22
+
+Azure OpenAI as a venue. MINOR: a new `TranslateMode`, and `parse_upstream` now
+accepts something it used to refuse.
+
+### Added
+
+- **`--translate azure`.** Azure serves the OpenAI dialect, so **nothing is
+  translated**: the body is forwarded exactly as the client wrote it, and an option we
+  do not model cannot be dropped on the way through. What differs is everything
+  around it. The deployment lives in the path, the `api-version` in the query, and the
+  credential goes in an `api-key` header, never `Authorization`. Streams take the
+  byte-forward path, so Azure needs nothing beyond what 0.22.0 already fixed.
+
+  A request with no credential is refused before it leaves: Azure rejects an
+  unauthenticated call anyway, so spending a round trip to be told so buys nothing.
+
+- **A query on the upstream URL**, parsed and kept:
+  `https://x.openai.azure.com/openai/deployments/gpt-4o?api-version=2024-02-01`.
+
+  This was previously refused outright, and the stated reason was that it would have
+  to be merged with the client's own query. That reason **does not apply to a mode
+  that builds its own request target**, which discards the client's. So the rule moved
+  and did not loosen: `parse_upstream` reports what it found, and the `Gateway`
+  refuses a query on a byte-forwarding venue **at startup**, where the mode is known
+  and the operator is watching, instead of dropping the `api-version` and returning
+  404 forever.
+
+  The query is split off before the path is normalised, so no `?` can reach a
+  request-line path, and it carries the same charset refusal as the path: it lands in
+  a request line, so anything that could split or retarget that line is rejected, never
+  sanitised.
+
+### Verified
+
+- **SigV4 signing works against real AWS.** 0.23.0 shipped it with an explicit
+  "untested against AWS" caveat, because it had only ever been checked against
+  published vectors and a mock. An OpenAI-shaped request through
+  `--translate bedrock` to `bedrock-runtime.us-east-1.amazonaws.com` returned **HTTP
+  200** with a translated Anthropic response and usage, on
+  `us.anthropic.claude-haiku-4-5-20251001-v1:0`.
+
+  That id contains a colon, so it exercised the trap the whole module was built
+  around: `%3A` on the wire, `%253A` in the signed canonical URI. A mismatch there is
+  a 403 with an empty body, and it was a 200. Region derivation from the hostname and
+  the `bedrock` service pin were exercised at the same time.
+
+  A bare model id returns 400 asking for an inference profile. That is Bedrock policy
+  about on-demand throughput, not a signing failure, and the gateway relayed it with
+  the upstream's own status and message.
+
+- **The Anthropic-compatible Bedrock surfaces are region-scoped and credential-fussy.**
+  A long-term Bedrock API key authenticates on `bedrock-mantle.{its region}.api.aws`
+  and is rejected by `bedrock-runtime/anthropic`, which wants the short-lived token
+  `aws_bedrock_token_generator` mints. Mantle also takes the short model id
+  (`anthropic.claude-haiku-4-5`) and 404s on an inference-profile id. So reaching
+  Bedrock over plain SSE depends on having a key and an entitlement in the same
+  region; SigV4 has neither constraint but cannot stream without an AWS event-stream
+  decoder.
+
+### Changed
+
+- **A fragment is refused with its own message.** It never travels on the wire, so a
+  URL carrying one is a paste error worth naming; it used to be reported as "query or
+  fragment", which named the wrong half for the Azure case.
+
+
 ## [0.23.0]. 2026-08-21
 
 AWS SigV4 request signing, and Bedrock as a venue for non-streamed requests. MINOR:

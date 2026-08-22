@@ -99,6 +99,7 @@ namespace llmbridge
                 case TranslateMode::Gemini: return "gemini";
                 case TranslateMode::Cohere: return "cohere";
                 case TranslateMode::Bedrock: return "bedrock";
+                case TranslateMode::Azure: return "azure";
             }
             return "?";
         }
@@ -416,6 +417,18 @@ namespace llmbridge
                     }
                     break;
                 }
+                case TranslateMode::Azure:
+                {
+                    // `api-key`, Azure's own header. A client sending Authorization is
+                    // using the OpenAI SDK against an Azure endpoint, which is the
+                    // normal case and the reason the bearer is accepted here at all.
+                    const std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
+                    if (key.empty()) return false;
+                    out.append("api-key: ");
+                    out.append(key);
+                    out.append("\r\n");
+                    break;
+                }
                 case TranslateMode::Bedrock:
                     // Never reached: build_translated_request routes Bedrock to
                     // sign_bedrock, because a signature covers the target and the body
@@ -432,7 +445,8 @@ namespace llmbridge
         // the upstream start line. Empty return = malformed body. Shared by both
         // event-loop backends.
         std::string xlate_req(TranslateMode mode, std::string_view body,
-                              std::string_view base_path, std::string& start_line_store,
+                              std::string_view base_path, std::string_view query,
+                              std::string& start_line_store,
                               std::string_view& start_line, std::string_view& target_out)
         {
             std::string target_store;
@@ -467,13 +481,22 @@ namespace llmbridge
                     target = target_store;
                     break;
                 }
+                case TranslateMode::Azure:
+                    // NOTHING is translated: Azure serves the OpenAI dialect. The body
+                    // is forwarded as the client wrote it, so an option we do not
+                    // model is not silently dropped on the way through.
+                    out.assign(body);
+                    if (out.empty()) return {};
+                    target = "/chat/completions";
+                    break;
                 case TranslateMode::None:
                     return {};
             }
             // No base path is the common case and stays allocation-free: the view
             // points at a literal with static storage. Bedrock never takes that path,
             // because its target is built per request.
-            if (base_path.empty() && mode != TranslateMode::Bedrock)
+            if (base_path.empty() && query.empty() && mode != TranslateMode::Bedrock &&
+                mode != TranslateMode::Azure)
             {
                 switch (mode)
                 {
@@ -483,18 +506,24 @@ namespace llmbridge
                         break;
                     case TranslateMode::Cohere: start_line = "POST /v2/chat HTTP/1.1"; break;
                     case TranslateMode::Bedrock:
+                    case TranslateMode::Azure:
                     case TranslateMode::None: return {};
                 }
                 target_out = start_line.substr(5, start_line.size() - 14);
             }
             else
             {
-                start_line_store.assign("POST ").append(base_path).append(target).append(" HTTP/1.1");
+                start_line_store.assign("POST ").append(base_path).append(target);
+                // The venue's query, not the client's: a translating mode builds the
+                // whole target, so there is nothing to merge. Azure's api-version
+                // rides here; every other mode has an empty query.
+                if (!query.empty()) start_line_store.append("?").append(query);
+                start_line_store.append(" HTTP/1.1");
                 start_line = start_line_store;
                 // A view into the caller's store, so it outlives this frame: the
                 // signature is computed over exactly these bytes.
                 target_out = std::string_view(start_line_store).substr(
-                    5, start_line_store.size() - 14);
+                    5, start_line_store.size() - 14);  // between "POST " and " HTTP/1.1"
             }
             return out;
         }
@@ -570,7 +599,8 @@ namespace llmbridge
             std::string start_line_store;
             std::string_view start_line, target;
             const std::string tbody =
-                xlate_req(up.translate, body, up.base_path, start_line_store, start_line, target);
+                xlate_req(up.translate, body, up.base_path, up.query, start_line_store,
+                          start_line, target);
             if (tbody.empty()) { why = "translate"; return false; }
 
             std::string auth_hdrs;
@@ -974,6 +1004,8 @@ namespace llmbridge
                 // leg is the same translator; only the request leg differs.
                 case TranslateMode::Bedrock:
                 case TranslateMode::Anthropic: return provider::anthropic_to_openai_response(body);
+                // Azure answers in the OpenAI shape it was asked in.
+                case TranslateMode::Azure: return std::string(body);
                 case TranslateMode::Gemini: return provider::gemini_to_openai_response(body);
                 case TranslateMode::Cohere: return provider::cohere_to_openai_response(body);
                 case TranslateMode::None: return {};
@@ -1052,6 +1084,11 @@ namespace llmbridge
         {
             u.host_hdr = host_header_for(u);
             u.aws_region = aws_region_for(u);
+            if (!u.query.empty() && u.translate != TranslateMode::Azure)
+                throw std::runtime_error(
+                    "upstream '" + u.sni_host + "' has a query (" + u.query +
+                    ") but its mode does not build its own request target; only "
+                    "--translate azure may carry one");
         }
         _idle_upstreams.resize(_upstreams.size());
         // Normalize once, at construction: lower-case with the colon, so the hot path
@@ -2291,6 +2328,7 @@ namespace llmbridge
         // dialect the client cannot read; they keep falling through to the whole-body
         // path until their translators exist.
         if (upstream_of(u).translate == TranslateMode::Anthropic ||
+            upstream_of(u).translate == TranslateMode::Azure ||
             upstream_of(u).translate == TranslateMode::None)
         {
             net::http::ResponseHead h;
@@ -3334,6 +3372,7 @@ namespace llmbridge
             // streaming pump, everything else the whole-body path below.
             // See the epoll mirror: translated or byte-forward, never Gemini/Cohere.
             if (upstream_of(c).translate == TranslateMode::Anthropic ||
+                upstream_of(c).translate == TranslateMode::Azure ||
                 upstream_of(c).translate == TranslateMode::None)
             {
                 net::http::ResponseHead h;

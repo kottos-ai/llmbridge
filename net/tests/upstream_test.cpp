@@ -214,13 +214,29 @@ TEST(ParseUpstream, RejectsControlBytesInABasePath)
 
 TEST(ParseUpstream, RejectsQueryAndFragmentInABasePath)
 {
-    // Azure OpenAI needs "?api-version=", which means merging our query with the
-    // client's. Refused until that is designed, never guessed at.
-    // And SAY it is the query, since pasting an Azure URL is how someone gets here.
-    const auto q = parse_upstream("https://h.io/openai?api-version=2024-02-01");
-    EXPECT_FALSE(q.ok());
-    EXPECT_NE(q.error.find("query"), std::string::npos) << q.error;
+    // Azure OpenAI needs "?api-version=". It is now PARSED and kept: a translating
+    // mode builds its own request target and has no client query to merge with. The
+    // pairing that would need merging, a query on a byte-forwarding venue, is refused
+    // by the Gateway at startup, where the mode is known.
+    const auto q = parse_upstream("https://h.io/openai/deployments/gpt-4o?api-version=2024-02-01");
+    ASSERT_TRUE(q.ok()) << q.error;
+    EXPECT_EQ(q.path, "/openai/deployments/gpt-4o");
+    EXPECT_EQ(q.query, "api-version=2024-02-01");
+    EXPECT_TRUE(q.tls);
+
+    // The query is split off BEFORE the path is normalised, so no '?' can reach a
+    // request-line path.
+    EXPECT_EQ(parse_upstream("https://h.io/x?a=1&b=2").query, "a=1&b=2");
+    EXPECT_EQ(parse_upstream("https://h.io/x?a=1&b=2").path, "/x");
+    EXPECT_TRUE(parse_upstream("https://h.io/x").query.empty());
+
+    // A fragment never travels on the wire, so it is a paste error worth naming.
     EXPECT_FALSE(parse_upstream("https://h.io/openai#frag").ok());
+    EXPECT_FALSE(parse_upstream("https://h.io/x?a=1#frag").ok());
+    // The query lands in a request line, so the same charset reasoning as the path
+    // applies: anything that could split or retarget the line is refused.
+    EXPECT_FALSE(parse_upstream("https://h.io/x?a=1 HTTP/1.1").ok());
+    EXPECT_FALSE(parse_upstream("https://h.io/x?a=\r\nX: y").ok());
 }
 
 TEST(ParseUpstream, RejectsDotAndEmptySegments)

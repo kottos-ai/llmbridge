@@ -9,7 +9,7 @@
 //
 //   llmbridge [--listen PORT] [--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]]
 //          [--duration SECONDS]
-//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere|bedrock]
+//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere|bedrock|azure]
 //          [--upstream-timeout SECONDS]
 //          [--io auto|epoll|uring]
 //
@@ -65,7 +65,7 @@ namespace
         return 2;
     }
 
-    /// "anthropic" | "gemini" | "cohere" | "bedrock" | anything else -> None. Both
+    /// "anthropic" | "gemini" | "cohere" | "bedrock" | "azure" | else -> None. Both
     /// the config parser and --translate validate the string, so an unknown one
     /// cannot arrive.
     llmbridge::TranslateMode translate_from(const std::string& s)
@@ -74,6 +74,7 @@ namespace
                : s == "gemini"  ? llmbridge::TranslateMode::Gemini
                : s == "cohere"  ? llmbridge::TranslateMode::Cohere
                : s == "bedrock" ? llmbridge::TranslateMode::Bedrock
+               : s == "azure"   ? llmbridge::TranslateMode::Azure
                                 : llmbridge::TranslateMode::None;
     }
 
@@ -219,6 +220,7 @@ static int run(int argc, char** argv)
                 else if (mode == "gemini") translate = llmbridge::TranslateMode::Gemini;
                 else if (mode == "cohere") translate = llmbridge::TranslateMode::Cohere;
                 else if (mode == "bedrock") translate = llmbridge::TranslateMode::Bedrock;
+                else if (mode == "azure") translate = llmbridge::TranslateMode::Azure;
                 else translate = llmbridge::TranslateMode::None;
             }
         }
@@ -237,7 +239,7 @@ static int run(int argc, char** argv)
             std::printf("usage: %s [--listen PORT] "
                         "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
                         "[--duration SECONDS] [--warmup SECONDS] "
-                        "[--translate none|anthropic|gemini|cohere|bedrock] "
+                        "[--translate none|anthropic|gemini|cohere|bedrock|azure] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
                         "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
@@ -335,7 +337,8 @@ static int run(int argc, char** argv)
                             .tls = up.tls,
                             .sni_host = up.host,
                             .translate = translate,
-                            .base_path = up.path});
+                            .base_path = up.path,
+                            .query = up.query});
     for (const auto& e : extra_upstreams)
     {
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
@@ -360,7 +363,8 @@ static int run(int argc, char** argv)
                                                      .tls = s2.tls,
                                                      .sni_host = s2.host,
                                                      .translate = translate_from(e.translate),
-                                                     .base_path = s2.path});
+                                                     .base_path = s2.path,
+                                                     .query = s2.query});
     }
 
     std::signal(SIGPIPE, SIG_IGN);

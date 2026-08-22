@@ -5224,3 +5224,136 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyBedrock,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── Azure OpenAI: same dialect, different everything around it ─────────────────
+//
+// Nothing is translated. What Azure needs is a deployment in the path, an
+// api-version in the query, and the credential in an `api-key` header. Byte-forward
+// cannot do it, because it would have to merge the venue's query with the client's
+// target, which is the case parse_upstream refuses.
+class ProxyAzure : public ProxyIT,
+                   public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    void start_azure()
+    {
+        _backend.start();
+        _upstreams.push_back(llmbridge::Upstream{
+            .ip = "127.0.0.1",
+            .port = _backend.port(),
+            .sni_host = "example.openai.azure.com",
+            .translate = TranslateMode::Azure,
+            .base_path = "/openai/deployments/gpt-4o",
+            .query = "api-version=2024-02-01"});
+        start(0, false, TranslateMode::None, GetParam());
+    }
+};
+
+TEST_P(ProxyAzure, DeploymentInThePathAndApiVersionInTheQuery)
+{
+    _backend.set_response(http_ok(R"({"choices":[{"message":{"content":"ok"}}]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("ping", "Authorization: Bearer K\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    EXPECT_EQ(up.find("POST /openai/deployments/gpt-4o/chat/completions"
+                      "?api-version=2024-02-01 HTTP/1.1\r\n"),
+              0u)
+        << up;
+    EXPECT_NE(up.find("\r\nHost: example.openai.azure.com"), std::string::npos) << up;
+}
+
+TEST_P(ProxyAzure, TheCredentialBecomesAnApiKeyHeader)
+{
+    _backend.set_response(http_ok(R"({"choices":[]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("ping", "Authorization: Bearer SECRETKEY\r\n")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    EXPECT_NE(up.find("\r\napi-key: SECRETKEY\r\n"), std::string::npos) << up;
+    // Azure ignores Authorization for key auth, and forwarding it would put the
+    // credential on the wire twice under two names.
+    EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Bearer "), std::string::npos) << up;
+}
+
+TEST_P(ProxyAzure, TheBodyIsForwardedUnchanged)
+{
+    // Azure serves the OpenAI dialect, so re-serialising would risk dropping a
+    // parameter we do not model. The bytes go through as the client wrote them.
+    _backend.set_response(http_ok(R"({"choices":[]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],)"
+        R"("seed":7,"logit_bias":{"1234":-5},"some_future_field":true})";
+    std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                      "Authorization: Bearer K\r\nContent-Type: application/json\r\n"
+                      "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    ASSERT_TRUE(c.send(req));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(body_of(up), body) << up;
+}
+
+TEST_P(ProxyAzure, ItStreams)
+{
+    // Azure's stream needs no translating, so it takes the byte-forward path. The
+    // head must reach the client before the body has finished arriving.
+    _backend.set_trickle(8);
+    _backend.set_response(openai_sse_response(4096));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    std::string sreq = openai_stream_request_with_usage();
+    sreq.insert(sreq.find("\r\n") + 2, "Authorization: Bearer K\r\n");
+    ASSERT_TRUE(c.send(sreq));
+    const std::string first = c.recv_some();
+    EXPECT_NE(first.find("text/event-stream"), std::string::npos) << first;
+    EXPECT_EQ(first.find("[DONE]"), std::string::npos) << first;
+    EXPECT_NE((first + c.recv_all()).find("[DONE]"), std::string::npos);
+}
+
+TEST_P(ProxyAzure, AQueryOnAVenueThatCannotUseItIsRefusedAtStartup)
+{
+    // A byte-forwarding venue would have to merge this with the client's own target.
+    // Refusing loudly at startup beats dropping the api-version and 404ing forever.
+    _backend.start();
+    std::vector<llmbridge::Upstream> bad{
+        llmbridge::Upstream{.ip = "127.0.0.1",
+                            .port = _backend.port(),
+                            .sni_host = "example.openai.azure.com",
+                            .translate = TranslateMode::None,
+                            .query = "api-version=2024-02-01"}};
+    EXPECT_THROW(
+        Gateway(0, bad, 0, GetParam(), Gateway::kDefaultUpstreamIdleNs,
+                llmbridge::TlsConfig{}, false, nullptr, std::vector<std::string>{}),
+        std::runtime_error);
+}
+
+TEST_P(ProxyAzure, WithNoCredentialTheRequestIsRefusedAndNothingIsSent)
+{
+    // Azure rejects an unauthenticated call anyway; refusing here keeps the request
+    // off the wire instead of spending a round trip to be told so.
+    _backend.set_response(http_ok(R"({"choices":[]})"));
+    start_azure();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("ping")));  // no Authorization
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyAzure,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
