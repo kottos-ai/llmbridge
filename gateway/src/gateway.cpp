@@ -8,6 +8,7 @@
 #include "gateway/gateway.hpp"
 
 #include "net/secure.hpp"
+#include "net/sigv4.hpp"
 // Only for translate_failure(): the error path re-parses a rejected body to
 // say WHY it was rejected. Not used anywhere on the success path.
 #include "provider/json.hpp"
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #include <string_view>
 
@@ -96,6 +98,7 @@ namespace llmbridge
                 case TranslateMode::Anthropic: return "anthropic";
                 case TranslateMode::Gemini: return "gemini";
                 case TranslateMode::Cohere: return "cohere";
+                case TranslateMode::Bedrock: return "bedrock";
             }
             return "?";
         }
@@ -413,6 +416,12 @@ namespace llmbridge
                     }
                     break;
                 }
+                case TranslateMode::Bedrock:
+                    // Never reached: build_translated_request routes Bedrock to
+                    // sign_bedrock, because a signature covers the target and the body
+                    // and neither exists yet at this point. Refuse, because falling
+                    // through to `return true` would emit no credential at all.
+                    return false;
                 case TranslateMode::None:
                     break; // byte-forward path; never called, but total anyway
             }
@@ -424,8 +433,9 @@ namespace llmbridge
         // event-loop backends.
         std::string xlate_req(TranslateMode mode, std::string_view body,
                               std::string_view base_path, std::string& start_line_store,
-                              std::string_view& start_line)
+                              std::string_view& start_line, std::string_view& target_out)
         {
+            std::string target_store;
             std::string_view target;
             std::string out;
             switch (mode)
@@ -442,12 +452,28 @@ namespace llmbridge
                     target = "/v2/chat";
                     out = provider::openai_to_cohere_request(body);
                     break;
+                case TranslateMode::Bedrock:
+                {
+                    // The model moves from the body into the path, so the target is
+                    // per-request and cannot be a literal. Encoded as ONE segment,
+                    // slashes included: an inference-profile id may contain them, and
+                    // a raw slash there would silently change which resource is named.
+                    std::string model;
+                    out = provider::openai_to_bedrock_request(body, model);
+                    if (out.empty() || model.empty()) return {};
+                    target_store.assign("/model/")
+                        .append(net::sigv4::uri_encode(model, true))
+                        .append("/invoke");
+                    target = target_store;
+                    break;
+                }
                 case TranslateMode::None:
                     return {};
             }
             // No base path is the common case and stays allocation-free: the view
-            // points at a literal with static storage.
-            if (base_path.empty())
+            // points at a literal with static storage. Bedrock never takes that path,
+            // because its target is built per request.
+            if (base_path.empty() && mode != TranslateMode::Bedrock)
             {
                 switch (mode)
                 {
@@ -456,15 +482,105 @@ namespace llmbridge
                         start_line = "POST /v1beta/models/gemini:generateContent HTTP/1.1";
                         break;
                     case TranslateMode::Cohere: start_line = "POST /v2/chat HTTP/1.1"; break;
+                    case TranslateMode::Bedrock:
                     case TranslateMode::None: return {};
                 }
+                target_out = start_line.substr(5, start_line.size() - 14);
             }
             else
             {
                 start_line_store.assign("POST ").append(base_path).append(target).append(" HTTP/1.1");
                 start_line = start_line_store;
+                // A view into the caller's store, so it outlives this frame: the
+                // signature is computed over exactly these bytes.
+                target_out = std::string_view(start_line_store).substr(
+                    5, start_line_store.size() - 14);
             }
             return out;
+        }
+
+
+        /// Sign a rebuilt Bedrock request, or refuse it.
+        ///
+        /// SHARED BY BOTH BACKENDS on purpose. This is the credential path, and the
+        /// three calls it replaces used to be repeated in the epoll and io_uring
+        /// dispatchers: a fix that lands on one of those misses the shipped one,
+        /// because io_uring is the default on Ubuntu 24.04.
+        ///
+        /// Signing must happen HERE and not at the client: the target and the body are
+        /// both rewritten above, so any signature a caller pre-computed is void by the
+        /// time these bytes exist.
+        bool sign_bedrock(const Upstream& up, std::string_view client_hdrs,
+                          const std::vector<std::string>& strip, std::string_view target,
+                          std::string_view body, std::string& out)
+        {
+#ifdef LLMBRIDGE_HAVE_TLS
+            if (up.aws_region.empty()) return false;
+            const AuthHeaders h = scan_auth_headers(client_hdrs, strip);
+            if (!header_value_safe(h.authorization)) return false;
+            std::string_view bearer = h.authorization;
+            if (bearer.size() <= 7 ||
+                (bearer.compare(0, 7, "Bearer ") != 0 && bearer.compare(0, 7, "bearer ") != 0))
+                return false;
+            bearer = net::http::detail::ltrim(bearer.substr(7));
+
+            net::sigv4::Credentials cred{};
+            if (!net::sigv4::parse_credentials(bearer, cred)) return false;
+
+            char stamp[17];
+            const std::time_t now = std::time(nullptr);
+            std::tm utc{};
+            if (::gmtime_r(&now, &utc) == nullptr) return false;
+            if (std::strftime(stamp, sizeof stamp, "%Y%m%dT%H%M%SZ", &utc) != 16) return false;
+
+            net::sigv4::Request r{};
+            r.method = "POST";
+            r.path = target;
+            r.host = up.host_hdr;
+            r.content_type = "application/json";
+            r.body = body;
+            r.region = up.aws_region;
+            // The signing service name is `bedrock` for the runtime endpoint too; it
+            // does not follow the hostname, which is one of the ways this returns 403.
+            r.service = "bedrock";
+            r.amz_date = std::string_view(stamp, 16);
+
+            const auto headers = net::sigv4::sign(cred, r);
+            if (headers.empty()) return false;
+            out.clear();
+            for (const auto& hdr : headers)
+                out.append(hdr.name).append(": ").append(hdr.value).append("\r\n");
+            return true;
+#else
+            (void)up; (void)client_hdrs; (void)strip; (void)target; (void)body; (void)out;
+            return false;   // no OpenSSL, no signature, and never an unsigned request
+#endif
+        }
+
+        /// Everything between a client request and the bytes for a translated venue.
+        ///
+        /// One function because both event loops need identical behaviour on the
+        /// credential path, and because the ordering matters: the body and target are
+        /// built first, then signed, because a Bedrock signature covers both.
+        bool build_translated_request(const Upstream& up, std::string_view body,
+                                      std::string_view client_hdrs,
+                                      const std::vector<std::string>& strip,
+                                      std::string& out, const char*& why)
+        {
+            std::string start_line_store;
+            std::string_view start_line, target;
+            const std::string tbody =
+                xlate_req(up.translate, body, up.base_path, start_line_store, start_line, target);
+            if (tbody.empty()) { why = "translate"; return false; }
+
+            std::string auth_hdrs;
+            const bool ok = up.translate == TranslateMode::Bedrock
+                                ? sign_bedrock(up, client_hdrs, strip, target, tbody, auth_hdrs)
+                                : auth_headers_for(up.translate, client_hdrs, strip, auth_hdrs);
+            if (!ok) { why = "credential"; return false; }
+
+            out = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
+            return true;
         }
 
         // ── Timing headers (opt-in: --timing-headers) ───────────────────────
@@ -854,6 +970,9 @@ namespace llmbridge
         {
             switch (mode)
             {
+                // Bedrock answers with Anthropic's Messages envelope, so the response
+                // leg is the same translator; only the request leg differs.
+                case TranslateMode::Bedrock:
                 case TranslateMode::Anthropic: return provider::anthropic_to_openai_response(body);
                 case TranslateMode::Gemini: return provider::gemini_to_openai_response(body);
                 case TranslateMode::Cohere: return provider::cohere_to_openai_response(body);
@@ -872,6 +991,31 @@ namespace llmbridge
             if (u.sni_host.empty()) return u.ip + ":" + std::to_string(u.port);
             const bool default_port = (u.tls && u.port == 443) || (!u.tls && u.port == 80);
             return default_port ? u.sni_host : u.sni_host + ":" + std::to_string(u.port);
+        }
+
+        /// The AWS region inside an endpoint name, or empty.
+        ///
+        /// `bedrock-runtime.us-east-1.amazonaws.com` -> `us-east-1`. Derived and not
+        /// configured because the endpoint already states it and two sources of one
+        /// fact drift; empty is a refusal, never a default, since signing with the
+        /// wrong region returns a 403 whose body explains nothing.
+        std::string aws_region_for(const Upstream& u)
+        {
+            const std::string& h = u.sni_host;
+            const size_t first = h.find('.');
+            if (first == std::string::npos) return {};
+            const size_t second = h.find('.', first + 1);
+            if (second == std::string::npos) return {};
+            const std::string_view region(h.data() + first + 1, second - first - 1);
+            // Shape check, not a list: regions are added faster than any list is
+            // updated, and "letters, digits and hyphens with a digit in it" separates
+            // `us-east-1` from `amazonaws` without pinning us to a snapshot of AWS.
+            if (region.size() < 5 || region.find_first_of("0123456789") == std::string_view::npos)
+                return {};
+            for (const char c : region)
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+                    return {};
+            return std::string(region);
         }
     } // namespace
 
@@ -904,7 +1048,11 @@ namespace llmbridge
         // Every path below indexes the table without a bounds special case, so an empty
         // one is a programming error caught here and not a crash on the first request.
         if (_upstreams.empty()) throw std::runtime_error("Gateway: no upstreams configured");
-        for (Upstream& u : _upstreams) u.host_hdr = host_header_for(u);
+        for (Upstream& u : _upstreams)
+        {
+            u.host_hdr = host_header_for(u);
+            u.aws_region = aws_region_for(u);
+        }
         _idle_upstreams.resize(_upstreams.size());
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
@@ -1955,20 +2103,19 @@ namespace llmbridge
         if (up.translate != TranslateMode::None)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-            std::string_view start_line;
-            std::string start_line_store;
-            std::string tbody = xlate_req(up.translate, body, up.base_path, start_line_store,
-                                          start_line);
-            if (tbody.empty()) { ep_error_respond(c, 400, translate_failure(body)); return; }
             // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
             c->wants_usage = provider::openai_wants_stream_usage(body);
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
-            std::string auth_hdrs;
-            // Malformed credential => 400, and NOTHING goes upstream.
-            if (!auth_headers_for(up.translate, client_hdrs, _strip_headers, auth_hdrs))
-            { ep_error_respond(c, 400, "malformed credential"); return; }
-            upstream_bytes = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
+            const char* why = "";
+            // Either failure => 400, and NOTHING goes upstream.
+            if (!build_translated_request(up, body, client_hdrs, _strip_headers,
+                                          upstream_bytes, why))
+            {
+                if (why[0] == 't') ep_error_respond(c, 400, translate_failure(body));
+                else ep_error_respond(c, 400, "malformed credential");
+                return;
+            }
         }
         else
         {
@@ -3265,25 +3412,21 @@ namespace llmbridge
         if (up.translate != TranslateMode::None)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-            std::string_view start_line;
-            std::string start_line_store;
-            std::string tbody = xlate_req(up.translate, body, up.base_path, start_line_store,
-                                          start_line);
-            if (tbody.empty()) { ur_error_respond(c, 400, translate_failure(body)); return; }
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
-            std::string auth_hdrs;
-            // Malformed credential => 400, and NOTHING goes upstream.
-            // (This called the EPOLL responder until the ep_/ur_ split. Every
-            // other error in this function used the uring one. It was harmless,
-            // but only by three accidents: `peer` is still null here so the epoll
-            // upstream-close branch never ran; a ~100-byte error body always
-            // completes inline so the epoll write-arm was never reached; and the
-            // close path was already deferred via _doomed. The old naming made the
-            // crossing invisible. The prefixes turn it into a grep.)
-            if (!auth_headers_for(up.translate, client_hdrs, _strip_headers, auth_hdrs))
-            { ur_error_respond(c, 400, "malformed credential"); return; }
-            upstream_bytes = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
+            const char* why = "";
+            // Either failure => 400, and NOTHING goes upstream.
+            // (The credential branch called the EPOLL responder until the ep_/ur_
+            // split. It was harmless by three accidents, and the prefixes turned it
+            // into a grep; folding both loops onto one builder removes the chance of
+            // the next such divergence entirely.)
+            if (!build_translated_request(up, body, client_hdrs, _strip_headers,
+                                          upstream_bytes, why))
+            {
+                if (why[0] == 't') ur_error_respond(c, 400, translate_failure(body));
+                else ur_error_respond(c, 400, "malformed credential");
+                return;
+            }
         }
         else
         {

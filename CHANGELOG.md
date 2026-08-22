@@ -8,6 +8,74 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.23.0]. 2026-08-21
+
+AWS SigV4 request signing, and Bedrock as a venue for non-streamed requests. MINOR:
+a new `TranslateMode`, a new credential shape, and a new module.
+
+**Untested against AWS.** The signing is verified against AWS's published test
+vectors and the gateway wiring against a mock, so the arithmetic and the plumbing are
+proven; whether Bedrock accepts the result is not. No request from this code has ever
+reached the service. Treat a 403 from a first real attempt as expected work, not as a
+surprise, and start the bisect at the canonical request, not at the signature.
+
+### Added
+
+- **`net::sigv4`**, enough of SigV4 to reach Bedrock: canonical request, canonical
+  query, the `kDate`/`kRegion`/`kService`/`kSigning` chain, and the `Authorization`
+  header. Session tokens are supported, because temporary credentials are what most
+  real deployments use and an implementation that omits them works in a demo and
+  fails at a customer. Each link of the signing chain is scrubbed as soon as the next
+  is derived: the intermediates are as good as the secret to anything reading that
+  memory.
+
+  Built against **AWS's own published values**, reproduced independently before being
+  written into the tests, so a disagreement means this code is wrong and not that a
+  constant was mistyped. That discipline paid immediately: "URI-encode a non-S3 path
+  segment twice" counts from the RAW path, and the request line already holds the
+  first pass, so encoding the wire form twice turns a model id's `%3A` into `%25253A`
+  and fails exactly like not encoding it at all.
+
+  TLS builds only: it needs SHA-256 and HMAC-SHA256 from the OpenSSL a TLS build
+  already links, so the dependency-free build is untouched and simply cannot reach a
+  venue that requires signing.
+
+- **`provider::openai_to_bedrock_request`**, the Messages body as Bedrock takes it:
+  no `model` field, because the model id belongs in the path, and `anthropic_version`
+  inside the JSON where Anthropic wants a header. It shares one message walk with
+  `openai_to_anthropic_request`, since a second copy would be a second place for tool
+  results, vision and system-prompt joining to drift; a test asserts the two bodies
+  are byte-identical after their respective first fields.
+
+- **`TranslateMode::Bedrock`**, and `--translate bedrock`. The model moves from the
+  body into `/model/{id}/invoke`, percent-encoded as one segment, and the response leg
+  reuses the Anthropic translator because Bedrock answers in the same envelope.
+
+- **Per-request AWS credentials**, `Authorization: Bearer AKID:SECRET[:TOKEN]`.
+  Signing has to happen here: the gateway rewrites the target and the body, so any
+  signature a caller pre-computed is void by the time the bytes exist. Passthrough is
+  what keeps that secret out of anything the request path could read, and it reuses
+  the header the BYOK path already carries, so nothing upstream needs a new mechanism.
+  Colon is unambiguous because AWS's alphabets exclude it. A value that does not split
+  into two or three non-empty parts is refused, never signed partially, since AWS
+  answers a partial credential with the same opaque 403 as a wrong signature.
+
+### Security
+
+- **The region is derived from the endpoint name and checked by shape**, not against a
+  list of regions that would go stale. An endpoint carrying no region refuses every
+  request; it never signs with a guess. The signing service is pinned to `bedrock`
+  and deliberately does not follow the `bedrock-runtime` hostname.
+- **A build without OpenSSL refuses Bedrock** instead of sending the customer's secret
+  unsigned on a call AWS would reject anyway.
+
+### Not yet
+
+Streaming. `invoke-with-response-stream` returns AWS event-stream binary frames, which
+is a second framing decoder and its own release. A streamed request to a Bedrock venue
+today builds a request to `/invoke`.
+
+
 ## [0.22.0]. 2026-08-21
 
 Byte-forwarded responses stream. MINOR because the default deployment shape behaves

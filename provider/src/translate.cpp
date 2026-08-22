@@ -162,7 +162,17 @@ namespace llmbridge::provider
 
     // ── Anthropic Messages ──────────────────────────────────────────────────
 
-    std::string openai_to_anthropic_request(std::string_view openai_body)
+    namespace
+    {
+    /// Both Messages bodies, because they differ in exactly two fields and a second
+    /// copy of the message walk would be a second place for tool results, vision and
+    /// system-prompt handling to drift.
+    ///
+    /// Bedrock puts the model in the PATH, so its body must not carry one, and it
+    /// wants `anthropic_version` in the JSON where Anthropic wants it in a header.
+    /// Everything between those two is identical.
+    std::string messages_request(std::string_view openai_body, bool bedrock,
+                                 std::string* model_out)
     {
         bool ok = false;
         json::Value v = json::parse(openai_body, ok);
@@ -266,8 +276,20 @@ namespace llmbridge::provider
         }
         messages += ']';
 
-        std::string out = "{\"model\":";
-        json::append_raw_string(out, v.str_or("model", "claude-3-5-sonnet-latest"));
+        const std::string_view model = v.str_or("model", "claude-3-5-sonnet-latest");
+        if (model_out) model_out->assign(model);
+        std::string out = "{";
+        if (bedrock)
+        {
+            // Not a version we choose: Bedrock rejects a Messages body without it,
+            // and this literal is the only value its Anthropic models accept.
+            out += "\"anthropic_version\":\"bedrock-2023-05-31\"";
+        }
+        else
+        {
+            out += "\"model\":";
+            json::append_raw_string(out, model);
+        }
         // Anthropic requires max_tokens; default if the OpenAI request omitted it.
         out += ",\"max_tokens\":";
         out += v.num_or("max_tokens", "1024");
@@ -304,6 +326,18 @@ namespace llmbridge::provider
         out += messages;
         out += "}";
         return out;
+    }
+    } // namespace
+
+    std::string openai_to_anthropic_request(std::string_view openai_body)
+    {
+        return messages_request(openai_body, false, nullptr);
+    }
+
+    std::string openai_to_bedrock_request(std::string_view openai_body,
+                                          std::string& model_out)
+    {
+        return messages_request(openai_body, true, &model_out);
     }
 
     std::string anthropic_to_openai_response(std::string_view anthropic_body)

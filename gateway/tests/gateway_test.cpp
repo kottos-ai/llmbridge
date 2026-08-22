@@ -193,6 +193,12 @@ namespace
         // this backend blocks after a few hundred KB instead of many MB.
         void set_small_rcvbuf(int b) { _rcvbuf = b; }
         int requests_seen() const { return _requests_seen.load(); }
+        void clear_last_request()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            _last_request.clear();
+        }
+
         std::string last_request()
         {
             std::lock_guard<std::mutex> lk(_mu);
@@ -5025,6 +5031,194 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
+
+// ── Bedrock: signed, per request, over the bytes we actually send ──────────────
+//
+// The signature ARITHMETIC is proven in net_sigv4_test against AWS's published
+// vectors. What is proven here is the wiring: that the model reaches the path, the
+// body loses it, the credential is consumed and not forwarded, and both event loops
+// behave identically.
+class ProxyBedrock : public ProxyIT,
+                     public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    static constexpr std::string_view kHost = "bedrock-runtime.us-east-1.amazonaws.com";
+
+    void start_bedrock(const std::string& host = std::string(kHost))
+    {
+        _backend.start();
+        _backend.set_response(http_ok(anthropic_resp_body("pong")));
+        _upstreams.push_back(llmbridge::Upstream{.ip = "127.0.0.1",
+                                                 .port = _backend.port(),
+                                                 .sni_host = host,
+                                                 .translate = TranslateMode::Bedrock});
+        start(0, false, TranslateMode::None, GetParam());
+    }
+
+    /// An OpenAI request naming a versioned Bedrock model, with AWS credentials in
+    /// the bearer slot the BYOK path already carries.
+    static std::string request(std::string_view bearer)
+    {
+        const std::string body =
+            R"({"model":"anthropic.claude-3-5-sonnet-20240620-v1:0",)"
+            R"("messages":[{"role":"user","content":"ping"}]})";
+        std::string r = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n";
+        if (!bearer.empty())
+        {
+            r += "Authorization: Bearer ";
+            r += bearer;
+            r += "\r\n";
+        }
+        r += "Content-Type: application/json\r\nContent-Length: ";
+        r += std::to_string(body.size());
+        r += "\r\n\r\n";
+        r += body;
+        return r;
+    }
+};
+
+// Signing needs OpenSSL, so the four tests that expect a SIGNED request only mean
+// anything in a TLS build. The dependency-free build gets its own case below, which
+// asserts the behaviour that matters there: refuse, never send unsigned.
+#ifdef LLMBRIDGE_HAVE_TLS
+
+TEST_P(ProxyBedrock, ModelMovesIntoThePathAndOutOfTheBody)
+{
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    // The colon is percent-encoded on the wire; the canonical form signed over it
+    // carries %253A, which net_sigv4_test pins.
+    EXPECT_EQ(up.find("POST /model/anthropic.claude-3-5-sonnet-20240620-v1%3A0/invoke"
+                      " HTTP/1.1\r\n"),
+              0u)
+        << up;
+    const std::string body = body_of(up);
+    EXPECT_EQ(body.find("\"model\""), std::string::npos) << body;
+    EXPECT_NE(body.find(R"("anthropic_version":"bedrock-2023-05-31")"), std::string::npos)
+        << body;
+}
+
+TEST_P(ProxyBedrock, SignsWithTheDerivedRegionAndNeverForwardsTheSecret)
+{
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:supersecretvalue")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    EXPECT_NE(up.find("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), std::string::npos) << up;
+    // Region derived from the endpoint name, service pinned: `bedrock`, which does
+    // NOT follow the `bedrock-runtime` hostname.
+    EXPECT_NE(up.find("/us-east-1/bedrock/aws4_request"), std::string::npos) << up;
+    EXPECT_NE(up.find("SignedHeaders=content-type;host;x-amz-date"), std::string::npos) << up;
+    EXPECT_NE(up.find("\r\nx-amz-date: "), std::string::npos) << up;
+
+    // The client's credential is CONSUMED. Neither the secret nor the bearer form may
+    // appear anywhere in the bytes we send.
+    EXPECT_EQ(up.find("supersecretvalue"), std::string::npos) << up;
+    EXPECT_EQ(up.find("Bearer "), std::string::npos) << up;
+    // Host names the venue, and the signature covers that same value. The test
+    // backend is on an ephemeral port, so the header carries `host:port`, which is
+    // exactly what host_header_for produces and therefore what got signed.
+    EXPECT_NE(up.find(std::string("\r\nHost: ") + std::string(kHost)), std::string::npos)
+        << up;
+}
+
+TEST_P(ProxyBedrock, ContentLengthMatchesTheRewrittenBody)
+{
+    // The body is rewritten, so a stale length is a framing desync on a POOLED
+    // upstream: the tail of one request becomes the head of the next client's.
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(up, m),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_EQ(m.body_len, up.size() - m.header_len) << up;
+    EXPECT_EQ(m.body_len, body_of(up).size());
+}
+
+TEST_P(ProxyBedrock, SessionTokenIsSignedAndSentInItsOwnHeader)
+{
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret:SESSIONTOKENVALUE")));
+    (void)c.recv_response();
+    const std::string up = _backend.last_request();
+
+    EXPECT_NE(up.find("\r\nx-amz-security-token: SESSIONTOKENVALUE\r\n"), std::string::npos)
+        << up;
+    EXPECT_NE(up.find("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"),
+              std::string::npos)
+        << up;
+}
+
+#else  // no TLS compiled in
+
+TEST_P(ProxyBedrock, WithoutTlsEveryRequestIsRefusedAndNothingIsSent)
+{
+    // A build with no OpenSSL cannot sign, and Bedrock is HTTPS-only anyway. What
+    // must NOT happen is the request going out unsigned with the customer's AWS
+    // secret on the wire for a call that was always going to be rejected.
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
+#endif // LLMBRIDGE_HAVE_TLS
+
+TEST_P(ProxyBedrock, RefusesRatherThanSendingUnsigned)
+{
+    // Each of these must produce a 400 with NOTHING reaching the upstream. An
+    // unsigned request would be rejected by AWS anyway, but a request that leaves
+    // here with a half-formed credential is a secret on the wire for no purpose.
+    start_bedrock();
+    for (const std::string_view bearer : {"", "AKIDEXAMPLE", "AKIDEXAMPLE:", ":secret"})
+    {
+        _backend.clear_last_request();
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(request(bearer)));
+        const std::string resp = c.recv_response();
+        EXPECT_NE(resp.find("400"), std::string::npos) << "bearer=[" << bearer << "]";
+        EXPECT_TRUE(_backend.last_request().empty())
+            << "sent upstream for bearer=[" << bearer << "]: " << _backend.last_request();
+        c.close();
+    }
+}
+
+TEST_P(ProxyBedrock, AnEndpointWithNoRegionInItsNameRefusesEveryRequest)
+{
+    // Signing with a guessed region returns a 403 whose body says nothing, so an
+    // underivable region is a refusal here instead of a mystery there.
+    start_bedrock("bedrock.example.com");
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyBedrock,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
                          [](const auto& i) {

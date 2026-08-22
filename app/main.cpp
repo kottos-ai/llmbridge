@@ -9,7 +9,7 @@
 //
 //   llmbridge [--listen PORT] [--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]]
 //          [--duration SECONDS]
-//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere]
+//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere|bedrock]
 //          [--upstream-timeout SECONDS]
 //          [--io auto|epoll|uring]
 //
@@ -65,13 +65,15 @@ namespace
         return 2;
     }
 
-    /// "anthropic" | "gemini" | "cohere" | anything else -> None. Both the config
-    /// parser and --translate validate the string, so an unknown one cannot arrive.
+    /// "anthropic" | "gemini" | "cohere" | "bedrock" | anything else -> None. Both
+    /// the config parser and --translate validate the string, so an unknown one
+    /// cannot arrive.
     llmbridge::TranslateMode translate_from(const std::string& s)
     {
         return s == "anthropic" ? llmbridge::TranslateMode::Anthropic
                : s == "gemini"  ? llmbridge::TranslateMode::Gemini
                : s == "cohere"  ? llmbridge::TranslateMode::Cohere
+               : s == "bedrock" ? llmbridge::TranslateMode::Bedrock
                                 : llmbridge::TranslateMode::None;
     }
 
@@ -216,6 +218,7 @@ static int run(int argc, char** argv)
                 if (mode == "anthropic") translate = llmbridge::TranslateMode::Anthropic;
                 else if (mode == "gemini") translate = llmbridge::TranslateMode::Gemini;
                 else if (mode == "cohere") translate = llmbridge::TranslateMode::Cohere;
+                else if (mode == "bedrock") translate = llmbridge::TranslateMode::Bedrock;
                 else translate = llmbridge::TranslateMode::None;
             }
         }
@@ -234,7 +237,7 @@ static int run(int argc, char** argv)
             std::printf("usage: %s [--listen PORT] "
                         "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
                         "[--duration SECONDS] [--warmup SECONDS] "
-                        "[--translate none|anthropic|gemini|cohere] "
+                        "[--translate none|anthropic|gemini|cohere|bedrock] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
                         "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
