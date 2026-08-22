@@ -8,6 +8,26 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.26.1]. 2026-08-22
+
+Tests only, no shipped code changed. The ThreadSanitizer job is green again, and the
+defect it caught now fails in the ordinary build.
+
+### Fixed
+
+- **The model-rewrite tests joined the loop thread too late.** They read the upstream's
+  bytes and returned, so the policy object they had lent the gateway was destroyed
+  while the loop thread was still running and had already read its model string. TSan
+  reported the `delete` against that read.
+
+- **The fixture now enforces that instead of relying on it.** `TestBackend` refuses to
+  answer `last_request()` or `all_requests()` while the loop is running, but **only
+  when the loop borrows an object the test owns** (a `Policy` or a `RequestSink`).
+
+  It fires without a sanitizer, on both backends, which is the point: this bug was
+  invisible outside one CI job and on one backend. Verified by reintroducing the
+  defect and watching the check fail.
+
 ## [0.26.0]. 2026-08-22
 
 A policy may name the model, not only the venue. MINOR: one new field on `Decision`,
