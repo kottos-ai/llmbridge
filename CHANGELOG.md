@@ -8,6 +8,30 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.25.0]. 2026-08-22
+
+`Content-Length` on a byte-forwarded request is stated by the gateway, from the bytes
+it actually sends. MINOR: nothing observable changes for a body we do not edit, but a
+duplicate length is no longer echoed to a venue.
+
+### Changed
+
+- **The forwarded length is derived, never copied.** `request_without` rebuilt the
+  header block from the client's, which carried the client's `Content-Length` through
+  unexamined. It now drops it and emits its own from the body being forwarded.
+
+  This is a **precondition, not a fix**. Today the two numbers are equal, so the change
+  is invisible.
+
+  Unambiguous because `parse_request` refuses `Transfer-Encoding` outright, so every
+  byte-forwarded request is length-framed or bodyless. A request that carried no body
+  and no length still carries neither.
+
+  One behaviour does change, and it is the case that tells derived from copied apart:
+  the parser accepts an **identical** duplicate `Content-Length` and collapses it, and
+  the old code forwarded both lines to the venue. Exactly one is now emitted. Two
+  lengths reaching an upstream is smuggling-adjacent even when they agree.
+
 ## [0.24.0]. 2026-08-22
 
 Azure OpenAI as a venue. MINOR: a new `TranslateMode`, and `parse_upstream` now
