@@ -260,6 +260,8 @@ namespace llmbridge
         int64_t ts_wire_ready = 0;
         int64_t ts_up_sent = 0;
         int64_t ts_up_recvd = 0;
+        // Streaming only, and deliberately OUTSIDE the t0-t6 scheme.
+        int64_t ts_first_token = 0;
         // Last time this request saw ANY upstream progress (request forwarded, or
         // bytes received). The idle-timeout sweep measures against this.
         int64_t ts_up_activity = 0;

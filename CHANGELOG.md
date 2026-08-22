@@ -8,16 +8,25 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
-## [0.20.1]. 2026-08-20
+## [0.21.0]. 2026-08-21
 
-A logging default fix, no API change.
+Time to first TOKEN, distinct from time to first byte. MINOR because
+`RequestRecord` and the SSE translator each gain a field.
 
-### Fixed
+### Added
 
-- **The runtime log level now defaults to the COMPILE floor**, so a binary built with
-  the debug floor (`-DLLMBRIDGE_LOG_LEVEL=debug`) emits debug without an explicit
-  `set_level`. Before, the runtime default was hardcoded to Info regardless of the
-  compile floor.
+- **`RequestRecord::ts_first_token`**, stamped when a streamed response emits its
+  first CONTENT token, as opposed to `ts_up_recvd` (t4), which is the response HEAD.
+  Their difference is the provider's prefill. It sits outside the t0-t6 scheme by
+  design (a non-streamed request has no first token), and it is stamped once in the
+  shared `stream_step`, so both the epoll and io_uring backends carry it. 0 on a
+  non-streamed request, or a stream that produced no content.
+- **`AnthropicToOpenAiSse::content_started()`**, a one-way latch that turns true when
+  the first text delta or tool call is emitted, NOT the role-only opening delta. This
+  is the signal the gateway stamps its clock against. It is the same first-token event
+  `streamgen` measures client-side, now available per request to an in-process sink.
+  It rides no response header: a stream's headers are written before the first token
+  exists (see LATENCY.md).
 
 
 ## [0.20.0]. 2026-08-20
@@ -39,7 +48,12 @@ it did not before.
   embedder can record cache reads per request. On a gateway header,
   not the installed provider API.
 
+### Fixed
 
+- **The runtime log level now defaults to the COMPILE floor**, so a binary built with
+  the debug floor (`-DLLMBRIDGE_LOG_LEVEL=debug`) emits debug without an explicit
+  `set_level`. Before, the runtime default was hardcoded to Info regardless of the
+  compile floor.
 
 Diagnostics only, PATCH for the same reason as 0.19.2: the installed `provider` API
 is unchanged; the new accessors sit on `net::BufRing`, which llmbridge does not

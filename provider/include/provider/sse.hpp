@@ -78,6 +78,10 @@ namespace llmbridge::provider
         /// usage.cache_read_input_tokens; 0 when the provider reported none.
         [[nodiscard]] long long cached_tokens() const noexcept { return _cached_tok; }
 
+        /// True once the first CONTENT chunk has been emitted (a text delta, or a
+        /// tool call's name/arguments).
+        [[nodiscard]] bool content_started() const noexcept { return _content_started; }
+
 
     private:
         void dispatch(std::string_view data, std::string& out);
@@ -119,6 +123,7 @@ namespace llmbridge::provider
         long long _created_secs = -1;           // fixed stamp, or -1 => wall clock
         const char* _finish = nullptr;          // mapped stop_reason (static literal)
         bool _role_emitted = false;
+        bool _content_started = false; // first text/tool delta emitted; see content_started()
         bool _finish_emitted = false;
         bool _done = false;
 
