@@ -67,6 +67,13 @@ namespace llmbridge
         /// a TLS build: the signing needs OpenSSL, and the service is HTTPS-only, so
         /// selecting it without one fails at startup instead of sending unsigned bytes.
         Bedrock,
+        /// Azure OpenAI. The BODY is already OpenAI's, so nothing is translated; what
+        /// differs is everything around it. The deployment lives in the path, the
+        /// api-version in the query, and the credential goes in an `api-key` header
+        /// instead of `Authorization`. Byte-forwarding cannot do it: it would have to
+        /// merge our query with the client's target, which is the case parse_upstream
+        /// deliberately refuses.
+        Azure,
     };
 
     // TLS towards the upstream. Declared unconditionally so callers don't need
@@ -128,6 +135,12 @@ namespace llmbridge
         std::string base_path{};
 
         std::string host_hdr{}; ///< derived at construction; see host_header_for()
+
+        /// Query for this venue, without the '?'. Azure's `api-version` lives here.
+        /// Only a mode that builds its own target may carry one; the constructor
+        /// refuses a query on a byte-forwarding venue, where it would have to be
+        /// merged with whatever the client sent.
+        std::string query{};
 
         /// AWS region for SigV4, derived at construction from the hostname
         /// (`bedrock-runtime.us-east-1.amazonaws.com` -> `us-east-1`). Empty when the

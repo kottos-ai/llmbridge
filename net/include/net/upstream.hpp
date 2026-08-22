@@ -29,9 +29,13 @@
 // Deliberately rejected, with a reason in `error` instead of a guess:
 //   - userinfo ("https://a@b"), the classic URL-confusion trick where the
 //     eyeball host and the connect host differ
-//   - query and fragment, in any position. Azure OpenAI needs "?api-version=",
-//     which means merging our query with the client's; that is a separate design
-//     question and guessing at it would misroute every request
+//   - a FRAGMENT, in any position: it never travels on the wire, so a URL carrying
+//     one is a paste error worth naming, and dropping it silently is worse
+//   - a QUERY on a venue whose mode BYTE-FORWARDS. Azure OpenAI needs
+//     "?api-version=", and that is now parsed and kept, because a translating mode
+//     builds the whole request target itself and has no client query to merge with.
+//     Byte-forward does, so the Gateway refuses that pairing at startup, where the
+//     mode is known; parse_upstream only reports what it found
 //   - IPv6 literals: the transport stack is sockaddr_in/AF_INET end to end;
 //     half-accepting "[::1]:443" would fail later with a worse message
 //   - hosts with characters outside [A-Za-z0-9.-]: the host string is later
@@ -54,6 +58,9 @@ namespace llmbridge::net
         /// Normalized base path: empty, or "/..." with no trailing slash. Prefixed
         /// to the request target; empty means the target is used as-is.
         std::string path;
+        /// Query as written, WITHOUT the '?'. Empty when there is none. Only a mode
+        /// that builds its own target may use it; see the note above.
+        std::string query;
         uint16_t port{0};
         bool tls{false};
         std::string error;  ///< non-empty => parse failed, other fields unspecified

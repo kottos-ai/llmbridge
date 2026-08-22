@@ -62,11 +62,10 @@ namespace llmbridge::net
             // Named separately from the charset check below, because this is the
             // case an operator hits by pasting an Azure OpenAI URL, and "character
             // outside [...]" would not tell them which character or why.
-            if (in.find('?') != std::string_view::npos || in.find('#') != std::string_view::npos)
+            if (in.find('#') != std::string_view::npos)
             {
                 err = "base path '" + std::string(in) +
-                      "' has a query or fragment; not supported, because it would have "
-                      "to be merged with the client's own";
+                      "' has a fragment, which never travels on the wire";
                 return false;
             }
             std::string_view p = in;
@@ -137,8 +136,36 @@ namespace llmbridge::net
         // hidden inside a path that was never inspected.
         if (const size_t slash = rest.find('/'); slash != std::string_view::npos)
         {
-            const std::string_view p = rest.substr(slash);
+            std::string_view p = rest.substr(slash);
             rest = rest.substr(0, slash);
+            // Split the query off before the path is normalised: it has its own
+            // charset and its own rule, and folding them together is how "?" ends up
+            // inside a request-line path.
+            if (const size_t q = p.find('?'); q != std::string_view::npos)
+            {
+                spec.query.assign(p.substr(q + 1));
+                p = p.substr(0, q);
+                if (spec.query.find('#') != std::string::npos)
+                {
+                    spec.error = "fragment not allowed in upstream";
+                    return spec;
+                }
+                for (const char ch : spec.query)
+                {
+                    // The query lands in a request line, so the same reasoning as the
+                    // path applies: refuse anything that could split or retarget it.
+                    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                                    (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' ||
+                                    ch == '_' || ch == '~' || ch == '=' || ch == '&' ||
+                                    ch == '%' || ch == ':' || ch == '+';
+                    if (!ok)
+                    {
+                        spec.error = "upstream query has a character outside "
+                                     "[A-Za-z0-9-._~=&%:+]";
+                        return spec;
+                    }
+                }
+            }
             if (!have_scheme)
             {
                 // The legacy HOST:PORT form has no scheme, and "host:9001/x" reads
@@ -157,7 +184,7 @@ namespace llmbridge::net
         }
         if (rest.find('?') != std::string_view::npos || rest.find('#') != std::string_view::npos)
         {
-            spec.error = "query/fragment not allowed in upstream";
+            spec.error = "query/fragment in the authority; put them after the path";
             return spec;
         }
         if (rest.find('[') != std::string_view::npos)
