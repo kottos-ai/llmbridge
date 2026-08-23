@@ -9,7 +9,7 @@
 
 // A minimal, hand-rolled raw io_uring: the completion-based I/O engine that will
 // back the gateway's hot path (Phase 1), replacing the readiness-based epoll loop
-// to batch the ~4 syscalls/request toward <<1. Deliberately NO liburing: we drive
+// to batch the ~4 syscalls/request toward <<1. Deliberately no liburing: we drive
 // io_uring_setup / io_uring_enter directly and mmap the SQ/CQ rings ourselves, so
 // the runtime stays dependency-free like the rest of llmbridge.
 //

@@ -10,7 +10,7 @@ add_library(llmbridge_config STATIC config.cpp)
 target_link_libraries(llmbridge_config PUBLIC provider)
 target_include_directories(llmbridge_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Install the daemon (so `cmake --install` puts `llmbridge` on PATH). Top-level only.
+# Install the daemon (so `cmake --install` puts `llmbridge` on path). Top-level only.
 if (PROJECT_IS_TOP_LEVEL)
     install(TARGETS llmbridge RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif ()
@@ -23,7 +23,7 @@ endif ()
 if (LLMBRIDGE_BUILD_TESTS)
     function(llmbridge_cli_refuses name expect)
         add_test(NAME ${name} COMMAND llmbridge ${ARGN})
-        # TIMEOUT matters: a guard that fails to fire leaves a gateway RUNNING, so
+        # Timeout matters: a guard that fails to fire leaves a gateway running, so
         # without it the regression hangs the suite instead of failing it.
         set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${expect}" TIMEOUT 10)
     endfunction()

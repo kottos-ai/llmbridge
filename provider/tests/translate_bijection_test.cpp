@@ -8,13 +8,13 @@
 // Bijection / round-trip tests for request translation.
 //
 // "OpenAI -> provider -> back should return the original message": the request
-// translators must be LOSSLESS on the covered chat surface (model, system,
+// translators must be lossless on the covered chat surface (model, system,
 // user/assistant turns, max_tokens/temperature/top_p). We verify that by
 // reducing both the original OpenAI request and the translated provider request
 // to the same canonical form and asserting equality; i.e. the inverse mapping
 // exists and recovers the original.
 //
-// The hard cases are LARGE bodies and nasty escaping, because the zero-copy DOM
+// The hard cases are large bodies and nasty escaping, because the zero-copy DOM
 // references raw still-escaped spans: any mis-scan of an escaped quote/backslash
 // or any truncation would corrupt the recovered content and fail here.
 
@@ -54,7 +54,7 @@ namespace
         bool operator==(const Turn&) const = default;
     };
 
-    // Canonical chat form. Content is the RAW (still-escaped) bytes, concatenated
+    // Canonical chat form. Content is the raw (still-escaped) bytes, concatenated
     // the way both the translator and a reader would, so equality is byte-exact.
     struct Canon
     {

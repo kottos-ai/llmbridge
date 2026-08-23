@@ -12,7 +12,7 @@
 // Scope (Phase A): just enough to (a) know when a full request/response has
 // arrived in a buffer, and (b) decide keep-alive. Content-Length framing only.
 // Because we frame solely by Content-Length, any `Transfer-Encoding` header is
-// REJECTED instead of ignored. Ignoring it (while an upstream honours it) is
+// Rejected instead of ignored. Ignoring it (while an upstream honours it) is
 // the classic request-smuggling desync, dangerous with pooled upstreams. A
 // conflicting duplicate Content-Length is likewise rejected (RFC 9112 §6). No
 // allocation, no copy: everything is index math over a caller-owned buffer, a
@@ -56,12 +56,12 @@ namespace llmbridge::net::http
             return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
         }
 
-        // Case-insensitive PREFIX test: `name` must be lower-case, and callers that
+        // Case-insensitive prefix test: `name` must be lower-case, and callers that
         // mean a header name must include the ':' themselves, or `x-tenant` matches
         // the line `x-tenant-spoof:`. That is why this is `detail::` and why
         // find_header() below does not use it: an exact header lookup is the thing
         // callers actually want, and this primitive is one colon away from being a
-        // header-forgery hole. It is also used on VALUES (`close`), which is why it
+        // header-forgery hole. It is also used on values (`close`), which is why it
         // cannot simply require a colon itself.
         inline bool line_is(std::string_view line, std::string_view name) noexcept
         {
@@ -80,7 +80,7 @@ namespace llmbridge::net::http
         }
 
         // Trim optional whitespace (RFC 9110 OWS = SP / HTAB) from both ends of a
-        // field value. Trailing OWS is legal and must be stripped BEFORE a strict
+        // field value. Trailing OWS is legal and must be stripped before a strict
         // numeric test, or "Content-Length: 27 " would be rejected as non-numeric.
         inline std::string_view trim_ows(std::string_view v) noexcept
         {
@@ -91,7 +91,7 @@ namespace llmbridge::net::http
         }
 
         // Strict Content-Length: RFC 9112 §8.6 is 1*DIGIT, nothing else. Plain
-        // std::from_chars is NOT enough; it stops at the first non-digit and
+        // std::from_chars is not enough; it stops at the first non-digit and
         // still reports success, so "0x1b" parses as 0 and "27abc" as 27. Both
         // were measured: the first framed a 27-byte body as empty. A length we
         // read differently from the upstream is a desync, so anything that is not
@@ -109,13 +109,13 @@ namespace llmbridge::net::http
             return true;
         }
 
-        // Reject a header block containing a BARE CR or BARE LF.
+        // Reject a header block containing a bare CR or bare LF.
         //
         // We split lines on CRLF. A parser that splits on a bare CR (or bare LF)
         // instead sees a different set of headers than we do; it may see a
         // Content-Length we never saw. Measured: "X-A: 1\rContent-Length: 27"
         // made the length invisible to this framer while a lenient upstream
-        // honoured it, framing 27 bytes we never sent. On a POOLED upstream that
+        // honoured it, framing 27 bytes we never sent. On a pooled upstream that
         // disagreement is a cross-client desync, so this is a refusal and never a
         // sanitise-and-forward.
         inline bool block_line_endings_ok(std::string_view h) noexcept
@@ -131,7 +131,7 @@ namespace llmbridge::net::http
         // Validate one header line and locate its colon.
         //
         // Two refusals beyond "must have a colon", both of which otherwise make a
-        // header INVISIBLE to every `name:` prefix test in this file while a more
+        // header invisible to every `name:` prefix test in this file while a more
         // lenient upstream still honours it:
         //   * obs-fold: a line starting with SP/HTAB is a continuation of the
         //     previous header (RFC 9112 §5.2, deprecated, MUST-reject on receipt).
@@ -150,22 +150,22 @@ namespace llmbridge::net::http
     // Case-insensitive single-header lookup over a raw header block (the bytes
     // between the start line's CRLF and the terminating CRLFCRLF, or the whole
     // message; the start line simply never matches a `name:` prefix). Returns the
-    // FIRST occurrence's value, left-trimmed, or empty if absent. Zero-copy: the
+    // First occurrence's value, left-trimmed, or empty if absent. Zero-copy: the
     // view aliases `headers`.
     //
     // First-wins is a deliberate anti-smuggling stance: when a client sends a
     // duplicated header, the copies must not be interpreted differently by us
-    // and by the upstream. We take the first and, because the gateway REBUILDS
+    // and by the upstream. We take the first and, because the gateway rebuilds
     // the upstream request from a whitelist instead of echoing the block, the
     // duplicate never travels.
     //
-    // WARNING: The returned value is NOT safe to re-emit as-is. Splitting on CRLF leaves
-    // a BARE CR (or any other control byte) inside the value, a lenient parser
+    // Warning: The returned value is not safe to re-emit as-is. Splitting on CRLF leaves
+    // a bare CR (or any other control byte) inside the value, a lenient parser
     // that treats bare CR as a line terminator then sees an injected header. An
     // earlier revision of this comment claimed the opposite; it was wrong, and the
     // injection was measured reaching an upstream. Callers that re-emit a value
-    // MUST validate its charset first (see header_value_safe in gateway.cpp).
-    // `name` must be LOWERCASE and INCLUDE the trailing colon ("x-api-key:"),
+    // Must validate its charset first (see header_value_safe in gateway.cpp).
+    // `name` must be lowercase and include the trailing colon ("x-api-key:"),
     // same convention as the framer's own header matching, and the colon is what
     // stops "x-api-key-2:" from prefix-matching "x-api-key".
     /// Value of header `name`, empty when absent. A view into `headers`.
@@ -173,7 +173,7 @@ namespace llmbridge::net::http
     /// Write the name however reads best: `"authorization"`, `"Authorization"` and
     /// `"authorization:"` all do the same thing.
     ///
-    /// It used to take the name WITH a trailing colon, compare it as a bare prefix
+    /// It used to take the name with a trailing colon, compare it as a bare prefix
     /// and never lower-case it, so both spellings above failed silently and
     /// `find_header(h, "x-tenant")` returned the value of a client-supplied
     /// `x-tenant-spoof:` line. Nothing in production called it, so nothing was
@@ -189,9 +189,9 @@ namespace llmbridge::net::http
             size_t eol = headers.find("\r\n", start);
             if (eol == std::string_view::npos) eol = headers.size();
             const std::string_view line = headers.substr(start, eol - start);
-            // STOP AT THE BLANK LINE. Every caller passes exactly a header block today,
+            // Stop at the blank line. Every caller passes exactly a header block today,
             // so this changes nothing for them; it exists because the one that does not
-            // hands an attacker a free header. A credential written into the BODY was
+            // hands an attacker a free header. A credential written into the body was
             // otherwise found and honoured, which is a header the client controls
             // entirely and no framing check ever sees.
             if (line.empty()) return {};
@@ -299,7 +299,7 @@ namespace llmbridge::net::http
     // transfer-encoding and carry no Content-Length, so the strict `parse()`
     // above (Content-Length only, TE rejected) cannot read them. The two helpers
     // below add exactly what the gateway's *response* path needs to pump a stream
-    //, and ONLY the response path: client-request framing stays strict, so the
+    //, and only the response path: client-request framing stays strict, so the
     // anti-smuggling posture is unchanged. A trusted upstream sending chunked is
     // not a smuggling vector the way an untrusted client would be.
 
@@ -332,7 +332,7 @@ namespace llmbridge::net::http
         }
     } // namespace detail
 
-    // Parse a RESPONSE header block. Unlike parse(), this tolerates chunked
+    // Parse a response header block. Unlike parse(), this tolerates chunked
     // transfer-encoding (needed for SSE) and reports how the body is framed so the
     // caller can choose whole-body vs streaming handling. Returns NeedMore until
     // the CRLFCRLF is buffered.
@@ -346,8 +346,8 @@ namespace llmbridge::net::http
 
         std::string_view headers = buf.substr(0, hdr_end);
 
-        // The status line MUST be "HTTP/1.x SP ...", and checking that is what stops
-        // arbitrary leading bytes being ABSORBED into it. The scan below takes the
+        // The status line must be "HTTP/1.x SP ...", and checking that is what stops
+        // arbitrary leading bytes being absorbed into it. The scan below takes the
         // first space anywhere in the head and reads three digits after it, so
         // without this check a blob prepended to a response frames as a normal
         // reply whenever it contains no space and no CRLF: "JUNKHTTP/1.1 200 OK"
@@ -356,7 +356,7 @@ namespace llmbridge::net::http
         // Only reachable if stray bytes survive on a pooled upstream, which
         // {ep,ur}_release_upstream prevents by clearing rbuf. This is the second
         // lock. The v0.8.1 defects were all one shape, malformed input becoming
-        // INVISIBLE input, and the cure is refusing it here instead of trusting a
+        // Invisible input, and the cure is refusing it here instead of trusting a
         // single guard elsewhere.
         if (headers.size() < 9 || headers.compare(0, 7, "HTTP/1.") != 0 ||
             (headers[7] != '0' && headers[7] != '1') || headers[8] != ' ')
@@ -375,8 +375,8 @@ namespace llmbridge::net::http
         }
 
         // Same strictness as the request framer, and for a sharper reason: a
-        // mis-framed RESPONSE leaves stray bytes on a POOLED upstream connection,
-        // where they become the head of the NEXT client's response. A framing
+        // mis-framed response leaves stray bytes on a pooled upstream connection,
+        // where they become the head of the next client's response. A framing
         // disagreement here hands one client another client's bytes, so a
         // malformed response is refused instead of salvaged.
         if (!detail::block_line_endings_ok(headers)) return FrameStatus::Error;
@@ -514,7 +514,7 @@ namespace llmbridge::net::http
         [[nodiscard]] bool done() const noexcept { return _st == St::Done; }
 
         // Total input bytes consumed across all feeds. Needed to find where a
-        // chunked message ENDS: anything after that is the next pipelined response
+        // chunked message ends: anything after that is the next pipelined response
         // (or trailing junk that must not be mistaken for one). The loop above
         // stops advancing `i` once Done, so this never over-counts past the
         // terminating chunk.
@@ -531,17 +531,17 @@ namespace llmbridge::net::http
         std::string _line;     // accumulates a size/CRLF/trailer line across reads
     };
 
-    // Frame a complete upstream RESPONSE, accepting BOTH body encodings.
+    // Frame a complete upstream response, accepting both body encodings.
     //
-    // WHY THIS EXISTS SEPARATELY FROM parse(). HTTP/1.1 delimits a body either by
+    // Why this exists separately from parse(). HTTP/1.1 delimits a body either by
     // Content-Length or by Transfer-Encoding: chunked. parse() implements only the
-    // former and REJECTS the latter deliberately, because on the REQUEST path we
+    // former and rejects the latter deliberately, because on the request path we
     // are the server, the bytes are attacker-controlled, and framing TE as CL while
     // an upstream honours TE is the classic smuggling desync (worse here, since a
-    // desync on a POOLED upstream lets one client's trailing bytes become the head
+    // desync on a pooled upstream lets one client's trailing bytes become the head
     // of another client's request). That rule must not be relaxed.
     //
-    // On the RESPONSE path the threat model is inverted: we are the client, talking
+    // On the response path the threat model is inverted: we are the client, talking
     // to a configured and TLS-verified provider, and chunked is simply normal
     // HTTP/1.1: a server uses it whenever the body length is unknown when headers
     // are sent, which is the usual case for a generated completion. Real providers
@@ -558,12 +558,12 @@ namespace llmbridge::net::http
     // Returns everything in one value instead of through out-parameters: four of
     // them (head, body, total_len + status) was unreadable at the call site.
     //
-    // ZERO-COPY WHERE IT CAN BE. On Complete, `body` is a view of the decoded body:
+    // ZERO-COPY where it can be. On Complete, `body` is a view of the decoded body:
     //   Content-Length -> it aliases `buf` directly. The bytes are already
     //                     contiguous, so copying them would be pure waste, and this
     //                     is the path that runs at full request rate.
     //   chunked        -> it aliases `scratch`, because the body bytes are
-    //                     interleaved with chunk-size lines and CANNOT be viewed in
+    //                     interleaved with chunk-size lines and cannot be viewed in
     //                     place. That copy is inherent to the encoding, not a
     //                     choice.
     // `scratch` is caller-owned so its capacity can be reused across requests
@@ -585,7 +585,7 @@ namespace llmbridge::net::http
 
     // Per-connection decode state for non-streaming responses.
     //
-    // This exists to keep the chunked path LINEAR. An earlier revision built a
+    // This exists to keep the chunked path linear. An earlier revision built a
     // fresh ChunkDecoder on every call and re-decoded the whole buffer from byte
     // zero, which is O(n^2) as bytes trickle in, measured on a single upstream
     // connection, decoding a body arriving in 64 KiB reads:
@@ -593,13 +593,13 @@ namespace llmbridge::net::http
     //     1 MB ->  1.6 ms      4 MB -> 13.9 ms
     //     2 MB ->  4.3 ms      8 MB -> 79.0 ms   (65x the body re-decoded)
     //
-    // Scope, so nobody over-reads the table: a typical 1 KB reply arrives in ONE
+    // Scope, so nobody over-reads the table: a typical 1 KB reply arrives in one
     // read, so this loop never runs and the cost is ~0.4 us either way. It takes a
     // body spanning several reads to matter at all (~128 KB), and ~500 KB before it
     // costs a millisecond. Normal traffic was never affected.
     //
     // What makes it worth fixing is not the latency of the request that triggers it
-    // but HEAD-OF-LINE BLOCKING: the loop is single-threaded, so a 79 ms decode
+    // but HEAD-OF-LINE blocking: the loop is single-threaded, so a 79 ms decode
     // delays every other client on that worker by up to 79 ms. An unusually large
     // completion can trigger it; a hostile upstream can do it at will up to
     // kMaxBodyLen. Feeding only the newly-arrived bytes makes the cost linear and
@@ -643,11 +643,11 @@ namespace llmbridge::net::http
             return r;
         }
 
-        // Chunked: feed ONLY the bytes that arrived since the last call. The
+        // Chunked: feed only the bytes that arrived since the last call. The
         // decoder and the decoded body persist in `st` across calls, so a body
         // delivered in N reads costs O(body) instead of O(N * body). Still
         // idempotent: re-calling with an unchanged buffer feeds nothing and
-        // re-reports the same result. `st` MUST be reset between responses on a
+        // re-reports the same result. `st` must be reset between responses on a
         // pooled connection (see ResponseDecoder::reset).
         const std::string_view after = buf.substr(r.head.header_len);
         if (!st.dec.done() && st.fed < after.size())

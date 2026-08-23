@@ -87,7 +87,7 @@ namespace llmbridge::app
             return true;
         }
 
-        /// Strings are COPIED here, which is what lets the caller drop the DOM. The
+        /// Strings are copied here, which is what lets the caller drop the DOM. The
         /// parser's `sv` is a view into the input and is still JSON-escaped; config
         /// values are paths, URLs and enum words, none of which may contain an escape,
         /// so a backslash is refused instead of silently mis-decoded.
@@ -170,7 +170,7 @@ namespace llmbridge::app
 
         if (const json::Value* g = root.find("upstream"))
         {
-            // OBJECT OR ARRAY. The object form is the one-upstream shorthand and is
+            // Object or array. The object form is the one-upstream shorthand and is
             // what almost every deployment writes; the array is the same object
             // repeated, so nothing moves when a config grows a second venue. This is
             // the migration DESIGN.md promised when `--config` shipped ahead of the
@@ -260,7 +260,7 @@ namespace llmbridge::app
         if (!in) return fail(err, "config: cannot read " + path);
         std::ostringstream ss;
         ss << in.rdbuf();
-        // `text` is a local, and that is safe ONLY because parse_config copies every
+        // `text` is a local, and that is safe only because parse_config copies every
         // value out of the zero-copy DOM. If a field is ever changed to hold a
         // string_view, this becomes a use-after-free.
         const std::string text = ss.str();

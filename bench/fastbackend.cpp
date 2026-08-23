@@ -20,8 +20,8 @@
 //                                               (latency default 0 = instant)
 //
 // --tools serves an Anthropic response containing tool_use blocks. That path is
-// NOT covered by the plain body: a tool response makes the translator decode the
-// tool_use input object and re-emit it as an OpenAI `arguments` STRING (escaping
+// Not covered by the plain body: a tool response makes the translator decode the
+// tool_use input object and re-emit it as an OpenAI `arguments` string (escaping
 // it), which is measurably more work than copying text through. Without this the
 // regression sweep would report "no change" for edits that only affect the tool
 // path, which is exactly what happened once: a live check showed 19 us for tool
@@ -68,7 +68,7 @@ namespace
         "\"content\":[{\"type\":\"text\",\"text\":\"pong\"}],\"stop_reason\":\"end_turn\","
         "\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}";
 
-    // Anthropic response carrying TWO tool_use blocks (parallel calls are the
+    // Anthropic response carrying two tool_use blocks (parallel calls are the
     // common agent shape) plus a text block, so the translator exercises: block
     // iteration, input-object -> arguments-string escaping, and the tool_calls
     // array build. Kept deliberately small; this measures the translation, not

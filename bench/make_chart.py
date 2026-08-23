@@ -52,7 +52,7 @@ with open(CSV) as f:
             "litellm_sat": c[9].strip() == "yes",
         })
 
-# Geometry. W/H kept IDENTICAL to make_saturation_chart.py so the two figures
+# Geometry. W/H kept identical to make_saturation_chart.py so the two figures
 # render at exactly the same size on the page.
 W, H = 1000, 620
 ML, MR, MT, MB = 96, 44, 116, 116
@@ -70,7 +70,7 @@ def ly(v):
     return MT + t * PH
 
 
-LLMBRIDGE = "#16a34a"  # green: semantic pass/fail against red, NOT brand colour
+LLMBRIDGE = "#16a34a"  # green: semantic pass/fail against red, not brand colour
 LITELLM = "#dc2626"  # red
 GRID = "#e5e7eb"
 INK = "#111827"
@@ -96,7 +96,7 @@ while dec <= 5:
     svg.append(f'<text x="{ML - 10}" y="{y + 5:.1f}" font-size="{F_AXIS}" fill="{SUB}" text-anchor="end">{v:g} ms</text>')
     dec += 1
 
-# 1 ms PASS line
+# 1 ms pass line
 y1 = ly(1.0)
 svg.append(
     f'<line x1="{ML}" y1="{y1:.1f}" x2="{ML + PW}" y2="{y1:.1f}" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 4"/>')
@@ -129,7 +129,7 @@ for i, r in enumerate(rows):
     svg.append(
         f'<text x="{gx:.1f}" y="{axis_y + 26:.1f}" font-size="{F_XLBL}" fill="{INK}" text-anchor="middle" font-weight="600">{r["rps"]} RPS</text>')
 
-# ONE spanning "saturated" annotation, not one per group: the 12px label is wider
+# One spanning "saturated" annotation, not one per group: the 12px label is wider
 # than the group spacing, so per-group copies overlapped into an unreadable smear.
 # A thin rule marks the saturated span; the label sits between the x labels and
 # the legend (axis_y+47 clears the x-label descenders and the legend's top).

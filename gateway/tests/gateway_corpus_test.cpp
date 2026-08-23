@@ -6,29 +6,29 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // Concurrency + fidelity regression: 100 clients x 10 questions through one
-// gateway, NON-STREAMING and STREAMED, on BOTH event-loop backends.
+// gateway, NON-STREAMING and streamed, on both event-loop backends.
 //
 // What this proves that the other gateway tests do not:
 //
-//   1. RESPONSE CORRELATION UNDER A SHARED POOL. Every request carries a different
+//   1. Response correlation under A shared pool. Every request carries a different
 //      question and expects a different answer, and the mock provider answers by
-//      LOOKING THE QUESTION UP instead of replying with a canned body. So if the
+//      Looking the question up instead of replying with a canned body. So if the
 //      gateway ever hands client A the bytes meant for client B, the failure mode
 //      a framing desync produces, and the reason a shared upstream pool makes
 //      framing bugs cross-client; this test says so by name, instead of passing
 //      because both clients expected the same string. A canned-response test is
 //      structurally blind to that. Question uniqueness is asserted, not assumed.
 //
-//   2. TEXT FIDELITY ON REAL MODEL OUTPUT. The corpus is recorded Claude answers
+//   2. Text fidelity on real model output. The corpus is recorded Claude answers
 //      (scripts/gen_qa_corpus.py, recorded once, replayed here; the test itself
 //      never touches the network). Each entry carries a `kind`:
 //
 //        plain          ordinary prose
 //        escape_stress  answers forced to contain JSON-hostile characters
-//        json_hostile   answers ABOUT JSON escaping, so the text is itself full of
+//        json_hostile   answers about JSON escaping, so the text is itself full of
 //                       backslashes, quotes and \uXXXX the model wrote literally.
-//                       NOTE the limit of this: asked directly about \u0000 and raw
-//                       control characters, the model DESCRIBES them. 68 answers
+//                       Note the limit of this: asked directly about \u0000 and raw
+//                       control characters, the model describes them. 68 answers
 //                       carry a literal backslash-u sequence, none carries a raw
 //                       control byte. Recorded output cannot cover that byte class,
 //                       which is where the control-character defect lived, so it is covered
@@ -37,14 +37,14 @@
 //        long           multi-paragraph answers
 //        backend_stress deliberately large answers, see (3)
 //
-//      The fixture is CURATED, not merely sampled: 2000 pairs are generated, answers
+//      The fixture is curated, not merely sampled: 2000 pairs are generated, answers
 //      are capped at 6144 bytes (records that hit the cap carry "truncated": true),
 //      and the best 1000 are kept by character-class coverage. Curating beats
-//      generating 1000 directly because the selector can then guarantee every RARE
+//      generating 1000 directly because the selector can then guarantee every rare
 //      class survives at 100%: tab 18/18, astral 97/97, literal-\u 68/68,
 //      backslash 224/224, while the abundant ones (newline, non-ascii) halve
 //      harmlessly. A proportional sample does not do this: a naive stride-2 halving
-//      of the same 2000 drops `tab` to ZERO.
+//      of the same 2000 drops `tab` to zero.
 //
 //      1000 is also exactly kTotal, so pick() strides by 1 and every entry is used
 //      by the concurrency runs. At 2000 the stride was 2 and half the corpus was
@@ -58,15 +58,15 @@
 //      defect fixed in 0.9.0 was found: the parser accepted raw control bytes and
 //      passed them straight through into a 200 OK that no strict client can read.
 //
-//   3. BOTH BACKENDS, INCLUDING WHERE THEY DIFFER. epoll and io_uring implement
+//   3. Both backends, including where they differ. epoll and io_uring implement
 //      this path independently (DESIGN.md, "Naming conventions"), so a fix to one
 //      is not a fix to the other and every case here runs twice. The
 //      backend_stress answers exist because io_uring reassembles reads across a
 //      provided-buffer ring of kUrBufSize = 4096 while epoll grows a single buffer,
 //      and on the streaming path io_uring accumulates into `wpending` where epoll
-//      pauses reads, so answers past a few KB exercise code that is NOT shared.
+//      pauses reads, so answers past a few KB exercise code that is not shared.
 //
-//   4. STREAMING AS WELL AS NOT. The streamed cases drive real SSE: the provider
+//   4. Streaming as well as not. The streamed cases drive real SSE: the provider
 //      emits the Anthropic event envelope one HTTP chunk per event, the gateway
 //      translates it to OpenAI chunks, and the client reassembles the answer from
 //      the deltas. Note the framing changes across the gateway: the upstream leg
@@ -80,7 +80,7 @@
 // in the chunked-decode regression with a deterministic one. Use the printed
 // numbers for tracking; the pass/fail signal here is correctness.
 //
-// The TTFT figures are NOT a provider-latency claim: the mock replies instantly, so
+// The TTFT figures are not a provider-latency claim: the mock replies instantly, so
 // they measure the gateway plus 1000 concurrent connection setups, nothing else.
 
 #include "gateway/gateway.hpp"
@@ -158,7 +158,7 @@ namespace
     }
 
     // ---------------------------------------------------------- mock provider
-    // Answers by LOOKING UP the question in the request. That lookup is the whole
+    // Answers by looking up the question in the request. That lookup is the whole
     // point: a canned reply cannot distinguish "right answer" from "some answer".
     class CorpusBackend
     {
@@ -192,7 +192,7 @@ namespace
             ::close(_fd);
             _fd = -1;
             if (_acc.joinable()) _acc.join();
-            {   // the gateway POOLS upstream conns, so handler threads sit in read()
+            {   // the gateway pools upstream conns, so handler threads sit in read()
                 std::lock_guard<std::mutex> lk(_mu);
                 for (int fd : _fds) ::shutdown(fd, SHUT_RDWR);
             }
@@ -202,11 +202,11 @@ namespace
         ~CorpusBackend() { stop(); }
 
         uint16_t port() const { return _port; }
-        // Fault injection, used ONLY by the negative-control tests below: reply to
+        // Fault injection, used only by the negative-control tests below: reply to
         // every question with this text instead of the correct answer. Simulates a
         // pooled-connection desync handing one client another's response.
         void set_wrong_answer(std::string s) { _wrong = std::move(s); }
-        // Emit the answer text into the JSON body WITHOUT escaping it, simulating an
+        // Emit the answer text into the JSON body without escaping it, simulating an
         // escaping regression in the translator.
         void set_skip_escaping(bool b) { _skip_escape = b; }
         int served() const { return _served.load(std::memory_order_relaxed); }
@@ -438,7 +438,7 @@ namespace
         bool ok = false;
         bool saw_done = false;
         std::string content;   // reassembled from every delta
-        double ttft_ms = 0;    // to the FIRST content delta: the number voice agents feel
+        double ttft_ms = 0;    // to the first content delta: the number voice agents feel
         double total_ms = 0;   // to [DONE]
         int deltas = 0;
     };
@@ -527,7 +527,7 @@ namespace
         // Drive one streaming request end to end, timestamping the first content
         // delta.
         //
-        // NOTE the framing: the gateway's client-facing SSE is CLOSE-DELIMITED
+        // Note the framing: the gateway's client-facing SSE is CLOSE-DELIMITED
         // ("Connection: close", no Content-Length and no Transfer-Encoding). The
         // upstream leg is chunked, the client leg is not. An earlier version of this
         // helper ran a ChunkDecoder over the client bytes and every single stream
@@ -630,15 +630,15 @@ namespace
     }
 
     // The gateway's own added-latency histogram tops out at ~2.62 ms, and
-    // Histogram::percentile() returns the running MAX once the target lands in the
+    // Histogram::percentile() returns the running max once the target lands in the
     // overflow region, so a saturated histogram silently reports a number that
     // looks like a percentile and is not one. That exact artifact has produced a
     // wrong result in this project before, so refuse to print one.
     //
     // It saturates here for io_uring under concurrency because the uring stamps
-    // bracket a SUBMITTED send and its completion, so the interval includes time
+    // bracket a submitted send and its completion, so the interval includes time
     // the SQE spent queued; the epoll path stamps around an inline write() and
-    // measures only compute. The two are therefore NOT comparable under load.
+    // measures only compute. The two are therefore not comparable under load.
     // Compare them in the sequential control instead, where both read ~45 us.
     std::string added_latency(const llmbridge::Histogram& h)
     {
@@ -704,7 +704,7 @@ namespace
     };
 } // namespace
 
-// Every client gets a DISJOINT slice of the corpus, so all 1000 questions are asked
+// Every client gets a disjoint slice of the corpus, so all 1000 questions are asked
 // exactly once and every expected answer is unique to one in-flight request.
 TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
 {
@@ -761,7 +761,7 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
     for (auto& f : fails) all.insert(all.end(), f.begin(), f.end());
     EXPECT_TRUE(all.empty()) << all.size() << " of " << kTotal << " answers were wrong";
 
-    // Name the failure mode explicitly: a wrong answer that is ANOTHER question's
+    // Name the failure mode explicitly: a wrong answer that is another question's
     // answer is cross-client response mixing, which is far more serious than
     // corruption and has a different cause (pooled-connection desync).
     int swapped = 0;
@@ -786,7 +786,7 @@ TEST_P(CorpusIT, ThousandQuestionsAcrossHundredClients)
 
     // Two very different numbers, printed together on purpose.
     //
-    // The client-observed figure is dominated by QUEUEING, not by the gateway: one
+    // The client-observed figure is dominated by queueing, not by the gateway: one
     // single-threaded loop serves 100 concurrent clients, so by Little's law the
     // wait is concurrency/throughput regardless of how fast the gateway is. The
     // harness makes it worse. ~201 threads (100 clients + up to 100 mock-provider
@@ -955,7 +955,7 @@ TEST_P(CorpusIT, StreamedThousandQuestionsAcrossHundredClients)
 // Large answers are where the two backends genuinely differ: io_uring reassembles
 // across a provided-buffer ring (kUrBufSize = 4096) while epoll grows one buffer, and
 // on the streaming path io_uring accumulates in `wpending` where epoll pauses reads.
-// Anything past a few KB therefore exercises code that is NOT shared.
+// Anything past a few KB therefore exercises code that is not shared.
 TEST_P(CorpusIT, LargeAnswersCrossBufferBoundariesOnBothPaths)
 {
     start();
@@ -1003,7 +1003,7 @@ TEST_P(CorpusIT, LargeAnswersCrossBufferBoundariesOnBothPaths)
                               "is not reaching the multi-buffer path it exists for";
 }
 
-// Control for the two load tests above: identical code path, ONE client, no
+// Control for the two load tests above: identical code path, one client, no
 // concurrency. Anything the loaded runs report beyond what this reports is
 // queueing, not gateway cost, so this is the number to reason about when the
 // concurrent figures look alarming.
@@ -1105,7 +1105,7 @@ TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
         for (auto& v : lat) for (double x : v) all.add(x);
         const double rps = (nclients * per) / (wall / 1000.0);
         // Little's law prediction: in-flight / throughput. If this tracks the measured
-        // p50, the latency IS the queue and not the gateway.
+        // p50, the latency is the queue and not the gateway.
         const double little = nclients / rps * 1000.0;
         std::printf("           %8d %10.0f %12.3f %14.3f %10.3f   %s\n",
                     nclients, rps, all.pct(0.50), all.pct(0.99), little,
@@ -1113,11 +1113,11 @@ TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
     }
 }
 
-// Raw control bytes, which the CORPUS CANNOT REACH.
+// Raw control bytes, which the corpus cannot reach.
 //
 // The json_hostile entries ask Claude directly about \u0000, raw control
 // characters, form feed and backspace. It answers by *describing* them: 68 corpus
-// answers contain a literal backslash-u sequence as text, and ZERO contain a raw
+// answers contain a literal backslash-u sequence as text, and zero contain a raw
 // control byte. So that category exercises backslash and \u-literal handling: real
 // and worth having, but not the byte class where the control-character defect lived.
 //
@@ -1126,7 +1126,7 @@ TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
 //
 //   escaped by the provider  -> must round-trip byte for byte, and our own body
 //                               must contain no raw control byte either
-//   raw from the provider    -> must be REFUSED (RFC 8259 s7), never forwarded into
+//   raw from the provider    -> must be refused (RFC 8259 s7), never forwarded into
 //                               a 200 that a strict client then chokes on
 TEST_P(CorpusIT, ControlBytesAreRoundTrippedWhenEscapedAndRefusedWhenRaw)
 {
@@ -1187,7 +1187,7 @@ TEST_P(CorpusIT, ControlBytesAreRoundTrippedWhenEscapedAndRefusedWhenRaw)
 
 // ---------------------------------------------------------------- negative controls
 //
-// The two tests above pass. That is only meaningful if they would FAIL when the
+// The two tests above pass. That is only meaningful if they would fail when the
 // property they check is violated. A test that has never failed is decoration,
 // the same reasoning that makes every security fix here ship with a test that
 // fails without it. These two break the property on purpose and assert the
@@ -1214,7 +1214,7 @@ TEST_P(CorpusIT, NegativeControl_DetectsResponseMixing)
         ++checked;
         const std::string got = answer_of(resp);
         if (got != qa.a) ++detected;
-        // and it is specifically ANOTHER question's answer, not corruption
+        // and it is specifically another question's answer, not corruption
         EXPECT_EQ(got, corpus()[0].a);
     }
     cl.close();

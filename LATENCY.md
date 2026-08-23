@@ -32,7 +32,7 @@ same handshake on the same schedule (once per connection, again after idle).
 It is reported separately because it is real latency the request
 experienced and an operator should see it; it is just not *ours*.
 
-**The INBOUND handshake is a different argument, and it goes the other way.**
+**The inbound handshake is a different argument, and it goes the other way.**
 When the gateway terminates TLS for the client (`--listen-tls`), that handshake
 exists only because the gateway is in the path. Nothing on the other side of the
 subtraction cancels it: without us, the client connects straight to the provider
@@ -123,16 +123,16 @@ assigns the stamp attributed to it.
 
 **Two stamps sit outside the scheme, deliberately.** `ts_accepted` is taken when
 the client connection is accepted, which is before t0 and on a different clock
-of relevance: t0–t6 describe one REQUEST, and `ts_accepted` belongs to the
-CONNECTION that carries it. It feeds two things and neither is a request
+of relevance: t0–t6 describe one request, and `ts_accepted` belongs to the
+Connection that carries it. It feeds two things and neither is a request
 interval: the client setup deadline in `sweep_idle`, and the `accept(TLS)`
 histogram (§4), stamped where the inbound handshake completes in `tls_feed`. Do
 not add it to the table above; a per-connection stamp in a per-request scheme is
 how `connect-us` came to mean two things.
 
 `ts_first_token` is the second, and it is streaming-only. It is stamped when the
-translator emits the first CONTENT token (`content_started()`), which for a
-stream lands somewhere *after* t4: t4 is the response HEAD, this is the first
+translator emits the first content token (`content_started()`), which for a
+stream lands somewhere *after* t4: t4 is the response head, this is the first
 token, and their gap is the provider's prefill. It is not a mainline step,
 because a non-streaming request has no first token at all. It is stamped once, in the shared
 `stream_step`, so both backends inherit it without a twin divergence. Its only
@@ -195,7 +195,7 @@ own decomposition of that specific request:
 They are easy to conflate and they measure different events:
 
 - **`x-llmbridge-upstream-ttfb-us`** (this section) stamps t4 = **the provider's
-  response HEAD is complete**. It is a *first-byte* measure, taken on the
+  response head is complete**. It is a *first-byte* measure, taken on the
   gateway's clock, and a provider that accepts a stream early can look fast on
   it. Anthropic does not, measured 2026-08-06, its head trails its first token
   by ~1 ms, but that is a per-provider fact, not a protocol guarantee.
@@ -279,7 +279,7 @@ The boundary this draws is deliberate and load-bearing:
 
 - **`t0` is for human-scale correlation**: lining a request up against an
   application log or a provider's dashboard, at millisecond granularity. Fine.
-- **`t0` is NOT an ordering primitive**, and must never become one. That is
+- **`t0` is not an ordering primitive**, and must never become one. That is
   what `seq` is for: a process-wide atomic counter, immune to slew, to clock
   steps, and to two requests landing in the same nanosecond. Anything that
   needs to know which of two requests came first reads `seq`, and this is
@@ -322,7 +322,7 @@ accept(TLS)    ...          <- only when --listen-tls; see below
 | `connect(TLS)` | (t2−t1) | handshake only: **no handshake at all** on a pooled connection, and this line existing separately is the point. See the note on resolution below |
 | `response-path` | t4 → t6 | translate-back **plus** the client write, through full flush |
 | `added-total` | request-path + response-path | everything the gateway did to this request; **both handshakes excluded** |
-| `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per CONNECTION, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
+| `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per connection, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,
 t2→t1, and are computed by the same function. They cannot disagree on the
@@ -374,7 +374,7 @@ If a histogram prints `[overflow!]`, at least one sample exceeded the
 histogram's range and the reported max is clamped. Treat that max as "above
 range", not as a measurement.
 
-### What the histograms do NOT cover
+### What the histograms do not cover
 
 They are **not** a distribution over all served traffic, and the `count=` field
 is not the request total. Two classes are excluded, on both backends:

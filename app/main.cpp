@@ -49,7 +49,7 @@ namespace
     /// timestamp to filter on. Both, deliberately, and through one function so a
     /// message cannot drift between them.
     ///
-    /// `loc` defaults to the CALL SITE, and emits through the same path LB_ERROR
+    /// `loc` defaults to the call site, and emits through the same path LB_ERROR
     /// does. An LB_ERROR inside this function would stamp every refusal in the
     /// binary with this one line number, which is worse than no line number: it
     /// looks like a location and is not one.
@@ -106,7 +106,7 @@ static int run(int argc, char** argv)
     std::string log_level = "info";
     int workers = 1;
     bool timing_headers = false;
-    // Inbound TLS. ONE LISTENER, ONE MODE: --listen-tls makes the single listener
+    // Inbound TLS. One listener, one mode: --listen-tls makes the single listener
     // TLS-only, so "am I exposed in the clear?" is answerable from the command
     // line. There is deliberately no second plaintext port.
     bool listen_tls = false;
@@ -114,11 +114,11 @@ static int run(int argc, char** argv)
     llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
-    // --config is applied FIRST and flags overwrite it, so the CLI always wins and a
+    // --config is applied first and flags overwrite it, so the CLI always wins and a
     // one-off override needs no file edit. bench/*.sh drives this daemon with eight
     // flags and must keep working, so the file is additive, never a replacement.
-    // --config is applied FIRST and flags overwrite it, so the CLI always wins and a
-    // one-off override needs no file edit. Precedence is NOT positional: a flag wins
+    // --config is applied first and flags overwrite it, so the CLI always wins and a
+    // one-off override needs no file edit. Precedence is not positional: a flag wins
     // whether it sits before or after --config. bench/*.sh drives this daemon with
     // eight flags and must keep working, so the file is additive, never a replacement.
     //
@@ -275,7 +275,7 @@ static int run(int argc, char** argv)
 #ifndef LLMBRIDGE_HAVE_TLS
     if (listen_tls)
     {
-        // The dangerous direction of the guard above, and the one that fails OPEN:
+        // The dangerous direction of the guard above, and the one that fails open:
         // without this the flag is accepted, the listener serves plaintext, and the
         // operator has every client credential on the wire believing otherwise. The
         // upstream leg refuses the mirror case a few lines down.
@@ -285,7 +285,7 @@ static int run(int argc, char** argv)
     }
 #endif
 
-    // Parse + resolve --upstream. Resolution happens ONCE, here, on the setup path:
+    // Parse + resolve --upstream. Resolution happens once, here, on the setup path:
     // the workers get a dotted-quad and never touch the resolver. (Re-resolution on
     // TTL expiry is future work: providers rotate IPs, but a long-lived gateway
     // pinning one A record is exactly what the pooled connections do anyway.)
@@ -316,7 +316,7 @@ static int run(int argc, char** argv)
                 " (list several venues under \"upstream\" to reach the rest)");
 
     // Credentials over plaintext: the gateway forwards the client's provider key
-    // upstream, so a non-TLS upstream that is NOT loopback puts that key on the
+    // upstream, so a non-TLS upstream that is not loopback puts that key on the
     // wire in the clear. Loopback is exempt; that is the benchmark/mock setup and
     // the sidecar deployment, where there is no network to sniff.
     {
@@ -379,7 +379,7 @@ static int run(int argc, char** argv)
     {
         llmbridge::TlsConfig tls;
         tls.upstream_tls = up.tls;
-        tls.sni_host = up.host; // SNI + hostname verification: the PARSED host,
+        tls.sni_host = up.host; // SNI + hostname verification: the parsed host,
                                 // never the resolved IP (verification needs the name)
         tls.client_tls = listen_tls;
         tls.cert_file = tls_cert;
@@ -461,7 +461,7 @@ static int run(int argc, char** argv)
     agg.connect.print(std::cerr, "  connect(TLS) ");
     // Only when it has samples. A plaintext listener never terminates a handshake,
     // and a permanent "(no samples)" line for a feature that is off reads as a
-    // missing measurement. This is the one handshake that IS ours; see LATENCY.md 1.
+    // missing measurement. This is the one handshake that is ours; see LATENCY.md 1.
     if (agg.accept_tls.total() > 0) agg.accept_tls.print(std::cerr, "accept(TLS)   ");
     agg.resp_path.print(std::cerr, "  response-path");
     return 0;

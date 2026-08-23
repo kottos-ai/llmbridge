@@ -11,7 +11,7 @@
 // upstream, driven by a plaintext loopback client. Hermetic: self-signed cert
 // generated in-process, nothing leaves 127.0.0.1.
 //
-// What this proves that net_tls_test cannot: the PUMP WIRING inside both event
+// What this proves that net_tls_test cannot: the pump wiring inside both event
 // loops: handshake interleaved with connect/recv/send completions, the
 // plaintext-invariant on rbuf/wbuf, session survival across the keep-alive
 // pool, and certificate rejection surfacing as a client-visible 502.
@@ -90,7 +90,7 @@ namespace
             if (crt) X509_free(crt);
             if (key) EVP_PKEY_free(key);
         }
-        // The CA path must be unique per process AND per call. ctest runs this
+        // The CA path must be unique per process and per call. ctest runs this
         // binary many times in parallel (-j), and a fixed name meant one process
         // truncated the file another was mid-way through loading, surfacing as a
         // spurious "no certificate or crl found" in whichever test lost the race.
@@ -168,7 +168,7 @@ namespace
             ::close(_lfd);
             _lfd = -1;
             if (_acc.joinable()) _acc.join();
-            // Unblock serve threads parked in SSL_read: the gateway POOLS its
+            // Unblock serve threads parked in SSL_read: the gateway pools its
             // keep-alive TLS upstream (by design), so a serve thread legitimately
             // waits for a next request that will never come once the test ends.
             // shutdown() (not close: the thread still owns the fd) makes SSL_read
@@ -234,10 +234,10 @@ namespace
                     ++_requests;
                     if (_mode == "sse-badchunk-hold")
                     {
-                        // Valid TLS throughout, but INVALID CHUNKED FRAMING inside
+                        // Valid TLS throughout, but invalid chunked framing inside
                         // it. That reaches stream_step()'s Corrupt path, which calls
                         // stream_truncate(), and not the TLS record failure that
-                        // "sse-corrupt" exercises. Then HOLD the connection: the
+                        // "sse-corrupt" exercises. Then hold the connection: the
                         // point is whether the gateway tears the client down itself,
                         // or waits for a provider that never closes.
                         const std::string head = sse_corrupt_prefix();
@@ -255,13 +255,13 @@ namespace
                     if (_mode == "sse-corrupt")
                     {
                         // Start a legitimate stream (headers + first token through
-                        // TLS), then write RAW GARBAGE to the socket: a corrupt
+                        // TLS), then write raw garbage to the socket: a corrupt
                         // record. The gateway must abort the client stream, not
                         // finish it cleanly.
                         const std::string head = sse_corrupt_prefix();
                         if (SSL_write(ssl, head.data(), static_cast<int>(head.size())) <= 0)
                             goto done;
-                        // Let the gateway PROCESS the prefix (stream begins, first
+                        // Let the gateway process the prefix (stream begins, first
                         // token reaches the client) before the corruption lands
                         // otherwise both arrive in one drain and the gateway
                         // correctly 502s a stream that never started, which is a
@@ -297,7 +297,7 @@ namespace
         }
 
         // A well-formed Anthropic message. The gateway only emits timing headers
-        // where it REBUILDS the response, so a non-streaming timing test needs a
+        // where it rebuilds the response, so a non-streaming timing test needs a
         // body the translator accepts; the plain {"ok":true} body is byte-
         // forwarded and carries the provider's headers untouched.
         static std::string anthropic_json_response()
@@ -358,7 +358,7 @@ namespace
                    chunk(ev);
         }
 
-        // ~32 MiB of well-formed deltas, ONE CHUNK PER EVENT. The first version of
+        // ~32 MiB of well-formed deltas, one chunk per event. The first version of
         // this put the whole body in a single chunk, which the decoder correctly
         // refuses as a hostile chunk size (kMaxBodyLen is 16 MiB), so 96 bytes
         // reached the client and the "bounded" result below was measuring nothing.
@@ -424,7 +424,7 @@ namespace
     };
 
     // Plaintext loopback client (the gateway's client side is not TLS).
-    /// A PLAINTEXT mock upstream, so the client leg can be TLS while the upstream
+    /// A plaintext mock upstream, so the client leg can be TLS while the upstream
     /// leg is not. TlsBackend cannot serve that case: it always speaks TLS.
     class PlainBackend
     {
@@ -523,7 +523,7 @@ namespace
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = htons(port);
             if (::connect(_fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) return false;
-            // NOTE: no SO_RCVTIMEO here, deliberately. Adding one seemed like cheap
+            // Note: no SO_RCVTIMEO here, deliberately. Adding one seemed like cheap
             // insurance against a hanging test, and it broke three of them: with a
             // receive deadline SSL_read and SSL_connect return -1 with WANT_READ on
             // expiry, and these loops treat any non-positive return as fatal. The
@@ -543,7 +543,7 @@ namespace
 
         bool handshake() { return SSL_connect(_ssl) == 1; }
 
-        /// Send the ClientHello ONE BYTE AT A TIME. The handshake then spans many
+        /// Send the ClientHello one byte at A time. The handshake then spans many
         /// reads on the gateway, which is the fragmentation case a single write
         /// never exercises.
         bool handshake_dribbled()
@@ -728,10 +728,10 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
-    /// Inbound TLS: the gateway becomes a TLS SERVER for its own listener. The
+    /// Inbound TLS: the gateway becomes a TLS server for its own listener. The
     /// upstream leg stays TLS too, so one test covers a request crossing two
     /// independent TLS sessions in opposite roles, which is the real deployment.
-    /// `setup_ns` is applied BEFORE the loop thread starts. Setting it afterwards
+    /// `setup_ns` is applied before the loop thread starts. Setting it afterwards
     /// writes state the loop thread reads in sweep_idle, which is a genuine data
     /// race that TSan reports; the seam is not for live reconfiguration.
     void start_inbound(TranslateMode mode = TranslateMode::None,
@@ -753,7 +753,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _gt = std::thread([this] { _gw->run(); });
     }
 
-    /// The missing row of the matrix: TLS on the CLIENT leg, plaintext upstream.
+    /// The missing row of the matrix: TLS on the client leg, plaintext upstream.
     /// This is `--listen-tls` with `--upstream 127.0.0.1:8000`, which is what
     /// terminating TLS at the edge in front of a local model looks like, and it is
     /// the configuration where a leg mix-up in tls_required() or wbuf_on_wire()
@@ -808,7 +808,7 @@ TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
 // The TLS handshake must land in connect-us (t2-t1), not in upwrite-us (t3-t2).
 //
 // The defect this locks down: t2 was stamped when the TCP connect completed,
-// which is BEFORE start_handshake(). t3 is stamped when the request ciphertext
+// which is before start_handshake(). t3 is stamped when the request ciphertext
 // is flushed, which cannot happen until the handshake finishes. So on a cold TLS
 // connection the whole handshake was reported as "the write() into the kernel's
 // socket buffer": a live run showed upwrite-us at 32-43 ms against 34-107 us on
@@ -820,13 +820,13 @@ TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
 // The TLS handshake must land in connect-us (t2-t1), not in upwrite-us (t3-t2).
 //
 // The defect these lock down (fixed in 0.10.1): t2 was stamped when the TCP
-// connect completed, which is BEFORE start_handshake(), while t3 waits for the
+// connect completed, which is before start_handshake(), while t3 waits for the
 // request ciphertext to flush, which cannot happen until the handshake ends. So
 // a cold TLS connection reported the entire handshake as "the write() into the
 // kernel's socket buffer". A live run measured upwrite-us at 32-43 ms cold
 // against 34 us warm, against a documented ~4.4 us.
 //
-// Run on BOTH response paths, because they build their headers in different
+// Run on both response paths, because they build their headers in different
 // code: the non-streaming path rebuilds the response after the body arrives, the
 // streaming path emits headers up front at first upstream byte. Both are
 // parameterized over both event loops, so four tests in total.
@@ -890,7 +890,7 @@ TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)
 {
     start();
     // Two sequential clients -> the second request must ride the pooled TLS
-    // connection: same session, ONE handshake, two requests. This is the test
+    // connection: same session, one handshake, two requests. This is the test
     // that fails if release/acquire drops or resets the Session.
     for (int i = 0; i < 2; ++i)
     {
@@ -927,8 +927,8 @@ TEST_P(GatewayTls, SseStreamsThroughTlsWithTranslation)
 TEST_P(GatewayTls, HostnameMismatchYields502NotPlaintextFallback)
 {
     // Gateway verifies the peer as "wrong.test"; the cert says provider.test.
-    // The client must see a structured 502, and the provider must see ZERO
-    // completed handshakes and ZERO requests (nothing was sent to an unverified
+    // The client must see a structured 502, and the provider must see zero
+    // completed handshakes and zero requests (nothing was sent to an unverified
     // peer, which is the security property the whole TLS layer exists for).
     start(TranslateMode::None, "json", "wrong.test");
     Client c;
@@ -939,7 +939,7 @@ TEST_P(GatewayTls, HostnameMismatchYields502NotPlaintextFallback)
     EXPECT_EQ(Client::status_of(r), 502);
     EXPECT_EQ(_backend.handshakes(), 0);
     EXPECT_EQ(_backend.requests(), 0);
-    // The counter is the INBOUND leg only. An upstream handshake failure is a
+    // The counter is the inbound leg only. An upstream handshake failure is a
     // provider or trust-store problem, it keeps its WARN, and it must not move this
     // number: otherwise scanner noise and a broken provider are indistinguishable in
     // the one metric that exists to separate them.
@@ -976,7 +976,7 @@ TEST_P(GatewayTls, ConcurrentTlsStreamsAllComplete)
 
 TEST_P(GatewayTls, CorruptRecordMidStreamAbortsWithoutDone)
 {
-    // The stream STARTS cleanly (headers + first token through TLS), then the
+    // The stream starts cleanly (headers + first token through TLS), then the
     // provider writes raw garbage on the wire. The client must get the partial
     // stream and a hard close, never a well-formed [DONE]: finalizing a
     // corrupted stream as clean would hide the corruption entirely.
@@ -994,7 +994,7 @@ TEST_P(GatewayTls, ProviderClosingPooledConnDoesNotBreakNextRequest)
 {
     // Provider closes its side after every response (keep-alive header, then
     // close, rude but real). Whichever way the gateway learns (pool eviction on
-    // EOF, or stale-conn retry at reuse time), the NEXT request must still get a
+    // EOF, or stale-conn retry at reuse time), the next request must still get a
     // 200 on a fresh session. Guards the retry/eviction paths' TLS attach.
     start(TranslateMode::None, "close1");
     for (int i = 0; i < 3; ++i)
@@ -1024,10 +1024,10 @@ TEST_P(GatewayTls, UpstreamClosingMidHandshakeYields502)
 }
 
 // ---------------------------------------------------------------------------
-// Cross-venue upstream TLS: each venue must be verified against ITS OWN hostname.
+// Cross-venue upstream TLS: each venue must be verified against its own hostname.
 //
 // tls_attach_upstream once passed the global TlsConfig::sni_host for every venue,
-// so init_client drove both SNI and SSL_set1_host from the FIRST venue's name.
+// so init_client drove both SNI and SSL_set1_host from the first venue's name.
 // The consequence is a valid-cert-wrong-server hole across the table: a request
 // translated and credentialed for venue 1's dialect is sent on a socket whose
 // certificate was only ever checked against venue 0's name. These tests fail
@@ -1039,7 +1039,7 @@ namespace
     constexpr const char* kHostTwo = "venue-two.test";
 
     /// Concatenate two self-signed leaves into one trust bundle, so the gateway's
-    /// single upstream context trusts BOTH venues. Without this the second venue
+    /// single upstream context trusts both venues. Without this the second venue
     /// would fail for lack of a trust anchor, masking the hostname question.
     std::string write_ca_bundle(const SelfSigned& a, const SelfSigned& b)
     {
@@ -1081,7 +1081,7 @@ namespace
     };
 
     /// Starts on `first`, moves to `next` once. Failover matters most on the TLS leg,
-    /// where a retry must build a NEW session against the NEW venue's hostname; reusing
+    /// where a retry must build a new session against the new venue's hostname; reusing
     /// the failed venue's SNI would either fail verification or, far worse, accept it.
     class TlsFailoverPolicy final : public Policy
     {
@@ -1108,7 +1108,7 @@ namespace
 class GatewayCrossVenueTls : public ::testing::TestWithParam<llmbridge::IoBackend>
 {
   protected:
-    // venue_one_cert lets a test hand venue 1 the WRONG identity (venue 0's), to
+    // venue_one_cert lets a test hand venue 1 the wrong identity (venue 0's), to
     // prove per-venue verification actually discriminates instead of passing
     // everything. Default gives each venue its matching cert.
     void start(int route_to, bool venue_one_serves_its_own_cert = true)
@@ -1148,7 +1148,7 @@ class GatewayCrossVenueTls : public ::testing::TestWithParam<llmbridge::IoBacken
     uint16_t _port{0};
 };
 
-// Route to venue 1, which presents ITS OWN valid cert for venue-two.test. With the
+// Route to venue 1, which presents its own valid cert for venue-two.test. With the
 // bug the gateway verifies against venue 0's name (provider.test) and the handshake
 // fails, surfacing as a 502; the fix verifies against venue-two.test and it is 200.
 TEST_P(GatewayCrossVenueTls, SecondVenueIsVerifiedAgainstItsOwnHostname)
@@ -1167,7 +1167,7 @@ TEST_P(GatewayCrossVenueTls, SecondVenueIsVerifiedAgainstItsOwnHostname)
 }
 
 // The negative control that makes the test above meaningful: venue 1 serves venue
-// 0's cert (wrong for venue-two.test). Correct per-venue verification MUST reject
+// 0's cert (wrong for venue-two.test). Correct per-venue verification must reject
 // it. If this passed, the check would be verifying against nothing.
 TEST_P(GatewayCrossVenueTls, SecondVenueWithTheWrongCertIsRejected)
 {
@@ -1182,9 +1182,9 @@ TEST_P(GatewayCrossVenueTls, SecondVenueWithTheWrongCertIsRejected)
         << "verification is not discriminating per venue. " << r.substr(0, 200);
 }
 
-// FAILOVER ON THE TLS LEG. Venue 0 is a closed port, so the connect fails before any
+// Failover on the TLS leg. Venue 0 is a closed port, so the connect fails before any
 // handshake; the policy names venue 1, and the retry must build a fresh session and
-// verify against VENUE 1's hostname. Carrying the failed venue's SNI would either
+// verify against venue 1's hostname. Carrying the failed venue's SNI would either
 // reject a healthy provider or, far worse, accept the wrong one.
 TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
 {
@@ -1222,7 +1222,7 @@ TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
     EXPECT_EQ(_b1.handshakes(), 1) << "the retry never completed a handshake with venue 1";
 }
 
-// The negative control. Venue 1 serves venue 0's certificate, so the FAILOVER target
+// The negative control. Venue 1 serves venue 0's certificate, so the failover target
 // must be rejected exactly as a directly-routed one is. Without this, a failover could
 // be the hole that skips verification.
 TEST_P(GatewayCrossVenueTls, AFailoverTargetIsStillVerified)
@@ -1276,9 +1276,9 @@ INSTANTIATE_TEST_SUITE_P(Backends, GatewayTls,
 
 #endif // LLMBRIDGE_HAVE_TLS
 
-// ── Task 5: inbound TLS, the gateway as a TLS SERVER ────────────────────────
+// ── Task 5: inbound TLS, the gateway as a TLS server ────────────────────────
 //
-// Everything below runs on BOTH backends. That is not ceremony: when inbound
+// Everything below runs on both backends. That is not ceremony: when inbound
 // TLS was first wired, 920 tests passed and the convention checker was clean
 // while io_uring was completely broken, because no test reached the new path.
 // Thirty seconds of curl found it. These exist so the next such break is caught
@@ -1300,7 +1300,7 @@ static const std::string kReq = make_req(kBody);
 
 TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)
 {
-    // Anthropic mode on purpose: translation PARSES the body, so a malformed or
+    // Anthropic mode on purpose: translation parses the body, so a malformed or
     // truncated request fails here instead of being byte-forwarded to a mock that
     // answers 200 to anything.
     start_inbound(TranslateMode::Anthropic);
@@ -1355,7 +1355,7 @@ TEST_P(GatewayTls, PlaintextSentToTlsListenerIsRefusedAndNothingIsServed)
     // stats() is loop-thread state: gateway.hpp says it is valid only once that
     // thread has been joined, and reading it live is a data race TSan reports.
     // The empty response above already means the gateway processed the bytes,
-    // counted the failure and closed the connection; the join makes the READ safe.
+    // counted the failure and closed the connection; the join makes the read safe.
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();
     EXPECT_EQ(_gw->stats().requests, 0u);
@@ -1477,7 +1477,7 @@ TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
 }
 
 // 4.7: a client that completes the handshake and then never reads must not grow
-// the gateway without bound through the write BIO. Written as a MEASUREMENT, not an
+// the gateway without bound through the write BIO. Written as a measurement, not an
 // argument: the upstream floods ~32 MiB of stream while the client reads nothing,
 // and the assertion is on the peak ciphertext staged for that connection. If the
 // buffer were unbounded the peak would track what was produced.
@@ -1489,7 +1489,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     ASSERT_TRUE(c.handshake());
     ASSERT_TRUE(c.send(make_req(kStreamBody)));
 
-    // Read NOTHING. Give the gateway time to pull everything the upstream will give
+    // Read nothing. Give the gateway time to pull everything the upstream will give
     // it and stage as much as it is willing to stage.
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
@@ -1503,7 +1503,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     // record, and the next event cannot start until the client's write makes progress,
     // because a partial write pauses the upstream read.
     //
-    // The old bound was 12 MiB and it passed BY LUCK. Back-pressure only engaged after
+    // The old bound was 12 MiB and it passed by luck. Back-pressure only engaged after
     // a pump, and the drain loop had no byte budget, so one readable event could pull
     // as much as a local flooder could supply: measured 100 KB idle and 33 MB on a
     // loaded machine, which read as a flaky test and was an unbounded-growth bug.
@@ -1512,7 +1512,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
     // 4 MiB: above the ~1.4 MiB one event can stage (kEpMaxReadPerEvent plus a TLS
     // record) and far below what the unbounded version reached.
     //
-    // HONEST LIMIT OF THIS TEST: it detects the unbounded version only SOMETIMES,
+    // Honest limit of this test: it detects the unbounded version only sometimes,
     // because that bug needs the event loop to fall behind a flooding provider, which
     // depends on machine load. Measured against the pre-fix code: 2 failures in 6 runs
     // under 12 busy cores, 1 in 6 idle. Shrinking the client's receive window did not
@@ -1538,7 +1538,7 @@ TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
     ASSERT_TRUE(c.handshake());
     ASSERT_TRUE(c.send(make_req(kStreamBody)));
 
-    // Target 4 MiB, deliberately BELOW the 8 MiB io_uring drop cap
+    // Target 4 MiB, deliberately below the 8 MiB io_uring drop cap
     // (kUrStreamBufCap).
     size_t total = 0;
     char tmp[65536];
@@ -1602,8 +1602,8 @@ TEST_P(GatewayTls, HandshakingClientCannotReachThePooledUpstream)
     EXPECT_EQ(_gw->pooled_upstream_count(), 1u) << "the pooled conn was taken or dropped";
 }
 
-// The end-to-end half. The unit test in net/tests proves no ERROR STRING
-// carries key material; this proves nothing the process actually EMITS does, over a
+// The end-to-end half. The unit test in net/tests proves no ERROR string
+// carries key material; this proves nothing the process actually emits does, over a
 // run that includes the failure paths. stderr is captured for the whole run and
 // every byte any client received is kept, then both are searched for the base64
 // body of the private key the listener is using.
@@ -1681,7 +1681,7 @@ TEST_P(GatewayTls, InboundTlsEmitsNoKeyMaterialAnywhere)
     }
 }
 
-// 6.1: the INBOUND handshake completes before t0, so every other number in
+// 6.1: the inbound handshake completes before t0, so every other number in
 // LATENCY.md is blind to it. accept(TLS) is the only place its cost is visible.
 // Three claims, because one of them alone would pass for the wrong reason: it
 // records on an inbound-TLS listener, it counts one sample per handshake (not per
@@ -1694,7 +1694,7 @@ TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
         TlsClient c;
         ASSERT_TRUE(c.connect(_port, _ca_path));
         ASSERT_TRUE(c.handshake());
-        ASSERT_TRUE(c.send(kReq)); // two requests on the SECOND session, so samples
+        ASSERT_TRUE(c.send(kReq)); // two requests on the second session, so samples
         if (i == 1)                // cannot be per-request
         {
             ASSERT_TRUE(c.send(kReq)); // braced: ASSERT_* expands to an if/else, and an
@@ -1714,7 +1714,7 @@ TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
 
 TEST_P(GatewayTls, AcceptTlsStaysEmptyOnAPlaintextListener)
 {
-    start(TranslateMode::Anthropic); // TLS upstream, PLAINTEXT listener
+    start(TranslateMode::Anthropic); // TLS upstream, plaintext listener
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -1722,7 +1722,7 @@ TEST_P(GatewayTls, AcceptTlsStaysEmptyOnAPlaintextListener)
     _gw->request_stop();
     if (_gt.joinable()) _gt.join();
 
-    // The UPSTREAM handshake must not be booked here: it is the one that cancels.
+    // The upstream handshake must not be booked here: it is the one that cancels.
     EXPECT_EQ(_gw->stats().accept_tls.total(), 0u);
     EXPECT_GT(_gw->stats().connect.total(), 0u) << "the upstream handshake still lands in connect";
 }
@@ -1730,7 +1730,7 @@ TEST_P(GatewayTls, AcceptTlsStaysEmptyOnAPlaintextListener)
 // ── The missing row of the matrix: TLS in, plaintext upstream ───────────────
 //
 // Every other combination of {client leg} x {upstream leg} x {streaming} was
-// covered; this row was not, and it is the one where the two legs DISAGREE.
+// covered; this row was not, and it is the one where the two legs disagree.
 // tls_required(), wbuf_on_wire() and tls_invariant_ok() all read direction from
 // the leg, so a leg mix-up is invisible until the legs differ.
 
@@ -1772,7 +1772,7 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 // across many writes without losing or duplicating any of it. Nothing else in
 // the suite covered that.
 //
-// WHAT IT DOES NOT TEST, stated because the first version of this comment
+// What it does not test, stated because the first version of this comment
 // claimed otherwise. It does not distinguish "fed to the Session" from "on the
 // wire", even though that distinction is real and documented on `woff`.
 // Replacing wbuf_on_wire() with woff alone leaves this test passing, because
@@ -1781,7 +1781,7 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 // drains completely, and on io_uring the send_inflight guard covers it. So
 // wbuf_on_wire() is defensive today and not load-bearing, and no test at the
 // current call sites can show otherwise. It earns its place by being the correct
-// thing for a FUTURE call site that lacks those guards, which is a weaker claim
+// thing for a future call site that lacks those guards, which is a weaker claim
 // than "verified" and should not be written up as one.
 TEST_P(GatewayTls, SlowClientReceivesAFullLargeBodyThroughTls)
 {
@@ -1843,7 +1843,7 @@ TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
     // A real client is unaffected: the deadline must not touch a peer that
-    // completes a request. Done BEFORE the join, since it needs a live gateway.
+    // completes a request. Done before the join, since it needs a live gateway.
     TlsClient ok;
     ASSERT_TRUE(ok.connect(_port, _ca_path));
     ASSERT_TRUE(ok.handshake());
@@ -1861,11 +1861,11 @@ TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
 // stream_truncate() broke no test, because every mock closes promptly after
 // sending and the client goes away either way.
 //
-// Here the provider corrupts the chunked framing and then HOLDS the connection
+// Here the provider corrupts the chunked framing and then holds the connection
 // open. stream_ended is what gates finalize_stream, so without it the gateway
 // resumes reading from an upstream that will never speak again and the client
 // socket is held until the 120 s idle sweep. With it, the client is closed at
-// once. The assertion is therefore about TIME, which is the only way the two
+// once. The assertion is therefore about time, which is the only way the two
 // behaviours differ.
 TEST_P(GatewayTls, CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient)
 {
@@ -1895,7 +1895,7 @@ TEST_P(GatewayTls, CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTh
     EXPECT_LT(elapsed.count(), 10000)
         << "closed only after " << elapsed.count() << "ms, which suggests the idle "
         << "sweep did it rather than the truncation path";
-    // Truncated honestly: the client saw real tokens and NO fabricated terminator.
+    // Truncated honestly: the client saw real tokens and no fabricated terminator.
     EXPECT_NE(all.find("hola"), std::string::npos) << "no tokens reached the client";
     EXPECT_EQ(all.find("[DONE]"), std::string::npos) << "fabricated a clean finish";
 }

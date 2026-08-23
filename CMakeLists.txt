@@ -22,7 +22,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # On by default; there were none at all before 0.9.0, which is a strange gap for a
 # codebase whose pitch is systems rigour. -Werror is CI-only (LLMBRIDGE_WERROR=ON)
 # so a warning never blocks a local edit-compile loop, but also never reaches main.
-# Scoped to our own targets via add_compile_options AFTER FetchContent, so
+# Scoped to our own targets via add_compile_options after FetchContent, so
 # GoogleTest's warnings are not our problem.
 option(LLMBRIDGE_WERROR "Treat warnings as errors (CI)" OFF)
 
@@ -30,8 +30,8 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif ()
 # Optimization. Default Release is -O2, applied via add_compile_options so it does
-# NOT clobber a user's CMAKE_CXX_FLAGS_RELEASE (which the default `-DNDEBUG` etc.
-# still supply). We deliberately do NOT force -march=native: it bakes in the build
+# Not clobber a user's CMAKE_CXX_FLAGS_RELEASE (which the default `-DNDEBUG` etc.
+# still supply). We deliberately do not force -march=native: it bakes in the build
 # machine's instruction set and crashes with SIGILL on a different/older CPU, a
 # footgun for packagers and CI. Opt in for a local, non-portable perf build (this
 # is what reproduces the published benchmark numbers):
@@ -63,15 +63,15 @@ if (LLMBRIDGE_BUILD_TESTS)
 endif ()
 
 # ── llmbridge modules (bottom-up) ────────────────────────────────────────────────
-# TLS for outbound gateway connections. OpenSSL is the ONE sanctioned runtime
+# TLS for outbound gateway connections. OpenSSL is the one sanctioned runtime
 # dependency (CLAUDE.md), confined to the gateway path; the translator library
-# (`provider`) stays dependency-free and must never link it. OFF by default so a
+# (`provider`) stays dependency-free and must never link it. Off by default so a
 # plain build of the OSS remains dependency-free end to end. find_package here at
 # the root because imported targets are directory-scoped and both net/ and
 # gateway/tests/ link them.
 # Compile-time log floor. Release keeps info and above so a running process still
 # says something; a lab or debugging build passes `debug` (or `trace`) to compile the
-# per-connection and per-request lines IN. They are compiled OUT by default so the
+# per-connection and per-request lines in. They are compiled out by default so the
 # published latency numbers are measured on exactly what ships.
 set(LLMBRIDGE_LOG_LEVEL "info" CACHE STRING "Compiled-in log floor: trace|debug|info|warn|error|off")
 set_property(CACHE LLMBRIDGE_LOG_LEVEL PROPERTY STRINGS trace debug info warn error off)
@@ -134,8 +134,8 @@ endif ()
 # Installs the embeddable translator library (llmbridge::provider) + its headers
 # (rules live in provider/), the `llmbridge` daemon (rule in app/), and a package
 # config so a downstream project can:
-#   find_package(llmbridge CONFIG REQUIRED)
-#   target_link_libraries(myapp PRIVATE llmbridge::provider)
+#   find_package(llmbridge config required)
+#   target_link_libraries(myapp private llmbridge::provider)
 if (PROJECT_IS_TOP_LEVEL)
     install(EXPORT llmbridgeTargets
             FILE llmbridgeTargets.cmake

@@ -5,14 +5,14 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// TLS for outbound (gateway -> provider) connections, driven through MEMORY BIOs.
+// TLS for outbound (gateway -> provider) connections, driven through memory BIOs.
 //
-// WHY MEMORY BIOs AND NOT SSL_set_fd
+// Why memory BIOs and not SSL_set_fd
 // ----------------------------------
 // The obvious approach is to hand OpenSSL the socket and call SSL_read/SSL_write.
 // That cannot work here, because it assumes whoever owns the fd also owns the
 // syscalls -- and on the io_uring backend we do not. io_uring hands us bytes that
-// have ALREADY been read (multishot recv into provided buffers); there is no read
+// have already been read (multishot recv into provided buffers); there is no read
 // for OpenSSL to perform. Giving OpenSSL the fd would mean it issuing its own
 // blocking-ish recv() behind the loop's back, defeating the completion model and
 // bypassing the registered-buffer path.
@@ -28,12 +28,12 @@
 // is one extra copy through the BIO pair, which is the price of not caring how the
 // bytes arrived.
 //
-// USAGE (identical on both backends)
+// Usage (identical on both backends)
 //   1. start_handshake(), then loop: pull_ciphertext() -> send; recv -> feed_ciphertext()
 //      until handshake_done().
 //   2. Steady state: write_plaintext() then pull_ciphertext() -> send;
 //      recv -> feed_ciphertext() then read_plaintext().
-//   3. ALWAYS drain pull_ciphertext() after any call that advances the state machine --
+//   3. Always drain pull_ciphertext() after any call that advances the state machine --
 //      OpenSSL can emit protocol bytes (key updates, alerts, close_notify) with no
 //      application data involved. Forgetting this is the classic memory-BIO stall.
 //
@@ -74,7 +74,7 @@ namespace llmbridge::net::tls
 
     /// Process-wide TLS configuration: one SSL_CTX shared by every session.
     ///
-    /// Verification is ON by default and there is deliberately no "disable" knob in
+    /// Verification is on by default and there is deliberately no "disable" knob in
     /// the constructor -- a gateway that silently skips certificate checks is a
     /// credential-exfiltration bug, not a convenience. Tests that need a self-signed
     /// peer pass their own CA via `ca_file`.
@@ -92,12 +92,12 @@ namespace llmbridge::net::tls
             bool require_tls13{false};
         };
 
-        /// Inbound: client -> gateway. We are the server and we PROVE identity
+        /// Inbound: client -> gateway. We are the server and we prove identity
         /// instead of checking it. These are separate structs on purpose: passing
         /// client options to a server context, or the reverse, should not compile.
         struct ServerOptions
         {
-            /// PEM certificate CHAIN (leaf first, then intermediates). Let's
+            /// PEM certificate chain (leaf first, then intermediates). Let's
             /// Encrypt calls this fullchain.pem. Using cert.pem instead omits the
             /// intermediate and clients that do not fetch it will fail to verify.
             std::string cert_file{};
@@ -113,11 +113,11 @@ namespace llmbridge::net::tls
         Context(Context&&) noexcept;
         Context& operator=(Context&&) noexcept;
 
-        /// Build a CLIENT SSL_CTX. Returns false and sets last_error() on failure.
+        /// Build a client SSL_CTX. Returns false and sets last_error() on failure.
         /// Call once at startup -- this is a setup path, so it may allocate freely.
         [[nodiscard]] bool init_client(const ClientOptions& opts) noexcept;
 
-        /// Build a SERVER SSL_CTX for the inbound listener.
+        /// Build a server SSL_CTX for the inbound listener.
         ///
         /// Every failure here is a startup failure, deliberately: an unreadable
         /// certificate, a key the wrong mode, a key that does not match the
@@ -139,7 +139,7 @@ namespace llmbridge::net::tls
 
     /// One TLS connection's worth of state. Owns an SSL object and its BIO pair.
     ///
-    /// `host` is used for BOTH the SNI extension and hostname verification -- they
+    /// `host` is used for both the SNI extension and hostname verification -- they
     /// must agree, and taking one argument makes it impossible to set one and forget
     /// the other (a real and quiet way to end up with a valid cert for the wrong
     /// host).
@@ -153,13 +153,13 @@ namespace llmbridge::net::tls
         Session(Session&&) noexcept;
         Session& operator=(Session&&) noexcept;
 
-        /// Attach to a context as a CLIENT (gateway -> provider). Returns false on
+        /// Attach to a context as a client (gateway -> provider). Returns false on
         /// failure. `host` must be the DNS name, not an IP literal, for verification
         /// to mean anything.
         [[nodiscard]] bool init_client(const Context& ctx, std::string_view host) noexcept;
 
-        /// Attach to a context as a SERVER (client -> gateway). Takes no host: a
-        /// server RECEIVES the SNI name and does not verify a peer, so there is
+        /// Attach to a context as a server (client -> gateway). Takes no host: a
+        /// server receives the SNI name and does not verify a peer, so there is
         /// nothing to check a hostname against. The context supplies the identity.
         [[nodiscard]] bool init_server(const Context& ctx) noexcept;
 
@@ -205,8 +205,8 @@ namespace llmbridge::net::tls
         Want classify(int rc) noexcept;
 
         ssl_st* _ssl{nullptr};
-        bio_st* _rbio{nullptr};  ///< ciphertext IN  (we write, OpenSSL reads)
-        bio_st* _wbio{nullptr};  ///< ciphertext OUT (OpenSSL writes, we read)
+        bio_st* _rbio{nullptr};  ///< ciphertext in  (we write, OpenSSL reads)
+        bio_st* _wbio{nullptr};  ///< ciphertext out (OpenSSL writes, we read)
         Want _want{Want::None};
         bool _hs_done{false};
         std::string _err{};

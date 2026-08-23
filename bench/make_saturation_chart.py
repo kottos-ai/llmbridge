@@ -11,7 +11,7 @@
 
 Log-log axes so both ceilings fit on one plot: llmbridge tracks the ideal y=x line
 up to its measured ceiling then flattens (single-thread CPU bound: ~89% of the
-worker's CPU is kernel-side, 32.7% TCP stack. NOT the loopback packet path); LiteLLM
+worker's CPU is kernel-side, 32.7% TCP stack. Not the loopback packet path); LiteLLM
 flattens at ~250 RPS/worker. The gap between each curve and the diagonal is
 dropped load.
 
@@ -36,7 +36,7 @@ def chart_outputs(name):
 
 OUTS = chart_outputs("saturation.svg")
 
-# llmbridge's curve is PARSED from the most recent bench/results/saturation-*.txt so the
+# llmbridge's curve is parsed from the most recent bench/results/saturation-*.txt so the
 # chart cannot drift from the measurements. It used to be a hardcoded array, which meant
 # "regenerating" the chart redrew stale numbers: the published ceiling said 90k RPS long
 # after the measured figure had moved. If no results file is present the script refuses to
@@ -58,7 +58,7 @@ def _load_llmbridge():
     # Drop levels where achieved > offered. That is impossible in steady state; you cannot
     # serve more requests than were asked for, so it means the load generator overshot its
     # target rate for that level and the point measures the harness, not the gateway. The
-    # 2026-07-31 sweep's 60,000 level reported 61,699 achieved (+2.8%) and plotted ABOVE the
+    # 2026-07-31 sweep's 60,000 level reported 61,699 achieved (+2.8%) and plotted above the
     # ideal diagonal, which is where the visible kink in the curve came from. Dropping such
     # points is the honest way to remove that kink; nudging a measured marker down to make
     # the line look nicer is not. Tolerance allows for rounding in the rate controller.
@@ -70,9 +70,9 @@ CEILING = max(a for _, a in LLMBRIDGE)          # highest achieved = the plateau
 _BODY = (_re.search(r"body=(\d+)B", _HDR) or [None, "?"])[1]
 
 # LiteLLM measured separately (run_headtohead.sh); a single uvicorn worker.
-# CANONICAL ceiling: the July-30 cold-boot repeats at 90k offered 86,982 / 84,928 /
+# Canonical ceiling: the July-30 cold-boot repeats at 90k offered 86,982 / 84,928 /
 # 82,380, mean 84.8k, which are the figures published in BENCHMARKS.md, CLAUDE.md and the
-# website. This is deliberately NOT max(LLMBRIDGE): the ceiling is thermally dependent, so
+# website. This is deliberately not max(LLMBRIDGE): the ceiling is thermally dependent, so
 # a sweep taken on an already-warm box plateaus lower without anything having regressed
 # (the 2026-07-31 sweep started at 78 C, ended at 88 C, and topped out at 80,000). Deriving
 # the headline from whatever run happens to be newest would silently republish a hot run.
@@ -83,7 +83,7 @@ CANON_SRC = "saturation-20260730-2028/2029, cold boot + performance governor"
 LITELLM = [(100, 100), (500, 246), (1000, 244), (5000, 236)]
 LITELLM_CEILING = max(a for _, a in LITELLM)
 
-# Geometry. W/H kept IDENTICAL to make_chart.py so the two figures render at
+# Geometry. W/H kept identical to make_chart.py so the two figures render at
 # exactly the same size on the page.
 W, H = 1000, 620
 ML, MR, MT, MB = 96, 56, 116, 100
@@ -147,7 +147,7 @@ poly(LLMBRIDGE, CG)
 poly(LITELLM, CR)
 
 # ceiling annotations. The headline cites the pinned cold-boot figure (CANON_*), not this
-# run's plateau. The thermal caveat that explains the difference is deliberately NOT on the
+# run's plateau. The thermal caveat that explains the difference is deliberately not on the
 # chart (it was unreadable at this size) and lives in BENCHMARKS.md and BENCHMARK-CONFIG.md
 # instead. Keep it there: the chart states the number, the docs state the conditions.
 s.append(

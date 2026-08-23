@@ -14,7 +14,7 @@ scripts and the price observatory) sits inside the same working tree as the publ
 repo, separated only by .gitignore. One mis-added file is unrecoverable once pushed but
 rotating the key fixes the key, not the git history or the forks of it.
 
-So this checks what is actually TRACKED, not what is on disk. A key sitting in
+So this checks what is actually tracked, not what is on disk. A key sitting in
 `private/` or `~/.anthropic_key` is fine and expected; the same bytes in `git
 ls-files` are not.
 

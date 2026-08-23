@@ -7,8 +7,8 @@
 
 // secure_clear correctness.
 //
-// NOTE ON WHAT THESE CAN AND CANNOT PROVE. A unit test can show the bytes are
-// zero, but it CANNOT show the store survives dead-store elimination; reading
+// Note on what these can and cannot prove. A unit test can show the bytes are
+// zero, but it cannot show the store survives dead-store elimination; reading
 // the buffer afterwards is exactly what stops the compiler eliding it. The
 // no-elision property is verified by inspecting generated assembly (see
 // net/secure.hpp for the command) and by the platform primitive's own contract.

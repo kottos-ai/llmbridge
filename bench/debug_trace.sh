@@ -14,10 +14,10 @@
 #                  ◀─OpenAI──            ◀─provider──┘
 #
 # It prints four stages so you can see exactly what the translator did:
-#   1. CLIENT  → GATEWAY    the OpenAI request you send
-#   2. GATEWAY → UPSTREAM   the request after openai_to_<provider>_request()
-#   3. UPSTREAM→ GATEWAY    the canned provider response
-#   4. GATEWAY → CLIENT     the response after <provider>_to_openai_response()
+#   1. client   -> gateway    the OpenAI request you send
+#   2. gateway  -> upstream   the request after openai_to_<provider>_request()
+#   3. upstream -> gateway    the canned provider response
+#   4. gateway  -> client     the response after <provider>_to_openai_response()
 # ...plus the gateway's own added-latency profile.
 #
 # Modes:

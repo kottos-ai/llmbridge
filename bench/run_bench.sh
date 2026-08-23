@@ -14,7 +14,7 @@
 #   (2) direct to the mock provider     -> backend latency baseline
 # The proxy's added latency is the delta of those two client-observed numbers,
 # cross-checked against the proxy's own self-reported overhead (request-path +
-# response-path, with the upstream wait excluded). PASS = p99 added < 1 ms at
+# response-path, with the upstream wait excluded). Pass = p99 added < 1 ms at
 # 1000 RPS.
 #
 # Everything runs on one box (mock + proxy + loadgen compete for the same 10

@@ -225,7 +225,7 @@ namespace
     }
 } // namespace
 
-// The property that matters: for ANY input (hostile or malformed), the emitted
+// The property that matters: for any input (hostile or malformed), the emitted
 // stream is strict (no bare control bytes leak through passthrough) and the
 // translator never crashes (ASan/UBSan enforce the latter in CI).
 TEST(Sse, OutputIsAlwaysStrict)
@@ -402,7 +402,7 @@ TEST(Sse, CapOnEndlessEventRejects)
 // ── stream_options.include_usage ───────────────────────────────────────────
 namespace
 {
-    // Anthropic reports input tokens in message_start and CUMULATIVE output
+    // Anthropic reports input tokens in message_start and cumulative output
     // tokens in message_delta; this stream ends at 7 output tokens.
     const char* kAnthropicWithUsage =
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_u\",\"model\":\"claude-3-5-sonnet\","
@@ -465,7 +465,7 @@ TEST(SseUsage, EmitsFinalUsageChunkBeforeDone)
     EXPECT_EQ(usage->num_or("prompt_tokens"), "11");     // from message_start
     EXPECT_EQ(usage->num_or("completion_tokens"), "7");  // cumulative, from message_delta
     EXPECT_EQ(usage->num_or("total_tokens"), "18");
-    // Per the OpenAI spec the usage chunk carries an EMPTY choices array.
+    // Per the OpenAI spec the usage chunk carries an empty choices array.
     const Value* ch = u.find("choices");
     ASSERT_TRUE(ch && ch->is_array());
     EXPECT_TRUE(ch->arr.empty());
@@ -529,7 +529,7 @@ TEST(SseUsage, MissingUpstreamUsageYieldsZeros)
 // ── Cross-path "reconstruction": stream-then-reassemble == translate-the-whole-body ─
 //
 // We have only the forward direction (Anthropic->OpenAI), so a true round-trip
-// isn't possible yet. The strong analog is that the STREAMING path and the
+// isn't possible yet. The strong analog is that the streaming path and the
 // NON-STREAMING path must agree: translating an Anthropic SSE stream and
 // reassembling its OpenAI chunks must recover exactly what
 // anthropic_to_openai_response() produces for the equivalent whole body. This
@@ -587,7 +587,7 @@ namespace
             if (pay == "[DONE]") continue;
             Value ch = P(pay); // named local: keep the DOM alive for find()
             if (first) { r.id.assign(ch.str_or("id")); r.model.assign(ch.str_or("model")); first = false; }
-            // The usage-only chunk has an EMPTY choices array; harvest it.
+            // The usage-only chunk has an empty choices array; harvest it.
             if (const Value* u = ch.find("usage"); u && u->is_object())
             {
                 r.prompt_tokens.assign(u->num_or("prompt_tokens"));
@@ -694,7 +694,7 @@ TEST(SseReconstruction, ContentSplitAcrossDeltasReassemblesWhole)
     EXPECT_EQ(many.content, "Hello, world!"); // chunk boundaries don't change the message
 }
 
-// Guard against a tautological comparison: different content MUST reassemble
+// Guard against a tautological comparison: different content must reassemble
 // differently (so the equivalence tests above can actually fail).
 TEST(SseReconstruction, DetectsContentMismatch)
 {
@@ -706,7 +706,7 @@ TEST(SseReconstruction, DetectsContentMismatch)
 // ── Streamed tool calls ─────────────────────────────────────────────────────
 // Anthropic streams a call as content_block_start (id + name) followed by
 // input_json_delta fragments; OpenAI expects one opening tool_calls delta carrying
-// id/name, then arguments fragments under the same index. The indices are NOT the
+// id/name, then arguments fragments under the same index. The indices are not the
 // same number, which is what most of these tests are about.
 
 namespace
@@ -742,7 +742,7 @@ namespace
             const size_t a = out.find(R"("arguments":")", p);
             if (a == std::string::npos) break;
             size_t s = a + 13;
-            // Find the CLOSING quote, skipping escaped ones: the arguments value is
+            // Find the closing quote, skipping escaped ones: the arguments value is
             // JSON-inside-JSON, so it is full of \" and a naive find('"') stops on
             // the first one. (That bug made this test report "{\\" as the payload.)
             size_t e = s;
@@ -782,8 +782,8 @@ TEST(SseTools, ArgumentFragmentsReassembleExactly)
 
 TEST(SseTools, BlockIndexIsNotTheToolOrdinal)
 {
-    // THE bug this mapping exists to prevent: Anthropic indexes every content
-    // block, so a leading TEXT block pushes tool blocks to 1,2, while OpenAI's
+    // The bug this mapping exists to prevent: Anthropic indexes every content
+    // block, so a leading text block pushes tool blocks to 1,2, while OpenAI's
     // tool_calls index must still start at 0. Emitting tool_calls[1] with no [0]
     // breaks client-side reassembly.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
@@ -851,7 +851,7 @@ TEST(SseTools, AbsurdBlockIndexDoesNotAllocate)
 
 TEST(SseTools, MalformedIndexIsRejectedNotAliasedToBlockZero)
 {
-    // to_ll()/from_chars leave their output UNTOUCHED on overflow, so a naive parse
+    // to_ll()/from_chars leave their output untouched on overflow, so a naive parse
     // turns a garbage index into 0, attaching a customer's argument fragments to
     // whichever tool call happens to occupy block 0. Found by audit before merge.
     for (const char* bad : {"99999999999999999999", "-99999999999999999999", "1e5", "0x10"})
@@ -881,7 +881,7 @@ TEST(SseTools, MalformedIndexDoesNotOpenACall)
 
 TEST(SseTools, EveryEmittedChunkIsValidJsonUnderHostileEscaping)
 {
-    // id, name and every argument fragment are forwarded as RAW (still-escaped)
+    // id, name and every argument fragment are forwarded as raw (still-escaped)
     // spans. A span that terminated in a lone backslash would escape our closing
     // quote and corrupt the chunk. The parser's escape-skipping makes that
     // impossible; this pins it so a future parser change cannot silently break it.
@@ -921,7 +921,7 @@ TEST(SseTools, ToolChunksCarryUsageNullWhenIncludeUsageIsSet)
     size_t n = 0, p = 0;
     while ((p = out.find("tool_calls", p)) != std::string::npos) { ++n; ++p; }
     ASSERT_EQ(n, 2u) << out;
-    // Count chunks, then assert EVERY one carries usage:null; the role chunk does
+    // Count chunks, then assert every one carries usage:null; the role chunk does
     // too, so pinning a literal 2 would have been wrong for the wrong reason.
     size_t q = 0, chunks = 0, usage = 0;
     while ((q = out.find("data: ", q)) != std::string::npos) { ++chunks; ++q; }
@@ -970,7 +970,7 @@ TEST(SseTools, CompletedToolCallStillEndsCleanly)
 TEST(SseTools, MessageStopWithoutMessageDeltaStillEndsCleanly)
 {
     // Regression for a bug the truncation guard itself introduced: dispatch()
-    // emits [DONE] on message_stop, but the guard was checked BEFORE _done, so a
+    // emits [DONE] on message_stop, but the guard was checked before _done, so a
     // stream that had already ended correctly was reported as a failure; the
     // gateway then counts an error and closes abruptly on a good response.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
@@ -997,7 +997,7 @@ TEST(SseTools, FinishReasonDefaultsToToolCallsOnceACallWasEmitted)
 {
     // Found by second-pass review. Every OpenAI SDK branches on
     // finish_reason == "tool_calls" to decide whether to dispatch; reporting "stop"
-    // makes the client treat the call as a plain answer and SILENTLY ignore it.
+    // makes the client treat the call as a plain answer and silently ignore it.
     // Reachable whenever the upstream sends message_stop with no message_delta.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;
@@ -1023,7 +1023,7 @@ TEST(SseTools, TextOnlyStreamStillDefaultsToStop)
 TEST(SseTools, ForeignDoneCannotVouchForATruncatedCall)
 {
     // `data: [DONE]` is an OpenAI-ism; Anthropic ends with message_stop. Honouring
-    // it blindly gave a truncated tool call a clean ending AND skipped the finish
+    // it blindly gave a truncated tool call a clean ending and skipped the finish
     // chunk, leaving finish_reason:null with no way for a client to know.
     llmbridge::provider::AnthropicToOpenAiSse t(1700000000, false);
     std::string out;

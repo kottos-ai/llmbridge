@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// The config parser exists to REFUSE things, so most of this file is rejection
+// The config parser exists to refuse things, so most of this file is rejection
 // cases. The one that matters most is the unknown key: a parser that ignores a
 // misspelled setting fails open, silently, with no `ps` output to catch it, which
 // is the exact shape of the `--listen-tls`-on-a-non-TLS-build defect.
@@ -95,7 +95,7 @@ TEST(Config, AbsentKeysAreNotApplied)
     EXPECT_TRUE(c.upstreams.empty());
 }
 
-// ── The upstream TABLE ───────────────────────────────────────────────────────
+// ── The upstream table ───────────────────────────────────────────────────────
 //
 // `upstream` accepts an object (one venue, what nearly every deployment writes) or
 // an array of the same object. The array is what lets a policy route, and the object
@@ -115,7 +115,7 @@ TEST(Config, UpstreamArrayBecomesATableInOrder)
     EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
     EXPECT_EQ(c.upstreams[1].url, "127.0.0.1:9002");
     EXPECT_EQ(c.upstreams[2].url, "https://api.anthropic.com");
-    // ORDER IS THE CONTRACT: a policy selects by index, so a table that reorders
+    // Order is the contract: a policy selects by index, so a table that reorders
     // silently sends requests to the wrong venue.
     EXPECT_EQ(c.upstreams[1].translate, "none");
     EXPECT_EQ(c.upstreams[2].translate, "anthropic");
@@ -147,7 +147,7 @@ TEST_P(ConfigReject, IsRefusedAndNamesTheProblem)
 INSTANTIATE_TEST_SUITE_P(
     Cases, ConfigReject,
     ::testing::Values(
-        // THE ONE THAT MATTERS: a misspelling must not be silently ignored.
+        // The one that matters: a misspelling must not be silently ignored.
         std::make_pair(R"({"listen":{"listen_tls":true}})", "listen_tls"),
         std::make_pair(R"({"lisen":{"port":1}})", "lisen"),
         std::make_pair(R"({"runtime":{"worker":2}})", "worker"),
@@ -161,7 +161,7 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(R"({"upstream":[1,2]})", "must be an object"),
         std::make_pair(R"({"upstream":[{"translate":"none"},{"url":"x:1"}]})", "needs a url"),
         std::make_pair(R"({"upstream":"127.0.0.1:9001"})", "object or an array"),
-        // A bare string where a list was meant must NOT quietly become a no-op on a
+        // A bare string where a list was meant must not quietly become a no-op on a
         // header the operator believes is being dropped.
         std::make_pair(R"({"upstream":{"strip_headers":"authorization"}})", "array of strings"),
         std::make_pair(R"({"upstream":{"strip_headers":[1]}})", "only strings"),
@@ -232,7 +232,7 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_DOUBLE_EQ(c.duration_s, 0);
     EXPECT_DOUBLE_EQ(c.warmup_s, 0);
 
-    // Every settable key must APPEAR, or the example silently stops documenting one.
+    // Every settable key must appear, or the example silently stops documenting one.
     EXPECT_TRUE(c.has_listen_port && c.has_listen_tls && c.has_upstream_s &&
                 c.has_client_idle_s && c.has_pool_idle_s && c.has_workers &&
                 c.has_timing_headers && c.has_duration_s && c.has_warmup_s)

@@ -43,7 +43,7 @@ namespace llmbridge::net
         /// The result is spliced into a request line, so this is the same threat
         /// model as the Host header: a byte that ends the line or the target lets a
         /// caller retarget the request, and the upstream pool means the victim can
-        /// be a DIFFERENT client's connection. Hence a whitelist, and a refusal
+        /// be a different client's connection. Hence a whitelist, and a refusal
         /// instead of a strip.
         ///
         /// Rejected for reasons that are not injection: "." and ".." because the
@@ -131,7 +131,7 @@ namespace llmbridge::net
             rest = rest.substr(ss + 3);
         }
 
-        // Split the authority from the base path BEFORE the authority checks, so a
+        // Split the authority from the base path before the authority checks, so a
         // '?' or '#' anywhere in the argument is reported as such instead of being
         // hidden inside a path that was never inspected.
         if (const size_t slash = rest.find('/'); slash != std::string_view::npos)

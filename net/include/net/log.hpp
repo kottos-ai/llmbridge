@@ -8,30 +8,30 @@
 // Structured logging for the gateway, sized for a process that must not lose its
 // latency claim to its own diagnostics.
 //
-// THE CONSTRAINT. Roughly twenty interesting events per request at ~84k RPS is 1.7M
-// records/second, against a published budget of 41-80 us added p99 for the WHOLE
+// The constraint. Roughly twenty interesting events per request at ~84k RPS is 1.7M
+// records/second, against a published budget of 41-80 us added p99 for the whole
 // request. One fprintf to stderr costs 1-5 us and takes a lock, so twenty of them
 // exceed the entire number the project is sold on. A logger here is therefore not a
 // convenience, it is a thing that can invalidate the benchmark.
 //
-// THE SHAPE THAT FOLLOWS.
+// The shape that follows.
 //
-//   1. TWO LEVEL GATES. A compile-time floor removes call sites entirely, so a
+//   1. Two level gates. A compile-time floor removes call sites entirely, so a
 //      Release build carries no trace/debug code at all and the published numbers
 //      are measured on what ships. A runtime level then gates what remains, as one
 //      relaxed atomic load and a predictable branch.
-//   2. NO ALLOCATION, EVER. A line is formatted into a fixed stack buffer. Past the
+//   2. No allocation, ever. A line is formatted into a fixed stack buffer. Past the
 //      buffer it truncates and says so; it never grows, never allocates, never
 //      throws.
-//   3. NO IOSTREAMS. `operator<<` on the event loop means locales, virtual dispatch
+//   3. No iostreams. `operator<<` on the event loop means locales, virtual dispatch
 //      and allocation. The variadic form below reads the same and costs none of it.
-//   4. ONE write(2) PER LINE, so concurrent workers interleave whole lines instead
+//   4. One write(2) per line, so concurrent workers interleave whole lines instead
 //      of fragments. There is no mutex.
-//   5. A SINK SEAM. The default sink writes to stderr.
+//   5. A sink seam. The default sink writes to stderr.
 //
-// WHAT MUST NEVER BE LOGGED. No credential, at any level, ever: not an
+// What must never be logged. No credential, at any level, ever: not an
 // Authorization value, not an x-api-key, not a bearer token, not a TLS private key.
-// Log a header's NAME and LENGTH, never its value. `SECURITY.md` promises
+// Log a header's name and length, never its value. `SECURITY.md` promises
 // credentials are never logged, and this is the file where that promise is kept or
 // broken.
 
@@ -74,7 +74,7 @@ namespace llmbridge::net::log
     Level level() noexcept;
 
     // Runtime default = the compile floor, so a binary built with the debug floor
-    // EMITS debug without an explicit set_level.
+    // Emits debug without an explicit set_level.
     inline std::atomic<uint8_t> g_level_cache{static_cast<uint8_t>(LLMBRIDGE_LOG_COMPILE_LEVEL)};
 
     [[nodiscard]] inline bool enabled(Level l) noexcept
@@ -84,10 +84,10 @@ namespace llmbridge::net::log
 
     // ---------------------------------------------------------------- identity
     //
-    // A log line is worthless if you cannot tell WHICH connection or WHICH request
+    // A log line is worthless if you cannot tell which connection or which request
     // it belongs to. Three identities, all cheap:
     //
-    //   thread   a small index and a name, assigned once per thread. NOT
+    //   thread   a small index and a name, assigned once per thread. Not
     //            pthread_self(), which prints as a meaningless 15-digit number.
     //   object   a class name plus a monotonic instance number, so a connection is
     //            "Connection#42" for its whole life and can be grepped.
@@ -143,7 +143,7 @@ namespace llmbridge::net::log
     // Anything with a free `log_put(Line&, const T&)` in its own namespace is
     // loggable. This is how an object gets a "print method" without iostreams:
     // Connection defines one, and `LB_LOG_INFO("closed ", *conn)` just works.
-    // Constrained so it participates ONLY for types that actually define log_put.
+    // Constrained so it participates only for types that actually define log_put.
     // Unconstrained, it beat the string_view overload for std::string (which needs a
     // user-defined conversion) and the error surfaced as a confusing ADL failure
     // deep inside the header.
@@ -169,7 +169,7 @@ namespace llmbridge::net::log
 
     // ---------------------------------------------------------------- sink
     //
-    // THE OPEN-CORE SEAM. The default sink formats nothing and does one write(2) to
+    // The OPEN-CORE seam. The default sink formats nothing and does one write(2) to
     // stderr, which is correct and adequate for a sidecar. A deployment that cares
     // about the syscall installs a sink that copies the finished line into a
     // lock-free ring and lets a writer thread do the write; that removes the 1-5 us

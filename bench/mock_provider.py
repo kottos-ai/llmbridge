@@ -25,7 +25,7 @@ Streaming mode (Phase B): when the request body contains "stream": true and
 --format anthropic, the mock instead emits an Anthropic SSE event stream over
 chunked transfer-encoding, one content_block_delta every --token-interval-ms.
 
-Each delta's TEXT carries the mock's own CLOCK_MONOTONIC emission timestamp
+Each delta's text carries the mock's own CLOCK_MONOTONIC emission timestamp
 ("t=<ns> "). That timestamp rides the payload through whichever gateway is under
 test, so the load generator can compute exact per-chunk added latency
 (arrival - emission) with no clock synchronisation and no coordinated-omission
@@ -68,7 +68,7 @@ CANNED_ANTHROPIC = {
     "usage": {"input_tokens": 8, "output_tokens": 1},
 }
 
-# BODY is selected at startup from --format (see main()).
+# Body is selected at startup from --format (see main()).
 BODY = json.dumps(CANNED_OPENAI).encode()
 
 
@@ -87,7 +87,7 @@ async def stream_anthropic(writer: asyncio.StreamWriter, latency: float,
 
     Timing is absolute (scheduled off a single start point), not cumulative
     sleeps, so the emission cadence doesn't drift with per-iteration overhead.
-    The benchmark needs the PROVIDER to be the stable reference.
+    The benchmark needs the provider to be the stable reference.
     """
     writer.write(
         b"HTTP/1.1 200 OK\r\n"
@@ -214,9 +214,9 @@ async def main():
         lambda r, w: handle(r, w, latency, args.format == "anthropic",
                             args.tokens, args.token_interval_ms / 1000.0),
         "127.0.0.1", args.port, limit=1 << 20,
-        # FAIRNESS: asyncio's default listen backlog is 100. A gateway that opens
+        # Fairness: asyncio's default listen backlog is 100. A gateway that opens
         # upstream connections in bursts instead of pooling them, can overflow
-        # that at high concurrency and get its connects REFUSED, which would
+        # that at high concurrency and get its connects refused, which would
         # look like the gateway failing when it is really the mock's socket
         # queue. A deep backlog removes the harness from the comparison.
         backlog=4096,

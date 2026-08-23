@@ -19,7 +19,7 @@ namespace llmbridge::provider
     namespace
     {
         // Append the raw (already JSON-escaped) text of a content field: a plain
-        // string, or an array of {type:"text",text:...} parts, to `out`, WITHOUT
+        // string, or an array of {type:"text",text:...} parts, to `out`, without
         // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
         // the output's, so nothing is decoded or re-escaped; the bytes are viewed
         // straight out of the request/response buffer.
@@ -41,26 +41,26 @@ namespace llmbridge::provider
         // The two dialects disagree in three places, and each one is a real
         // conversion instead of a rename:
         //
-        //  1. TOOL DECLARATION
+        //  1. Tool declaration
         //       OpenAI     {"type":"function","function":{name,description,parameters}}
         //       Anthropic  {name,description,input_schema}
         //     `parameters`/`input_schema` is an arbitrary JSON Schema: forwarded as a
-        //     RAW SPAN, never rebuilt, so we cannot corrupt a customer's schema.
+        //     Raw span, never rebuilt, so we cannot corrupt a customer's schema.
         //
-        //  2. THE ASSISTANT'S CALL
+        //  2. The assistant'S call
         //       OpenAI     tool_calls[].function.arguments  -> a JSON *string*
         //       Anthropic  content[].input                  -> a JSON *object*
         //     So crossing this boundary means unescaping a string into JSON one way
         //     and escaping JSON into a string the other. This is the fiddly part and
         //     the reason json.hpp grew unescape_string/append_escaped_string.
         //
-        //  3. THE RESULT
+        //  3. The result
         //       OpenAI     a message with role:"tool" + tool_call_id
-        //       Anthropic  a USER message whose content is a tool_result block
-        //     Consecutive OpenAI tool messages merge into ONE Anthropic user turn.
-        //     NOT because the API demands it: measured against the live API, two
+        //       Anthropic  a user message whose content is a tool_result block
+        //     Consecutive OpenAI tool messages merge into one Anthropic user turn.
+        //     Not because the API demands it: measured against the live API, two
         //     consecutive user turns return 200, and an earlier version of this
-        //     comment claimed otherwise. We merge because a parallel tool call IS
+        //     comment claimed otherwise. We merge because a parallel tool call is
         //     semantically one turn of results, so this produces the canonical shape
         //     the model was trained on instead of leaning on provider-side
         //     turn-combining we do not control.
@@ -168,7 +168,7 @@ namespace llmbridge::provider
     /// copy of the message walk would be a second place for tool results, vision and
     /// system-prompt handling to drift.
     ///
-    /// Bedrock puts the model in the PATH, so its body must not carry one, and it
+    /// Bedrock puts the model in the path, so its body must not carry one, and it
     /// wants `anthropic_version` in the JSON where Anthropic wants it in a header.
     /// Everything between those two is identical.
     std::string messages_request(std::string_view openai_body, bool bedrock,
@@ -197,8 +197,8 @@ namespace llmbridge::provider
                     continue;
                 }
 
-                // OpenAI role:"tool" -> an Anthropic USER turn holding tool_result
-                // blocks. Consecutive tool messages MERGE into one turn: Anthropic
+                // OpenAI role:"tool" -> an Anthropic user turn holding tool_result
+                // blocks. Consecutive tool messages merge into one turn: Anthropic
                 // rejects two user turns in a row, and a parallel tool call produces
                 // exactly that shape.
                 if (role == "tool")
@@ -224,7 +224,7 @@ namespace llmbridge::provider
                 if (in_tool_results) { messages += "]}"; in_tool_results = false; }
 
                 // An assistant turn carrying tool_calls becomes an Anthropic
-                // assistant turn whose content is an ARRAY: optional text, then one
+                // assistant turn whose content is an array: optional text, then one
                 // tool_use block per call.
                 const json::Value* tcs = m.find("tool_calls");
                 if (role == "assistant" && tcs && tcs->is_array() && !tcs->arr.empty())
@@ -343,7 +343,7 @@ namespace llmbridge::provider
         const json::Value* m = v.find("model");
         if (!m || !m->is_string()) return {};
 
-        // The parser's string view points INTO the body, so its offsets are the exact
+        // The parser's string view points into the body, so its offsets are the exact
         // span to replace, quotes excluded. No searching, and no chance of hitting a
         // "model" that lives inside a prompt.
         const char* base = openai_body.data();
@@ -451,11 +451,11 @@ namespace llmbridge::provider
             if (message.empty()) message = v.str_or("message");
         }
 
-        // Both spans come from an UNTRUSTED upstream body, so sanitize on the way
+        // Both spans come from an untrusted upstream body, so sanitize on the way
         // out: the same rule the SSE passthrough follows. Otherwise a provider could
         // make our own error envelope unparseable to a strict client.
         //
-        // This is now DEFENCE IN DEPTH instead of the primary mitigation: the
+        // This is now defence in depth instead of the primary mitigation: the
         // parser rejects raw control bytes in strings outright (RFC 8259 §7), so a
         // body carrying one no longer parses and `message`/`type` come back empty,
         // yielding the generic envelope below. An earlier version of this comment

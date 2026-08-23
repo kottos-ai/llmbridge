@@ -66,7 +66,7 @@ TEST(UpstreamParse, BareTrailingSlashTolerated)
 
 // ── rejected forms; each with a specific reason, not a generic failure ──────
 
-// Was RejectsBasePath until 0.19.0. A base path is now KEPT and prefixed to the
+// Was RejectsBasePath until 0.19.0. A base path is now kept and prefixed to the
 // request target, so the case that used to be refused is the Groq/OpenRouter shape.
 TEST(UpstreamParse, KeepsABasePathAndTheAuthorityWithIt)
 {
@@ -116,7 +116,7 @@ TEST(UpstreamParse, RejectsBadPorts)
 
 // The host string is later written into an HTTP Host header and the TLS SNI
 // field. A CR/LF (or space, or slash smuggled via percent-encoding) that survived
-// parsing would be a header-injection primitive, so the charset gate IS a
+// parsing would be a header-injection primitive, so the charset gate is a
 // security boundary and gets tested as one.
 TEST(UpstreamParse, RejectsHeaderInjectionChars)
 {
@@ -164,7 +164,7 @@ TEST(UpstreamResolve, LocalhostResolvesToLoopback)
 // A prefix for providers serving an OpenAI-compatible API below the root. It is
 // spliced into a request line, so the rejection cases below matter more than the
 // acceptance ones: the pooled upstream means a target one client can retarget is
-// a target ANOTHER client's request can be sent to.
+// a target another client's request can be sent to.
 
 TEST(ParseUpstream, KeepsABasePath)
 {
@@ -214,7 +214,7 @@ TEST(ParseUpstream, RejectsControlBytesInABasePath)
 
 TEST(ParseUpstream, RejectsQueryAndFragmentInABasePath)
 {
-    // Azure OpenAI needs "?api-version=". It is now PARSED and kept: a translating
+    // Azure OpenAI needs "?api-version=". It is now parsed and kept: a translating
     // mode builds its own request target and has no client query to merge with. The
     // pairing that would need merging, a query on a byte-forwarding venue, is refused
     // by the Gateway at startup, where the mode is known.
@@ -224,7 +224,7 @@ TEST(ParseUpstream, RejectsQueryAndFragmentInABasePath)
     EXPECT_EQ(q.query, "api-version=2024-02-01");
     EXPECT_TRUE(q.tls);
 
-    // The query is split off BEFORE the path is normalised, so no '?' can reach a
+    // The query is split off before the path is normalised, so no '?' can reach a
     // request-line path.
     EXPECT_EQ(parse_upstream("https://h.io/x?a=1&b=2").query, "a=1&b=2");
     EXPECT_EQ(parse_upstream("https://h.io/x?a=1&b=2").path, "/x");

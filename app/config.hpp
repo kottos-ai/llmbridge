@@ -7,23 +7,23 @@
 
 // Optional JSON configuration for the gateway daemon (`--config FILE`).
 //
-// WHY IT EXISTS. Fourteen flags is uncomfortable; the fifteenth is impossible.
+// Why it exists. Fourteen flags is uncomfortable; the fifteenth is impossible.
 // Multi-upstream routing needs an ordered list with per-upstream fields, which flat
 // flags cannot express without inventing a mini-language. The grouped shape below
 // lets `upstream` become an array later without disturbing anything else.
 //
-// THE CONTRACT:
-//   1. UNKNOWN KEYS, wrong types and out-of-range values are STARTUP ERRORS. A
+// The contract:
+//   1. Unknown keys, wrong types and out-of-range values are startup errors. A
 //      parser that skips a misspelled `listen_tls` fails open in the shape this
 //      project has already been bitten by: `--listen-tls` on a non-TLS build was
 //      accepted and ignored, serving plaintext while the operator believed otherwise.
 //   2. Keys beginning with `_` are comments. JSON has none and an edited file needs them.
-//   3. PATHS, NEVER SECRETS, or the file becomes a credential store on disk.
+//   3. Paths, never secrets, or the file becomes a credential store on disk.
 //   4. The CLI wins, so a one-off override needs no edit.
 //
-// LIFETIME FOOTGUN. `provider::json` is a ZERO-COPY DOM: every string in a parsed
+// Lifetime footgun. `provider::json` is a zero-copy DOM: every string in a parsed
 // `Value` points into the input buffer. So `Config` owns the file bytes in `raw` and
-// every field below is COPIED out during parsing.
+// every field below is copied out during parsing.
 
 #pragma once
 
@@ -34,7 +34,7 @@
 namespace llmbridge::app
 {
     /// Everything `--config` can set. Defaults here are never consulted: only keys
-    /// PRESENT in the file are overwritten, so absent means "leave the caller's value".
+    /// Present in the file are overwritten, so absent means "leave the caller's value".
     struct ConfigFile
     {
         // listen
@@ -76,7 +76,7 @@ namespace llmbridge::app
         double warmup_s = 0;
     };
 
-    /// Parse `text` into `out`. On failure sets `err` to one line NAMING the offending
+    /// Parse `text` into `out`. On failure sets `err` to one line naming the offending
     /// key: "config error" with no key is a message an operator cannot act on. `text`
     /// need not outlive the call; every value is copied.
     bool parse_config(std::string_view text, ConfigFile& out, std::string& err);

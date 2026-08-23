@@ -7,36 +7,36 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Streaming (SSE) head-to-head: llmbridge vs LiteLLM, both translating the SAME
-# Anthropic event stream from the SAME mock into OpenAI chat.completion.chunks,
-# measured by the SAME client instrument, swept over concurrency.
+# Streaming (SSE) head-to-head: llmbridge vs LiteLLM, both translating the same
+# Anthropic event stream from the same mock into OpenAI chat.completion.chunks,
+# measured by the same client instrument, swept over concurrency.
 #
 # ── Fairness controls (each one is a way this could have been rigged) ─────────
-#  1. SAME INSTRUMENT, BOTH SIDES. Every number comes from streamgen, client-side.
+#  1. Same instrument, both sides. Every number comes from streamgen, client-side.
 #     Neither gateway self-reports. (The non-streaming benchmark measures llmbridge
 #     by self-report and LiteLLM by client delta; this one removes that asymmetry.)
-#  2. SAME BASELINE. "Added" latency is measured against the identical
-#     direct-to-mock control run at the SAME concurrency, subtracted the same way
+#  2. Same baseline. "Added" latency is measured against the identical
+#     direct-to-mock control run at the same concurrency, subtracted the same way
 #     for both. The floor (loopback + the Python mock's own jitter) is charged to
 #     neither gateway.
-#  3. SAME WORKERS. One worker each: llmbridge single-threaded, LiteLLM one uvicorn
+#  3. Same workers. One worker each: llmbridge single-threaded, LiteLLM one uvicorn
 #     worker. No SO_REUSEPORT fan-out for llmbridge.
-#  4. SAME WARMUP. Both get the same (generous) warmup so LiteLLM's cold-start /
+#  4. Same warmup. Both get the same (generous) warmup so LiteLLM's cold-start /
 #     first-request path is never charged to it.
-#  5. SAME WORK. Identical request body, model, mock, and token rate; neither side
+#  5. Same work. Identical request body, model, mock, and token rate; neither side
 #     requests stream_options.include_usage, so neither emits an extra usage chunk.
-#  6. BOTH PROXIES STAY UP for the whole sweep: no restart between levels, so
+#  6. Both proxies stay up for the whole sweep: no restart between levels, so
 #     neither gets a "fresh process" advantage at any concurrency.
-#  7. ORDER ALTERNATES per level (llmbridge-first, then LiteLLM-first) so any
+#  7. Order alternates per level (llmbridge-first, then LiteLLM-first) so any
 #     thermal/cache drift within a level doesn't systematically favour one side.
-#  8. DISCARD ROUND. Both gateways get one full unmeasured round before the sweep
+#  8. Discard round. Both gateways get one full unmeasured round before the sweep
 #     begins. LiteLLM's lazy imports / first-request path cost far more than a few
-#     seconds of in-run warmup: measured directly, its FIRST level came out 134x
+#     seconds of in-run warmup: measured directly, its first level came out 134x
 #     worse than the same level run later. Without this the sweep's first entry is
 #     an artifact of cold start, not of the gateway.
-#  9. MOCK-SATURATION GUARD. If the direct baseline itself degrades at a level, the
+#  9. MOCK-SATURATION guard. If the direct baseline itself degrades at a level, the
 #     Python mock, not either gateway, is the limiter, and the level is flagged
-#     UNRELIABLE instead of silently reported.
+#     Unreliable instead of silently reported.
 #
 #   ./bench/run_stream_headtohead.sh [tokens] [interval_ms] [duration] [warmup] [streams...]
 set -uo pipefail
@@ -82,7 +82,7 @@ fi
 [ -z "$BIN" ] && { echo "No built llmbridge+streamgen; build first or set BIN=path" >&2; exit 1; }
 echo "Using binaries in $BIN"
 
-# A stale binary silently benchmarks the WRONG code; streaming lands in v0.3.0, so
+# A stale binary silently benchmarks the wrong code; streaming lands in v0.3.0, so
 # refuse to run against a gateway that can't stream.
 if ! "$BIN/llmbridge" --help 2>&1 | grep -q 'upstream-timeout'; then
   echo "ERROR: $BIN/llmbridge looks stale (no --upstream-timeout). Rebuild before benchmarking." >&2
@@ -91,9 +91,9 @@ fi
 
 wait_port() { for _ in $(seq 1 120); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }; sleep 0.5; done; return 1; }
 
-# PROVIDER=fast (default): the C++ faststream. The Python mock saturates near
+# Provider=fast (default): the C++ faststream. The Python mock saturates near
 # 45-50k chunks/s, below llmbridge, so it would cap the comparison. faststream is
-# wire-identical (same events, framing and emission stamps), so BOTH gateways see
+# wire-identical (same events, framing and emission stamps), so both gateways see
 # exactly the same upstream, and neither is measured against a limited provider.
 PROVIDER="${PROVIDER:-fast}"
 echo "Starting provider=$PROVIDER (anthropic SSE: ${TOKENS} tokens @ ${INTERVAL}ms) ..."
@@ -115,7 +115,7 @@ GW_PID=$!
 wait_port "$GW_PORT" || { echo "llmbridge failed to start" >&2; exit 1; }
 
 echo "Starting LiteLLM (1 worker) ..."
-# The checked-in config hardcodes the mock's default port; point it at THIS run's
+# The checked-in config hardcodes the mock's default port; point it at this run's
 # mock, otherwise LiteLLM dials a port nothing is listening on and every stream fails.
 # Derived per-run artifact, not a result: keep it out of bench/results/ (which is
 # partly tracked) so runs don't litter the repo with redundant configs.

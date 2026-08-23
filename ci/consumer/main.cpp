@@ -40,7 +40,7 @@ int main()
         return 1;
     }
 
-    // 3. The strictness fix shipped in 0.9.0 must be present in the INSTALLED header,
+    // 3. The strictness fix shipped in 0.9.0 must be present in the installed header,
     //    not just in-tree: a raw control byte in a string is refused.
     bool bad_ok = true;
     (void)llmbridge::provider::json::parse("{\"t\":\"a\nb\"}", bad_ok);

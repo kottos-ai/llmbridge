@@ -16,7 +16,7 @@
 //                 Transfer-Encoding, conflicting duplicate CL, over-cap body.
 //   - Pipeline  : concatenated messages -> first is framed, total_len = first.
 //   - Lenient   : documented parser quirks (identical dup CL collapses, "closed"
-//                 prefix-matching "close"). NOTE: "trailing garbage after CL is
+//                 prefix-matching "close"). Note: "trailing garbage after CL is
 //                 accepted" used to live here as a quirk. It was a smuggling
 //                 primitive, not a quirk; see the HttpDesync suite, which now
 //                 asserts the rejection.
@@ -263,12 +263,12 @@ INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_increm
 // ── Lenient / documented quirks ─────────────────────────────────────────────
 // --- Framing-desync regressions (security sweep, 2026-08-03) ------------------
 //
-// Every case below was MEASURED against the pre-fix framer. Six of the seven had
+// Every case below was measured against the pre-fix framer. Six of the seven had
 // the identical signature: parse_request() returned Complete with body_len == 0 while the
 // body sat unconsumed in the buffer. In passthrough mode the gateway then forwards
 // the header block verbatim (malformed header included) so an upstream that
 // reads the length we could not becomes a desync, and because the upstream pool is
-// SHARED, that desync crosses clients. Hence: refuse, never re-interpret.
+// Shared, that desync crosses clients. Hence: refuse, never re-interpret.
 //
 // The first of these replaces a test that asserted the opposite ("trailing garbage
 // after the CL number is accepted"). It was written as a documented quirk; it was
@@ -276,7 +276,7 @@ INSTANTIATE_TEST_SUITE_P(Cases, HttpIncremental, ::testing::ValuesIn(make_increm
 
 namespace
 {
-    // Each input carries a 5-byte body the framer must NOT silently frame as empty.
+    // Each input carries a 5-byte body the framer must not silently frame as empty.
     void expect_rejected(const std::string& raw, const char* why)
     {
         Message m;
@@ -340,7 +340,7 @@ TEST(HttpDesync, ResponseWithBothChunkedAndContentLengthIsRejected)
 {
     // The two framings disagree about where the body ends. Whichever we pick, the
     // other is what some intermediary picked, and a mis-framed response leaves
-    // stray bytes on the POOLED connection, i.e. in the next client's response.
+    // stray bytes on the pooled connection, i.e. in the next client's response.
     const std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
                             "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     llmbridge::net::http::ResponseHead h;
@@ -368,14 +368,14 @@ TEST(HttpDesync, ResponseWithoutAnHttpVersionStatusLineIsRejected)
     using llmbridge::net::http::parse_response_head;
     llmbridge::net::http::ResponseHead h;
 
-    // The status-line parser used to take the first space ANYWHERE in the head and
+    // The status-line parser used to take the first space anywhere in the head and
     // read three digits after it, never checking the line began with "HTTP/". Any
-    // bytes prepended to a response were therefore ABSORBED into the status line
+    // bytes prepended to a response were therefore absorbed into the status line
     // and never rejected, provided they held no space and no CRLF.
     //
     // Reachable only if stray bytes survive on a pooled upstream, which
     // {ep,ur}_release_upstream prevents. This is the second lock: the shape of the
-    // v0.8.1 defects was malformed input becoming INVISIBLE input, and the cure
+    // v0.8.1 defects was malformed input becoming invisible input, and the cure
     // was refusing it at the framer instead of relying on one guard upstream.
     EXPECT_EQ(parse_response_head("JUNKHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", h),
               FrameStatus::Error);
@@ -484,7 +484,7 @@ TEST(FindHeader, FirstOccurrenceWinsOnDuplicates)
     EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "first");
 }
 
-// THE ONE THIS FUNCTION WAS REWRITTEN FOR. The colon has to sit exactly where the
+// The one this function was rewritten for. The colon has to sit exactly where the
 // name ends, or a client can name a header `x-tenant-spoof:` and have it answer a
 // lookup for `x-tenant`. Whoever asks the question is deciding authorisation, so
 // the forged field is a privilege the client granted itself.
@@ -518,7 +518,7 @@ TEST(FindHeader, CrlfEndsTheValue)
     EXPECT_EQ(llmbridge::net::http::find_header(h, "x-api-key"), "k");
 }
 
-// A blank line ends the header block. Anything after it is the BODY, which the
+// A blank line ends the header block. Anything after it is the body, which the
 // client controls completely, so finding a credential there would let a caller
 // forge any header simply by writing it below the blank line.
 TEST(FindHeader, StopsAtTheBlankLineSoTheBodyIsNotSearched)
@@ -528,7 +528,7 @@ TEST(FindHeader, StopsAtTheBlankLineSoTheBodyIsNotSearched)
     EXPECT_EQ(llmbridge::net::http::find_header(m, "host"), "x");
 }
 
-// Documents the SHARP EDGE deliberately: a bare CR does NOT terminate a line, so
+// Documents the sharp edge deliberately: a bare CR does not terminate a line, so
 // it survives inside the value. Callers must validate before re-emitting; this
 // test exists so nobody "fixes" the comment back to claiming otherwise.
 TEST(FindHeader, BareCrSurvivesInsideValueSoCallersMustValidate)
@@ -617,7 +617,7 @@ TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
     // first and flaked on allocator warmth, which is exactly the kind of test
     // people learn to ignore, so assert the invariant that actually matters:
     // across the whole incremental arrival, the decoder's consumed count only
-    // ever moves FORWARD, and each step is bounded by the bytes that just
+    // ever moves forward, and each step is bounded by the bytes that just
     // arrived. Re-decoding from byte zero violates both.
     const size_t body = 1024 * 1024, read_size = 64 * 1024;
     const std::string wire = make_chunked_response(body, 16 * 1024);

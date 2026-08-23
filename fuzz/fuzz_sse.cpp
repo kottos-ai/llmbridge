@@ -14,7 +14,7 @@
 //   cmake --build build-fuzz --target fuzz_sse
 //   ./build-fuzz/bin/fuzz_sse -max_total_time=120 fuzz/corpus/sse
 //
-// Invariants asserted on EVERY input:
+// Invariants asserted on every input:
 //   (1) Output strictness. The emitted stream never contains a bare C0 control
 //       byte other than the '\n' we frame with (append_sanitized's guarantee).
 //   (2) Fragmentation-invariance. Feeding the same bytes one-at-a-time yields

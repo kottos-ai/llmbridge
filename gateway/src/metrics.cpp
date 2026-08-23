@@ -24,10 +24,10 @@ namespace llmbridge
         // Anchors captured together, once, on first use. `static` init is
         // thread-safe in C++11+ and this is not a hot path (once per response).
         //
-        // CAVEAT; this DRIFTS. It assumes both clocks tick at the same rate after
+        // Caveat; this drifts. It assumes both clocks tick at the same rate after
         // the anchor; under NTP slew they do not, and the error grows with process
         // uptime. Good enough for correlating a request against an external log at
-        // ms granularity, which is all `x-llmbridge-t0` promises. NOT an ordering
+        // ms granularity, which is all `x-llmbridge-t0` promises. Not an ordering
         // primitive: use `seq` for that. See LATENCY.md §3.
         static const int64_t mono0 = now_ns();
         static const int64_t wall0 = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -65,7 +65,7 @@ namespace llmbridge
 
     void Histogram::print(std::ostream& os, const char* label) const
     {
-        // An empty histogram must NOT print zeros. It did once, and "p99=0 ns" reads
+        // An empty histogram must not print zeros. It did once, and "p99=0 ns" reads
         // as a spectacular result instead of as no data, while bench/run_bench.sh
         // seds this very line for `p99=`, so a zero-sample run would have published a
         // fabricated 0 us added latency. Streaming workloads hit this every time:

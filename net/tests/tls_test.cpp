@@ -48,7 +48,7 @@ namespace
         EVP_PKEY* key{nullptr};
         X509* crt{nullptr};
 
-        /// `lifetime_s` is seconds from now. Negative produces an ALREADY EXPIRED
+        /// `lifetime_s` is seconds from now. Negative produces an already expired
         /// certificate, which init_server() must refuse at startup.
         explicit SelfSigned(long lifetime_s = 3600)
         {
@@ -82,12 +82,12 @@ namespace
         /// Write the cert to a temp PEM so the client Context can trust it as a CA.
         std::string write_pem() const
         {
-            // Unique per process AND per call. ctest gives each gtest case its own
+            // Unique per process and per call. ctest gives each gtest case its own
             // process and runs them with -j, so a fixed name meant one process
             // truncated the file another was mid-way through loading, surfacing as a
             // spurious TLS failure in whichever lost the race.
             //
-            // This is the SAME bug, in the SAME copy-pasted SelfSigned helper, as the
+            // This is the same bug, in the same copy-pasted SelfSigned helper, as the
             // one fixed in gateway/tests/gateway_tls_test.cpp, and it was left behind
             // when that one was fixed. Duplicated code, one-sided fix: exactly the
             // failure mode the ep_/ur_ audit was about. If a third copy ever appears,
@@ -168,7 +168,7 @@ namespace
         void pump() { SSL_do_handshake(ssl); }
     };
 
-    /// Feed the server one byte at a time, pumping after each, so BOTH directions
+    /// Feed the server one byte at a time, pumping after each, so both directions
     /// of the handshake see worst-case fragmentation.
     void server_feed_bytewise(Server& s, const std::vector<uint8_t>& bytes)
     {
@@ -199,7 +199,7 @@ namespace
         }
         if (!client.handshake_done()) return false;
 
-        // In TLS 1.3 the CLIENT is done a flight before the server is: it sends
+        // In TLS 1.3 the client is done a flight before the server is: it sends
         // Finished and considers the handshake complete without waiting for a reply.
         // So client.handshake_done() does not imply the server can write yet -- its
         // SSL_write returns -1 until it has consumed that last flight. Flush it here,
@@ -383,7 +383,7 @@ TEST_F(TlsPump, PeerCloseNotifySurfacesAsClosed)
     EXPECT_EQ(c.want(), Want::Closed);
 }
 
-// The inverse property: the ABSENCE of close_notify must NOT read as a clean
+// The inverse property: the absence of close_notify must not read as a clean
 // close. A TCP FIN with no close_notify is a truncation attack (strip the end of
 // a response, e.g. the SSE final-usage chunk); the session must stay un-Closed so
 // the gateway can flag the upstream response as truncated.
@@ -461,7 +461,7 @@ TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
 
 // ── Task 2: server-side context and session ─────────────────────────────────
 //
-// Inbound TLS makes llmbridge the SERVER for the first time. Every failure below
+// Inbound TLS makes llmbridge the server for the first time. Every failure below
 // is a startup failure on purpose: a process that starts happily and then fails
 // every handshake gives the client an opaque alert and gives the operator
 // nothing. These tests pin that behaviour so a later "cleanup" cannot soften it
@@ -498,7 +498,7 @@ TEST(ServerContext, RefusesKeyThatDoesNotMatchTheCert)
     o.cert_file = a.write_pem();
     o.key_file = b.write_key_pem();  // the stale-renewal / swapped-file case
     EXPECT_FALSE(ctx.init_server(o));
-    // Assert WHICH guard fired, not just that one did. Measured 2026-08-10:
+    // Assert which guard fired, not just that one did. Measured 2026-08-10:
     // SSL_CTX_use_PrivateKey_file rejects it, because the cert is already loaded
     // by then. Deleting SSL_CTX_check_private_key leaves this test passing, so a
     // bare EXPECT_FALSE would have been decoration.
@@ -598,7 +598,7 @@ TEST(ServerSession, OurClientAndOurServerCompleteAHandshake)
 // A handshake that never completes must not let a peer buffer without bound.
 // Measured 2026-08-12 before writing any cap, because the cap would otherwise be a
 // fix for a condition nobody had shown occurs: OpenSSL's record layer already
-// bounds it at ONE record. Two shapes, both refused at ~16 KiB.
+// bounds it at one record. Two shapes, both refused at ~16 KiB.
 //
 // This test exists to keep that true. It fails if a future change adds buffering of
 // our own ahead of the Session, which is the only way the bound could be lost.
@@ -621,7 +621,7 @@ namespace
     }
 } // namespace
 
-// No failure path may put private key MATERIAL into an error string. Paths and
+// No failure path may put private key material into an error string. Paths and
 // OpenSSL reason strings are fine and useful; the base64 body of the key is not.
 //
 // Audited alongside this (2026-08-12): `Session::last_error()` is consumed nowhere in
@@ -676,7 +676,7 @@ TEST(ServerContext, NoFailurePathLeaksKeyMaterial)
     }
 
     // Every distinct startup failure, each of which builds an error string, and one
-    // of which interpolates the key PATH (which is allowed and wanted).
+    // of which interpolates the key path (which is allowed and wanted).
     {   // key that does not match the certificate
         SelfSigned other;
         Context ctx;
@@ -715,7 +715,7 @@ TEST(ServerContext, NoFailurePathLeaksKeyMaterial)
     }
 
     // And a Session that fails its handshake: the error text is derived from the same
-    // OpenSSL queue, on a context that HAS loaded the key.
+    // OpenSSL queue, on a context that has loaded the key.
     {
         Context sctx;
         Context::ServerOptions o;
@@ -756,7 +756,7 @@ TEST(ServerSession, UnfinishedHandshakeCannotBufferWithoutBound)
     }
 
     // Shape 2: a well-formed record whose handshake message declares a 16 MB
-    // ClientHello. Refused on the FIRST record, 16,009 bytes including the header.
+    // ClientHello. Refused on the first record, 16,009 bytes including the header.
     {
         Session server;
         ASSERT_TRUE(server.init_server(sctx)) << server.last_error();

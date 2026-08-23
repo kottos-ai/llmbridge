@@ -6,14 +6,14 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 // streamgen: the streaming (SSE) load generator, the Phase-B counterpart to
-// loadgen.cpp. Deliberately a SEPARATE binary: loadgen is open-loop and paced by
+// loadgen.cpp. Deliberately a separate binary: loadgen is open-loop and paced by
 // RPS (one short request per slot), while a streaming benchmark is closed-loop and
-// paced by CONCURRENCY (N long-lived streams, each delivering many chunks). It
+// paced by concurrency (N long-lived streams, each delivering many chunks). It
 // also keeps loadgen byte-for-byte untouched, so the already-published
 // non-streaming numbers stay exactly reproducible.
 //
 // ── What it measures, and why it can't be fooled ─────────────────────────────
-// The mock provider stamps its own CLOCK_MONOTONIC emission time INSIDE each
+// The mock provider stamps its own CLOCK_MONOTONIC emission time inside each
 // token ("t=<ns> "), and that stamp rides the payload through whatever gateway is
 // under test. So per chunk we compute:
 //
@@ -52,7 +52,7 @@
 // Optional TLS arm, so the inbound-TLS cost can be measured at all. Without it
 // there is no client in this tree that speaks TLS to the gateway, and the only
 // well-formed comparison (same gateway, --listen-tls on against off) cannot run.
-// Verification is NOT disableable here either; pass the CA with --ca.
+// Verification is not disableable here either; pass the CA with --ca.
 #ifdef LLMBRIDGE_HAVE_TLS
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -83,7 +83,7 @@ namespace
     };
 
     // Pull the mock's emission stamp out of a payload: "t=<digits>". Searching the
-    // raw bytes (instead of JSON-parsing) means the SAME parser works for the
+    // raw bytes (instead of JSON-parsing) means the same parser works for the
     // OpenAI chunk shape (delta.content), the raw Anthropic shape (delta.text),
     // and anything else a gateway might wrap it in.
     bool extract_stamp(std::string_view data, int64_t& out)
@@ -296,11 +296,11 @@ int main(int argc, char** argv)
         if (!start_stream(c)) { std::fprintf(stderr, "connect failed\n"); return 1; }
     }
 
-    // Histogram RANGE MATTERS HERE. The default (20ns x 131072 = 2.62ms ceiling) is
+    // Histogram range matters here. The default (20ns x 131072 = 2.62ms ceiling) is
     // sized for sub-millisecond proxy overhead; streaming under load produces
     // multi-SECOND outliers, and percentile() returns _max once the target falls in
     // the overflow region, so an overflowing histogram silently reports
-    // "p50 == p99 == max" that LOOKS like a percentile but is just the maximum.
+    // "p50 == p99 == max" that looks like a percentile but is just the maximum.
     // 1us buckets over 2s for latency/gap; 100us over 20s for TTFT (a saturated
     // Python gateway can take >10s to first token).
     Histogram h_chunk(1000, 2'000'000);   // 1us buckets, 2s range
@@ -361,7 +361,7 @@ int main(int argc, char** argv)
             if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR))
             {
 #ifdef LLMBRIDGE_HAVE_TLS
-                // The handshake can be waiting on a READ, which is why it is driven
+                // The handshake can be waiting on a read, which is why it is driven
                 // from both branches. Resuming it only on EPOLLOUT deadlocks after
                 // the ClientHello has gone out.
                 if (c->ssl && !c->hs_done)
@@ -461,7 +461,7 @@ int main(int argc, char** argv)
 
     const double secs = duration - warmup;
     std::printf("streams=%d  duration=%.0fs (warmup %.0fs)\n", streams, duration, warmup);
-    // chunk_rate counts ONLY post-warmup chunks over the post-warmup window;
+    // chunk_rate counts only post-warmup chunks over the post-warmup window;
     // dividing all-chunks by the measured window inflated it by duration/(duration-warmup).
     std::printf("chunks=%ld  measured=%ld  completed_streams=%ld  failures=%ld  chunk_rate=%.0f/s\n",
                 total_chunks, measured_chunks, completed, failures,

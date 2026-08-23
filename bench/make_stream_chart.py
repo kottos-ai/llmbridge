@@ -7,7 +7,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Render the STREAMING (SSE) llmbridge-vs-LiteLLM charts as standalone SVGs.
+"""Render the streaming (SSE) llmbridge-vs-LiteLLM charts as standalone SVGs.
 
 Pure stdlib (no matplotlib), same geometry/palette as make_chart.py so the
 streaming and non-streaming figures sit together on a page without clashing.
@@ -17,8 +17,8 @@ Two figures, deliberately chosen:
   stream-comparison.svg  time to first token vs concurrent streams (log y)
   stream-saturation.svg  chunks delivered as % of the achievable floor
 
-Why THESE two metrics and not per-token added latency: TTFT and delivery-rate are
-measured reliably for BOTH systems at every level. Per-token latency for LiteLLM
+Why these two metrics and not per-token added latency: TTFT and delivery-rate are
+measured reliably for both systems at every level. Per-token latency for LiteLLM
 exceeds the load generator's 2 s histogram range at >=256 streams, so plotting it
 would imply a precision we do not have; that number belongs in BENCHMARKS.md as
 ">2 s", with the caveat attached. Charts should not launder an overflow into a
@@ -71,7 +71,7 @@ PW = W - ML - MR
 PH = H - MT - MB
 F_TITLE, F_SUB, F_AXIS, F_VAL, F_XLBL, F_LEG, F_ANNOT = 27, 15, 15, 16, 18, 15, 13
 
-LLMBRIDGE = "#16a34a"   # green: semantic pass/fail against red, NOT brand colour
+LLMBRIDGE = "#16a34a"   # green: semantic pass/fail against red, not brand colour
 LITELLM = "#dc2626"
 FLOOR = "#2563eb"
 GRID = "#e5e7eb"
@@ -134,9 +134,9 @@ for i, s in enumerate(LEVELS):
     barw = bw * 0.3
     for j, (val, colour) in enumerate(((kb, LLMBRIDGE), (ll, LITELLM))):
         bx = x0 + bw * 0.18 + j * (barw + 8)
-        # A TTFT of 0 does NOT mean "instant": the generator records no TTFT sample when
+        # A TTFT of 0 does not mean "instant": the generator records no TTFT sample when
         # a path completes too few streams inside the window, and it writes 0. Plotting
-        # that as a bar renders the WORST result as the BEST one (LiteLLM at 256 streams
+        # that as a bar renders the worst result as the best one (LiteLLM at 256 streams
         # completed 64 of 4096 and would have shown "0 ms"). Draw "n/a" instead.
         if val <= 0:
             svg.append(f'<text x="{bx + barw/2:.1f}" y="{MT + PH - 12:.1f}" font-size="{F_VAL}" '
@@ -196,7 +196,7 @@ for i, s in enumerate(LEVELS):
         # clamp the value label for full-height bars: at 100% the bar top is MT,
         # and y-8 would push the label into the subtitle block above the plot
         lbl_y = max(y - 8, MT - 4)
-        # NEVER let a sub-100 value render as "100%". `.0f` rounded 99.93 up, which
+        # Never let a sub-100 value render as "100%". `.0f` rounded 99.93 up, which
         # put the exact claim we removed from the prose back into the chart. Values
         # in the last percent get two decimals so 99.93% reads as 99.93%.
         lbl = "100%" if val >= 99.995 else (f"{val:.2f}%" if val >= 99 else f"{val:.0f}%")

@@ -124,7 +124,7 @@ TEST(NowNs, IsMonotonicNonDecreasing)
 // An empty histogram must announce that it has no data instead of print zeros.
 // This is not cosmetic: bench/run_bench.sh seds the `added-total` line for
 // `p99=<n> us`, so an all-zero print made a zero-sample run publishable as a
-// FABRICATED 0 us added latency. Streaming workloads produce exactly this state
+// Fabricated 0 us added latency. Streaming workloads produce exactly this state
 // every run -- streams count in `requests` but are never recorded here
 // (LATENCY.md section 4). Delete the `_total == 0` guard in Histogram::print and
 // both expectations below fail.
@@ -137,7 +137,7 @@ TEST(Histogram, EmptyPrintsNoSamplesNotZeros)
 
     EXPECT_NE(out.find("count=0"), std::string::npos) << out;
     EXPECT_NE(out.find("(no samples)"), std::string::npos) << out;
-    // The bench harness must find NO percentile to scrape.
+    // The bench harness must find no percentile to scrape.
     EXPECT_EQ(out.find("p99="), std::string::npos) << out;
     EXPECT_EQ(out.find("p50="), std::string::npos) << out;
 }
@@ -159,7 +159,7 @@ TEST(Histogram, NonEmptyStillPrintsPercentiles)
 // ---- timing_split: the single definition shared by headers and histograms ----
 //
 // The bug these lock down: `connect-us` (header) used to span t1->t3 -- handshake
-// PLUS the upstream write -- while the `connect(TLS)` histogram spanned t1->t2,
+// Plus the upstream write -- while the `connect(TLS)` histogram spanned t1->t2,
 // handshake only. One name, two meanings, on the same request. Both surfaces now
 // derive from timing_split(), so the drift is unrepresentable; these assert the
 // arithmetic that makes that safe.
@@ -178,7 +178,7 @@ TEST(TimingSplit, PooledConnectionHasExactlyZeroConnect)
 
 TEST(TimingSplit, UnstampedT2FallsBackToT1)
 {
-    // t2 == 0 means no connect ever ran; wire-ready IS t1.
+    // t2 == 0 means no connect ever ran; wire-ready is t1.
     const TimingSplit s = timing_split(0, 100, 0, 140, 9000, 9100);
     EXPECT_EQ(s.connect_ns, 0);
     EXPECT_EQ(s.upwrite_ns, 40) << "must not attribute the write to a phantom handshake";
@@ -191,7 +191,7 @@ TEST(TimingSplit, ColdConnectionSeparatesHandshakeFromWrite)
                                        60'000'100);
     EXPECT_EQ(s.connect_ns, 50'000'000) << "the handshake must land in connect, alone";
     EXPECT_EQ(s.upwrite_ns, 40);
-    // The handshake must NOT inflate req_path -- that is the added-latency claim.
+    // The handshake must not inflate req_path -- that is the added-latency claim.
     EXPECT_EQ(s.req_path_ns, 140);
 }
 
@@ -206,7 +206,7 @@ TEST(TimingSplit, ConnectPlusWriteReproducesTheOldHeaderSpan)
 
 TEST(TimingSplit, ReqPathIsComputeLegPlusWriteNotTheWholeCompute)
 {
-    // req_path (histogram) and compute (header) are DIFFERENT groupings of the same
+    // req_path (histogram) and compute (header) are different groupings of the same
     // stamps: req_path carries the write, compute carries the response leg.
     const TimingSplit s = timing_split(0, 100, 100, 140, 9000, 9100);
     EXPECT_NE(s.req_path_ns, s.compute_ns);
@@ -223,7 +223,7 @@ TEST(TimingSplit, StreamingPassesT5EqualT4SoComputeIsRequestLegOnly)
 // is not a preference: the default is 20 ns buckets over 2.62 ms, sized for a
 // sub-millisecond overhead claim, while LATENCY.md section 3 documents a cold
 // connect at ~50-80 ms. Every cold sample therefore landed in the overflow region,
-// where percentile() returns the running MAX, so the printed p50/p99/max were one
+// where percentile() returns the running max, so the printed p50/p99/max were one
 // clamped number wearing three labels. Local mocks hid it: a loopback handshake
 // fits in the default range, so only a real provider triggered it.
 TEST(Stats, HandshakeHistogramsCoverARealHandshake)
@@ -248,7 +248,7 @@ TEST(Stats, HandshakeHistogramsCoverARealHandshake)
 }
 
 // The property the connect line exists to make: a pooled connection paid no
-// handshake. percentile() reports a bucket's UPPER edge, so it reads as one bucket
+// handshake. percentile() reports a bucket's upper edge, so it reads as one bucket
 // width and not as zero; max() is exact. LATENCY.md said "exactly 0" for years and
 // the histogram was printing 20 ns, which nobody questioned because 20 ns reads as
 // zero. It stops reading as zero the moment somebody widens the bucket, so this

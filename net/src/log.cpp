@@ -186,9 +186,9 @@ namespace llmbridge::net::log
     // ------------------------------------------------------------------ emit
     void emit_prefix(Line& l, Level lv, const char* file, int line) noexcept
     {
-        // "2026-08-12T18:04:05.123456Z LEVEL worker0/1 gateway.cpp:1234 "
+        // "2026-08-12T18:04:05.123456Z level worker0/1 gateway.cpp:1234 "
         //
-        // Wall time here, deliberately, and it is the ONE place the project uses it:
+        // Wall time here, deliberately, and it is the one place the project uses it:
         // a log line has to correlate with the outside world (a provider's dashboard,
         // a customer's incident). LATENCY.md's rule still holds for measurement,
         // where every interval is monotonic.

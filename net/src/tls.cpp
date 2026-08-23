@@ -123,7 +123,7 @@ namespace llmbridge::net::tls
         // HTTP/1.1 parser that cannot read them. The failure would look like a
         // corrupt request instead of an unsupported protocol.
         //
-        // Fail CLOSED on no overlap: a client that offers ONLY h2 gets a fatal
+        // Fail closed on no overlap: a client that offers only h2 gets a fatal
         // no_application_protocol alert, which is a clear error at its end. Clients
         // that send no ALPN extension at all never reach this callback and are
         // treated as HTTP/1.1, which is correct.
@@ -183,7 +183,7 @@ namespace llmbridge::net::tls
             return false;
         }
 
-        // The CHAIN, not just the leaf. A client that cannot fetch the missing
+        // The chain, not just the leaf. A client that cannot fetch the missing
         // intermediate itself would fail to verify, and which clients do that is
         // not something we get to choose.
         if (SSL_CTX_use_certificate_chain_file(_ctx, opts.cert_file.c_str()) != 1)
@@ -197,7 +197,7 @@ namespace llmbridge::net::tls
             return false;
         }
         // Belt and braces, and measured to be exactly that: with the certificate
-        // already loaded above, SSL_CTX_use_PrivateKey_file ITSELF rejects a
+        // already loaded above, SSL_CTX_use_PrivateKey_file itself rejects a
         // mismatched pair ("key values mismatch"), so removing this line does not
         // change the outcome today. It is kept because it becomes the only guard if
         // the two loads are ever reordered, which is a one-line edit away. Verified
@@ -220,7 +220,7 @@ namespace llmbridge::net::tls
             }
         }
 
-        // NO SSL_CTX_set_verify here, and that is a DIFFERENT decision from the
+        // No SSL_CTX_set_verify here, and that is a different decision from the
         // client path, not an oversight. A server verifying a peer means requiring
         // client certificates (mutual TLS), which we do not do: callers are
         // identified by a bearer token at the HTTP layer. The client context must
@@ -327,21 +327,21 @@ namespace llmbridge::net::tls
         if (SSL_set_tlsext_host_name(_ssl, host_z.c_str()) != 1)
         {
             _err = drain_errors();
-            SSL_free(_ssl);  // fail CLOSED: a live _ssl here could be handshaken
+            SSL_free(_ssl);  // fail closed: a live _ssl here could be handshaken
             _ssl = nullptr;  // without SNI/hostname checks by a caller that
             _rbio = _wbio = nullptr;  // ignored our return value
             return false;
         }
 
         // Hostname verification. SSL_VERIFY_PEER alone only proves the chain is
-        // trusted -- NOT that it was issued for the host we dialled. Omitting this is
+        // trusted -- not that it was issued for the host we dialled. Omitting this is
         // the classic "valid certificate, wrong server" hole.
         if (SSL_set1_host(_ssl, host_z.c_str()) != 1)
         {
             _err = drain_errors();
-            SSL_free(_ssl);  // fail CLOSED -- same reasoning as above: without
+            SSL_free(_ssl);  // fail closed -- same reasoning as above: without
             _ssl = nullptr;  // set1_host the handshake would verify the chain
-            _rbio = _wbio = nullptr;  // but not WHO it was issued to
+            _rbio = _wbio = nullptr;  // but not who it was issued to
             return false;
         }
 

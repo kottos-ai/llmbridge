@@ -42,7 +42,7 @@ if (LLMBRIDGE_TLS)
 endif ()
 
 # The logger. Its own target so a private repo can swap the sink without touching
-# these tests: they exercise the SEAM (Sink), never the built-in stderr path.
+# these tests: they exercise the seam (Sink), never the built-in stderr path.
 add_executable(net_log_test log_test.cpp)
 target_link_libraries(net_log_test PRIVATE net GTest::gtest_main)
 gtest_discover_tests(net_log_test)

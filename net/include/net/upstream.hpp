@@ -16,22 +16,22 @@
 //   https://HOST[:PORT]     default port 443             -> TLS
 //   https://HOST/BASE       e.g. https://api.groq.com/openai
 //
-// The BASE PATH is a prefix, not a target: it is joined in front of whatever path
+// The base path is a prefix, not a target: it is joined in front of whatever path
 // this request would otherwise use, so "/openai" + "/v1/chat/completions" reaches
 // "/openai/v1/chat/completions". It exists because several providers serve an
 // OpenAI-compatible API below the root (Groq at /openai, OpenRouter at /api,
 // Fireworks at /inference) and were unreachable without it.
 //
-// A base path is REBUILT, never echoed: it lands in a request line, so anything
+// A base path is rebuilt, never echoed: it lands in a request line, so anything
 // that could split or retarget that line is refused at parse time, never
 // sanitised. See normalize_base_path in the .cpp for the exact rule.
 //
 // Deliberately rejected, with a reason in `error` instead of a guess:
 //   - userinfo ("https://a@b"), the classic URL-confusion trick where the
 //     eyeball host and the connect host differ
-//   - a FRAGMENT, in any position: it never travels on the wire, so a URL carrying
+//   - a fragment, in any position: it never travels on the wire, so a URL carrying
 //     one is a paste error worth naming, and dropping it silently is worse
-//   - a QUERY on a venue whose mode BYTE-FORWARDS. Azure OpenAI needs
+//   - a query on a venue whose mode BYTE-FORWARDS. Azure OpenAI needs
 //     "?api-version=", and that is now parsed and kept, because a translating mode
 //     builds the whole request target itself and has no client query to merge with.
 //     Byte-forward does, so the Gateway refuses that pairing at startup, where the
@@ -42,7 +42,7 @@
 //     written into an HTTP Host header and the TLS SNI field, so a stray CR/LF
 //     here is a header-injection primitive, not a typo
 //
-// Everything here is SETUP path (parsed once at startup): allocation is fine,
+// Everything here is setup path (parsed once at startup): allocation is fine,
 // getaddrinfo may block, and errors are strings meant for a human at a terminal.
 
 #include <cstdint>
@@ -58,7 +58,7 @@ namespace llmbridge::net
         /// Normalized base path: empty, or "/..." with no trailing slash. Prefixed
         /// to the request target; empty means the target is used as-is.
         std::string path;
-        /// Query as written, WITHOUT the '?'. Empty when there is none. Only a mode
+        /// Query as written, without the '?'. Empty when there is none. Only a mode
         /// that builds its own target may use it; see the note above.
         std::string query;
         uint16_t port{0};

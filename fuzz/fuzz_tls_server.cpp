@@ -5,13 +5,13 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// libFuzzer target for the INBOUND TLS path: arbitrary bytes from an unauthenticated
+// libFuzzer target for the inbound TLS path: arbitrary bytes from an unauthenticated
 // peer, fed to a server-role Session through the same four memory-BIO calls the
 // gateway uses. This is the first surface a remote attacker reaches, before framing,
 // before translation, before any credential exists, so it must never crash, never
 // over-read, and never buffer without bound.
 //
-// What this actually exercises is OUR plumbing, not OpenSSL's: feed_ciphertext ->
+// What this actually exercises is our plumbing, not OpenSSL's: feed_ciphertext ->
 // SSL -> read_plaintext, the error latching in Want, and the shutdown path. OpenSSL
 // is fuzzed by its own project; the memory-BIO glue in net/src/tls.cpp is not fuzzed
 // anywhere else.
@@ -78,7 +78,7 @@ namespace
             assert(f);
             PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr);
             std::fclose(f);
-            // NOT inside assert(): a side effect in an assertion vanishes under
+            // Not inside assert(): a side effect in an assertion vanishes under
             // NDEBUG, and init_server would then refuse the world-readable key with
             // no clue why. This exact line compiled only while asserts were dead.
             const int mode_ok = ::chmod(key_path.c_str(), 0600);

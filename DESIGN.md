@@ -259,12 +259,12 @@ lookup helper; `net::http::find_header(facts.head, name)` is the safe one.
 
 `Decision::upstream_index` picks one entry from the gateway's upstream table. The table
 is fixed at construction and every venue carries its own address, TLS setting and
-DIALECT, so routing Claude to Anthropic and a Llama to an OpenAI-compatible host means
+Dialect, so routing Claude to Anthropic and a Llama to an OpenAI-compatible host means
 one request is rebuilt and the other forwarded, decided per request.
 
 Two rules make the single-upstream gateway a special case of this one, not a different
 thing. An index that is unset (-1) or past the end of the table means the
-FIRST upstream, so a policy that only authenticates never learns the table exists. And
+First upstream, so a policy that only authenticates never learns the table exists. And
 **pools are per venue**: a keep-alive connection to one provider is never handed to a
 request bound for another, because that would put the request, and its credential, on a
 socket to the wrong company. A retry after a stale pooled connection stays on the same
@@ -278,10 +278,10 @@ its 30 s default was chosen when there was one pool.
 ### When a venue fails
 
 `Policy::on_failure` fires when a venue did not answer and the client has seen nothing.
-It may name another; the request is then REBUILT for that venue's dialect, since the
+It may name another; the request is then rebuilt for that venue's dialect, since the
 bytes queued for the failed one were translated for its API.
 
-A venue that DID answer, unparseably, never reaches the hook: retrying would mask an
+A venue that did answer, unparseably, never reaches the hook: retrying would mask an
 incompatibility as a blip. Bounds, none of them policy: three venues per request, the
 failed venue may not be renamed, and nothing is re-sent once a byte reached the client.
 
@@ -441,7 +441,7 @@ strictly at the socket edge. Three things fall out of this for free:
    re-pushes the identical request through a brand-new session.
 3. **The two backends share all TLS logic**; only the flush/kick differs: epoll
    writes `tls_out` inline and arms `EPOLLOUT` on a partial; io_uring serializes one
-   SEND at a time (`send_inflight`), because a SEND SQE points into `tls_out` and the
+   Send at a time (`send_inflight`), because a send SQE points into `tls_out` and the
    buffer must stay immutable while the kernel reads it. Ciphertext produced meanwhile
    stages inside the SSL write BIO until the send completes.
 
@@ -508,7 +508,7 @@ The benchmark is designed to be honest first and impressive second:
 Reproduce: see [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md), the host
 configuration (`BACKENDS=4`, governor, sysctls) changes the result as much as the code.
 
-## What this repo does NOT do (yet)
+## What this repo does not do (yet)
 
 Checked against the tree on 2026-08-13, not against memory. Everything below was
 verified by grep before it was written down.
@@ -521,10 +521,10 @@ verified by grep before it was written down.
 - **No vision, no `cache_control`.** Tool calling is done, streaming and not.
 - **No Bedrock, Vertex or Azure.** The dialects are close or identical; what is missing
   is auth (SigV4, OAuth) and, for Bedrock streaming, a binary event-stream decoder.
-- **No failover POLICY.** `Policy::on_failure` is the mechanism; the default never
+- **No failover policy.** `Policy::on_failure` is the mechanism; the default never
   retries.
 - **No language bindings.** Python, Go and Rust are planned.
-- **No routing POLICY, no matching, pricing or observability**, by design; that is the
+- **No routing policy, no matching, pricing or observability**, by design; that is the
   separate commercial layer.
 
 Shipped since earlier revisions of this list said otherwise: **TLS on both legs**

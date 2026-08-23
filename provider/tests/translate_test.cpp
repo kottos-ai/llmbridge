@@ -202,8 +202,8 @@ TEST(UpstreamError, UnparseableBodyStillYieldsValidEnvelope)
 
 TEST(UpstreamError, RawControlBytesFromUpstreamNeverReachTheEnvelope)
 {
-    // A hostile/broken provider puts a RAW control byte in its error message.
-    // Relaying it verbatim would make OUR error envelope invalid JSON for a strict
+    // A hostile/broken provider puts a raw control byte in its error message.
+    // Relaying it verbatim would make our error envelope invalid JSON for a strict
     // client. Since the parser was tightened (RFC 8259 §7) such a body does not
     // parse at all, so we emit the generic envelope instead of guessing at a
     // message inside malformed JSON, refusing to interpret beats sanitising and
@@ -629,7 +629,7 @@ TEST(ToolReq, AssistantCallBecomesToolUseWithObjectInput)
     EXPECT_EQ(content->arr[0].str_or("type"), "tool_use");
     EXPECT_EQ(content->arr[0].str_or("id"), "call_1");
     EXPECT_EQ(content->arr[0].str_or("name"), "get_weather");
-    // The crux: OpenAI's arguments STRING became a real object.
+    // The crux: OpenAI's arguments string became a real object.
     const Value* input = content->arr[0].find("input");
     ASSERT_NE(input, nullptr);
     ASSERT_TRUE(input->is_object()) << "arguments string was not decoded to an object";
@@ -680,7 +680,7 @@ TEST(ToolReq, ToolResultBecomesUserTurn)
 TEST(ToolReq, ConsecutiveToolResultsMergeIntoOneTurn)
 {
     // A parallel tool call yields several OpenAI tool messages that are semantically
-    // ONE turn of results. (Anthropic tolerates consecutive user turns, measured,
+    // One turn of results. (Anthropic tolerates consecutive user turns, measured,
     // so this is about emitting the canonical shape, not about avoiding an error.)
     const Value v = P(openai_to_anthropic_request(R"({"model":"m","max_tokens":8,"messages":[
       {"role":"tool","tool_call_id":"a","content":"1"},
@@ -771,7 +771,7 @@ TEST(ToolResp, ToolUseBecomesToolCallsWithStringArguments)
     const Value* fn = calls->arr[0].find("function");
     ASSERT_NE(fn, nullptr);
     EXPECT_EQ(fn->str_or("name"), "get_weather");
-    // arguments is a STRING containing JSON, so decoding it must yield the input.
+    // arguments is a string containing JSON, so decoding it must yield the input.
     const Value* args = fn->find("arguments");
     ASSERT_NE(args, nullptr);
     ASSERT_TRUE(args->is_string()) << "arguments must be a string, not an object";
@@ -830,7 +830,7 @@ TEST(ToolRoundTrip, ArgumentsSurviveBothDirections)
 {
     // The round trip that matters in an agent loop: Anthropic emits input (object),
     // we hand the client arguments (string), the client sends it back, and it must
-    // arrive at Anthropic as the SAME object. Includes escaping hazards.
+    // arrive at Anthropic as the same object. Includes escaping hazards.
     const std::string anth = R"({"id":"m","model":"c","stop_reason":"tool_use","content":[
       {"type":"tool_use","id":"t1","name":"f","input":{"q":"say \"hi\"\nnow","path":"a/b\\c","n":-1.5e3,"u":"café"}}],
       "usage":{"input_tokens":1,"output_tokens":1}})";
@@ -858,7 +858,7 @@ TEST(ToolRoundTrip, ArgumentsSurviveBothDirections)
 
 TEST(BedrockRequest, DropsModelAndCarriesAnthropicVersion)
 {
-    // Bedrock takes the model id in the PATH, so a `model` in the body is not merely
+    // Bedrock takes the model id in the path, so a `model` in the body is not merely
     // redundant: it is a field the endpoint does not accept.
     std::string model;
     const std::string out = llmbridge::provider::openai_to_bedrock_request(

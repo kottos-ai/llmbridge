@@ -3,11 +3,11 @@ name: Auto-close external PRs
 # Closes pull requests from non-collaborators with a polite message
 # pointing to CONTRIBUTING.md. Internal team PRs are unaffected.
 #
-# SECURITY NOTE: This workflow uses `pull_request_target`, which runs in the
+# SECURITY note: This workflow uses `pull_request_target`, which runs in the
 # context of the target (base) repository with write permissions. This is
-# REQUIRED so we can comment on and close PRs from forks.
+# Required so we can comment on and close PRs from forks.
 #
-# DO NOT add `actions/checkout` to this workflow, and DO NOT check out the
+# Do not add `actions/checkout` to this workflow, and do not check out the
 # PR's code or run any PR-supplied scripts. Doing so would create a privilege
 # escalation vector (arbitrary PR code running with write permissions to the
 # repo). The workflow as written is safe because it only reads PR metadata

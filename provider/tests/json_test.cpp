@@ -82,7 +82,7 @@ TEST(Json, EmptyArrayAndObject)
 
 TEST(Json, StringEscapesPassedThroughRaw)
 {
-    // The parser is zero-copy: a string value is the RAW span between the quotes,
+    // The parser is zero-copy: a string value is the raw span between the quotes,
     // still JSON-escaped, never decoded. The backslash escapes survive verbatim.
     Value v = P(R"({"s":"a\"b\\c\nd\te"})");
     EXPECT_EQ(v.str_or("s"), "a\\\"b\\\\c\\nd\\te");
@@ -211,7 +211,7 @@ TEST(JsonBuilder, EscapesControlChars)
 
 TEST(RawSpan, ObjectAndArraySpansIncludeTheirBrackets)
 {
-    // Tool schemas are forwarded by span, so the span must be the EXACT source text
+    // Tool schemas are forwarded by span, so the span must be the exact source text
     // including delimiters; anything else corrupts a customer's JSON Schema.
     const std::string src = R"({"o":{"a":[1,2,{"b":null}]},"arr":[{"x":1}],"s":"str"})";
     bool ok = false;
@@ -285,7 +285,7 @@ TEST(Unescape, TruncatedEscapesDoNotReadPastTheEnd)
 
 // --- RFC 8259 §7 string strictness (found by the corpus concurrency test) -----
 //
-// The parser's string span is re-emitted VERBATIM on the passthrough path, so
+// The parser's string span is re-emitted verbatim on the passthrough path, so
 // anything accepted here reaches the client's bytes. Accepting an illegal string
 // therefore does not produce a lenient parse; it produces a 200 OK whose body a
 // strict parser rejects. Measured before the fix: a provider answer containing a
@@ -399,14 +399,14 @@ TEST(JsonNumbers, ANumberDoesNotSwallowWhatFollowsIt)
     EXPECT_FALSE(number_parses("1 2"));
 }
 
-// Anything that DOES parse must survive strtod, because that is what every consumer
+// Anything that does parse must survive strtod, because that is what every consumer
 // does with it. This is the property the old scanner broke.
 TEST(JsonNumbers, WhatParsesAlsoConvertsWithStrtod)
 {
     for (const char* n : {"0", "-0", "12345", "1.5", "-1.5e-5", "1e999", "0.0001"})
     {
         bool ok = false;
-        // NAMED, not a temporary. The DOM is zero-copy, so `v.sv` points into this
+        // Named, not a temporary. The DOM is zero-copy, so `v.sv` points into this
         // buffer; parsing a temporary leaves every view dangling the moment the full
         // expression ends. ASan calls it stack-use-after-scope, and it found this.
         const std::string doc = std::string("{\"n\":") + n + "}";

@@ -63,7 +63,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 300
 
   # TLS with GCC. The matrix above builds without TLS, and the two sanitizer jobs
-  # below build WITH it but only under clang, so gateway_tls_test.cpp had no GCC
+  # below build with it but only under clang, so gateway_tls_test.cpp had no GCC
   # coverage at all. The compilers disagree about that file: GCC rejects a dangling
   # else and an ignored warn_unused_result write that clang accepts, and three such
   # errors sat in the tree undetected.
@@ -87,7 +87,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build-tls --output-on-failure --timeout 300
 
-  # macOS builds the EMBEDDABLE LIBRARY only, which is the portable half and the whole
+  # macOS builds the embeddable library only, which is the portable half and the whole
   # "drop it into your binary" story. The gateway is Linux-only by design (epoll and
   # io_uring), so this job deliberately does not build it; that is the supported
   # boundary, not a gap. Configure succeeds because net/ feature-detects io_uring
@@ -144,7 +144,7 @@ jobs:
       - uses: actions/checkout@v4
       # setarch -R disables ASLR. TSan aborts with "unexpected memory mapping" under
       # the entropy recent kernels use, and CMAKE_CROSSCOMPILING_EMULATOR makes
-      # gtest_discover_tests run the binary the same way at BUILD time, where the
+      # gtest_discover_tests run the binary the same way at build time, where the
       # failure would otherwise delete the executable it just linked.
       - name: Configure (TSan, TLS on)
         run: >
@@ -213,7 +213,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # Builds a downstream project against an INSTALLED llmbridge, exactly as the README
+  # Builds a downstream project against an installed llmbridge, exactly as the README
   # tells a user to. Nothing else here touches the install tree; the suite builds
   # in-tree, so a broken export, a header that does not stand alone, or a renamed
   # public namespace would pass every other job and break only for the consumer.

@@ -30,7 +30,7 @@ defect it caught now fails in the ordinary build.
 
 ## [0.26.0]. 2026-08-22
 
-A policy may name the model, not only the venue. MINOR: one new field on `Decision`,
+A policy may name the model, not only the venue. Minor: one new field on `Decision`,
 and a stock build (no policy) puts the client's bytes on the wire unchanged.
 
 ### Added
@@ -62,7 +62,7 @@ and a stock build (no policy) puts the client's bytes on the wire unchanged.
 ## [0.25.0]. 2026-08-22
 
 `Content-Length` on a byte-forwarded request is stated by the gateway, from the bytes
-it actually sends. MINOR: nothing observable changes for a body we do not edit, but a
+it actually sends. Minor: nothing observable changes for a body we do not edit, but a
 duplicate length is no longer echoed to a venue.
 
 ### Changed
@@ -85,7 +85,7 @@ duplicate length is no longer echoed to a venue.
 
 ## [0.24.0]. 2026-08-22
 
-Azure OpenAI as a venue. MINOR: a new `TranslateMode`, and `parse_upstream` now
+Azure OpenAI as a venue. Minor: a new `TranslateMode`, and `parse_upstream` now
 accepts something it used to refuse.
 
 ### Added
@@ -152,7 +152,7 @@ accepts something it used to refuse.
 
 ## [0.23.0]. 2026-08-21
 
-AWS SigV4 request signing, and Bedrock as a venue for non-streamed requests. MINOR:
+AWS SigV4 request signing, and Bedrock as a venue for non-streamed requests. Minor:
 a new `TranslateMode`, a new credential shape, and a new module.
 
 **Untested against AWS.** The signing is verified against AWS's published test
@@ -174,7 +174,7 @@ surprise, and start the bisect at the canonical request, not at the signature.
   Built against **AWS's own published values**, reproduced independently before being
   written into the tests, so a disagreement means this code is wrong and not that a
   constant was mistyped. That discipline paid immediately: "URI-encode a non-S3 path
-  segment twice" counts from the RAW path, and the request line already holds the
+  segment twice" counts from the raw path, and the request line already holds the
   first pass, so encoding the wire form twice turns a model id's `%3A` into `%25253A`
   and fails exactly like not encoding it at all.
 
@@ -220,7 +220,7 @@ today builds a request to `/invoke`.
 
 ## [0.22.0]. 2026-08-21
 
-Byte-forwarded responses stream. MINOR because the default deployment shape behaves
+Byte-forwarded responses stream. Minor because the default deployment shape behaves
 differently: an OpenAI-compatible venue's SSE response now reaches the client as the
 provider produces it, and carries token counts it did not before.
 
@@ -264,7 +264,7 @@ provider produces it, and carries token counts it did not before.
   stream and the bytes searched for a usage block were separate constants, 1024 and
   512, which had to relate and did not: half the retained buffer was dead and the
   relationship was invisible. Both are now `kUsageWindow`, sized by what must fit and
-  pinned by a test using a full-size provider usage chunk. This did NOT correct a
+  pinned by a test using a full-size provider usage chunk. This did not correct a
   miscount: measured against a realistic OpenAI usage chunk, the counts sit 267 bytes
   from the end and the old window reached them.
 
@@ -278,19 +278,19 @@ non-OpenAI stream for an OpenAI usage block and quietly report nothing.
 
 ## [0.21.0]. 2026-08-21
 
-Time to first TOKEN, distinct from time to first byte. MINOR because
+Time to first token, distinct from time to first byte. Minor because
 `RequestRecord` and the SSE translator each gain a field.
 
 ### Added
 
 - **`RequestRecord::ts_first_token`**, stamped when a streamed response emits its
-  first CONTENT token, as opposed to `ts_up_recvd` (t4), which is the response HEAD.
+  first content token, as opposed to `ts_up_recvd` (t4), which is the response head.
   Their difference is the provider's prefill. It sits outside the t0-t6 scheme by
   design (a non-streamed request has no first token), and it is stamped once in the
   shared `stream_step`, so both the epoll and io_uring backends carry it. 0 on a
   non-streamed request, or a stream that produced no content.
 - **`AnthropicToOpenAiSse::content_started()`**, a one-way latch that turns true when
-  the first text delta or tool call is emitted, NOT the role-only opening delta. This
+  the first text delta or tool call is emitted, not the role-only opening delta. This
   is the signal the gateway stamps its clock against. It is the same first-token event
   `streamgen` measures client-side, now available per request to an in-process sink.
   It rides no response header: a stream's headers are written before the first token
@@ -299,7 +299,7 @@ Time to first TOKEN, distinct from time to first byte. MINOR because
 
 ## [0.20.0]. 2026-08-20
 
-Prompt-cache token reporting, MINOR because the translated usage now carries a field
+Prompt-cache token reporting, minor because the translated usage now carries a field
 it did not before.
 
 ### Added
@@ -308,7 +308,7 @@ it did not before.
   reports `usage.cache_read_input_tokens` (the prompt tokens served from cache, at a
   discount), the translator now emits `usage.prompt_tokens_details.cached_tokens` in
   the OpenAI shape, on both the non-streaming response and the streaming usage chunk.
-  It is emitted ONLY when the provider reported a non-zero value, so an uncached
+  It is emitted only when the provider reported a non-zero value, so an uncached
   request produces byte-for-byte the usage object it always did. An OpenAI-compatible
   upstream that already sends `prompt_tokens_details.cached_tokens` passes through
   unchanged.
@@ -318,18 +318,18 @@ it did not before.
 
 ### Fixed
 
-- **The runtime log level now defaults to the COMPILE floor**, so a binary built with
+- **The runtime log level now defaults to the compile floor**, so a binary built with
   the debug floor (`-DLLMBRIDGE_LOG_LEVEL=debug`) emits debug without an explicit
   `set_level`. Before, the runtime default was hardcoded to Info regardless of the
   compile floor.
 
-Diagnostics only, PATCH for the same reason as 0.19.2: the installed `provider` API
+Diagnostics only, patch for the same reason as 0.19.2: the installed `provider` API
 is unchanged; the new accessors sit on `net::BufRing`, which llmbridge does not
 install.
 
 ### Added
 
-- **The io_uring provided-buffer ring fallback now reports WHY.** `BufRing::init`
+- **The io_uring provided-buffer ring fallback now reports why.** `BufRing::init`
   records the failing step (`mmap-ring`, `mmap-bufs`, or `register-pbuf-ring`) and
   the errno, and the gateway prints both when it drops to epoll.
 - `BufRing::init_stage()` and `BufRing::init_errno()`, the accessors the log line
@@ -338,14 +338,14 @@ install.
 
 ## [0.19.2]. 2026-08-19
 
-Diagnostics only, again, and PATCH for the same reasons as 0.19.1: nothing new is
+Diagnostics only, again, and patch for the same reasons as 0.19.1: nothing new is
 reachable and the installed library's API is unchanged.
 
 ### Changed
 
-- **A failed INBOUND TLS handshake logs at DEBUG instead of WARN.** On a public
+- **A failed inbound TLS handshake logs at DEBUG instead of WARN.** On a public
   listener that is overwhelmingly internet scanners speaking junk at 443, and one
-  WARN each buries every line worth reading. An UPSTREAM handshake failure, and a
+  WARN each buries every line worth reading. An upstream handshake failure, and a
   mid-session failure on either leg, stay at WARN: those are actionable.
 
 ### Added
@@ -354,20 +354,20 @@ reachable and the installed library's API is unchanged.
   what it stood for is how a customer who cannot handshake produces no evidence at
   all on a production build. The rate is the diagnostic: a steady climb is
   background noise, a step change the moment someone tries to connect is their TLS
-  problem. The counter is the inbound leg ONLY, so scanner noise and a broken
+  problem. The counter is the inbound leg only, so scanner noise and a broken
   provider stay distinguishable, and a test asserts each half.
 
 
 ## [0.19.1]. 2026-08-18
 
 Diagnostics only. Nothing new is reachable that was not reachable at 0.19.0: the
-same inputs are refused, with the same exit code and the same text on stderr. PATCH
+same inputs are refused, with the same exit code and the same text on stderr. Patch
 for that reason, and because the installed library is untouched. `app/main.cpp` is
 the binary and ships no header.
 
 ### Changed
 
-- Every startup refusal in `llmbridge`'s own `main` goes to stderr AND the log now,
+- Every startup refusal in `llmbridge`'s own `main` goes to stderr and the log now,
   through one `refuse()` helper, so a message cannot drift between the two. stderr
   is for an operator running the binary by hand; the log line is what a journal can
   filter by level and timestamp. **Operators scraping logs will see ERROR lines that
@@ -394,13 +394,13 @@ question without writing to a journal.
 ## [0.19.0]. 2026-08-18
 
 **A venue may now carry a base path** (`--upstream https://api.groq.com/openai`).
-It is a PREFIX, joined in front of whatever target the request would otherwise use,
+It is a prefix, joined in front of whatever target the request would otherwise use,
 so `/openai` + `/v1/chat/completions` reaches `/openai/v1/chat/completions`. It
 exists because several providers serve an OpenAI-compatible API below the root and
 were unreachable without it: Groq at `/openai` and OpenRouter at `/api` both answer
 on their prefixed path and 404 at the root.
 
-MINOR. Nothing changes for a venue without a base path, and a test asserts the
+Minor. Nothing changes for a venue without a base path, and a test asserts the
 target stays byte-identical there.
 
 ### Added
@@ -409,14 +409,14 @@ target stays byte-identical there.
   empty or `/...` with no trailing slash. `parse_upstream` accepts one only in the
   `http(s)://` form, since `host:9001/x` reads as a path here and as something else
   in half the world's URL parsers.
-- The prefix applies on BOTH legs: the client's own target when forwarding bytes,
+- The prefix applies on both legs: the client's own target when forwarding bytes,
   and ours (`/v1/messages`, `/v2/chat`, Gemini's `generateContent`) when
   translating. Tested end to end on epoll and io_uring.
 
 ### Security
 
 - The base path is spliced into a request line, so it is validated as strictly as a
-  host: a whitelist of `[A-Za-z0-9-._~:/]`, and a REFUSAL instead of a strip for
+  host: a whitelist of `[A-Za-z0-9-._~:/]`, and a refusal instead of a strip for
   anything else. Control bytes, spaces, `?`, `#`, `%`, `//`, `/./` and `/../` are all
   rejected at parse time. Percent-encoding is refused precisely because `%2e%2e` and
   `%2f` are how a dot segment or a separator gets past a check that only looks at
@@ -443,7 +443,7 @@ target stays byte-identical there.
 ### Known gaps
 
 - No query-string support, so Azure OpenAI is still out of reach.
-- AWS Bedrock and Google Vertex need this AND request signing (SigV4, OAuth2), so
+- AWS Bedrock and Google Vertex need this and request signing (SigV4, OAuth2), so
   the base path alone does not reach them.
 
 
@@ -455,7 +455,7 @@ wants `Host` to name the origin being addressed. The translating path has always
 emitted the venue's `Host`; byte-forward passed the client's straight through, so a
 provider behind a CDN or serving several vhosts saw a name that was never its own.
 
-MINOR, and **this changes bytes on the wire** for `--translate none`: a deployment
+Minor, and **this changes bytes on the wire** for `--translate none`: a deployment
 that relied on the client's `Host` reaching the upstream will see the venue's
 instead. That is the fix, not a side effect, but it is called out because pre-1.0
 minor releases may change behaviour and this one does.
@@ -480,7 +480,7 @@ configured-but-ABSENT header with `memcpy(dst, nullptr, 0)`: `find_header` retur
 null view when the header is missing, and memcpy's arguments are declared non-null
 even for a zero length. Every request that omitted a captured header did it.
 
-PATCH: a fix and the test that was missing, no API change.
+Patch: a fix and the test that was missing, no API change.
 
 ### Fixed
 
@@ -498,7 +498,7 @@ token counts where the provider reported them, and up to two request-header valu
 the integrator asked to capture. Streams and gateway-generated error replies emit
 too, because a record of successes only cannot answer "why was this slow".
 
-MINOR: additive API. A build that never calls `set_request_sink` pays one
+Minor: additive API. A build that never calls `set_request_sink` pays one
 predicted-false branch per request and nothing else.
 
 ### Added
@@ -511,7 +511,7 @@ predicted-false branch per request and nothing else.
   gateway generated itself (stamps unset, `error_reply` set).
 - Tests on both backends: capture round-trip, per-request capture on keep-alive,
   bounded over-long values, failover attribution (the record names the venue that
-  SERVED), stream token counts, and error replies. Mutation-checked: removing the
+  Served), stream token counts, and error replies. Mutation-checked: removing the
   framing-time capture or the stream emit fails the suite.
 
 ## [0.16.0]. 2026-08-16
@@ -519,7 +519,7 @@ predicted-false branch per request and nothing else.
 **An tag from the decision to the failure.** `Decision::tag` is stored with the
 request and handed back verbatim as `FailureFacts::tag`.
 
-MINOR: additive API, no behaviour change for existing policies (both fields default
+Minor: additive API, no behaviour change for existing policies (both fields default
 to 0, and a policy that never sets the tag reads 0 at the failure).
 
 ### Added
@@ -537,12 +537,12 @@ flaky test: `ClientThatNeverReadsCannotGrowUsWithoutBound` failed occasionally u
 parallel CI load and passed on rerun. It was not flaky. It was an unbounded-growth bug
 that the test caught only when the machine was loaded enough to expose it.
 
-PATCH: a fix and a measurement correction, no API change.
+Patch: a fix and a measurement correction, no API change.
 
 ### Fixed
 
 - **`ep_drain_read` had no byte budget.** It looped until EAGAIN, so against a provider
-  that writes as fast as we read, ONE readable event pulled as much as the loop could
+  that writes as fast as we read, one readable event pulled as much as the loop could
   keep up with. That plaintext became `wbuf`, then ciphertext, then staged memory.
   Bounded to `kEpMaxReadPerEvent` (1 MiB) per event; epoll is level-triggered, so the
   remainder re-notifies and back-pressure engages between events, which is what the
@@ -555,7 +555,7 @@ PATCH: a fix and a measurement correction, no API change.
   mechanism next to the cap; it is epoll's equivalent of that 4 KB buffer.
 - **`Stats::tls_buffered_peak` counted the wrong thing.** It measured `tls_out.size()`,
   which includes the prefix already handed to the kernel, so it grew with total
-  throughput, not with backlog. Now the UNSENT backlog: unwritten ciphertext plus
+  throughput, not with backlog. Now the unsent backlog: unwritten ciphertext plus
   the write BIO. This is why the symptom read as an erratic metric.
 
 ### Measured
@@ -593,20 +593,20 @@ where it went. It now holds an ordered table and `Decision::upstream_index` sele
 from it. llmbridge still chooses nothing itself: picking a venue needs measurements it
 does not collect, so a stock build always uses the first entry.
 
-MINOR: new functionality, and a behaviour change in the CONFIG FILE, called out below.
+Minor: new functionality, and a behaviour change in the config file, called out below.
 The C++ API is additive: the single-upstream constructor still exists and delegates.
 
 ### Added
 
 - **`Gateway::Upstream`** and a constructor taking `std::vector<Upstream>`. Each venue
-  carries its own address, TLS setting, SNI host and DIALECT, which is what makes
+  carries its own address, TLS setting, SNI host and dialect, which is what makes
   cross-venue routing possible at all: one request is rebuilt for Anthropic while the
   next is forwarded to an OpenAI-compatible host, decided per request.
 - **`Decision::upstream_index`**, promised in 0.14.0's "known gaps" and deliberately
   withheld until the table existed, because a field the gateway ignored would have been
   a lie. Unset (-1) or out of range means the first upstream, so a policy that only
   authenticates never learns the table exists.
-- **`upstream` may be an ARRAY** in the config file. The object form is unchanged and
+- **`upstream` may be an array** in the config file. The object form is unchanged and
   means exactly one entry, which is the additive migration DESIGN.md promised when
   `--config` shipped ahead of the table.
 
@@ -627,20 +627,20 @@ The C++ API is additive: the single-upstream constructor still exists and delega
   does not answer: a refused connect, a failed write, an EOF before the response, an
   idle timeout. Twelve sites across both backends. **The default never retries**, so a
   stock build, and any policy that ignores failures, answers 502 exactly as before.
-- **A failover REBUILDS the request** for the new venue, never resends it: the bytes
+- **A failover rebuilds the request** for the new venue, never resends it: the bytes
   queued for the venue that failed were translated for its API, so resending them would
   put an Anthropic Messages body on an OpenAI-compatible host. The client's original
-  request is kept only when a policy is installed AND the table has more than one entry,
+  request is kept only when a policy is installed and the table has more than one entry,
   so a stock or single-upstream build copies nothing.
 - **`Stats::upstream_failovers`**, apart from `upstream_retries`: one says a provider
   dropped an idle keep-alive, the other says a provider is not answering.
 
 ### Not included, and deliberately
 
-- **No failover POLICY.** llmbridge forms no opinion about which venue is healthy,
+- **No failover policy.** llmbridge forms no opinion about which venue is healthy,
   because health is measured and it measures nothing. Ordering, ejection thresholds and
   cooldown belong to the caller.
-- **A venue that DID answer, with something unparseable, does not reach the hook.**
+- **A venue that did answer, with something unparseable, does not reach the hook.**
   Retrying elsewhere would mask a real incompatibility as a transient blip.
 - **Streaming fails over only before its first byte reaches the client.** After that the
   stream is truncated honestly: no LLM API can resume mid-stream, so a reconnect would
@@ -659,12 +659,12 @@ The C++ API is additive: the single-upstream constructor still exists and delega
 
 ### Verified
 
-Eight routing tests on BOTH backends, and five mutations of the routing logic all
+Eight routing tests on both backends, and five mutations of the routing logic all
 caught: the policy's index ignored, pools shared across venues, release into the wrong
 pool, an out-of-range index left unclamped, and a retry rerouted to another venue.
 
 That last one survived three attempts. The first two tests reached the retry path but
-could not observe where the retried connection LANDED, because the mock closed every
+could not observe where the retried connection landed, because the mock closed every
 connection and the contaminated one was evicted before anything could draw it. Catching
 it needed a mock that kills only its first connection, so the retried one survives to
 be pooled, and a following request to the other venue to expose it.
@@ -676,8 +676,8 @@ of `[0-9+-.eE]` and called the result a `Number`, so `1e`, `--1`, `1.2.3`, `+1`,
 and `00` all parsed. Found while chasing an uncovered branch in a consumer's config
 parser: the branch existed because the parser needed it to.
 
-PATCH, and the reason is worth recording because it is arguable. Input earlier
-versions accepted is now refused, which is the shape that made **0.9.0 a MINOR**. The
+Patch, and the reason is worth recording because it is arguable. Input earlier
+versions accepted is now refused, which is the shape that made **0.9.0 a minor**. The
 difference claimed here is that none of it was ever valid JSON, so no correct client
 is affected. If that reasoning does not hold, this is 0.15.0.
 
@@ -685,7 +685,7 @@ is affected. If that reasoning does not hold, this is 0.15.0.
 
 - **`parse_number` follows RFC 8259 §6**: `-? int frac? exp?`, with a leading zero
   standing alone, at least one digit after `.`, and at least one after `e`/`E`.
-- **What this was NOT.** No injection was possible: the old character set is closed, so
+- **What this was not.** No injection was possible: the old character set is closed, so
   a number span could never carry a quote, comma or brace, and re-emitting one could
   not break out of the JSON around it. What it did was push validation onto every
   consumer, since `strtod("1e")` fails and a consumer that forgets the check gets 0.
@@ -708,7 +708,7 @@ path does exactly that. `TranslateMode::None` never did: it copied the client's 
 verbatim, headers included, so an internal routing header, or a token meant for this
 gateway alone, reached a third party unchanged.
 
-PATCH: a defect fix. It ships one new config key because that is the only way to name
+Patch: a defect fix. It ships one new config key because that is the only way to name
 the headers, and the default (none) leaves every existing deployment byte-identical.
 
 ### Fixed
@@ -789,7 +789,7 @@ codes with no cause, every TLS handshake failure looked identical to a closed so
 and every configured limit was reached without a word. This release makes a running
 process describe itself.
 
-MINOR: new functionality. `net/log.hpp` is internal (only `provider/include/provider`
+Minor: new functionality. `net/log.hpp` is internal (only `provider/include/provider`
 is installed), so the public C++ API is unchanged.
 
 ### Added
@@ -938,7 +938,7 @@ OpenAI-compatible upstream), Gemini / Cohere streaming, vision / image inputs, a
 
 **Inbound TLS.** The gateway now terminates the client's TLS as well as originating
 its own to the provider, so it can be a remote endpoint instead of only a loopback
-sidecar. MINOR, because this is new functionality; nothing existing changed shape.
+sidecar. Minor, because this is new functionality; nothing existing changed shape.
 
 ### Added
 
@@ -1012,7 +1012,7 @@ sidecar. MINOR, because this is new functionality; nothing existing changed shap
   stamped in `tls_feed()` when the handshake completes, on both backends; pooled
   reuse still reports exactly 0. Published benchmark numbers are unaffected, as
   they run plaintext on pooled connections, and the error *overstated* our own
-  added latency. PATCH: no new functionality, and the headers now mean what
+  added latency. Patch: no new functionality, and the headers now mean what
   `LATENCY.md` always said they meant.
 
 ### Added
@@ -1025,9 +1025,9 @@ sidecar. MINOR, because this is new functionality; nothing existing changed shap
 ## [0.10.0]. 2026-08-06
 
 Latency accounting made consistent: `LATENCY.md` was re-derived against the source and
-the mismatches fixed in the code. MINOR because one response header changes meaning.
+the mismatches fixed in the code. Minor because one response header changes meaning.
 
-### WARNING: Breaking
+### Warning: Breaking
 
 - **`x-llmbridge-connect-us` is now the handshake alone (t2−t1), not handshake + upstream
   write (t3−t1).** It reads exactly **0** on a pooled connection, where it previously read
@@ -1068,11 +1068,11 @@ a zero-sample run could have published a fabricated 0 µs. Streaming hits this e
 
 ## [0.9.0]. 2026-08-04
 
-A naming audit, a JSON strictness fix, and the test suite that found it. MINOR because
+A naming audit, a JSON strictness fix, and the test suite that found it. Minor because
 two things break: an installed header moves namespace, and input earlier versions
 accepted is now refused.
 
-### WARNING: Breaking
+### Warning: Breaking
 
 - **`llmbridge::json` → `llmbridge::provider::json`.** The only public break. `provider/`
   is the installed header set. Add `provider::`, or alias it in one line.
@@ -1150,7 +1150,7 @@ They record what the code was called at the time, not a current API reference.
 ## [0.8.1]. 2026-08-03
 
 A security sweep of the public HTTP surface. **Fixes only, no new functionality**,
-hence a PATCH. No public API change: the one signature that moved
+hence a patch. No public API change: the one signature that moved
 (`http::parse_response`) lives in `net/`, which is internal to the reference gateway
 and is not among the installed headers (only `provider/` is).
 
@@ -1894,7 +1894,7 @@ configuration. See DESIGN.md § "TLS to the upstream" for the data-flow diagram.
 - **Gateway TLS integration**, both backends. Design invariant: `rbuf`/`wbuf` hold
   **plaintext always**. TLS interposes strictly at the socket edge, so HTTP framing,
   the SSE pump, translation, and stale-pool retry-resend are unchanged and unaware.
-  io_uring serializes one SEND at a time so the ciphertext buffer stays immutable
+  io_uring serializes one send at a time so the ciphertext buffer stays immutable
   while the kernel reads it; ciphertext produced meanwhile stages in the write BIO.
 - **TLS sessions survive the keep-alive pool**: a pooled reuse pays no second
   handshake (asserted by test: N requests, one handshake).

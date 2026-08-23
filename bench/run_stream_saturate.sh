@@ -8,15 +8,15 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 # Streaming saturation hunt: push concurrency until something knees over, and say
-# WHICH thing kneed. Only the direct baseline and llmbridge are run. LiteLLM
+# Which thing kneed. Only the direct baseline and llmbridge are run. LiteLLM
 # saturates at ~64 streams (see run_stream_headtohead.sh), so including it here
 # would burn minutes per level to re-measure a known ceiling.
 #
 # The critical distinction this script exists to make: at high concurrency the
-# Python mock will eventually become the limiter. If the DIRECT baseline stops
+# Python mock will eventually become the limiter. If the direct baseline stops
 # scaling, the mock is the bottleneck and llmbridge's number at that level says
 # nothing about llmbridge. Each level therefore reports achieved-vs-offered chunk
-# rate for BOTH paths, and flags which one (if either) fell behind.
+# rate for both paths, and flags which one (if either) fell behind.
 #
 #   ./bench/run_stream_saturate.sh [tokens] [interval_ms] [duration] [warmup] [streams...]
 set -uo pipefail
@@ -56,7 +56,7 @@ fi
 wait_port() { for _ in $(seq 1 120); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }; sleep 0.5; done; return 1; }
 
 # PROVIDER=fast (default) uses the C++ faststream: the Python mock saturates around
-# 45-50k chunks/s, which is BELOW llmbridge, so a sweep against it measures the
+# 45-50k chunks/s, which is below llmbridge, so a sweep against it measures the
 # harness. faststream is wire-identical (same events, same chunked framing, same
 # emission stamp) but single-threaded epoll with no per-token allocation.
 PROVIDER="${PROVIDER:-fast}"
@@ -80,7 +80,7 @@ wait_port "$GW_PORT" || { echo "llmbridge failed" >&2; exit 1; }
 "$BIN/streamgen" --port "$GW_PORT" --streams 32 --duration 6 --warmup 0 --label warm >/dev/null 2>&1
 
 run_one() { # port streams tag -> "p50 p99 chunks rate"
-  # NOTE: separate `local` statements, because a single `local a=$1 log="...$a..."` does
+  # Note: separate `local` statements, because a single `local a=$1 log="...$a..."` does
   # not see the earlier assignment, which under `set -u` silently breaks the run.
   local port="$1"
   local streams="$2"

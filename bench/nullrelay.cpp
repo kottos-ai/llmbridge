@@ -7,8 +7,8 @@
 
 // nullrelay. The ZERO-WORK control for the streaming benchmark: the dumbest
 // possible proxy. Accept a client, connect
-// upstream, forward bytes both ways. NO HTTP parsing, NO chunked decode, NO SSE
-// translation, no per-chunk state. Whatever latency THIS adds is the irreducible
+// upstream, forward bytes both ways. No HTTP parsing, no chunked decode, no SSE
+// translation, no per-chunk state. Whatever latency this adds is the irreducible
 // cost of inserting one extra process/hop into the path; i.e. the floor that any
 // gateway pays before doing any work at all.
 //
@@ -21,8 +21,8 @@
 //     nullrelay (2 hops, no work)             106 us                27 us
 //     llmbridge (2 hops, full translate)      108 us                32 us
 //     ------------------------------------------------------------------------
-//     => cost of the HOP itself                53 us                14 us
-//     => cost of ALL of llmbridge's work        2 us  (noise)         5 us
+//     => cost of the hop itself                53 us                14 us
+//     => cost of all of llmbridge's work        2 us  (noise)         5 us
 //
 // Two conclusions, both of which needed this control to reach:
 //
@@ -30,10 +30,10 @@
 //    costs ~5 us/token. Everything else is the price of inserting a process into the
 //    path. Every gateway sits at ~5% of one core, so none of this is compute-bound.
 //
-// 2. The hop is mostly a HOST TUNING artefact, not transit. Capping idle states at C1
+// 2. The hop is mostly a host tuning artefact, not transit. Capping idle states at C1
 //    (2 us exit, vs 70-890 us for C3-C10) cuts the hop 3.9x. See bench/LATENCY-TUNING.md.
 //    Of the 14 us that remains, busy-polling the relay recovers only ~3 us, so the
-//    residual is the loopback data path (copies, TCP, softirq, waking the RECEIVER),
+//    residual is the loopback data path (copies, TCP, softirq, waking the receiver),
 //    not this process's own wakeup.
 //
 // It also explains why io_uring and epoll measure the same here, which is not obvious:
@@ -67,14 +67,14 @@ std::vector<C*> doomed_list; // freed at end of batch, never mid-batch
 
 void add(C* c, uint32_t ev) { epoll_event e{}; e.events = ev; e.data.ptr = c; ::epoll_ctl(ep, EPOLL_CTL_ADD, c->fd, &e); }
 
-// One epoll_wait batch can carry events for BOTH ends of a pair, so a conn must not
+// One epoll_wait batch can carry events for both ends of a pair, so a conn must not
 // be freed while that batch is still being walked; the next entry would dereference
 // freed memory. Same deferred-free discipline as the gateway's event loop.
 //
-// Status of this hazard: LATENT here, not observed. A busy-polling variant of this
+// Status of this hazard: Latent here, not observed. A busy-polling variant of this
 // relay (which reaps far more events per epoll_wait, so both ends of a pair share a
 // batch much more often) did corrupt its heap without this guard. 250k pair teardowns
-// under ASan did NOT reproduce it in this blocking version; the guard is hardening,
+// under ASan did not reproduce it in this blocking version; the guard is hardening,
 // not a fix for a demonstrated failure. Kept because a control whose own memory
 // safety is in question cannot be used to attribute latency.
 void retire(C* c) {

@@ -111,8 +111,8 @@ TEST(SigV4, SignProducesThatSameSignatureEndToEnd)
 
 TEST(SigV4, ModelIdColonIsEncodedOnceMoreThanTheWire)
 {
-    // THE Bedrock trap, and it caught a wrong reading of the spec while this was
-    // written. AWS encodes a non-S3 path segment twice counting from the RAW path,
+    // The Bedrock trap, and it caught a wrong reading of the spec while this was
+    // written. AWS encodes a non-S3 path segment twice counting from the raw path,
     // and the request line already holds the first pass. Both spellings a client
     // might send must land on the same signed form for that request line.
     EXPECT_EQ(sigv4::canonical_uri("/model/anthropic.claude-3-5-sonnet-20240620-v1%3A0/invoke"),
@@ -190,7 +190,7 @@ TEST(SigV4, TheBodyIsHashed)
 
 TEST(SigV4, RefusesRatherThanSigningSomethingWrong)
 {
-    // Empty means REFUSE. The caller must not send the request unsigned, and every
+    // Empty means refuse. The caller must not send the request unsigned, and every
     // one of these would otherwise produce a signature AWS rejects with no clue why.
     sigv4::Request r{};
     r.method = "GET";

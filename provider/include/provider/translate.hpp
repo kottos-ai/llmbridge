@@ -17,7 +17,7 @@
 //   - Google Gemini              (contents/parts, role "model", generationConfig)
 //   - Cohere Chat v2             (messages, top_p -> "p", content blocks)
 // OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral,
-// Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need NO body translation because
+// Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need no body translation because
 // the gateway byte-forwards them (TranslateMode::None) and only rewrites
 // auth/endpoint. So this module covers the cases where the body actually changes.
 //
@@ -36,9 +36,9 @@ namespace llmbridge::provider
     // ── Anthropic Messages ──────────────────────────────────────────────────
     // OpenAI chat-completion request body  ->  Anthropic Messages request body.
     /// Replace the top-level `"model"` value in an OpenAI request body, leaving every
-    /// other byte alone. Empty return = REFUSE, never a partial edit.
+    /// other byte alone. Empty return = refuse, never a partial edit.
     ///
-    /// A SPLICE, not a re-serialisation. The body is forwarded to a venue that already
+    /// A splice, not a re-serialisation. The body is forwarded to a venue that already
     /// speaks this dialect, so re-emitting it from a parse would silently drop any
     /// field this parser does not model, and providers add fields faster than we
     /// adopt them. Only the model's value span moves.
@@ -56,7 +56,7 @@ namespace llmbridge::provider
     /// The same Messages body as Bedrock wants it, and the model id it names.
     ///
     /// Two differences from Anthropic direct, both required: no `model` field, because
-    /// Bedrock takes the model id in the request PATH, and `anthropic_version` inside
+    /// Bedrock takes the model id in the request path, and `anthropic_version` inside
     /// the JSON, where Anthropic wants a header. `model_out` receives the id so the
     /// caller can build `/model/{id}/invoke`; it is empty only when the body named no
     /// model, in which case there is no path to build and the request must be refused.

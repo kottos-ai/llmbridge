@@ -7,7 +7,7 @@
 
 // debug_translate: a tiny, synchronous harness for stepping through the dialect
 // translator in a debugger (CLion, gdb, lldb). Unlike the live gateway, there is
-// NO event loop, NO sockets, NO async I/O; each translate call runs inline on a
+// No event loop, no sockets, no async I/O; each translate call runs inline on a
 // hardcoded payload, so you can set a breakpoint on the call and "Step Into"
 // (CLion: F7) to walk provider/src/translate.cpp line by line.
 //
@@ -43,7 +43,7 @@ namespace
     // A representative OpenAI chat-completion request: system message + a
     // multi-turn user/assistant exchange + sampling params. Enough to exercise
     // system extraction, message restructuring, and parameter renaming. Edit it
-    // freely; it's just a string. Set `model` to the TARGET provider's model
+    // freely; it's just a string. Set `model` to the target provider's model
     // name; llmbridge passes `model` through verbatim (it translates the format,
     // not the model identity).
     std::string openai_request(std::string_view model)
@@ -70,7 +70,7 @@ namespace
         const std::string oai = openai_request("claude-3-5-sonnet-20241022");
         show("1. OpenAI request (input)", oai);
 
-        // ⬇ BREAKPOINT here, then Step Into to walk the request translator.
+        // ⬇ breakpoint here, then Step Into to walk the request translator.
         const std::string anthropic_req =
             llmbridge::provider::openai_to_anthropic_request(oai);
         show("2. translated Anthropic request", anthropic_req);
@@ -87,7 +87,7 @@ namespace
 })";
         show("3. Anthropic response (input)", anthropic_resp);
 
-        // ⬇ BREAKPOINT here, then Step Into to walk the response translator.
+        // ⬇ breakpoint here, then Step Into to walk the response translator.
         const std::string oai_resp =
             llmbridge::provider::anthropic_to_openai_response(anthropic_resp);
         show("4. translated OpenAI response", oai_resp);

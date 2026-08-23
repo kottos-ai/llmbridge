@@ -36,7 +36,7 @@ Two measurements on the reference box (i7-9750H, `intel_idle` driver, `menu` gov
 
 C-state exit latencies advertised by this CPU. Compare against the hop cost above:
 
-| state | POLL | C1 | C1E | C3 | C6 | C7s | C8 | C9 | C10 |
+| state | poll | C1 | C1E | C3 | C6 | C7s | C8 | C9 | C10 |
 |---|---|---|---|---|---|---|---|---|---|
 | exit µs | 0 | 2 | 10 | 70 | 85 | 124 | 200 | 480 | 890 |
 
@@ -55,7 +55,7 @@ absolute figures are only meaningful alongside the tuning state, which is why
 `BENCHMARKS.md` records it.
 
 
-## WARNING: Do not leave this tuning applied; it heats the machine
+## Warning: Do not leave this tuning applied; it heats the machine
 
 Capping idle states stops cores sleeping, and the `performance` governor pins clocks at
 maximum. On a thermally-limited laptop that raises the *idle* package temperature from
@@ -163,7 +163,7 @@ means constant fan and thermal throttling, which **lowers clocks and therefore d
 the very latency being measured.** Only defensible on a desktop or server with headroom.
 
 
-## Harness prerequisite: the listen / SYN queue (run this before ANY head-to-head)
+## Harness prerequisite: the listen / SYN queue (run this before any head-to-head)
 
 ```sh
 sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192 net.core.somaxconn=8192

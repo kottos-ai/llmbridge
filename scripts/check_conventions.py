@@ -17,18 +17,18 @@ habit. See DESIGN.md "Naming conventions".
 
 Three checks, each of which has caught a real defect:
 
-  1. CROSSING, a ep_* function calling a ur_* one, or vice versa.
+  1. Crossing, a ep_* function calling a ur_* one, or vice versa.
                   Caught ur_forward() calling the epoll error responder, which had
                   been invisible for as long as the epoll half was unprefixed.
 
-  2. UNMARKED, an unprefixed Gateway method reachable from only ONE backend.
+  2. Unmarked, an unprefixed Gateway method reachable from only one backend.
                   Unprefixed is supposed to mean "shared", so a one-sided unprefixed
                   method is a mislabelled backend-specific one. This is the check
-                  that matters most: a crossing grep alone CANNOT catch it, because
+                  that matters most: a crossing grep alone cannot catch it, because
                   the offending name has no prefix to grep for. Caught abort_pair,
                   which a prefix-only check had missed.
 
-  3. NAMESPACE, a header whose namespace does not mirror its directory.
+  3. Namespace, a header whose namespace does not mirror its directory.
                   Caught llmbridge::http (should nest under net) and llmbridge::json
                   (should nest under provider).
 
@@ -54,7 +54,7 @@ UNPREFIXED_ALLOWED = {
     "request_stop",
     "stats",
     "bound_port",
-    # Called from the DESTRUCTOR, which runs whichever backend was used, and from
+    # Called from the destructor, which runs whichever backend was used, and from
     # the epoll batch loop. The reachability walk below starts at run_epoll /
     # run_uring, so it cannot see the destructor and reports this as epoll-only.
     # It is genuinely shared; the check is right to ask, and this is the answer.
@@ -71,7 +71,7 @@ def strip_comments(text):
 def method_spans(text):
     """{name: (start_line, first_line_idx, last_line_idx)} for Gateway:: definitions.
 
-    Brace-matched, so a free function defined between two methods is NOT charged
+    Brace-matched, so a free function defined between two methods is not charged
     to whichever method happens to precede it, an error that produced a false
     finding when this analysis was first done by hand.
     """
@@ -98,7 +98,7 @@ def method_spans(text):
 
 
 def backend_strict(name):
-    """Backend by PREFIX only, used for the crossing check.
+    """Backend by prefix only, used for the crossing check.
 
     Deliberately excludes run_epoll/run_uring: they are the dispatch layer, and
     run_uring() legitimately tails into run_epoll() when io_uring init or the
@@ -113,7 +113,7 @@ def backend_strict(name):
 
 
 def backend_reach(name):
-    """Backend for REACHABILITY, including the two loop entry points.
+    """Backend for reachability, including the two loop entry points.
 
     sweep_idle is called from run_epoll and from ur_on_cqe and is genuinely
     shared; without run_epoll counting as an epoll-side caller it would look
@@ -198,7 +198,7 @@ def main():
     # ---------------------------------------------------------------- 4
     # LATENCY.md section 2 attributes every timing stamp to the function that
     # assigns it. Verify each attribution still holds: the named method must exist
-    # and must actually assign that stamp. Deliberately NOT line numbers -- those
+    # and must actually assign that stamp. Deliberately not line numbers -- those
     # rot on any edit above them, so every commit would have to re-check a doc, and
     # a reference that needs re-checking every commit is one nobody re-checks.
     # Function names move only when someone renames a function, which is exactly
@@ -240,7 +240,7 @@ def main():
     #
     #   kPascalCase  compile-time constants
     #   PascalCase   types and enum values
-    #   ALL_CAPS     PREPROCESSOR MACROS ONLY
+    #   ALL_CAPS     preprocessor macros only
     #
     # The last one is the rule with teeth. C++ constants obey scope, so they do
     # not need the shouting that warns about a macro; and a constant in ALL_CAPS
@@ -252,8 +252,8 @@ def main():
     for d in ("gateway", "net", "provider", "app"):
         src += sorted((ROOT / d).rglob("*.hpp")) + sorted((ROOT / d).rglob("*.cpp"))
 
-    # `constexpr <type> NAME =` / `[` / `{`, but NOT `constexpr <type> name(` which
-    # is a constexpr FUNCTION and correctly snake_case.
+    # `constexpr <type> NAME =` / `[` / `{`, but not `constexpr <type> name(` which
+    # is a constexpr function and correctly snake_case.
     const_re = re.compile(r"\bconstexpr\b[\w:<>,\s\*&]*?\b(\w+)\s*(?:=|\[|\{)")
     type_re = re.compile(r"^\s*(?:struct|class)\s+(\w+)\s*(?:[:{]|$)", re.M)
     for f in src:
@@ -289,7 +289,7 @@ def main():
     # ---------------------------------------------------------------- 5b
     # Constant backend prefixes, the same claim the ep_/ur_ method prefixes make:
     # kEp* is epoll's, kUr* is io_uring's, bare means shared. Worth enforcing because
-    # the two backends bound memory by DIFFERENT means (epoll pauses reads, io_uring
+    # the two backends bound memory by different means (epoll pauses reads, io_uring
     # drops past kUrStreamBufCap), so a constant read as shared invites a fix on the
     # wrong side, which is this codebase's most likely defect.
     #
@@ -332,9 +332,9 @@ def main():
         return 2
 
     # ------------------------------------------------- release version agreement
-    # project(VERSION) feeds write_basic_package_version_file, so a stale value makes
-    # find_package(llmbridge <ver> REQUIRED) fail against a correct install. It went
-    # unnoticed through the 0.11.0 tag: the consumer job calls find_package with NO
+    # project(version) feeds write_basic_package_version_file, so a stale value makes
+    # find_package(llmbridge <ver> required) fail against a correct install. It went
+    # unnoticed through the 0.11.0 tag: the consumer job calls find_package with no
     # version, so nothing compared them. Derived from the CHANGELOG, not from a
     # second hand-maintained constant, because two places to update is how it drifted.
     cml = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")

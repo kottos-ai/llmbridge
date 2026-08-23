@@ -36,7 +36,7 @@ cat /sys/class/thermal/thermal_zone*/temp | sort -rn | head -1     # want < 6000
 nstat -az | grep ListenOverflows                                   # note the number
 ```
 
-**Set the governor to `performance`. Do NOT cap idle states.** The two are not
+**Set the governor to `performance`. Do not cap idle states.** The two are not
 equivalent, and the difference is fairness:
 
 ```sh
@@ -102,7 +102,7 @@ Measured: 20 LiteLLM connect failures *during measurement* with the default rang
 sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"   # 55,536 ports
 ```
 
-### The fourth: a listen port INSIDE the widened ephemeral range
+### The fourth: a listen port inside the widened ephemeral range
 
 The fix above has a sting in its tail. Widening `ip_local_port_range` to `10000 65535`
 means **any listen port at or above 10000 can be stolen** by a lingering client socket
@@ -115,7 +115,7 @@ use. Because the harness recorded the dead runs as `achieved=0`, the first readi
 "the new build crashes under load", which was wrong in both directions: nothing crashed,
 and the build was fine. The gateway aborting when it cannot bind is correct behaviour.
 
-**Rule: pick benchmark listen ports BELOW 10000** (or whatever
+**Rule: pick benchmark listen ports below 10000** (or whatever
 `/proc/sys/net/ipv4/ip_local_port_range` starts at) and check before choosing:
 
 ```sh
@@ -155,7 +155,7 @@ so it does not drive the package toward TjMax.
 ## 1. Host prerequisites
 
 **The idle-state / governor tuning is per-benchmark, not global; applying it to the
-throughput benchmark makes the result WORSE.** See the table below.
+throughput benchmark makes the result worse.** See the table below.
 
 ```sh
 # ALWAYS: listen/SYN queues. The load generators open a connection per stream; the
@@ -172,7 +172,7 @@ sudo cpupower frequency-set -g performance
 |---|---|---|
 | **streaming latency** | **apply `-D 5`** | client-measured; a deep C-state exit adds ~40 us to every token. The gateway runs at ~5% of a core, so the extra heat is tolerable. |
 | **non-streaming latency** | **irrelevant** | llmbridge self-measures from client-request-received onward, so the wakeup is outside the measurement. Verified: 76 us p99 tuned vs 67 us untuned, no improvement. |
-| **throughput / saturation** | **do NOT apply** | at saturation the CPU never idles, so C-states are never entered, but the tuning keeps the machine ~20 C hotter at idle, which caps turbo. **Measured: 81.6k mean achieved with defaults versus ~75k with the tuning applied, on the same host in the same session.** |
+| **throughput / saturation** | **do not apply** | at saturation the CPU never idles, so C-states are never entered, but the tuning keeps the machine ~20 C hotter at idle, which caps turbo. **Measured: 81.6k mean achieved with defaults versus ~75k with the tuning applied, on the same host in the same session.** |
 
 **The tuning heats the machine.** `idle-set -D 5` prevents cores sleeping and the
 `performance` governor pins them at max clock, so this box idles at ~80 C instead of
@@ -183,8 +183,8 @@ sudo cpupower frequency-set -g performance
 sudo cpupower idle-set -E && sudo cpupower frequency-set -g powersave
 ```
 
-**Do NOT use `cpupower idle-set -D 0`.** Disabling C1 as well leaves cores spinning in
-POLL; on a laptop that drives the package to TjMax and throttles the clock, making
+**Do not use `cpupower idle-set -D 0`.** Disabling C1 as well leaves cores spinning in
+Poll; on a laptop that drives the package to TjMax and throttles the clock, making
 latency *worse* (measured: 13 µs floor → 17 µs). See
 [`LATENCY-TUNING.md`](LATENCY-TUNING.md).
 
@@ -391,7 +391,7 @@ is back under a threshold, so no run is measured on a hotter box than its counte
 while [ "$(awk '{printf "%.0f", $1/1000}' /sys/class/thermal/thermal_zone0/temp)" -gt 70 ]; do sleep 2; done
 ```
 
-**Run the whole thing a second time with the ARMS SWAPPED.** This is the control that
+**Run the whole thing a second time with the arms swapped.** This is the control that
 catches what the gate cannot. A threshold gate still lets the *first* run after a long
 idle start genuinely colder (measured: 62 C versus 70 C for every subsequent run), so
 whichever arm goes first gets a free advantage. If a delta is real it survives the swap;
@@ -403,7 +403,7 @@ if it is position bias it shrinks or inverts.
 > happened to run first. Per-token latency, flat in both orderings, was the honest
 > signal.
 
-**Report MIN as well as median.** Thermal noise and scheduler interference only ever
+**Report min as well as median.** Thermal noise and scheduler interference only ever
 *add* latency, so the minimum across runs is the cleanest estimator of what the code
 itself does. A median can be dragged by one spike; the min cannot.
 

@@ -14,11 +14,11 @@
 //
 // Why stateful: a single TCP read can split an SSE event mid-line or mid-JSON,
 // and OpenAI's chunk protocol carries cross-event context (a stable id/model, a
-// once-emitted role delta, the final finish_reason). So you hold ONE translator
+// once-emitted role delta, the final finish_reason). So you hold one translator
 // per in-flight response and feed() it as bytes arrive, then finish() at EOF.
 //
 // Scope (Phase B, slice 1): Anthropic Messages stream -> OpenAI chat.completion
-// .chunk stream, TEXT ONLY: message_start, content_block_delta/text_delta,
+// .chunk stream, text only: message_start, content_block_delta/text_delta,
 // message_delta (stop_reason), message_stop. Tool-call deltas, vision, and the
 // reverse direction are later slices. I/O-agnostic: operates on in-memory
 // buffers; the gateway owns the sockets and back-pressure.
@@ -45,7 +45,7 @@ namespace llmbridge::provider
         // a fixed value to make the output fully deterministic (tests, and so the
         // gateway can align a stream's `created` with its non-streaming path).
         // `include_usage` mirrors OpenAI's `stream_options.include_usage`: when set,
-        // every chunk carries `"usage": null` and ONE extra chunk, with empty `choices`
+        // every chunk carries `"usage": null` and one extra chunk, with empty `choices`
         // plus the real token counts, is emitted just before `data: [DONE]`.
         // Anthropic supplies the numbers itself (input in message_start, cumulative
         // output in message_delta), so this is pure re-shaping, never estimation.
@@ -78,7 +78,7 @@ namespace llmbridge::provider
         /// usage.cache_read_input_tokens; 0 when the provider reported none.
         [[nodiscard]] long long cached_tokens() const noexcept { return _cached_tok; }
 
-        /// True once the first CONTENT chunk has been emitted (a text delta, or a
+        /// True once the first content chunk has been emitted (a text delta, or a
         /// tool call's name/arguments).
         [[nodiscard]] bool content_started() const noexcept { return _content_started; }
 
@@ -100,7 +100,7 @@ namespace llmbridge::provider
         bool _have_data = false;
         bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
         // ── Streamed tool calls ──────────────────────────────────────────────
-        // Anthropic indexes EVERY content block (text blocks included); OpenAI's
+        // Anthropic indexes every content block (text blocks included); OpenAI's
         // tool_calls[].index counts only tool calls. The two diverge the moment a
         // text block precedes a call, so a mapping is required, using Anthropic's
         // index directly would emit tool_calls[1] with no tool_calls[0] and break

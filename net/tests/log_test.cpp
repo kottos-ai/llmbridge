@@ -136,7 +136,7 @@ TEST_F(LogTest, CompileFloorRemovesLowLevelsEntirely)
     EXPECT_NE(sink.all().find("info line"), std::string::npos);
 }
 
-// Arguments below the floor must not even be EVALUATED, or a disabled log line still
+// Arguments below the floor must not even be evaluated, or a disabled log line still
 // costs whatever computing them costs.
 TEST_F(LogTest, ArgumentsBelowTheFloorAreNotEvaluated)
 {
@@ -148,7 +148,7 @@ TEST_F(LogTest, ArgumentsBelowTheFloorAreNotEvaluated)
     EXPECT_EQ(calls, 1);
 }
 
-// Arguments must not be evaluated when the RUNTIME level suppresses the line either.
+// Arguments must not be evaluated when the runtime level suppresses the line either.
 TEST_F(LogTest, ArgumentsAreNotEvaluatedWhenRuntimeSuppressed)
 {
     log_::set_level(log_::Level::Error);
@@ -194,17 +194,17 @@ TEST_F(LogTest, LevelNamesRoundTripAndTyposAreRefused)
 }
 
 // SECURITY.md promises credentials are never logged. That promise is kept by call
-// sites, not by the logger, so this pins the ONE rule that makes it checkable: the
+// sites, not by the logger, so this pins the one rule that makes it checkable: the
 // helper below is what every credential-adjacent site must use.
 TEST_F(LogTest, RedactedHelperNeverPrintsTheValue)
 {
-    // Deliberately NOT shaped like a real key. An `sk-ant-...` fixture here would
+    // Deliberately not shaped like a real key. An `sk-ant-...` fixture here would
     // trip scripts/check_no_secrets.py, and the right response to that is a
-    // different fixture, never an ALLOW entry: the scanner exists to catch exactly
+    // different fixture, never an allow entry: the scanner exists to catch exactly
     // that pattern in tracked files, and an exception for test convenience is how
     // a real key eventually slips past it.
     const std::string secret = "CREDENTIAL-PLACEHOLDER-MUST-NOT-BE-LOGGED";
-    // The pattern: name and LENGTH, never the value.
+    // The pattern: name and length, never the value.
     LB_INFO("auth header present name=authorization len=", secret.size());
     const std::string s = sink.all();
     EXPECT_EQ(s.find(secret), std::string::npos) << "a credential reached a log line";

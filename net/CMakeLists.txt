@@ -1,6 +1,6 @@
 # net: low-level sockets + zero-alloc HTTP/1.1 framing.
 #
-# STATIC lib (socket setup lives in src/); the hot-path framer is header-only
+# Static lib (socket setup lives in src/); the hot-path framer is header-only
 # in include/net/http.hpp so it inlines into the proxy loop. No project deps.
 # This is the bottom of the llmbridge stack.
 
@@ -11,7 +11,7 @@ add_library(net STATIC
         src/log.cpp
 )
 target_include_directories(net PUBLIC include)
-# PUBLIC, so ANYTHING linking net compiles against the same floor. The root sets this
+# Public, so anything linking net compiles against the same floor. The root sets this
 # with add_compile_definitions, which reaches llmbridge's own directory scope and no
 # further: a consumer that pulls llmbridge in with add_subdirectory (FetchContent does)
 # silently kept the default, so `-DLLMBRIDGE_LOG_LEVEL=debug` compiled out every
@@ -23,7 +23,7 @@ target_compile_features(net PUBLIC cxx_std_20)
 # io_uring backend (Phase 0 scaffolding): compile the raw wrapper only where the
 # kernel headers expose it, and propagate LLMBRIDGE_HAVE_URING to consumers so
 # they can gate the (Phase 1) io_uring loop and fall back to epoll otherwise.
-# Secret-erasure primitive: DETECT the platform function instead of guessing from
+# Secret-erasure primitive: Detect the platform function instead of guessing from
 # the OS macro. explicit_bzero exists on glibc >= 2.25 and the BSDs but needs
 # _GNU_SOURCE to be declared; memset_s is C11 Annex K and optional (MSVC has it,
 # glibc does not). Where neither exists, net/src/secure.cpp falls back to a
@@ -55,7 +55,7 @@ else ()
     message(STATUS "net: linux/io_uring.h not found, epoll only")
 endif ()
 
-# TLS for outbound provider connections (option + find_package live at the ROOT
+# TLS for outbound provider connections (option + find_package live at the root
 # CMakeLists so the imported OpenSSL::* targets are visible to sibling dirs, an
 # imported target is directory-scoped, and gateway/tests links it too).
 if (LLMBRIDGE_TLS)

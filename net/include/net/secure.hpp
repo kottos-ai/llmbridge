@@ -9,16 +9,16 @@
 
 // Erase secret bytes so they cannot be recovered from the allocation later.
 //
-// THE PROBLEM. `std::string::clear()` sets size()=0 and leaves the bytes intact;
-// a plain `memset` before releasing the memory is a DEAD STORE the optimizer is
+// The problem. `std::string::clear()` sets size()=0 and leaves the bytes intact;
+// a plain `memset` before releasing the memory is a dead store the optimizer is
 // entitled to delete. That is not theoretical: compiled at -O2 on this project's
-// toolchain, the naive version emitted ZERO instructions while the version below
+// toolchain, the naive version emitted zero instructions while the version below
 // emitted the call. Verify with:
 //
 //     g++ -O2 -S ... | awk '/secure_clear/,/ret/' | grep call
 //
-// THE SOLUTION. There is no standard one: `std::secure_clear` (P1315) was proposed
-// and never adopted, so every real implementation calls a PLATFORM primitive and
+// The solution. There is no standard one: `std::secure_clear` (P1315) was proposed
+// and never adopted, so every real implementation calls a platform primitive and
 // falls back to a compiler barrier where none exists. That is exactly what this
 // does: the platform function is chosen at CMake configure time by feature
 // detection (never by guessing from #ifdef __linux__), so the common path is a
@@ -33,9 +33,9 @@
 // mandated by the standard, so the call cannot be elided, but it is deliberately
 // last, since it works for an indirect reason and the named functions do not.
 //
-// SCOPE. This is not a hot-path function and does not need to be: it runs once per
+// Scope. This is not a hot-path function and does not need to be: it runs once per
 // request when a pooled upstream is released (measured 2.4 ns for a ~96 B buffer,
-// ~0.02% of one core at 84k RPS). Do NOT sprinkle it over transient buffers that
+// ~0.02% of one core at 84k RPS). Do not sprinkle it over transient buffers that
 // are overwritten microseconds later; that buys nothing and costs the hot path.
 
 #include <cstddef>

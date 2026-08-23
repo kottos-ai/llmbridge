@@ -67,8 +67,8 @@ namespace llmbridge::net::sigv4
     std::string canonical_uri(std::string_view wire_path)
     {
         if (wire_path.empty()) return "/";
-        // ONE more encoding of what the request line already carries. AWS says a
-        // non-S3 path segment is encoded twice, counting from the RAW path: the wire
+        // One more encoding of what the request line already carries. AWS says a
+        // non-S3 path segment is encoded twice, counting from the raw path: the wire
         // form is the first pass, so this is the second. Encoding the wire form twice
         // yields %25253A for a model id colon, which is as wrong as not encoding it.
         // Handles both callers: a literal ':' becomes %3A, an already-escaped %3A

@@ -58,10 +58,10 @@ namespace llmbridge::net::sigv4
     };
 
     /// Split a bearer value into AWS credentials: "AKID:SECRET" or
-    /// "AKID:SECRET:SESSION_TOKEN". False means REFUSE the request; the caller must
+    /// "AKID:SECRET:SESSION_TOKEN". False means refuse the request; the caller must
     /// never fall back to sending it unsigned or with a partial credential.
     ///
-    /// PER-REQUEST PASSTHROUGH, which is the whole point: llmbridge holds no AWS
+    /// Per-request passthrough, which is the whole point: llmbridge holds no AWS
     /// credential of its own, the customer's travels with their request and is gone
     /// when it completes. That keeps the OSS gateway stateless and keeps a long-lived
     /// secret out of any store the request path can read.
@@ -123,9 +123,9 @@ namespace llmbridge::net::sigv4
 
     /// The canonical URI, from the path as it appears in the request line.
     ///
-    /// ENCODED ONE MORE TIME than the wire, and this is the single most common way a
+    /// Encoded one more time than the wire, and this is the single most common way a
     /// Bedrock signature fails. AWS encodes a non-S3 path segment twice counting from
-    /// the RAW path, and the request line already holds the first pass: a model id
+    /// the raw path, and the request line already holds the first pass: a model id
     /// colon travels as `%3A` and is signed as `%253A`. Sign the wire form unchanged
     /// and every request to a versioned model id returns 403 with an empty body;
     /// encode the wire form twice and you get `%25253A`, which fails the same way.

@@ -36,7 +36,7 @@ namespace llmbridge
         /// Must be 400-599; the gateway substitutes 403 for anything else and warns.
         int deny_status = 401;
         /// Which upstream serves this request, as an index into the gateway's table.
-        /// Out of range (including the -1 default) means the FIRST upstream, so a
+        /// Out of range (including the -1 default) means the first upstream, so a
         /// policy that only authenticates need not know the table exists.
         ///
         /// Ignored when `allow` is false: a refused request reaches no venue.
@@ -64,8 +64,8 @@ namespace llmbridge
     /// can send the request somewhere else, which is what failover is.
     ///
     /// Only "the venue did not answer" reaches here: a refused connect, a failed write,
-    /// an EOF before the response, an idle timeout. A venue that DID answer with
-    /// something we could not parse does NOT, because retrying elsewhere would mask a
+    /// an EOF before the response, an idle timeout. A venue that did answer with
+    /// something we could not parse does not, because retrying elsewhere would mask a
     /// real incompatibility as a transient blip.
     struct FailureFacts
     {
@@ -85,7 +85,7 @@ namespace llmbridge
     };
 
     /// Supplied at Gateway construction, non-owning, no setter. Called on that
-    /// Gateway's loop thread, once per framed request. A policy SHARED across workers
+    /// Gateway's loop thread, once per framed request. A policy shared across workers
     /// is called from several threads and must handle that itself: a lock here would
     /// sit on the per-request path.
     class Policy
@@ -97,7 +97,7 @@ namespace llmbridge
         virtual Decision decide(const RequestFacts& facts) noexcept = 0;
 
         /// Called only after a venue failed with nothing yet sent to the client. The
-        /// DEFAULT NEVER RETRIES: llmbridge has no opinion about which venue is healthy,
+        /// Default never retries: llmbridge has no opinion about which venue is healthy,
         /// because health is measured and it measures nothing. Ordering, ejection
         /// thresholds and cooldown belong to whoever implements this.
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }

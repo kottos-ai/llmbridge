@@ -7,7 +7,7 @@
 
 // libFuzzer target for the hand-rolled JSON parser (provider/json.hpp). This is the
 // highest-risk surface, since translate mode feeds client-controlled bytes into
-// it. The parser must NEVER crash, over-read, or overflow the stack on any input;
+// it. The parser must never crash, over-read, or overflow the stack on any input;
 // it may only set ok=false. Build (Clang):
 //   cmake -B build-fuzz -DLLMBRIDGE_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
 //   cmake --build build-fuzz --target fuzz_json

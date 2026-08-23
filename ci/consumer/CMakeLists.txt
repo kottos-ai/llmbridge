@@ -5,7 +5,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# A downstream project, built against an INSTALLED llmbridge exactly as the README
+# A downstream project, built against an installed llmbridge exactly as the README
 # tells a user to. Nothing else in CI exercises the install tree: the test suite
 # builds in-tree, so a broken export, a header that does not stand alone, or a
 # renamed public namespace all pass everything and only break for the consumer.

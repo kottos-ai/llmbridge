@@ -12,12 +12,12 @@
 # Why this exists: io_uring issues 2.31 fewer syscalls per delivered token than epoll
 # (measured with strace), but a syscall costs ~537 ns here, so the whole saving is
 # ~1.24 us/token: under 4% of the added latency and below run-to-run variance. It is
-# therefore INVISIBLE on the latency axis. If io_uring is worth anything on the
-# streaming path it must show up as CPU EFFICIENCY (less CPU burned per token) and
-# hence as HEADROOM (a later knee). This script measures those two axes directly.
+# therefore invisible on the latency axis. If io_uring is worth anything on the
+# streaming path it must show up as CPU efficiency (less CPU burned per token) and
+# hence as headroom (a later knee). This script measures those two axes directly.
 #
 # It also separates two things the earlier saturation sweep conflated:
-#   phase 1 (50 tok/s/stream): raises BOTH stream count and tokens/s together, so at
+#   phase 1 (50 tok/s/stream): raises both stream count and tokens/s together, so at
 #           >=2048 streams the provider's own ~100k tok/s ceiling co-limits the result
 #   phase 2 (10 tok/s/stream): pushes stream count high while keeping tokens/s well
 #           inside the provider's capacity, isolating connection scaling

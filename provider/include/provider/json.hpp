@@ -32,11 +32,11 @@ namespace llmbridge::provider::json
 
         Type type = Type::Null;
         bool boolean = false;
-        // For String, `sv` is the RAW span between the quotes, still JSON-escaped.
+        // For String, `sv` is the raw span between the quotes, still JSON-escaped.
         // A view into the parsed input, never decoded, never owned. For Number, it's
         // the raw number text. This makes the DOM zero-copy: a passthrough value is
         // emitted verbatim, since the input's escaping is exactly the output's.
-        // For Array and Object, `sv` is the RAW span INCLUDING the surrounding
+        // For Array and Object, `sv` is the raw span including the surrounding
         // brackets/braces, set by the parser so a subtree can be forwarded byte for
         // byte. Tool calling needs this: a tool's `parameters` is an arbitrary JSON
         // Schema we must pass through unaltered, and re-serialising from the DOM
@@ -125,11 +125,11 @@ namespace llmbridge::provider::json
                 return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
             }
 
-            // Return the RAW span between the quotes (assumes s[i]=='"'), still
+            // Return the raw span between the quotes (assumes s[i]=='"'), still
             // JSON-escaped, as a view into the input: never decoded, never copied.
             // We scan only for the real closing quote, skipping escape pairs (\X).
             //
-            // STRICTNESS IS LOAD-BEARING HERE. This span is re-emitted VERBATIM on the
+            // Strictness is LOAD-BEARING here. This span is re-emitted verbatim on the
             // passthrough path (see the comment on Value::sv), so whatever this scanner
             // accepts ends up in the bytes we hand the client. An earlier revision
             // skipped both checks below, and the measured result was: a provider string
@@ -304,11 +304,11 @@ namespace llmbridge::provider::json
         return v;
     }
 
-    // Append a RAW (already JSON-escaped) span as a quoted string literal. The
+    // Append a raw (already JSON-escaped) span as a quoted string literal. The
     // zero-copy passthrough path. The bytes came from valid JSON input, so the
     // escaping is already correct; emit verbatim, no decode/re-encode.
     // Emit `text` as a JSON string literal (with quotes), escaping what must be
-    // escaped. Use when the SOURCE IS NOT already JSON-escaped, e.g. turning a raw
+    // escaped. Use when the source is not already JSON-escaped, e.g. turning a raw
     // JSON subtree into OpenAI's `arguments`, which is a *string* containing JSON.
     inline void append_escaped_string(std::string& out, std::string_view text)
     {
@@ -436,7 +436,7 @@ namespace llmbridge::provider::json
         out += '"';
     }
 
-    // Append `raw` (a DECODED string) as a JSON string literal, escaping as needed.
+    // Append `raw` (a decoded string) as a JSON string literal, escaping as needed.
     // Bulk-copies runs of chars that don't need escaping (the common case), only
     // escaping the special ones individually, so most content is a few memcpys.
     inline void append_escaped(std::string& out, std::string_view raw)

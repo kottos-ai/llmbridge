@@ -86,13 +86,13 @@ measurement level is short enough for the ramp to matter.
 **What sets that ceiling: the gateway's own CPU, on its single thread.** Three
 percentages follow and they have three different denominators, so to be explicit:
 
-- **87-92% of ONE CORE**: the worker thread's own utilisation. llmbridge is
+- **87-92% of one core**: the worker thread's own utilisation. llmbridge is
   single-threaded, so 100% of one core is its hard ceiling; at saturation it is nearly
   there, and that is the cap.
 - **~95% idle SYSTEM-WIDE**, across all 12 logical CPUs. One saturated core is only ~8%
   of this box, so the machine looks idle while the gateway is maxed. It cannot reach the
   other 11 cores because it is single-threaded; that is what `--workers N` is for.
-- **89% kernel / 6.7% llmbridge**: a split of the worker's OWN CPU time (that 87-92%),
+- **89% kernel / 6.7% llmbridge**: a split of the worker's own CPU time (that 87-92%),
   not of the machine. Nine of every ten cycles the gateway burns execute kernel code.
 
 Softirq time is ~0%, so it is not the loopback packet path. An earlier revision of this
@@ -141,7 +141,7 @@ number.) Verified by re-profiling with the service inactive: still 6.37%. Removi
 `apparmor=0` on the kernel command line and a reboot, a security tradeoff, so treat it
 as a measurement step, not a deployment recommendation.
 
-**What did NOT help, measured:** `IORING_REGISTER_FILES` (fixed files) was implemented to
+**What did not help, measured:** `IORING_REGISTER_FILES` (fixed files) was implemented to
 attack the 3.2% fd-lookup line. It delivers **~0.5% less CPU per request and no
 detectable throughput change** (three interleaved A/B repeats at saturation: 75.9k vs
 75.3k, inside ±3% noise). Most of that 3.2% is not addressable this way, since
@@ -180,8 +180,8 @@ instrument**: neither gateway self-reports.
 
 > Charts regenerated from these runs (`bench/make_stream_chart.py`). The source CSV is
 > append-only and the chart takes a median over it, so reset it whenever the
-> CONFIGURATION changes; otherwise it silently blends incompatible runs. Repeating the
-> SAME configuration is the intended use and is what the median is for: these figures
+> Configuration changes; otherwise it silently blends incompatible runs. Repeating the
+> Same configuration is the intended use and is what the median is for: these figures
 > are the median of **three** runs on the **v0.10.0** tree, measured 2026-08-06 on a
 > host rebooted immediately beforehand (50 °C at each rep's start, load < 0.8). (An earlier revision of this note said to reset to a
 > single run's rows, which was true when only one run existed and would now silently
@@ -342,7 +342,7 @@ none completes inside the window (no connection churn).
 | p99.9 | 2.1-2.9 ms | 2.3-2.4 ms |
 | gateway sockets | 32,774 | 49,158 |
 | **gateway RSS** | **189 MB** | 272 MB |
-| **gateway CPU** | **30-33% of ONE core** | 42-47% of one core |
+| **gateway CPU** | **30-33% of one core** | 42-47% of one core |
 | established sockets (system) | 65,569 | 98,328 |
 
 **At 16,384 concurrent streams the gateway uses about a third of a single core and
@@ -502,8 +502,8 @@ At 64 concurrent streams, p50 added latency, measured at two host tuning levels:
 | direct - 1 hop, no proxy               | 53 us | 13 us |
 | **nullrelay** - 2 hops, **zero work**  | 106 us | 27 us |
 | llmbridge - 2 hops, full translate     | 108 us | 32 us |
-| **=> cost of the HOP itself**          | **53 us** | **14 us** |
-| **=> cost of ALL of llmbridge's work** | 2 us (noise) | **5 us** |
+| **=> cost of the hop itself**          | **53 us** | **14 us** |
+| **=> cost of all of llmbridge's work** | 2 us (noise) | **5 us** |
 
 Two things follow, and the second one is a host-configuration result, not a code result:
 
@@ -520,7 +520,7 @@ Two things follow, and the second one is a host-configuration result, not a code
 
 See [`bench/LATENCY-TUNING.md`](bench/LATENCY-TUNING.md) for the three ways to configure
 this, and for why the *aggressive* setting backfires: disabling C1 as well leaves the
-cores spinning in POLL, which drove this laptop to 94 C and thermal throttling and made
+cores spinning in poll, which drove this laptop to 94 C and thermal throttling and made
 latency **worse** (13 us -> 17 us floor).
 
 **Host state for the streaming numbers in this document:** idle states capped at C1
@@ -562,7 +562,7 @@ Since connection reuse landed, steady-state operation is the common case and io_
 remains the default. A deployment with very high connection churn and no reuse should
 measure both.
 
-**Hypotheses that were tested and are NOT the cause** of the churn-time io_uring tail,
+**Hypotheses that were tested and are not the cause** of the churn-time io_uring tail,
 recorded so they are not re-investigated: provided-buffer exhaustion (`ENOBUFS` counter
 0, multishot terminations 0, and an 8x larger pool changed nothing), CQ-ring overflow
 (kernel overflow counter 0; an 8x larger CQ changed nothing), send serialisation (never
@@ -587,7 +587,7 @@ interleaved and ran at identical clocks).
   out at 2 s and says so. llmbridge and the direct baseline never overflowed it.
 - **The reference box thermally throttles**, which penalises the CPU-bound competitor far
   more than the C++ gateway. See the caveat under the results table.
-- **Per-token latency is dominated by the HOP, not by the gateway's work** (~5 us of
+- **Per-token latency is dominated by the hop, not by the gateway's work** (~5 us of
   ~32 us) - measured, not assumed. This bounds how much further *our code* can move the
   streaming path.
 - **"Added" p99 figures are a difference of percentiles**, not a percentile of the

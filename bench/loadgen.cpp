@@ -284,7 +284,7 @@ int main(int argc, char** argv)
                     int err = llmbridge::net::connect_result(c->fd);
                     disarm_write(c);
                     // Connect refused/failed: retire this conn (close, drop from rotation).
-                    // We do NOT reconnect here: a fully-down target would otherwise storm
+                    // We do not reconnect here: a fully-down target would otherwise storm
                     // reconnects. (Reconnect is for *established* conns that later error;
                     // an unreachable target simply shrinks the pool and reports errors.)
                     if (err != 0) { ++errors; ::close(c->fd); c->fd = -1; continue; }

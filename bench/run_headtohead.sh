@@ -7,7 +7,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-# Equal-work head-to-head: llmbridge vs LiteLLM, BOTH doing the full OpenAI<->Anthropic
+# Equal-work head-to-head: llmbridge vs LiteLLM, both doing the full OpenAI<->Anthropic
 # round-trip (the work LiteLLM's transform_request/transform_response is built
 # around), against the same mock backend, same open-loop loadgen.
 #

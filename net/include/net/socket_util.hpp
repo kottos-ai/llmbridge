@@ -15,7 +15,7 @@
 //
 // Connection *setup* is not on the hot path (it happens once per connection,
 // not per request), so these live out-of-line in socket_util.cpp; the per-
-// request framing that IS hot stays header-only inline in net/http.hpp.
+// request framing that is hot stays header-only inline in net/http.hpp.
 
 #include <cstdint>
 
@@ -48,7 +48,7 @@ namespace llmbridge::net
     // SO_ERROR errno otherwise.
     int connect_result(int fd) noexcept;
 
-    // Create a non-blocking TCP socket with TCP_NODELAY but DON'T connect it, for
+    // Create a non-blocking TCP socket with TCP_NODELAY but don'T connect it, for
     // the io_uring path, which issues the connect as a ring op (IORING_OP_CONNECT).
     // Returns the fd, or -1 on error.
     int make_client_socket() noexcept;

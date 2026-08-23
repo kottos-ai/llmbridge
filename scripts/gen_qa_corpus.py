@@ -8,7 +8,7 @@
 
 """Generate the question/answer corpus used by the concurrency regression test.
 
-Run ONCE, offline; the output is committed as a fixture. The test itself is
+Run once, offline; the output is committed as a fixture. The test itself is
 hermetic and never touches the network; see CLAUDE.md, "Never write tests that
 depend on live LLM provider APIs". This is the "record once, replay in tests"
 half of that rule.
@@ -29,7 +29,7 @@ argv, or written to the output. Use a throwaway key.
 
 The cap is part of the committed fixture, not a tuning knob: without it the
 backend_stress answers come back at ~15 KB and the file is 4.25 MB. Re-running
-WITHOUT the flag on an existing corpus will not restore the full text (it is
+Without the flag on an existing corpus will not restore the full text (it is
 gone from the file), but a fresh generation would, so keep the flag.
 
 Resumable: an existing output file is loaded and only missing ids are fetched, so
@@ -72,9 +72,9 @@ TOPICS = [
 #
 #   plain          general knowledge, ordinary prose answers
 #   escape_stress  answers forced to contain JSON-hostile characters
-#   json_hostile   answers ABOUT JSON escaping, so the text is full of
+#   json_hostile   answers about JSON escaping, so the text is full of
 #                  backslashes, quotes and \uXXXX sequences the model wrote
-#                  literally; the reply is itself near-JSON. It does NOT
+#                  literally; the reply is itself near-JSON. It does not
 #                  produce raw control bytes: asked about \u0000 the model
 #                  writes the six characters, not the byte. Do not add prompts
 #                  hoping to change that; that byte class is covered by a
@@ -152,11 +152,11 @@ _printed = 0
 
 
 def utf8_trim(text, limit):
-    """Truncate to `limit` BYTES without splitting a UTF-8 sequence.
+    """Truncate to `limit` bytes without splitting a UTF-8 sequence.
 
     Drops trailing continuation bytes, then a dangling lead byte, so the result is
     always decodable. Safe with respect to JSON escaping because the corpus stores
-    DECODED text: escaping happens at serialisation, so there is no escape to split.
+    Decoded text: escaping happens at serialisation, so there is no escape to split.
     """
     b = text.encode()
     if len(b) <= limit:
@@ -301,7 +301,7 @@ def make_questions(key, n, seed, exclude):
     return questions[:n]
 
 
-# How the NEW half of the corpus is composed. `plain`/`escape_stress` already
+# How the new half of the corpus is composed. `plain`/`escape_stress` already
 # exist from the first run; these are the categories added on top.
 NEW_MIX = [("long", 330), ("json_hostile", 260), ("tricky_text", 260), ("backend_stress", 150)]
 BANKS = {"escape_stress": ESCAPE_STRESS, "json_hostile": JSON_HOSTILE, "tricky_text": TRICKY_TEXT}
@@ -317,12 +317,12 @@ def main():
     # The backend_stress answers come back at ~15 KB and are 55% of the fixture, so
     # the committed corpus caps them. 6144 = 1.5x the io_uring provided-buffer size
     # (kUrBufSize = 4096), which is what those entries exist to cross. The property
-    # survives the cap. Applied at WRITE time to every record, so re-running this
+    # survives the cap. Applied at write time to every record, so re-running this
     # script reproduces the committed file instead of silently restoring 4.25 MB.
     ap.add_argument("--max-answer-bytes", type=int, default=0,
                     help="cap answer length in bytes (0 = no cap); marks records truncated")
     # Curation. Generating 2000 and keeping the best 1000 beats generating 1000.
-    # The selector can then guarantee EVERY rare character class survives, which a
+    # The selector can then guarantee every rare character class survives, which a
     # proportional sample does not: a naive stride-2 halving of this corpus drops
     # `tab` from 18 entries to zero. Deterministic, so the committed file is
     # reproducible from the same inputs.
@@ -372,7 +372,7 @@ def main():
         def fetch(slot):
             idx, kind = slot
             topic, q = base[idx]
-            # For bank-backed kinds the stress instruction goes INTO the question, so
+            # For bank-backed kinds the stress instruction goes into the question, so
             # the corpus is self-describing and the lookup key stays unique.
             bank = BANKS.get(kind)
             if bank:

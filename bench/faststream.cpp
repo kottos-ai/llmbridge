@@ -7,7 +7,7 @@
 
 // faststream: a C++ streaming (SSE) provider for the Phase-B saturation test.
 // The streaming counterpart to fastbackend.cpp, and it exists for exactly the same
-// reason: the Python asyncio mock tops out around 45-50k chunks/s, which is BELOW
+// reason: the Python asyncio mock tops out around 45-50k chunks/s, which is below
 // what llmbridge sustains, so a sweep against it measures the mock's ceiling and
 // tells you nothing about the gateway's. This backend emits the identical Anthropic
 // event stream from a single-threaded epoll loop with no per-token allocation, so
@@ -114,7 +114,7 @@ namespace
     {
         c->streaming = true;
         c->tokens_sent = 0;
-        // PHASE STAGGER. Streams that start together would otherwise stay aligned
+        // Phase stagger. Streams that start together would otherwise stay aligned
         // and fire in one synchronized burst every interval, which is both
         // unrealistic (real providers are not in lockstep) and inflates measured
         // latency for every path: the whole burst queues behind one wakeup.
@@ -143,7 +143,7 @@ namespace
         append_chunk(c->wbuf, kBlock, sizeof(kBlock) - 1);
     }
 
-    // Emit one token, stamped with the CURRENT monotonic clock (the stamp is taken
+    // Emit one token, stamped with the current monotonic clock (the stamp is taken
     // at emit time, so scheduler jitter never corrupts the latency measurement
     // it only shifts when the token was sent, which is what we claim it is).
     void emit_token(Conn* c)

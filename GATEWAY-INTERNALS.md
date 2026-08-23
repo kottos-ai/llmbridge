@@ -29,7 +29,7 @@ completes. An upstream with no peer is either idle in the pool or dying.
 
 `r` and `w` are named from the **gateway's** point of view on that socket: `rbuf`
 is what we read from the peer, `wbuf` is what we write to it. The same field name
-therefore holds the REQUEST on one connection and the RESPONSE on the other, and
+therefore holds the request on one connection and the response on the other, and
 which is which depends on `is_client`. That is the most confusing thing about the
 data model, so here is one request crossing all four:
 
@@ -62,7 +62,7 @@ stale-connection resend never know it exists.
 Its meaning shifts with the transport, and this is a real trap:
 
 - **plaintext**: bytes actually written to the socket
-- **TLS**: bytes fed into the `Session`, which have NOT necessarily left the
+- **TLS**: bytes fed into the `Session`, which have not necessarily left the
   machine. Wire progress is `tls_out_off`
 
 So on a TLS connection `woff >= wbuf.size()` means "fully encrypted", never
@@ -74,7 +74,7 @@ So on a TLS connection `woff >= wbuf.size()` means "fully encrypted", never
 | transport | what `woff` counts |
 |---|---|
 | plaintext | bytes actually written to the socket |
-| TLS | bytes fed into the Session, which is NOT bytes on the wire. Wire progress is `tls_out_off`, and `woff` can reach `wbuf.size()` while nothing has left the machine |
+| TLS | bytes fed into the Session, which is not bytes on the wire. Wire progress is `tls_out_off`, and `woff` can reach `wbuf.size()` while nothing has left the machine |
 
 The write path deliberately does **not** clear `wbuf` when `woff` catches up.
 Callers do, at points they choose, and that is what keeps an upstream request
@@ -200,7 +200,7 @@ connection did nothing and the stream hung forever, on io_uring only.
 
 ### `wpending`: why streaming needs a second buffer
 
-`wbuf` is what a SEND SQE points at, so it must not move while that send is in
+`wbuf` is what a send SQE points at, so it must not move while that send is in
 flight. Newly translated stream output therefore accumulates in `wpending` and is
 moved into `wbuf` only when no send is outstanding. Past `kUrStreamBufCap` (8 MiB)
 the stream is dropped.
@@ -223,7 +223,7 @@ inflight says whether the kernel agrees yet.
 | | where |
 |---|---|
 | incremented | the three `ur_submit_*` functions, each at its tail immediately before `return true`, so an early return cannot leak a slot and strand the object forever |
-| decremented | exactly one place, `ur_on_cqe()`, and only when the completion is NOT armed: a multishot op carrying `F_MORE` is still outstanding and has not released its slot |
+| decremented | exactly one place, `ur_on_cqe()`, and only when the completion is not armed: a multishot op carrying `F_MORE` is still outstanding and has not released its slot |
 | read | `ur_maybe_free()`, the only thing allowed to conclude that freeing is safe |
 
 Multishot recv lands data in a shared provided-buffer pool, so there is no
@@ -289,7 +289,7 @@ It becomes true two ways, and only one of them is a finished answer:
 | | what happened | `close_after_resp` |
 |---|---|---|
 | **clean** | `stream_step()` saw the end of the body and the SSE translator emitted its terminal `[DONE]` | false |
-| **truncated** | the stream is being aborted, so NO `[DONE]` is emitted, deliberately: a client must see a cut-off stream instead of a fabricated clean finish. Always via `stream_truncate()` | true |
+| **truncated** | the stream is being aborted, so no `[DONE]` is emitted, deliberately: a client must see a cut-off stream instead of a fabricated clean finish. Always via `stream_truncate()` | true |
 
 So `stream_ended && close_after_resp` is the truncated case. That pairing is the
 difference between a client believing it received the whole answer and knowing
@@ -315,7 +315,7 @@ credentials, so the rules are worth stating exactly.
 
 | | why deferred | freed when |
 |---|---|---|
-| **epoll** | one event can close a pair, and a later event in the SAME batch would dereference a freed pointer | end of the current event batch, unconditionally |
+| **epoll** | one event can close a pair, and a later event in the same batch would dereference a freed pointer | end of the current event batch, unconditionally |
 | **io_uring** | a submitted SQE references the object, and the kernel does not care that we decided to close | `inflight` reaches 0, possibly several loop iterations later |
 
 ```
@@ -393,7 +393,7 @@ separately.
 **Stale-connection retry.** A pooled connection that fails before any response
 byte arrives is retry-eligible (`from_pool && !retried`): the request is resent
 on a fresh connection, and the client never sees the blip. `wbuf` is deliberately
-NOT cleared by the write path for exactly this reason, so the request survives to
+Not cleared by the write path for exactly this reason, so the request survives to
 be resent.
 
 
@@ -478,7 +478,7 @@ OpenSSL is involved. So the `Session` is a pure byte transform:
 The same four calls serve both directions and both backends. Only the handshake
 role differs (`SSL_set_accept_state` against `SSL_set_connect_state`) and what is
 verified: the client leg presents a certificate and verifies nobody, the upstream
-leg verifies the provider's chain AND its hostname, with no way to disable it.
+leg verifies the provider's chain and its hostname, with no way to disable it.
 
 
 ### 10b. Two offsets, two questions
@@ -488,7 +488,7 @@ stays intact there so a stale pooled connection can be retried.
 
 | field | answers |
 |---|---|
-| `woff` | plaintext handed to the TRANSPORT. For TLS that means fed into the Session, which has not necessarily left the machine |
+| `woff` | plaintext handed to the transport. For TLS that means fed into the Session, which has not necessarily left the machine |
 | `tls_out_off` | ciphertext that actually reached the socket |
 
 So `woff >= wbuf.size()` means "fully encrypted", never "fully sent". Ask

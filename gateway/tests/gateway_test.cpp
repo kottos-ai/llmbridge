@@ -89,7 +89,7 @@ namespace
             keep_alive);
     }
 
-    // Provider-dialect response BODIES whose assistant text is `text`.
+    // Provider-dialect response bodies whose assistant text is `text`.
     std::string anthropic_resp_body(const std::string& text)
     {
         return "{\"id\":\"msg_x\",\"model\":\"claude-3-5-sonnet\",\"stop_reason\":\"end_turn\","
@@ -172,11 +172,11 @@ namespace
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
         // Kill only the first N accepted connections after one response. Where
-        // set_close_after_first drops EVERY connection, this leaves later ones alive
+        // set_close_after_first drops every connection, this leaves later ones alive
         // and poolable, which is what a test needs when the thing under test is where
-        // a RETRIED connection ends up, not the retry itself.
+        // a retried connection ends up, not the retry itself.
         void set_close_after_first_n(int n) { _close_first_n = n; }
-        // Frame the reply with Transfer-Encoding: chunked and NO Content-Length
+        // Frame the reply with Transfer-Encoding: chunked and no Content-Length
         // what real providers actually do for a non-streaming completion, since the
         // body length is unknown when headers are sent. `n` = chunks to split into.
         void set_chunked_response(int n) { _chunked_chunks = n; }
@@ -184,7 +184,7 @@ namespace
         // 2 = send half the response, then hold the connection open forever.
         void set_stall(int mode) { _stall = mode; }
         // Answer with a complete keep-alive response the instant the connection is
-        // accepted, WITHOUT reading the request, and never read afterwards. Combined
+        // accepted, without reading the request, and never read afterwards. Combined
         // with set_small_rcvbuf() this pins the gateway's request send half-written
         // while a full response is already framed, which is what a provider doing an
         // early reject (413/401 on the headers) of a large body looks like.
@@ -199,7 +199,7 @@ namespace
             _last_request.clear();
         }
 
-        // ARMED ONLY WHILE THE LOOP BORROWS SOMETHING THE TEST OWNS; see
+        // Armed only while the loop borrows something the test owns; see
         // ProxyIT::start(). Not a blanket "join before you read": 53 of the 60 read
         // sites in this file read while the loop runs, the read itself is under _mu,
         // and a test that lends the loop nothing has nothing that can dangle.
@@ -211,8 +211,8 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             return _last_request;
         }
-        // EVERY request the upstream saw, concatenated, for leak tests that must
-        // assert a credential appeared in NO request, not merely the most recent.
+        // Every request the upstream saw, concatenated, for leak tests that must
+        // assert a credential appeared in no request, not merely the most recent.
         std::string all_requests()
         {
             check_joined("all_requests");
@@ -222,7 +222,7 @@ namespace
 
         // Re-frame a Content-Length reply as a chunked one, splitting the body.
         // Line-wise on purpose: an earlier version erased the Content-Length header
-        // by byte range, and because it is the LAST header that left a dangling CRLF
+        // by byte range, and because it is the last header that left a dangling CRLF
         // which terminated the header block early, producing a response with
         // neither framing header. Rebuild from lines so header order cannot matter.
         static std::string to_chunked(const std::string& resp, int nchunks)
@@ -477,7 +477,7 @@ namespace
             }
         }
 
-        /// One read. Whatever the gateway has produced SO FAR, which is the only way
+        /// One read. Whatever the gateway has produced so far, which is the only way
         /// to tell a stream from a buffered response: recv_all cannot distinguish
         /// "arrived in pieces" from "arrived at the end".
         std::string recv_some(int timeout_ms = 2000)
@@ -533,14 +533,14 @@ namespace
                                                 timing_headers, _policy, _strip_headers);
             if (uring_buf_count) _gw->set_uring_buf_count_for_test(uring_buf_count);
             if (_sink) _gw->set_request_sink(_sink, _sink_capture);
-            // Applied BEFORE the loop thread exists. Setting it afterwards writes
+            // Applied before the loop thread exists. Setting it afterwards writes
             // state sweep_idle reads, which is a genuine data race TSan reports.
             if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
             if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
             _proxy_port = _gw->bound_port();
-            // ARM THE READ GUARD only when the loop borrows something this test owns.
+            // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
-            // joins the loop AFTER those locals are destroyed, so a test that never
+            // joins the loop after those locals are destroyed, so a test that never
             // calls shutdown() itself frees them out from under a running thread.
             // That is a use-after-free the ordinary build cannot see; it took the
             // TSan job to catch it, and only on io_uring, where the deferred free
@@ -588,16 +588,16 @@ TEST_F(ProxyIT, SingleRequestRoundTrip)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
-// A provider may answer BEFORE it has read the whole request (an early 413/401 on
+// A provider may answer before it has read the whole request (an early 413/401 on
 // the headers of a large body), and the upstream recv is armed before the send, so
-// a complete response can be framed while our request SEND is still outstanding.
+// a complete response can be framed while our request send is still outstanding.
 // Releasing the upstream then scrubs and re-uses a buffer the transport has not
 // finished with. Under io_uring that buffer is the target of a live SQE.
 // An established client that goes quiet must eventually lose its descriptor. The
 // setup deadline does not cover this: ever_framed latches on the first request and
 // that check stops applying for the connection's life, so before this a client could
 // send one request and then hold an fd forever. That is a descriptor bound for an
-// exposed listener, NOT a load-balancing device: the default is three days, because
+// exposed listener, not a load-balancing device: the default is three days, because
 // anything short charges a reconnecting client a fresh TCP+TLS handshake to solve a
 // problem the client cannot see.
 // --pool-idle: how long a pooled upstream may sit unused before being closed. The
@@ -879,7 +879,7 @@ TEST_F(ProxyIT, ConnectionCloseHeaderClosesClientAfterResponse)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Extended correctness suite: the backend-agnostic gate that BOTH the epoll loop
+// Extended correctness suite: the backend-agnostic gate that both the epoll loop
 // and (once it lands) the io_uring loop must pass identically. Drives the public
 // Gateway over real loopback sockets: translation round-trips, large bodies,
 // pipelining, partial/trickled I/O framing, and the error/abort paths.
@@ -989,13 +989,13 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
     (void)c.recv_response();
     const std::string up = _backend.last_request();
     EXPECT_NE(up.find("x-api-key: sk-test-123\r\n"), std::string::npos) << up;
-    // The OpenAI-style header must NOT also cross: one credential, one shape.
+    // The OpenAI-style header must not also cross: one credential, one shape.
     EXPECT_EQ(up.find("Authorization:"), std::string::npos) << up;
     // Anthropic's required version header is pinned when the client has none.
     EXPECT_NE(up.find("anthropic-version: 2023-06-01\r\n"), std::string::npos) << up;
 }
 
-// BYOK, the shape the hosted pilot uses: Authorization carries a KOTTOS tenant
+// BYOK, the shape the hosted pilot uses: Authorization carries a kottos tenant
 // token that a policy reads, x-api-key carries the customer's own provider key.
 // x-api-key must win, or the tenant token goes to the provider as a credential:
 // a guaranteed 401, and our token handed to a third party.
@@ -1015,8 +1015,8 @@ TEST_P(ProxyAuth, XApiKeyWinsOverBearerSoATenantTokenNeverReachesTheProvider)
 }
 
 // The sharp edge that comes with it. Passthrough forwards the client's bytes
-// verbatim, so BOTH headers cross and the tenant token does reach the upstream.
-// A tenant token is therefore only safe in a TRANSLATING mode, where the request
+// verbatim, so both headers cross and the tenant token does reach the upstream.
+// A tenant token is therefore only safe in a translating mode, where the request
 // is rebuilt from a whitelist. Asserted so nobody points the pilot at an
 // OpenAI-compatible venue (no translation) and leaks it.
 TEST_P(ProxyAuth, PassthroughForwardsEveryHeaderIncludingATenantToken)
@@ -1035,7 +1035,7 @@ TEST_P(ProxyAuth, PassthroughForwardsEveryHeaderIncludingATenantToken)
 
 // ── Stripping headers off the upstream request ───────────────────────────────
 //
-// A hosted deployment puts its OWN tenant token in Authorization. Without this,
+// A hosted deployment puts its own tenant token in Authorization. Without this,
 // passthrough copies it to the provider verbatim and the translating path maps it
 // onto x-api-key, so a third party ends up holding our credential.
 
@@ -1056,7 +1056,7 @@ TEST_P(ProxyStrip, PassthroughDropsTheNamedHeader)
 }
 
 // The case the strip list exists for. With no x-api-key to win the contest, the
-// tenant token WOULD become the provider credential. Stripping has to happen
+// tenant token would become the provider credential. Stripping has to happen
 // before credential mapping, not just before the copy.
 TEST_P(ProxyStrip, TranslatedRequestNeverMapsAStrippedTokenOntoTheProviderKey)
 {
@@ -1074,7 +1074,7 @@ TEST_P(ProxyStrip, TranslatedRequestNeverMapsAStrippedTokenOntoTheProviderKey)
 }
 
 // Body and framing must survive untouched: a wrong Content-Length here would
-// desync the shared upstream connection for the NEXT client.
+// desync the shared upstream connection for the next client.
 TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
 {
     _strip_headers = {"x-drop-me"};
@@ -1095,7 +1095,7 @@ TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
     EXPECT_EQ(up.substr(up.size() - body.size()), body) << up;
 }
 
-// With nothing to strip, byte-forward changes exactly ONE header: Host, which must
+// With nothing to strip, byte-forward changes exactly one header: Host, which must
 // name the venue this request is being sent to and not the name the client used for
 // us. Everything else, including headers the gateway has no opinion about, survives
 // untouched.
@@ -1126,7 +1126,7 @@ TEST_P(ProxyStrip, EmptyListChangesOnlyTheHost)
     EXPECT_EQ(up.substr(up.size() - body.size()), body) << "the body was altered: " << up;
 }
 
-// THE REASON BYTE-FORWARD REWRITES HOST. This path sends the request to a different
+// The reason a byte-forward rewrites `Host`. This path sends the request to a different
 // origin than the client addressed, so forwarding the client's Host names a host the
 // provider was never asked about: a CDN-fronted or multi-vhost provider misroutes it
 // or refuses it. The translating path has always emitted the venue's Host; this makes
@@ -1180,7 +1180,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStrip,
 //
 // Several providers serve an OpenAI-compatible API below the root (Groq at
 // /openai, OpenRouter at /api), so a venue may carry a prefix. It is joined in
-// front of whatever target the request would otherwise use, on BOTH legs: the
+// front of whatever target the request would otherwise use, on both legs: the
 // client's own target when forwarding bytes, and ours when translating.
 
 class ProxyBasePath : public ProxyIT,
@@ -1236,10 +1236,10 @@ TEST_P(ProxyBasePath, NoBasePathChangesNothing)
         << _backend.last_request();
 }
 
-// FAIL CLOSED. An absolute-form target ("POST http://evil/x") is a request we
+// Fail closed. An absolute-form target ("POST http://evil/x") is a request we
 // cannot prefix without deciding what it means, and deciding wrongly sends a
 // caller's credential to a host the operator never listed. Refuse, and make sure
-// NOTHING reached the upstream: the pool means the next request on that
+// Nothing reached the upstream: the pool means the next request on that
 // connection belongs to someone else.
 TEST_P(ProxyBasePath, ANonOriginFormTargetIsRefusedAndNeverForwarded)
 {
@@ -1264,15 +1264,15 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyBasePath,
 // ── Content-Length disagreeing with the actual body ─────────────────────────
 //
 // The parser-level cases live in HttpDesync (non-numeric, chunked+CL, conflicting
-// duplicates). These are the END-TO-END ones: what a CLIENT sees, and what the
-// NEXT client sees, when the bytes on the wire do not match the declared length.
+// duplicates). These are the END-TO-END ones: what a client sees, and what the
+// Next client sees, when the bytes on the wire do not match the declared length.
 // The second question is the dangerous one, because a keep-alive upstream is
 // shared, so one response's residue is the next customer's problem.
 
 TEST_P(ProxyAuth, UpstreamBodyShorterThanContentLengthNeverBecomesASuccess)
 {
     // The provider declares 4096 bytes, sends a handful, then closes. The client
-    // must NOT receive a 200 carrying a truncated body: a half answer presented as
+    // must not receive a 200 carrying a truncated body: a half answer presented as
     // a whole one is a silent wrong result for an agent loop.
     std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                        "Content-Length: 4096\r\n\r\n{\"partial\":true}";
@@ -1291,9 +1291,9 @@ TEST_P(ProxyAuth, UpstreamBodyShorterThanContentLengthNeverBecomesASuccess)
 
 TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest)
 {
-    // The provider declares N and sends N PLUS trailing bytes on a keep-alive
+    // The provider declares N and sends N plus trailing bytes on a keep-alive
     // connection. The extra must never survive into the pool: the next client to
-    // reuse that connection would read it as the head of ITS response, which is a
+    // reuse that connection would read it as the head of its response, which is a
     // cross-client desync and the most severe failure this codebase can have.
     const std::string body = R"({"content":[{"type":"text","text":"ok"}]})";
     std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -1316,26 +1316,26 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
     const std::string r2 = c2.recv_response(4000);
     ASSERT_FALSE(r2.empty()) << "second client got nothing; the pooled connection "
                                 "was left unusable by the first response";
-    // WITHOUT THIS the test is vacuous, and it was: it passed with the pooled
-    // rbuf.clear() deleted, because the second request had opened a FRESH upstream
+    // Without this the test is vacuous, and it was: it passed with the pooled
+    // rbuf.clear() deleted, because the second request had opened a fresh upstream
     // and never touched the poisoned one. Assert the reuse actually happened.
     // Reuse is asserted after the join at the end: stats() belongs to the loop
     // thread, and polling it live is a data race TSan reports.
-    // THE CANARY MUST CONTAIN CRLF, and the first version did not. Residue with
-    // no space and no CRLF is silently ABSORBED into the next response's status
+    // The canary must contain CRLF, and the first version did not. Residue with
+    // no space and no CRLF is silently absorbed into the next response's status
     // line, because parse_response() finds the first space anywhere in the head
     // and reads three digits after it; it never checks the line begins with
     // "HTTP/". So "TRAILING-GARBAGE...POOL" merged into "...POOLHTTP/1.1 200 OK",
-    // yielded status 200, and the test passed with the pooled clear DELETED.
+    // yielded status 200, and the test passed with the pooled clear deleted.
     // Residue carrying CRLF cannot be absorbed that way, so it reaches the header
     // parser and the message is refused, which is the difference this asserts.
     //
     // It proves the observable contract: an over-long upstream body does not stop
-    // the next client on a REUSED connection from getting a correct answer.
+    // the next client on a reused connection from getting a correct answer.
     // upstream_reused is asserted above so the reuse really happens.
     //
-    // It does NOT prove that ep/ur_release_upstream's rbuf.clear() is what
-    // protects that. Deleting BOTH clears leaves this test passing and the second
+    // It does not prove that ep/ur_release_upstream's rbuf.clear() is what
+    // protects that. Deleting both clears leaves this test passing and the second
     // client still receiving a 200, so some other part of the path is keeping the
     // connection sane. Which part is not yet identified. The clear is obviously
     // right and stays, but calling this test its guard would be a claim the
@@ -1355,7 +1355,7 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
 TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
 {
     // The classic smuggling shape from the other direction: the client declares N
-    // and sends N plus something that looks like another request. Exactly ONE
+    // and sends N plus something that looks like another request. Exactly one
     // request may reach the provider.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam());
@@ -1376,13 +1376,13 @@ TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
 
 TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
 {
-    // A keep-alive upstream goes back into the pool holding the REBUILT REQUEST,
+    // A keep-alive upstream goes back into the pool holding the rebuilt request,
     // credential included, and idles there for up to 30 s before being handed to
     // whichever client asks next. Scrubbing it is what stops one customer's API
     // key sitting in a buffer another customer's request will reuse.
     //
     // A mutation sweep found secure_clear() could be deleted with nothing failing:
-    // every existing auth test inspects what reached the UPSTREAM, and none looks
+    // every existing auth test inspects what reached the upstream, and none looks
     // at what stays behind. This looks at what stays behind.
     static constexpr const char* kCanary = "sk-canary-DO-NOT-LEAVE-IN-THE-POOL";
 
@@ -1447,7 +1447,7 @@ TEST_P(ProxyAuth, NoCredentialMeansNoAuthHeaderUpstream)
 
 TEST_P(ProxyAuth, UnrelatedClientHeadersDoNotCross)
 {
-    // WHITELIST semantics: a rebuilt request must not echo arbitrary client
+    // Whitelist semantics: a rebuilt request must not echo arbitrary client
     // headers; that is the smuggling surface the rebuild exists to close.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, TranslateMode::Anthropic, GetParam());
@@ -1501,9 +1501,9 @@ TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
     EXPECT_NE(up.find("Authorization: Bearer co-test-9\r\n"), std::string::npos) << up;
 }
 
-// SECURITY: a credential value containing a BARE CR (not CRLF) must not be able
+// SECURITY: a credential value containing a bare CR (not CRLF) must not be able
 // to inject a header line into the rebuilt upstream request. This matters more
-// than usual here because upstream connections are POOLED AND SHARED across
+// than usual here because upstream connections are pooled and shared across
 // clients: smuggling on one is a cross-client request/response-splitting vector,
 // not just a self-inflicted malformed request.
 TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
@@ -1515,7 +1515,7 @@ TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
     ASSERT_TRUE(c.send(openai_request_hdrs(
         "hi", "Authorization: Bearer sk\rX-Smuggled: yes\r\n")));
     (void)c.recv_response();
-    // Fails CLOSED: 400 to the client, and the upstream is never contacted at all.
+    // Fails closed: 400 to the client, and the upstream is never contacted at all.
     EXPECT_EQ(_backend.last_request().find("X-Smuggled"), std::string::npos)
         << _backend.last_request();
     EXPECT_TRUE(_backend.last_request().empty()) << "request reached upstream despite bad credential";
@@ -1574,7 +1574,7 @@ TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
 
 // ── Credential-leak audit ────────────────────────────────────────────────────
 // The question these answer: can one client's key ever reach the provider on a
-// DIFFERENT client's request? Upstream connections are pooled and shared, so this
+// Different client's request? Upstream connections are pooled and shared, so this
 // is not obvious by inspection, so assert it.
 
 TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
@@ -1589,7 +1589,7 @@ TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
         ASSERT_TRUE(a.send(openai_request_hdrs("one", "Authorization: Bearer sk-CLIENT-A\r\n")));
         ASSERT_FALSE(a.recv_response().empty());
     }
-    // Client B sends NO credential and very likely reuses A's pooled connection.
+    // Client B sends no credential and very likely reuses A's pooled connection.
     {
         Client b;
         ASSERT_TRUE(b.connect(_proxy_port));
@@ -1598,7 +1598,7 @@ TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
     }
     shutdown();
 
-    // A's key must appear EXACTLY ONCE across everything the provider ever saw
+    // A's key must appear exactly once across everything the provider ever saw
     // on A's own request, never re-sent on B's.
     const std::string all = _backend.all_requests();
     size_t occurrences = 0;
@@ -1668,7 +1668,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyAuth,
                          });
 
 // ── Chunked non-streaming responses ──────────────────────────────────────────
-// REGRESSION: real providers return non-streaming completions with
+// Regression: real providers return non-streaming completions with
 // Transfer-Encoding: chunked and no Content-Length (Anthropic does over HTTP/1.1;
 // it is invisible over HTTP/2, which has native framing). Every mock in this file
 // used to reply with Content-Length, so the whole-body path's inability to read a
@@ -1717,7 +1717,7 @@ TEST_P(ProxyChunkedResp, PooledConnectionSurvivesAChunkedResponse)
 {
     // The end of a chunked message is found by decoding, not by Content-Length. If
     // total_len were wrong, leftover bytes would poison the pooled connection and
-    // the SECOND request would mis-frame, so two requests is the real test.
+    // the second request would mis-frame, so two requests is the real test.
     const auto [backend, nchunks] = GetParam();
     _backend.set_response(http_ok(anthropic_resp_body("again")));
     _backend.set_chunked_response(nchunks);
@@ -1976,7 +1976,7 @@ TEST_F(ProxyIT, EmptyContentTranslateRoundTrip)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Backend parity: the core scenarios must behave identically on epoll AND
+// Backend parity: the core scenarios must behave identically on epoll and
 // io_uring (Phase 1). Each test runs under both; if io_uring is unavailable the
 // Gateway falls back to epoll, so this is always safe to instantiate.
 // ════════════════════════════════════════════════════════════════════════════
@@ -2320,7 +2320,7 @@ TEST_P(ProxyBackend, ShutdownWithManyInFlightIsClean)
     SUCCEED();
 }
 
-// ── Bug-1 regression (heavy): an upstream that WILL close must never be pooled or
+// ── Bug-1 regression (heavy): an upstream that will close must never be pooled or
 // reused. Before the fix, io_uring pooled the corpse and the next request failed.
 // 300/200 iterations so a single reuse-of-corpse trips an assertion.
 TEST_P(ProxyBackend, StaleUpstreamNeverReused_ClientClose)
@@ -2377,14 +2377,14 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u); // stale connections recovered, never surfaced
     // Both backends keep a recv armed on idle pooled upstreams, so between sequential
-    // clients they EVICT the dead connection on EOF before reuse (occasionally retry
+    // clients they evict the dead connection on EOF before reuse (occasionally retry
     // if the timing races). Either recovery is correct; we only require every
     // request was served. The pipelined variant below forces the retry path itself.
 }
 
-// Pipelined variant: two requests on ONE keep-alive connection. The 2nd is
-// forwarded by reusing the pooled (already-dropped) upstream INLINE, before the
-// event loop can evict it, so BOTH backends are forced through the retry path.
+// Pipelined variant: two requests on one keep-alive connection. The 2nd is
+// forwarded by reusing the pooled (already-dropped) upstream inline, before the
+// event loop can evict it, so both backends are forced through the retry path.
 TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
@@ -2400,7 +2400,7 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u); // both requests served despite the dropped conn
     // Recovery mechanism: epoll only processes the dead conn's EOF at epoll_wait
-    // after the inline reuse, so it deterministically RETRIES. io_uring's always-
+    // after the inline reuse, so it deterministically retries. io_uring's always-
     // armed recv may instead evict the dead conn first (a completion-order race), so
     // we assert the retry path only where it's deterministic.
     if (GetParam() == llmbridge::IoBackend::Epoll)
@@ -2490,7 +2490,7 @@ TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
     EXPECT_EQ(llmbridge::Connection::s_live.load(), base); // no leak across workers
 }
 
-// Translation parity across BOTH backends AND all three dialects (2 x 3 = 6).
+// Translation parity across both backends and all three dialects (2 x 3 = 6).
 class ProxyXlate
     : public ProxyIT,
       public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, TranslateMode>>
@@ -2593,7 +2593,7 @@ namespace
                sse_chunk_encode(anthropic_sse_events(), chunk);
     }
 
-    // An Anthropic event stream that CALLS TOOLS: a text block first (so the
+    // An Anthropic event stream that calls tools: a text block first (so the
     // Anthropic block index and the OpenAI tool ordinal diverge), then two tool
     // blocks with fragmented arguments.
     std::string anthropic_sse_tool_events()
@@ -2671,7 +2671,7 @@ namespace
     }
 } // namespace
 
-// The streaming correctness tests run on BOTH backends (epoll + io_uring). With
+// The streaming correctness tests run on both backends (epoll + io_uring). With
 // io_uring unavailable the Gateway falls back to epoll, so this is always safe.
 class ProxyStream : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
 
@@ -2768,7 +2768,7 @@ TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
     shutdown();
 }
 
-// Corrupt chunked framing mid-stream must NOT fabricate a clean finish: the
+// Corrupt chunked framing mid-stream must not fabricate a clean finish: the
 // client sees the partial content and an aborted stream (no [DONE]).
 TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
 {
@@ -2791,7 +2791,7 @@ TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
     EXPECT_EQ(_gw->stats().requests, 0u); // ...not as a served request
 }
 
-// A streaming REQUEST whose upstream answers with a plain JSON completion (no
+// A streaming request whose upstream answers with a plain JSON completion (no
 // event-stream): the head-peek must fall through to the whole-body path.
 TEST_P(ProxyStream, StreamRequestWithNonStreamingUpstreamFallsBack)
 {
@@ -2833,7 +2833,7 @@ TEST_P(ProxyStream, ClientDisconnectsMidStreamSurvives)
 
 // ── Upstream model/provider errors are relayed, not masked ─────────────────
 // A provider failure (rate limit, overloaded GPU, context length, auth) must
-// reach the client with the upstream's OWN status code and message.
+// reach the client with the upstream's own status code and message.
 class ProxyUpstreamError
     : public ProxyIT,
       public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, int>>
@@ -3036,16 +3036,16 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Upstream connection REUSE across streaming requests.
+// Upstream connection reuse across streaming requests.
 //
 // A streaming request used to close its upstream unconditionally at stream end,
 // so every stream paid a fresh connect. Measured at 4096 concurrent streams that
 // was 706 connects/sec and the single largest component of time-to-first-token
-// on BOTH backends. The upstream is now returned to the keep-alive pool when the
+// on both backends. The upstream is now returned to the keep-alive pool when the
 // framing proves that is safe.
 //
 // "Safe" is conjunctive and each clause has its own test below, because the
-// failure mode of getting this wrong is silent corruption of the NEXT request's
+// failure mode of getting this wrong is silent corruption of the next request's
 // response instead of a visible error.
 // ════════════════════════════════════════════════════════════════════════════
 class ProxyStreamPool : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
@@ -3055,7 +3055,7 @@ TEST_P(ProxyStreamPool, ReusesUpstreamAcrossSequentialStreams)
     _backend.set_response(sse_chunked_response(4096)); // chunked + Connection: keep-alive
     start(0, true, TranslateMode::Anthropic, GetParam());
 
-    // Three sequential streams, each on its own CLIENT connection: only the
+    // Three sequential streams, each on its own client connection: only the
     // upstream side should be reused.
     for (int i = 0; i < 3; ++i)
     {
@@ -3138,7 +3138,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolACloseDelimitedStream)
     _backend.set_close_after_first(true); // close-delimited: EOF is what ends it
     start(0, true, TranslateMode::Anthropic, GetParam());
 
-    // TWO requests: with only one, upstream_reused is trivially 0 and the test
+    // Two requests: with only one, upstream_reused is trivially 0 and the test
     // proves nothing. The second request is what would consume a wrongly-pooled
     // connection.
     for (int i = 0; i < 2; ++i)
@@ -3230,7 +3230,7 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
         cs[i]->close();
     }
 
-    shutdown(); // join BEFORE reading stats(); the loop owns it
+    shutdown(); // join before reading stats(); the loop owns it
     const uint64_t enobufs = _gw->stats().uring_enobufs;
     EXPECT_EQ(_gw->stats().errors, 0u) << "buffer starvation must not be reported as an error";
     EXPECT_EQ(_gw->stats().requests, static_cast<uint64_t>(kClients));
@@ -3316,7 +3316,7 @@ TEST_P(ProxyTiming, BodyIsUnchangedWhenHeadersAreOn)
 TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
 {
     // A stream cannot know total gateway time when headers go out, so it must
-    // report TTFB instead, and must NOT claim a gateway-total it cannot have.
+    // report TTFB instead, and must not claim a gateway-total it cannot have.
     _backend.set_response(sse_chunked_response(64));
     start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
@@ -3331,7 +3331,7 @@ TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
 
 TEST_P(ProxyTiming, SeqIsUniqueAndIncreasingUnderConcurrency)
 {
-    // The sequencer property: a TOTAL order that needs no clock. Driven from
+    // The sequencer property: a total order that needs no clock. Driven from
     // several client threads at once, because the counter is shared across workers
     // and a non-atomic increment would hand two requests the same number, and the one
     // failure this must never have.
@@ -3416,7 +3416,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyTiming,
                          });
 
 // ── Tool calling through the gateway ────────────────────────────────────────
-// The translator tests prove the shapes. These prove the shapes SURVIVE the
+// The translator tests prove the shapes. These prove the shapes survive the
 // gateway: framing, the rebuilt upstream request, auth-header injection, and both
 // event-loop backends. A tool schema is the largest and most escape-heavy thing a
 // client ever sends, so it is also a good stress on the request path.
@@ -3525,7 +3525,7 @@ TEST_P(ProxyTools, ToolResultTurnForwardsCorrectly)
 
 TEST_P(ProxyTools, StreamingRequestWithToolsStillStreams)
 {
-    // Tools in a STREAMING request must not break the SSE path. (Tool-call DELTAS
+    // Tools in a streaming request must not break the SSE path. (Tool-call deltas
     // are not implemented yet; this asserts the stream still works when tools are
     // merely declared, which is the case that would silently regress.)
     _backend.set_response(sse_chunked_response(64));
@@ -3580,7 +3580,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyTools,
 // ── Streamed tool calls through the gateway ─────────────────────────────────
 // The translator tests prove the chunk shapes; these prove they survive the
 // gateway pump: chunked decode, back-pressure buffers, and both event loops.
-// Chunk sizes are varied because the tool events are LONGER than text events and
+// Chunk sizes are varied because the tool events are longer than text events and
 // so more likely to straddle a chunk boundary mid-JSON.
 class ProxyToolStream
     : public ProxyIT,
@@ -3649,7 +3649,7 @@ namespace
             // Copy, never retain: `head` dies with the call, and the assertions run
             // after the loop thread is joined.
             seen_head.assign(f.head.data(), f.head.size());
-            // Mixed case AND no colon: the two spellings find_header used to fail
+            // Mixed case and no colon: the two spellings find_header used to fail
             // silently on. A policy reads headers exactly like this.
             const std::string_view auth = llmbridge::net::http::find_header(f.head, "Authorization");
             seen_auth.assign(auth.data(), auth.size());
@@ -3706,7 +3706,7 @@ TEST_P(ProxyPolicy, AllowForwardsUnchanged)
 }
 
 // The one that matters. A refusal must be terminal. Asserting only "the client
-// got a 401" would pass even if the request had ALSO gone to the provider.
+// got a 401" would pass even if the request had also gone to the provider.
 TEST_P(ProxyPolicy, DenyAnswersTheClientAndContactsNoUpstream)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 401, .reason = "no token"}};
@@ -3750,7 +3750,7 @@ TEST_P(ProxyPolicy, ValueInitialisedDecisionRefuses)
 }
 
 // An unrenderable status must not become a misleading reply, and must not become
-// an ALLOW either. This path used to emit "502 Bad Gateway" for an auth refusal.
+// an allow either. This path used to emit "502 Bad Gateway" for an auth refusal.
 TEST_P(ProxyPolicy, OutOfRangeDenyStatusStillRefuses)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 9000, .reason = "bad status"}};
@@ -3801,14 +3801,14 @@ TEST_P(ProxyPolicy, FactsCarryTheHeadersAndTheBodySize)
 
 // ── Routing across several upstreams ─────────────────────────────────────────
 //
-// The gateway holds a table and the POLICY picks the index. llmbridge never chooses,
+// The gateway holds a table and the policy picks the index. llmbridge never chooses,
 // because choosing needs measurements it does not collect; what it owns is that the
 // choice is honoured exactly, on both backends, including which pool a connection
 // goes back to.
 
 namespace
 {
-    /// Answers with its own name, so a test can tell WHICH venue served a request.
+    /// Answers with its own name, so a test can tell which venue served a request.
     class NamedBackend
     {
       public:
@@ -3841,7 +3841,7 @@ namespace
         {
             return {.allow = true, .upstream_index = _idx.load(std::memory_order_relaxed)};
         }
-        /// ATOMIC because a test calls this from the main thread while the loop
+        /// Atomic because a test calls this from the main thread while the loop
         /// thread is serving: a plain int here is a genuine data race and TSan says
         /// so. Relaxed is enough, since the test synchronises on the response it
         /// waits for and only the value itself crosses threads.
@@ -3881,7 +3881,7 @@ class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
     bool _shut = false;
 };
 
-// THE FEATURE. Two venues, and the policy decides which one serves each request.
+// The feature. Two venues, and the policy decides which one serves each request.
 TEST_P(ProxyRoute, ThePolicyChoosesWhichVenueServes)
 {
     NamedBackend a, b;
@@ -3911,7 +3911,7 @@ TEST_P(ProxyRoute, ThePolicyChoosesWhichVenueServes)
     b.stop();
 }
 
-// THE ONE THAT PROTECTS CREDENTIALS. Pools are per venue, so a keep-alive connection
+// The one that protects credentials. Pools are per venue, so a keep-alive connection
 // to one provider must never be handed to a request bound for another: that would put
 // the request, and its credential, on a socket to the wrong company. Drive each venue
 // twice so both pools are warm and a cross-pool hand-out would show up.
@@ -3970,8 +3970,8 @@ TEST_P(ProxyRoute, AnUnsetOrOutOfRangeIndexMeansTheFirstUpstream)
     b.stop();
 }
 
-// A stale pooled connection is resent on a FRESH one, and that retry must reach the
-// SAME venue. Rerouting it would put a request already translated for this dialect,
+// A stale pooled connection is resent on a fresh one, and that retry must reach the
+// Same venue. Rerouting it would put a request already translated for this dialect,
 // and carrying this venue's credential, on a socket to a different company. Nothing
 // covered this until a mutation that hard-coded the retry to venue 0 survived.
 TEST_P(ProxyRoute, ARetryStaysOnTheSameVenue)
@@ -3979,12 +3979,12 @@ TEST_P(ProxyRoute, ARetryStaysOnTheSameVenue)
     NamedBackend a, b;
     a.start("alpha");
     b.start("bravo");
-    b.close_first_connection_only(); // its FIRST pooled connection goes stale
+    b.close_first_connection_only(); // its first pooled connection goes stale
     PinnedPolicy pol(1);
     start({{"127.0.0.1", a.port(), false, "", TranslateMode::None, ""},
            {"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol);
 
-    // PIPELINED on one connection, as ProxyBackend.RetriesOnStalePooledConnection does:
+    // Pipelined on one connection, as ProxyBackend.RetriesOnStalePooledConnection does:
     // the second request reuses the pooled upstream before the loop has noticed it
     // died, which is the only way to reach the retry path deterministically. Two
     // separate connections let the gateway evict the corpse first and never retry.
@@ -3995,8 +3995,8 @@ TEST_P(ProxyRoute, ARetryStaysOnTheSameVenue)
     EXPECT_NE(c.recv_response().find("bravo"), std::string::npos) << "response 2";
     c.close();
 
-    // AND WHERE THE RETRIED CONNECTION LANDED. It is physically a socket to bravo, so
-    // if it is released into alpha's pool the damage appears on the NEXT request to
+    // And where the retried connection landed. It is physically a socket to bravo, so
+    // if it is released into alpha's pool the damage appears on the next request to
     // alpha, which would be answered by bravo. That is cross-venue contamination, and
     // it is invisible to any assertion about the retry itself.
     pol.set(0);
@@ -4024,9 +4024,9 @@ TEST_P(ProxyRoute, ARetryStaysOnTheSameVenue)
     b.stop();
 }
 
-// REGRESSION: the single-upstream constructor must carry sni_host into the table.
+// Regression: the single-upstream constructor must carry sni_host into the table.
 // It once read tls.sni_host and std::move(tls)'d in the same argument list, and with
-// GCC's evaluation order the move ran first, so the string arrived EMPTY and every
+// GCC's evaluation order the move ran first, so the string arrived empty and every
 // single-upstream TLS gateway verified against no hostname. Build-agnostic on purpose:
 // the field is copied whether or not TLS is compiled, so upstream_tls stays false here
 // and the test needs no backend, no handshake, and no TLS build.
@@ -4046,7 +4046,7 @@ TEST_P(ProxyRoute, SingleUpstreamConstructorKeepsSniHost)
 // ── Failover: the policy reacts to a venue that did not answer ───────────────
 //
 // llmbridge supplies the mechanism only. It never decides that a venue is unhealthy,
-// because health is measured and it measures nothing; the DEFAULT on_failure never
+// because health is measured and it measures nothing; the default on_failure never
 // retries, so a policy that ignores failures behaves exactly as before the hook.
 
 namespace
@@ -4071,7 +4071,7 @@ namespace
             return {.retry = true, .upstream_index = _order[static_cast<size_t>(f.attempt)]};
         }
 
-        // Atomic: production shares ONE policy across every worker, so these are
+        // Atomic: production shares one policy across every worker, so these are
         // written from several loop threads at once. TSan reports the alternative.
         std::atomic<int> failures{0};
         std::atomic<int> last_failed{-1};
@@ -4096,7 +4096,7 @@ namespace
     };
 } // namespace
 
-// THE FEATURE. Venue 0 is a closed port, so the connect fails; the policy names venue
+// The feature. Venue 0 is a closed port, so the connect fails; the policy names venue
 // 1 and the client is served without ever seeing the failure.
 TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
 {
@@ -4123,7 +4123,7 @@ TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
     good.stop();
 }
 
-// THE DEFAULT. A policy that does not override on_failure must behave exactly as the
+// The default. A policy that does not override on_failure must behave exactly as the
 // gateway did before the hook existed: the client sees the error.
 TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
 {
@@ -4145,7 +4145,7 @@ TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
     good.stop();
 }
 
-// A chain must be BOUNDED. A policy that always names another venue would otherwise
+// A chain must be bounded. A policy that always names another venue would otherwise
 // walk the table on every failure, turning one dead provider into a latency multiplier.
 TEST_P(ProxyRoute, TheFailoverChainIsBounded)
 {
@@ -4184,8 +4184,8 @@ TEST_P(ProxyRoute, RetryingTheSameVenueIsRefused)
     good.stop();
 }
 
-// THE ONE THAT MAKES IT MORE THAN A RECONNECT. Failing over to a venue with a
-// DIFFERENT dialect means the request must be REBUILT, not resent: the bytes queued
+// The one that makes it more than A reconnect. Failing over to a venue with a
+// Different dialect means the request must be rebuilt, not resent: the bytes queued
 // for the first venue were translated for its API. Venue 0 is a dead Anthropic
 // endpoint, venue 1 an OpenAI-compatible one, so the retry must arrive untranslated.
 TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
@@ -4206,7 +4206,7 @@ TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
     shutdown();
 
     const std::string up = plain.last_request();
-    // Passthrough: the client's own OpenAI request, NOT the /v1/messages rebuild that
+    // Passthrough: the client's own OpenAI request, not the /v1/messages rebuild that
     // was queued for the venue that failed.
     EXPECT_NE(up.find("POST /v1/chat/completions"), std::string::npos) << up;
     EXPECT_EQ(up.find("/v1/messages"), std::string::npos)
@@ -4215,7 +4215,7 @@ TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
     plain.stop();
 }
 
-// The DEFAULT on_failure must never retry. Pinned to venue 1 (dead) with venue 0
+// The default on_failure must never retry. Pinned to venue 1 (dead) with venue 0
 // healthy, so a default that returned "retry venue 0" would quietly succeed; the
 // earlier version of this test pinned to venue 0 and could not tell the difference.
 TEST_P(ProxyRoute, TheDefaultOnFailureNeverRetries)
@@ -4238,7 +4238,7 @@ TEST_P(ProxyRoute, TheDefaultOnFailureNeverRetries)
     healthy.stop();
 }
 
-// The policy must be told WHICH venue failed, or its health tracking attributes the
+// The policy must be told which venue failed, or its health tracking attributes the
 // outage to the wrong provider and ejects the innocent one.
 TEST_P(ProxyRoute, ThePolicyIsToldWhichVenueFailed)
 {
@@ -4258,8 +4258,8 @@ TEST_P(ProxyRoute, ThePolicyIsToldWhichVenueFailed)
     healthy.stop();
 }
 
-// Two requests on ONE keep-alive connection, both failing over. Without a reset
-// between them the second reuses the FIRST request's saved bytes, so the provider is
+// Two requests on one keep-alive connection, both failing over. Without a reset
+// between them the second reuses the first request's saved bytes, so the provider is
 // asked the first question twice and the client gets an answer to a question it did
 // not ask. Distinct bodies are what makes that visible.
 TEST_P(ProxyRoute, EachRequestGetsItsOwnFailoverBudgetAndBytes)
@@ -4281,7 +4281,7 @@ TEST_P(ProxyRoute, EachRequestGetsItsOwnFailoverBudgetAndBytes)
     c.close();
     shutdown();
 
-    // The SECOND request must have carried its own body upstream.
+    // The second request must have carried its own body upstream.
     const std::string up = good.last_request();
     EXPECT_NE(up.find("SECOND-BODY"), std::string::npos)
         << "the second failover resent the FIRST request: " << up;
@@ -4329,7 +4329,7 @@ TEST_P(ProxyRoute, AStreamingClientIsNeverFailedOver)
     sse.stop();
 }
 
-// STREAMING, BEFORE THE FIRST BYTE. A streaming request that cannot even reach its
+// Streaming, before the first byte. A streaming request that cannot even reach its
 // venue is an ordinary failure: nothing has been sent to the client, so it fails over
 // and the client gets a complete stream from the healthy venue. This is the case that
 // matters for a voice agent, where a provider blip before the first token is the
@@ -4357,7 +4357,7 @@ TEST_P(ProxyRoute, AStreamingRequestFailsOverBeforeItsFirstByte)
     sse.stop();
 }
 
-// MULTITHREADING. Production runs one Gateway per worker, all sharing ONE policy, so
+// Multithreading. Production runs one Gateway per worker, all sharing one policy, so
 // the hook is called concurrently from several loop threads. The gateway adds no
 // locking around the seam by design, which makes this the shape a data race would
 // appear in; run it under TSan and the counters below must still add up exactly.
@@ -4375,7 +4375,7 @@ TEST_P(ProxyRoute, ConcurrentWorkersShareOnePolicyAndAllFailOver)
     std::vector<uint16_t> ports;
     for (int i = 0; i < kWorkers; ++i)
     {
-        // Separate listeners, not SO_REUSEPORT: the point here is one POLICY
+        // Separate listeners, not SO_REUSEPORT: the point here is one policy
         // shared by several loop threads, and separate ports make which worker served
         // a request irrelevant instead of racy.
         gws.push_back(std::make_unique<Gateway>(
@@ -4477,7 +4477,7 @@ namespace
     };
 } // namespace
 
-// THE ROUND TRIP. decide() tags the request, the venue refuses the connect, and
+// The round trip. decide() tags the request, the venue refuses the connect, and
 // on_failure() must receive that exact value.
 TEST_P(ProxyRoute, TheTagSetAtDecideArrivesAtTheFailure)
 {
@@ -4500,7 +4500,7 @@ TEST_P(ProxyRoute, TheTagSetAtDecideArrivesAtTheFailure)
     good.stop();
 }
 
-// One request, several failures: attempt 0 and attempt 1 are the SAME decision, so
+// One request, several failures: attempt 0 and attempt 1 are the same decision, so
 // they must carry the same tag. A tag that mutated across the chain would resolve
 // the second failure against the wrong routing context.
 TEST_P(ProxyRoute, TheTagIsStableAcrossTheFailoverChain)
@@ -4527,7 +4527,7 @@ TEST_P(ProxyRoute, TheTagIsStableAcrossTheFailoverChain)
     good.stop();
 }
 
-// Two requests on ONE keep-alive connection. The second decision's tag must replace
+// Two requests on one keep-alive connection. The second decision's tag must replace
 // the first, or a failure on request 2 is resolved against request 1's context: the
 // same staleness bug the per-request failover reset already guards for the bytes.
 TEST_P(ProxyRoute, AKeepAliveConnectionCarriesEachRequestsOwnTag)
@@ -4693,7 +4693,7 @@ TEST_P(ProxyRoute, TheSinkSeesGatewayGeneratedErrorReplies)
     EXPECT_EQ(recs[0].cap[0], "");
 }
 
-// After a failover the record must describe the venue that SERVED, the attempts it
+// After a failover the record must describe the venue that served, the attempts it
 // took, and the tag of the decision, or cost attribution lands on the dead venue.
 TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
 {
@@ -4721,7 +4721,7 @@ TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
 }
 
 // Two requests on one keep-alive connection: one record each, with each request's
-// OWN captured headers, because the capture is per request, not per connection.
+// Own captured headers, because the capture is per request, not per connection.
 TEST_P(ProxyRoute, AKeepAliveConnectionEmitsOneRecordPerRequest)
 {
     NamedBackend b;
@@ -4753,7 +4753,7 @@ TEST_P(ProxyRoute, AKeepAliveConnectionEmitsOneRecordPerRequest)
     EXPECT_NE(recs[0].r.seq, recs[1].r.seq);
 }
 
-// A malformed request fails BEFORE framing, so it never reaches the per-request
+// A malformed request fails before framing, so it never reaches the per-request
 // capture. Its 400's record must be empty, never the previous request's identity:
 // billing a customer for a stranger's garbage is the bug this test pins.
 TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
@@ -4787,7 +4787,7 @@ TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
     EXPECT_EQ(recs[1].r.tag, 0u) << "the 400 inherited the previous request's tag";
 }
 
-// A request that OMITS a captured header is the common case, and find_header returns
+// A request that omits a captured header is the common case, and find_header returns
 // a null view for it. Copying 0 bytes from a null pointer is undefined behaviour even
 // though it "works": UBSan flags it, and no test sent such a request until this one.
 TEST_P(ProxyRoute, ACaptureConfiguredButAbsentIsEmptyAndNotUndefined)
@@ -4844,7 +4844,7 @@ TEST_P(ProxyRoute, ACapturedHeaderIsBoundedAtTheCap)
 
 // A finished stream is a completion like any other: one record, streamed flag,
 // the provider's own token counts, t4 at the response head, and ts_first_token at
-// the first CONTENT token, which for a real stream lands at or after the head.
+// the first content token, which for a real stream lands at or after the head.
 TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
 {
     RecordingSink sink;
@@ -4891,7 +4891,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyPolicy,
 
 // ── Byte-forward streaming: an OpenAI-compatible venue needs no translator ─────
 //
-// Until 2026-08-21 the streaming pump was entered for the Anthropic path ONLY, so a
+// Until 2026-08-21 the streaming pump was entered for the Anthropic path only, so a
 // passthrough SSE response was framed as a whole body and handed over at the end.
 // Measured against an upstream finishing at 1000 ms, the client's first byte arrived
 // at 1003 ms instead of 200 ms. That is the default deployment shape and the exact
@@ -5024,7 +5024,7 @@ TEST_P(ProxyForwardStream, WithoutIncludeUsageNothingIsInventedFromNothing)
 
 TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
 {
-    // The retained tail is sized by what must FIT. A real OpenAI usage chunk carries
+    // The retained tail is sized by what must fit. A real OpenAI usage chunk carries
     // system_fingerprint, service_tier and both *_details blocks, and is followed by
     // data: [DONE], which puts the counts several hundred bytes from the end. This
     // pins that sizing against a realistic chunk instead of against arithmetic in a
@@ -5070,7 +5070,7 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
 
 // ── Bedrock: signed, per request, over the bytes we actually send ──────────────
 //
-// The signature ARITHMETIC is proven in net_sigv4_test against AWS's published
+// The signature arithmetic is proven in net_sigv4_test against AWS's published
 // vectors. What is proven here is the wiring: that the model reaches the path, the
 // body loses it, the credential is consumed and not forwarded, and both event loops
 // behave identically.
@@ -5113,7 +5113,7 @@ class ProxyBedrock : public ProxyIT,
     }
 };
 
-// Signing needs OpenSSL, so the four tests that expect a SIGNED request only mean
+// Signing needs OpenSSL, so the four tests that expect a signed request only mean
 // anything in a TLS build. The dependency-free build gets its own case below, which
 // asserts the behaviour that matters there: refuse, never send unsigned.
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -5150,12 +5150,12 @@ TEST_P(ProxyBedrock, SignsWithTheDerivedRegionAndNeverForwardsTheSecret)
 
     EXPECT_NE(up.find("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), std::string::npos) << up;
     // Region derived from the endpoint name, service pinned: `bedrock`, which does
-    // NOT follow the `bedrock-runtime` hostname.
+    // Not follow the `bedrock-runtime` hostname.
     EXPECT_NE(up.find("/us-east-1/bedrock/aws4_request"), std::string::npos) << up;
     EXPECT_NE(up.find("SignedHeaders=content-type;host;x-amz-date"), std::string::npos) << up;
     EXPECT_NE(up.find("\r\nx-amz-date: "), std::string::npos) << up;
 
-    // The client's credential is CONSUMED. Neither the secret nor the bearer form may
+    // The client's credential is consumed. Neither the secret nor the bearer form may
     // appear anywhere in the bytes we send.
     EXPECT_EQ(up.find("supersecretvalue"), std::string::npos) << up;
     EXPECT_EQ(up.find("Bearer "), std::string::npos) << up;
@@ -5168,7 +5168,7 @@ TEST_P(ProxyBedrock, SignsWithTheDerivedRegionAndNeverForwardsTheSecret)
 
 TEST_P(ProxyBedrock, ContentLengthMatchesTheRewrittenBody)
 {
-    // The body is rewritten, so a stale length is a framing desync on a POOLED
+    // The body is rewritten, so a stale length is a framing desync on a pooled
     // upstream: the tail of one request becomes the head of the next client's.
     start_bedrock();
     Client c;
@@ -5205,7 +5205,7 @@ TEST_P(ProxyBedrock, SessionTokenIsSignedAndSentInItsOwnHeader)
 TEST_P(ProxyBedrock, WithoutTlsEveryRequestIsRefusedAndNothingIsSent)
 {
     // A build with no OpenSSL cannot sign, and Bedrock is HTTPS-only anyway. What
-    // must NOT happen is the request going out unsigned with the customer's AWS
+    // must not happen is the request going out unsigned with the customer's AWS
     // secret on the wire for a call that was always going to be rejected.
     start_bedrock();
     Client c;
@@ -5219,7 +5219,7 @@ TEST_P(ProxyBedrock, WithoutTlsEveryRequestIsRefusedAndNothingIsSent)
 
 TEST_P(ProxyBedrock, RefusesRatherThanSendingUnsigned)
 {
-    // Each of these must produce a 400 with NOTHING reaching the upstream. An
+    // Each of these must produce a 400 with nothing reaching the upstream. An
     // unsigned request would be rejected by AWS anyway, but a request that leaves
     // here with a half-formed credential is a secret on the wire for no purpose.
     start_bedrock();
@@ -5407,7 +5407,7 @@ class ProxyLength : public ProxyIT,
 TEST_P(ProxyLength, ExactlyOneContentLengthReachesTheVenue)
 {
     // Two would be a framing ambiguity the upstream resolves however it likes, which
-    // on a pooled connection is a desync affecting the NEXT client.
+    // on a pooled connection is a desync affecting the next client.
     _backend.set_response(http_ok("{}"));
     start(0, true, TranslateMode::None, GetParam());
     Client c;
@@ -5451,7 +5451,7 @@ TEST_P(ProxyLength, TheLengthIsDerivedFromTheBodyAndNotCopied)
 
 TEST_P(ProxyLength, AStrippedHeaderDoesNotShiftTheLength)
 {
-    // Stripping shortens the HEADERS, never the body, so the length must not move.
+    // Stripping shortens the headers, never the body, so the length must not move.
     _strip_headers = {"x-secret"};
     _backend.set_response(http_ok("{}"));
     start(0, true, TranslateMode::None, GetParam());
@@ -5471,7 +5471,7 @@ TEST_P(ProxyLength, AStrippedHeaderDoesNotShiftTheLength)
 
 TEST_P(ProxyLength, ADuplicateLengthIsCollapsedAndNotEchoed)
 {
-    // parse_request accepts an IDENTICAL repeat and collapses it (a conflicting one is
+    // parse_request accepts an identical repeat and collapses it (a conflicting one is
     // refused as a smuggling vector). Copying the client's header block forwarded both
     // lines to the venue; deriving emits exactly one. This is the case that tells the
     // two apart, since for a body we do not edit they otherwise agree.
@@ -5547,7 +5547,7 @@ TEST_P(ProxyModelRewrite, ByteForwardSplicesTheModelAndKeepsTheLengthHonest)
                        "Content-Type: application/json\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
     (void)c.recv_response();
-    // JOIN BEFORE READING, and before this test's locals die. The loop thread owns
+    // Join before reading, and before this test's locals die. The loop thread owns
     // everything the request touched, including the policy's model string, and
     // nothing else orders its last read against the destructors below.
     c.close();
@@ -5562,7 +5562,7 @@ TEST_P(ProxyModelRewrite, ByteForwardSplicesTheModelAndKeepsTheLengthHonest)
     // Everything else the client sent survives the splice.
     EXPECT_NE(sent.find(R"("seed":7)"), std::string::npos) << sent;
 
-    // THE POINT OF DOING CONTENT-LENGTH FIRST. The body grew; a copied length would
+    // The point of doing CONTENT-LENGTH first. The body grew; a copied length would
     // now be a lie, and on a pooled upstream that is the next client's problem.
     EXPECT_GT(sent.size(), body.size());
     llmbridge::net::http::Message m;

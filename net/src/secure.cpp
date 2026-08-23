@@ -5,7 +5,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Out-of-line on purpose. _GNU_SOURCE must be defined before ANY libc header for
+// Out-of-line on purpose. _GNU_SOURCE must be defined before any libc header for
 // explicit_bzero to be declared, which a header cannot reliably guarantee, and
 // the caller should not have to care. The call cost is irrelevant here (once per
 // request, off the token path).

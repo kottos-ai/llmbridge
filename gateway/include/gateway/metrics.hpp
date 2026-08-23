@@ -29,25 +29,25 @@ namespace llmbridge
     // Epoch nanoseconds for a monotonic now_ns() stamp: a timestamp that is both
     // orderable and meaningful as wall time.
     //
-    // Why not just read CLOCK_REALTIME: it can STEP, forwards or backwards, when NTP
+    // Why not just read CLOCK_REALTIME: it can step, forwards or backwards, when NTP
     // disciplines it. Two requests would then be orderable by arrival but not by
     // timestamp, which is exactly the property an order book cannot lose. So the
-    // realtime clock is read ONCE at startup and every later timestamp is that anchor
+    // realtime clock is read once at startup and every later timestamp is that anchor
     // plus a monotonic delta: epoch-meaningful, strictly increasing within the
     // process, immune to NTP steps.
     //
     // The trade: without NTP correction this drifts from true wall time over a long
     // run (ppm-scale). Ordering and intra-process deltas are unaffected; joining
-    // timestamps ACROSS hosts to sub-millisecond accuracy needs PTP or a periodic
+    // timestamps across hosts to sub-millisecond accuracy needs PTP or a periodic
     // re-anchor, and is not something a single gateway can promise on its own.
     int64_t wall_ns(int64_t mono_ns) noexcept;
 
-    // THE ONE DEFINITION of how a request's stamps become reported intervals.
+    // The one definition of how a request's stamps become reported intervals.
     //
     // Both reporting surfaces derive from this: the per-request `x-llmbridge-*`
     // headers and the shutdown histograms. They previously computed their own
     // groupings independently, and drifted. `connect-us` spanned t1->t3 (handshake
-    // PLUS the upstream write) while the `connect(TLS)` histogram spanned t1->t2
+    // Plus the upstream write) while the `connect(TLS)` histogram spanned t1->t2
     // (handshake only). Same name, two meanings, and a code comment that copied the
     // histogram's "exactly 0 when pooled" onto the header's number, which is never 0.
     // Sharing this function makes that class of drift unrepresentable.
@@ -64,7 +64,7 @@ namespace llmbridge
     };
 
     // t2 == 0 means "no connect ever happened" (pooled reuse never stamped it), in
-    // which case wire-ready IS t1 and connect_ns is exactly 0.
+    // which case wire-ready is t1 and connect_ns is exactly 0.
     //
     // Streaming callers have no t5 (the response is not built at one instant): pass
     // t5 = t4 and compute_ns collapses to the request leg alone, which is the honest
