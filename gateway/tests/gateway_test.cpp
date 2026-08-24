@@ -5019,9 +5019,39 @@ TEST_P(ProxyForwardStream, TheSinkGetsTheProvidersTokenCountsIncludingCached)
     EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
 }
 
-TEST_P(ProxyForwardStream, WithoutIncludeUsageNothingIsInventedFromNothing)
+TEST_P(ProxyForwardStream, NothingIsInventedFromNothing)
 {
-    // No usage chunk means no counts. -1 is "not reported"; zero would be a claim.
+    // A stream that reports no usage records none. -1 is "not reported"; zero would
+    // be a claim. This is the property the old version of this test meant to hold:
+    // it used a fixture that does carry a usage block and passed only because the
+    // gateway refused to look at it without `include_usage`.
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(
+                              "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                              "data: [DONE]\n\n", 4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, -1);
+    EXPECT_EQ(recs[0].r.tokens_out, -1);
+    EXPECT_EQ(recs[0].r.cached_tokens, -1);
+}
+
+TEST_P(ProxyForwardStream, UsageIsRecordedWhetherOrNotTheClientAskedForIt)
+{
+    // `include_usage` decides whether the provider emits a usage block, not whether
+    // we are allowed to read one that arrived. Gating on it cost every Anthropic
+    // stream its counts, because that dialect has no such option and always reports.
     RecordingSink sink;
     _sink = &sink;
     _backend.set_response(openai_sse_response(4096));
@@ -5035,8 +5065,8 @@ TEST_P(ProxyForwardStream, WithoutIncludeUsageNothingIsInventedFromNothing)
 
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
-    EXPECT_EQ(recs[0].r.tokens_in, -1);
-    EXPECT_EQ(recs[0].r.cached_tokens, -1);
+    EXPECT_EQ(recs[0].r.tokens_in, 11);
+    EXPECT_EQ(recs[0].r.cached_tokens, 7);
 }
 
 TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
@@ -6019,3 +6049,146 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyUnsupported,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── the Anthropic dialect, byte-forwarded ────────────────────────────────────
+//
+// This is what Claude Code sends: POST /v1/messages, SSE every turn, and usage
+// reported in a shape nothing on this path translates. It arrives in two places:
+// input and cache in `message_start`, at the very beginning, and output in
+// `message_delta` at the end. A tail window sees only the second.
+namespace
+{
+    // Padding between the two usage events, so the input count is pushed out of any
+    // tail window. This is the case the old code could not see.
+    std::string anthropic_passthrough_events(int filler_deltas)
+    {
+        std::string ev =
+            "event: message_start\n"
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\","
+            "\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":137,"
+            "\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":9021,"
+            "\"output_tokens\":1}}}\n\n"
+            "event: content_block_start\n"
+            "data: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        for (int i = 0; i < filler_deltas; ++i)
+            ev += "event: content_block_delta\n"
+                  "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+                  "{\"type\":\"text_delta\",\"text\":\"" + std::string(64, 'x') + "\"}}\n\n";
+        ev += "event: message_delta\n"
+              "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+              "\"usage\":{\"output_tokens\":312}}\n\n"
+              "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        return ev;
+    }
+} // namespace
+
+TEST_P(ProxyForwardStream, AnthropicUsageIsRecordedAcrossTheWholeStream)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    // 60 deltas of 64 bytes is well over the 2 KiB tail, so message_start has long
+    // scrolled away by the time the stream ends. Before this, input and cache read
+    // as "not reported" and every Claude Code request cost $0.00.
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(anthropic_passthrough_events(60), 256));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, 137) << "message_start scrolled out of the window";
+    EXPECT_EQ(recs[0].r.tokens_out, 312) << "message_delta carries the real total";
+    // Cache reads, not cache creation: the read is what an agent does every turn and
+    // is billed at a fraction of the input rate. Counting the write here would
+    // overstate the discount.
+    EXPECT_EQ(recs[0].r.cached_tokens, 9021);
+}
+
+TEST_P(ProxyForwardStream, AnthropicFirstTokenIsTheFirstTextDelta)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(anthropic_passthrough_events(3), 128));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    // Stamped, and not by `content_block_start`, whose "text":"" is not a token.
+    EXPECT_GT(recs[0].r.ts_first_token, 0) << "no first-token time on an Anthropic stream";
+    EXPECT_GE(recs[0].r.ts_first_token, recs[0].r.ts_up_recvd);
+}
+
+
+// ── a compressed response is a response we cannot measure ────────────────────
+//
+// Every real client asks for gzip. curl does not, which is how a live test of the
+// usage scanner passed while Claude Code recorded nothing: measured on the real API,
+// the identical request recorded tokens_in=8 without `accept-encoding` and -1 with
+// it. So the header is dropped on the way out, and a provider that compresses anyway
+// is a warning, not a silent dash.
+TEST_P(ProxyForwardStream, AcceptEncodingIsNotForwarded)
+{
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // The length is computed: a hardcoded one that disagrees with the body leaves the
+    // gateway waiting for bytes that never arrive, and the test passes three seconds
+    // later for the wrong reason.
+    const std::string body =
+        "{\"model\":\"gpt-4o\",\"stream\":true,\"messages\":[{\"role\":\"user\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Accept-Encoding: gzip, deflate, br\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("Accept-Encoding"), std::string::npos)
+        << "a compressed body is one this gateway cannot read token counts out of:\n" << up;
+    EXPECT_EQ(up.find("gzip"), std::string::npos) << up;
+}
+
+TEST_P(ProxyForwardStream, ACompressedStreamStillReachesTheClientAndInventsNoCounts)
+{
+    // The bytes are forwarded faithfully whatever they are; what must not happen is
+    // a number made up out of compressed data.
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Content-Encoding: gzip\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode("\x1f\x8b\x08 not really gzip, opaque bytes\n\n", 64));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string got = c.recv_all();
+    c.close();
+    shutdown();
+    EXPECT_NE(got.find("opaque bytes"), std::string::npos) << "the body was not forwarded";
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, -1);
+    EXPECT_EQ(recs[0].r.tokens_out, -1);
+}

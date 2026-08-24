@@ -361,6 +361,11 @@ namespace llmbridge
         /// translated stream, which gets its counts from the translator, and empty
         /// when the client did not ask for usage. Bounded; see stream_note_usage.
         std::string stream_tail{};
+        /// Usage accumulated as a byte-forwarded stream runs. -1 = not reported,
+        /// which is not the same as zero and must never be rendered as a number.
+        /// Fields, and not a tail scan at the end, because Anthropic states input
+        /// and cache tokens in its first event and the tail has scrolled past them.
+        long long usage_in = -1, usage_out = -1, usage_cached = -1;
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`
         // while a client send SQE is in flight, so `wbuf` (the send's buffer) is
@@ -735,6 +740,10 @@ namespace llmbridge
         // End a stream without a terminal [DONE], because it is being aborted.
         // One call so the three mutations it needs cannot be split up; five sites
         // across both backends used to write them out by hand.
+        /// Warn once when a stream arrives compressed. Shared by both loops: it is a
+        /// statement about the response, not about an I/O model.
+        static void stream_warn_if_encoded(const Connection* client,
+                                           const net::http::ResponseHead& h) noexcept;
         void stream_truncate(Connection* client) noexcept;
         bool upstream_is_tls(const Connection* u) const noexcept;
         // Has this upstream's request left the machine on every transport it uses? A
