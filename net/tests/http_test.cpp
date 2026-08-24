@@ -639,3 +639,58 @@ TEST(HttpChunkedResponse, NoByteIsDecodedTwice)
     // Total decode work equals the payload exactly: no byte seen twice.
     EXPECT_EQ(total_steps, wire.size() - sizeof("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n") + 1);
 }
+
+// ── responses this framer must refuse ────────────────────────────────────────
+//
+// Both are RFC-legal responses that a pooled connection cannot survive. The old
+// code framed each as "complete, zero-length body, keep the connection", which is
+// the shape v0.8.1 spent a release removing from the request path: malformed or
+// unframeable input becoming invisible input.
+namespace
+{
+    llmbridge::net::http::FrameStatus frame_of(std::string_view wire)
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        return llmbridge::net::http::parse_response(wire, st).status;
+    }
+} // namespace
+
+TEST(ResponseFraming, NeitherLengthNorChunkedIsRefused)
+{
+    // Rule 8: the body runs until the server closes, so the connection is not
+    // reusable and the length is unknowable from the head. Framed as an empty body,
+    // the 17 bytes below were dropped and the head relayed to a client on a
+    // connection we kept alive, where the client reads our next response as this
+    // body.
+    EXPECT_EQ(frame_of("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+                       "{\"hello\":\"world\"}"),
+              llmbridge::net::http::FrameStatus::Error);
+}
+
+TEST(ResponseFraming, AnInterimResponseIsRefusedAndNotMistakenForTheAnswer)
+{
+    // "100 Continue" framed as the reply delivers it to the client as the answer
+    // and leaves the real 200 unread on a connection we then pool.
+    EXPECT_EQ(frame_of("HTTP/1.1 100 Continue\r\n\r\n"
+                       "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"),
+              llmbridge::net::http::FrameStatus::Error);
+}
+
+TEST(ResponseFraming, BodylessStatusesStillFrameWithNoLength)
+{
+    // 204 and 304 are the legitimate reason to send neither header, so refusing
+    // every unframed response would have refused these too.
+    EXPECT_EQ(frame_of("HTTP/1.1 204 No Content\r\n\r\n"),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_EQ(frame_of("HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n"),
+              llmbridge::net::http::FrameStatus::Complete);
+}
+
+TEST(ResponseFraming, AFramedResponseIsUnaffected)
+{
+    EXPECT_EQ(frame_of("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_EQ(frame_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                       "2\r\nhi\r\n0\r\n\r\n"),
+              llmbridge::net::http::FrameStatus::Complete);
+}

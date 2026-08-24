@@ -30,6 +30,9 @@ jobs:
       # once pushed.
       - name: Check no credentials are tracked
         run: python3 scripts/check_no_secrets.py
+      # Check docs benchmark claims.
+      - name: Check every documented path exists
+        run: python3 scripts/check_docs_data.py
 
   # Pinned compiler versions, not bare `gcc`/`clang`. DESIGN.md and the README state a
   # GCC 13+ / Clang 16+ floor; testing whatever the runner image happens to ship proves

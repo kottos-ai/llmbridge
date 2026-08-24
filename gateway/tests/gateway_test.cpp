@@ -171,6 +171,15 @@ namespace
         // Respond once (keep-alive), then close the connection, which simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
+        // Write these bytes on the same connection a moment after the response, so
+        // they land while the gateway holds the connection idle in its pool. That is
+        // the timing of a late or interim reply, and it is what turns a pooled
+        // connection into the next client's response.
+        void set_late_bytes(std::string b2, int after_ms)
+        {
+            _late = std::move(b2);
+            _late_ms = after_ms;
+        }
         // Kill only the first N accepted connections after one response. Where
         // set_close_after_first drops every connection, this leaves later ones alive
         // and poolable, which is what a test needs when the thing under test is where
@@ -343,6 +352,12 @@ namespace
                     ok = ::write(c, resp.data(), resp.size()) >= 0;
                 }
                 if (!ok) { ::close(c); return; }
+                if (!_late.empty())
+                {
+                    timespec ts{_late_ms / 1000, (_late_ms % 1000) * 1000000L};
+                    nanosleep(&ts, nullptr);
+                    (void)!::write(c, _late.data(), _late.size());
+                }
                 if (_close_after_first) { ::close(c); return; } // drop the "idle" keep-alive
                 if (_close_first_n > 0 && conn_index < _close_first_n) { ::close(c); return; }
                 if (!m.keep_alive) { ::close(c); return; }
@@ -357,6 +372,8 @@ namespace
         int _chunked_chunks = 0;
         bool _close_mid = false;
         bool _close_after_first = false;
+        std::string _late;
+        int _late_ms = 0;
         int _close_first_n = 0;
         std::atomic<int> _accepted{0};
         int _stall = 0;
@@ -5629,6 +5646,243 @@ TEST_P(ProxyModelRewrite, ARewriteThatCannotBeDoneRefusesInsteadOfSendingTheOldM
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyModelRewrite,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
+
+// ── one client's bytes must never become another's response ──────────────────
+//
+// The pool is the shared thing in this gateway, so anything left on a pooled
+// connection is a cross-client defect, not a tidiness one.
+class ProxyPoolHygiene : public ProxyIT,
+                         public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyPoolHygiene, BytesArrivingOnAnIdlePooledUpstreamDropTheConnection)
+{
+    // The upstream answers A, the gateway pools the connection, and a late reply
+    // then lands on it. Before the fix, epoll appended those bytes to the upstream's
+    // rbuf and left them there; ep_acquire_upstream does not clear rbuf, so client B
+    // was served this. The io_uring twin already closed the connection here.
+    _backend.set_late_bytes("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nLEAKED!!!", 50);
+    start(0, true, TranslateMode::None, GetParam());
+    {
+        Client a;
+        ASSERT_TRUE(a.connect(_proxy_port));
+        ASSERT_TRUE(a.send(make_request()));
+        ASSERT_EQ(Client::status_of(a.recv_response()), 200);
+    }
+    // Long enough for the late bytes to arrive while the connection sits idle.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    Client b;
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(make_request()));
+    const std::string resp = b.recv_response();
+    b.close();
+    shutdown();
+    EXPECT_EQ(resp.find("LEAKED!!!"), std::string::npos)
+        << "client B was served the bytes of client A's connection:\n" << resp;
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+}
+
+// A slow client pauses the upstream's reads. The upstream must not go back into the
+// pool still paused: its epoll interest mask is 0, so it never reports readable
+// again, and the next client's request goes out and is never answered.
+TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
+{
+    // The same shape as SlowClientEngagesBackpressureAndLosesNothing, because a
+    // small stream never fills a socket buffer and never pauses anything: the pause
+    // is the precondition for the defect, so the test asserts it happened.
+    const std::string filler(400, 'x');
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    for (int i = 0; i < 4000; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+    ev += "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+          "data: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    {
+        Client a;
+        ASSERT_TRUE(a.connect(_proxy_port, /*rcvbuf=*/4096));
+        ASSERT_TRUE(a.send(openai_stream_request("hi")));
+        timespec ts{0, 400'000'000}; // stall: the gateway's writes back up
+        nanosleep(&ts, nullptr);
+        (void)a.recv_all(15000);
+    }
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+    {
+        ASSERT_GT(_gw->stats().stream_pauses, 0u)
+            << "no pause happened, so this test proves nothing";
+    }
+
+    // The same shape of request A sent: this gateway translates, and "hello" is not
+    // a chat completion. What is under test is whether an answer arrives at all.
+    Client b;
+    ASSERT_TRUE(b.connect(_proxy_port));
+    ASSERT_TRUE(b.send(openai_stream_request("hi")));
+    const std::string resp = b.recv_all();
+    b.close();
+    shutdown();
+    EXPECT_FALSE(resp.empty()) << "the next client's request was never answered: the "
+                                  "upstream went back to the pool with reads disarmed";
+    EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 200);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyPoolHygiene,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
+
+// ── a provider's failure must not arrive as a success ────────────────────────
+class ProxyStatusRelay : public ProxyIT,
+                         public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyStatusRelay, AChunkedProviderErrorKeepsItsStatus)
+{
+    // Byte-forward re-frames a chunked response with Content-Length because it has
+    // already decoded it. It used to write the status line as a literal "200 OK", so
+    // a 429 reached the caller as a completion and no client could back off.
+    _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                          "Retry-After: 30\r\nContent-Length: 26\r\n\r\n"
+                          "{\"error\":\"rate_limited\"}");
+    _backend.set_chunked_response(3);
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 429) << resp;
+    EXPECT_NE(resp.find("rate_limited"), std::string::npos) << resp;
+}
+
+// The control that makes the test above mean something: the same 429 framed with
+// Content-Length was always relayed correctly, so the defect was chunkedness alone.
+TEST_P(ProxyStatusRelay, ALengthFramedProviderErrorWasAlwaysRelayed)
+{
+    _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 24\r\n\r\n{\"error\":\"rate_limited\"}");
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 429) << resp;
+}
+
+TEST_P(ProxyStatusRelay, AChunkedSuccessIsStillA200)
+{
+    _backend.set_response(http_ok("{\"ok\":true}"));
+    _backend.set_chunked_response(2);
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(resp.find("\"ok\":true"), std::string::npos) << resp;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStatusRelay,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
+
+// ── a cut stream must not be finished for the client ─────────────────────────
+//
+// stream_truncate's own comment says why: fabricating a terminal [DONE] tells the
+// client it received a complete answer when it did not, and for an agent loop that
+// is a silent wrong result instead of a visible failure. The end condition used to
+// read `chunkdec.done() || at_eof`, so EOF overrode the framing that proves the
+// stream was cut.
+class ProxyStreamTruncation : public ProxyIT,
+                              public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyStreamTruncation, AChunkedStreamCutBeforeItsTerminatorIsNotFinished)
+{
+    // A stream cut mid-answer: the events stop before message_delta/message_stop,
+    // so the provider never said how it ended, and the chunked framing loses its
+    // 0-length terminator. Every chunk that is present is well formed, so the
+    // decoder reports no error; it simply never reports done(). Truncating the
+    // events matters: with a complete payload the translator finishes on the
+    // provider's own message_stop, and the test would prove nothing.
+    const std::string whole = anthropic_sse_events();
+    const size_t cut = whole.find("event: message_delta");
+    ASSERT_NE(cut, std::string::npos);
+    const std::string ev = whole.substr(0, cut);
+    std::string enc = sse_chunk_encode(ev, 64);
+    const std::string term = "0\r\n\r\n";
+    ASSERT_EQ(enc.compare(enc.size() - term.size(), term.size(), term), 0);
+    enc.erase(enc.size() - term.size());
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + enc);
+    _backend.set_close_after_first(true); // EOF right after the truncated body
+
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(5000));
+    c.close();
+    shutdown();
+    EXPECT_FALSE(s.done) << "a truncated stream was terminated with [DONE]";
+    EXPECT_NE(s.finish, "stop") << "a truncated stream was given finish_reason stop";
+}
+
+// The control, and it is what stops the fix from being "never finish anything": a
+// close-delimited stream has no terminator to wait for, so EOF is its real end.
+TEST_P(ProxyStreamTruncation, ACloseDelimitedStreamStillFinishesAtEof)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Connection: close\r\n\r\n" + anthropic_sse_events());
+    _backend.set_close_after_first(true);
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(5000));
+    c.close();
+    shutdown();
+    EXPECT_TRUE(s.done) << "a complete close-delimited stream must still be finished";
+}
+
+// And a complete chunked stream is unaffected.
+TEST_P(ProxyStreamTruncation, ACompleteChunkedStreamStillFinishes)
+{
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(5000));
+    c.close();
+    shutdown();
+    EXPECT_TRUE(s.done);
+    EXPECT_EQ(s.finish, "stop");
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamTruncation,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
                          [](const auto& i) {

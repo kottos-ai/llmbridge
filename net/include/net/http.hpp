@@ -632,6 +632,28 @@ namespace llmbridge::net::http
         // (a compromised or buggy middlebox), so refuse instead of pick a winner.
         if (r.head.chunked && r.head.has_content_length) { r.status = FrameStatus::Error; return r; }
 
+        // An interim response is not the answer. Framed as one, "100 Continue"
+        // reaches the client as the reply and the real response is orphaned on a
+        // connection we then pool, where it becomes the next client's bytes. A
+        // client can provoke it with `Expect: 100-continue`, which is why
+        // request_without also drops that header on the way out.
+        if (r.head.status < 200) { r.status = FrameStatus::Error; return r; }
+
+        // Neither framing header means RFC 9112 rule 8: the body runs until the
+        // server closes, and the connection is not reusable afterwards. We pool
+        // upstream connections, so framing one here can only drop the body (which
+        // is what happened before this check) or desynchronise the pool. Refuse.
+        //
+        // 204 and 304 carry no body by definition and are the legitimate case for
+        // no framing header at all. A streamed response is diverted to the pump on
+        // its head, before this function, so close-delimited SSE is unaffected.
+        if (!r.head.chunked && !r.head.has_content_length &&
+            r.head.status != 204 && r.head.status != 304)
+        {
+            r.status = FrameStatus::Error;
+            return r;
+        }
+
         if (!r.head.chunked)
         {
             if (r.head.content_length > kMaxBodyLen) { r.status = FrameStatus::Error; return r; }

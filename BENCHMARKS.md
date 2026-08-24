@@ -14,8 +14,9 @@ conversely "tokens delivered per second" says nothing about non-streaming throug
 Any comparison that mixes them is wrong, including ours, so they are reported apart,
 with their own charts and their own caveats.
 
-Everything below is reproducible from this repository. All runs are on a **single
-co-located host** (client, gateway and provider on loopback), so absolute tails are a
+Everything below is reproducible from this repository, with one exception that says so
+in place: the concurrent-stream capacity table has no committed harness or data yet.
+All runs are on a **single co-located host** (client, gateway and provider on loopback), so absolute tails are a
 **dev-box upper bound**, not a datacenter figure.
 
 > **Host configuration changes the competitor's numbers, not just ours, and not every
@@ -317,6 +318,9 @@ failures**, and the four clients agree to within 3% on p99, The gateway holds **
 sockets** open throughout (one client plus one upstream per stream). Nothing is degrading:
 p50 under 200 us, p99 under 0.5 ms, p99.9 under 1 ms.
 
+**No committed CSV backs this table either**: the four-client run was read from four
+`streamgen` outputs by hand. Same status as the capacity table below.
+
 **This table uses `cpupower idle-set -D 5`** (idle states capped at C1), which is
 permissible here because there is no competitor in it to disadvantage, unlike the
 head-to-head above, where the same setting would cut LiteLLM's capacity by 40%. It is
@@ -366,7 +370,14 @@ Config: `cpupower idle-set -D 5`, `performance` governor,
 `ip_local_port_range="10000 65535"`. llmbridge-only, so the idle-state tuning is
 permissible (no competitor in the table to disadvantage).
 
-Raw data: `bench/results/stream-steadystate.csv`.
+**Raw data: not in this repository, and that is a gap, not an omission.** These two
+columns were produced by hand: eight `streamgen` processes against one gateway, with
+RSS, CPU and socket counts read from the host while it ran. `run_stream_saturate.sh`
+launches one generator and records none of those three, so nothing here reproduces the
+table.
+
+Until a driver and a CSV land, read this table as a founder's measurement, not a
+reproducible one. Everything else in this document is reproducible.
 
 ### Connection reuse (and why the earlier numbers were worse)
 

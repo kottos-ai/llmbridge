@@ -255,8 +255,38 @@ namespace llmbridge::provider
                         messages += ",\"name\":";
                         json::append_raw_string(messages, name);
                         // arguments (a JSON *string*) -> input (a JSON *object*).
-                        messages += ",\"input\":";
+                        //
+                        // Parsed before it is spliced. These bytes come from the
+                        // client, and appending them raw let a caller close our
+                        // object and append its own top-level members: an
+                        // `arguments` of `{}}]},{"role":"user",...}],"model":"theirs"`
+                        // produced a syntactically valid Anthropic body we did not
+                        // write. Non-JSON was worse in a quieter way: `"input":not
+                        // json` is a malformed body we then sent upstream, which is
+                        // sanitise-and-forward with the sanitising left out.
+                        //
+                        // rewrite_model refuses the same class three functions down;
+                        // this is the same rule applied to the same kind of input.
                         const std::string args = json::unescape_string(fn->str_or("arguments"));
+                        if (!args.empty())
+                        {
+                            bool arg_ok = false;
+                            const json::Value parsed = json::parse(args, arg_ok);
+                            if (!arg_ok || !parsed.is_object()) return {};
+                            // And nothing after it. The parser stops at the end of
+                            // the first value, so `{}}]},{...}` parses as a valid
+                            // empty object with the payload trailing behind it, and
+                            // checking only "is it an object" accepts exactly the
+                            // injection this refuses. `sv` spans the object's own
+                            // braces, so comparing it against the input is what
+                            // makes the whole string have to be that object.
+                            size_t end = args.size();
+                            while (end > 0 && (args[end - 1] == ' ' || args[end - 1] == '\t' ||
+                                               args[end - 1] == '\n' || args[end - 1] == '\r'))
+                                --end;
+                            if (parsed.sv.size() != end) return {};
+                        }
+                        messages += ",\"input\":";
                         messages += args.empty() ? "{}" : args;
                         messages += '}';
                     }
