@@ -28,7 +28,9 @@
 - **Tool calling**, declarations, `tool_choice`, parallel calls and `tool_result` round-trip, **streaming and non-streaming** (OpenAI ↔ Anthropic)
 - **TLS to the provider** (`--upstream https://...`, opt-in build) and **credential passthrough**, enough to front `api.anthropic.com` directly
 - **Per-request timing headers** (`--timing-headers`), what the gateway cost vs what the provider cost
-- Not yet shipped: vision, `cache_control`, AWS Bedrock, streaming for Gemini/Cohere, Anthropic-in mode
+- Not yet shipped, and **refused with a message that says so** instead of ignored:
+  vision, audio and file content parts. Also not yet shipped: `cache_control`,
+  streaming for Gemini/Cohere, Anthropic-in mode
 
 ## Benchmarks
 
@@ -64,8 +66,8 @@ profiling disproved that.)* *(Bifrost and Helicone not yet measured.)*
 A **separate** benchmark, because it measures a different unit of work: one token, not
 one request. Both gateways translate the same Anthropic event stream into OpenAI chunks
 at 50 tok/s per stream, measured by the same client-side instrument (neither gateway
-self-reports), against a no-gateway control run at the same concurrency. Single run per
-concurrency level.
+self-reports), against a no-gateway control run at the same concurrency. Median of 3
+runs per concurrency level, which is what the charts below plot.
 
 ![Streaming: time to first token vs concurrent streams](bench/results/stream-comparison.svg)
 
@@ -76,15 +78,16 @@ concurrency level.
 every 20 ms.
 
 llmbridge's time to first token stays **on the no-gateway floor (~30.8 ms)** through 512
-concurrent streams while delivering **99.9–100%** of the achievable token stream, adding
-**~50–120 µs per token** (against a 20 ms inter-token interval, under 1% of the budget).
+concurrent streams while delivering **99.93–100%** of the achievable token stream, adding
+**~55–131 µs per token** (against a 20 ms inter-token interval, under 1% of the budget).
 A single LiteLLM worker holds at 16 streams (94% delivered), then queues: at 512 streams
-it delivers **3%** of the tokens with **~13 s** to first token.
+it delivers **4%** of the tokens with **~13 s** to first token.
 
 **16,384 concurrent streams on a single worker**, using **a third of one CPU core and
 189 MB**: 32,756 of 32,768 offered tokens/s delivered (**99.96%**), **zero** client-side
 failures, **p50 36–48 µs**, p99 under 0.6 ms, holding 32,774 sockets open. Eight
-independent load generators agree within 5%.
+independent load generators agree within 5%. *(This capacity run is the one figure here
+with no committed harness or CSV behind it yet; BENCHMARKS.md says so in place.)*
 
 Pushed further to **24,576 streams** it still delivers 99.93% with zero failures, at
 42–47% of one core and 272 MB (p50 50–58 µs, p99 ~1.2 ms). That is **not llmbridge's
@@ -319,10 +322,13 @@ Anthropic's streaming protocol is richer, so the events must be synthesised inst
 discarded.
 
 **Planned:** vision / image inputs, `cache_control`, streaming for the Gemini / Cohere
-dialects, and Anthropic-in mode. AWS Bedrock and Google Vertex additionally need
-request signing (SigV4, OAuth2), and Azure OpenAI needs query strings in the upstream
-target, which are refused today. Embeddings and audio (Whisper / TTS) are out of scope
-for now.
+dialects, and Anthropic-in mode. Google Vertex additionally needs OAuth2 request
+signing. Embeddings and audio (Whisper / TTS) are out of scope for now.
+
+AWS Bedrock (SigV4, v0.23.0) and Azure OpenAI (v0.24.0, including the `api-version`
+query on the upstream target) already ship: `--translate bedrock` and
+`--translate azure`. This section said otherwise until 2026-08-24, which `--help`
+contradicted on line one.
 
 ## Installation
 

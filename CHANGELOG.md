@@ -8,6 +8,123 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.27.0]. 2026-08-24
+
+Six defects found by an audit of the whole repository, five of them reachable from an
+ordinary client request on shipped defaults and two of those cross-client. Minor:
+responses this gateway used to accept are now refused, and a chunked response now
+carries the status the provider sent.
+
+### Fixed
+
+- **A response with neither `Content-Length` nor `Transfer-Encoding` is refused**
+  (`net/http.hpp`). It used to frame as complete with a zero-length body and the
+  connection kept alive, which is RFC 9112 rule 8 read backwards: such a body runs
+  until the server closes, and the connection is not reusable afterwards. The body
+  was dropped and the unframed head relayed to a client on a pooled connection, where
+  by the specification the client reads our next response as this one's body.
+
+  `204` and `304` carry no body by definition and still frame. A streamed response is
+  diverted to the pump on its head, before this check, so close-delimited SSE is
+  unaffected.
+
+- **An interim (1xx) response is refused instead of being served as the answer.**
+  `100 Continue` framed as the reply reached the client as the reply itself, and the real
+  response was left unread on a connection then returned to the pool. A client could
+  provoke it with `Expect: 100-continue`, which byte-forward passed straight through;
+  that header is now dropped on the way out, so the request succeeds instead of
+  turning into a 502.
+
+- **epoll drops a pooled upstream that receives stray bytes** (`gateway.cpp`), which
+  is what the io_uring twin already did. Bytes arriving on an idle pooled connection
+  were appended to its read buffer and abandoned, and `ep_acquire_upstream` does not
+  clear that buffer, so the next client was served the previous exchange's bytes.
+  Chained to the interim-response defect above, a test reproduced client B receiving
+  client A's completion verbatim. A one-sided divergence where epoll was the wrong
+  side, so the fallback backend carried it and the default did not.
+
+- **A chunked response keeps the status the provider sent.** Byte-forward re-frames a
+  chunked body with `Content-Length`, and it wrote the status line as a literal
+  `HTTP/1.1 200 OK`: a provider's 429 reached the caller as a completion whose body
+  happened to be a rate-limit error, with no way to back off. Length-framed responses
+  were always relayed correctly, which is why it survived; only chunkedness triggered
+  it. Both backends.
+
+- **Tool-call `arguments` are parsed before they are spliced**
+  (`provider/translate.cpp`). The value arrives as a JSON string and leaves as a JSON
+  object, so its bytes are written into a body we construct, and they were appended
+  raw. An `arguments` of `{}}]},{...}` closed our object and appended members of its
+  own, producing a syntactically valid Anthropic body we did not write; a non-JSON
+  value produced `"input":not json`, a malformed body we then sent upstream. Now
+  parsed, required to be an object, and required to be the whole string: the parser
+  stops at the end of the first value, so checking only "is it an object" accepts
+  exactly the injection this refuses. `rewrite_model` already refused the same class
+  three functions away.
+
+- **A stream cut before its terminator is no longer finished for the client.** The end
+  condition was `(chunked && decoder.done()) || at_eof`, so EOF overrode the framing
+  even where the framing proves truncation, and a chunked SSE stream cut mid-answer
+  was completed with a fabricated `finish_reason: "stop"` and a `[DONE]`. The client
+  was told it received a complete answer, and the tape recorded a clean 200.
+  `stream_complete` now asks the framing: chunked ends at its terminator, and only a
+  close-delimited stream ends at EOF. EOF before the terminator is reported as the
+  truncation it is, so the stream is torn down honestly instead of hanging.
+
+- **A pooled upstream is always readable.** `ep_release_upstream` re-arms reads before
+  pooling. A slow client pauses its upstream, and `ep_stream_flush`'s `stream_ended`
+  branch returns before the resume below it, so a connection could enter the pool with
+  its interest mask at 0 and never report readable again: the next client's request
+  goes out and is never answered. **Stated plainly: no test reproduces the
+  interleaving.** It needs the final flush to be the one that paused. This is an
+  invariant at the door of the pool, not a repair for a demonstrated failure.
+
+### Changed
+
+- **A request carrying an image, audio or a file is refused, not quietly stripped.**
+
+  The refusal names the part, because the point of an error is that the reader knows
+  what to do: "image content is not supported", and likewise for audio, files, and
+  any part type that is not `text`.
+  Malformed tool `arguments` say what shape was expected. An array of text parts is
+  the multi-part shape we do carry and still works.
+
+  A malformed credential header says so too, without echoing the value: it is a
+  credential, and it would land in a JSON body unescaped. What a wrong or unfunded
+  key produces is unchanged and was never ours to write: that answer comes from the
+  provider, with its own status and its own message, relayed.
+
+  The message reaches the client, which took a second change: `why` went only to the
+  log and the client got a canned "malformed request". `{ep,ur}_error_respond` now
+  takes a separate `detail` shown only on a 4xx, **passed per call site and never
+  automatically**. A reason derived from the caller's own bytes is theirs to see; a
+  policy's deny reason is not.
+
+- **`BENCHMARKS.md` says which two tables have no committed data.** The
+  concurrent-stream capacity table cited `bench/results/stream-steadystate.csv`, which
+  is the 4,096-stream latency run and says so on its own first line. No tracked script
+  produces the capacity table's method, and nothing in the repository records its RSS,
+  CPU or socket columns. The four-client 4,096 table has no pointer at all. Both now
+  say so in place, and the document's "everything below is reproducible" now names the
+  exception instead of being false.
+
+- **The README's streaming numbers are re-derived from the committed CSV**: 4% not 3%
+  delivered by LiteLLM at 512 streams, 55-131 us not 50-120 us per token, and median
+  of 3 runs, not a single run. Stale since the v0.10.0 re-measurement updated
+  `BENCHMARKS.md` and the charts and left the README behind. Every deviation had been
+  in our favour.
+
+- **The README no longer says Bedrock and Azure are unshipped.** Both ship, with SigV4
+  and an upstream query respectively, since 0.23.0 and 0.24.0. `--help` contradicted
+  the README on line one.
+
+### Added
+
+- **`scripts/check_docs_data.py`, in CI**: every in-repo path a document points at
+  must exist. A benchmark claim is worth what the data under it is worth, and the
+  cheapest way for that to rot is a citation that stops resolving. Header shorthand
+  (`net/http.hpp` for the file the code includes) resolves by unique suffix, so the
+  design docs keep reading the way the code does.
+
 ## [0.26.1]. 2026-08-22
 
 Tests only, no shipped code changed. The ThreadSanitizer job is green again, and the

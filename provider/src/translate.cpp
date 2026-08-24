@@ -23,13 +23,30 @@ namespace llmbridge::provider
         // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
         // the output's, so nothing is decoded or re-escaped; the bytes are viewed
         // straight out of the request/response buffer.
-        void append_text(std::string& out, const json::Value* c)
+        // False when the content holds a part this translator cannot carry, which is
+        // anything that is not text: an image, audio, a PDF.
+        //
+        // It used to skip those parts and keep the text, and that is worse than not
+        // supporting them. A vision request became "what is in this image?" with no
+        // image attached, the provider answered confidently about nothing, the caller
+        // was billed, and the status was 200. Dropping part of a request and
+        // forwarding the rest is the sanitise-and-forward this codebase refuses
+        // everywhere else; the caller has to be told, and the gateway names the part
+        // in the error it returns.
+        [[nodiscard]] bool append_text(std::string& out, const json::Value* c)
         {
-            if (!c) return;
-            if (c->is_string()) { out += c->sv; return; }
+            if (!c) return true;
+            if (c->is_string()) { out += c->sv; return true; }
             if (c->is_array())
                 for (const auto& part : c->arr)
-                    if (part.str_or("type") == "text") out += part.str_or("text");
+                {
+                    const std::string_view type = part.str_or("type");
+                    if (type == "text") { out += part.str_or("text"); continue; }
+                    // A part with no type at all is as unusable as an unknown one:
+                    // guessing it is text is the same silent edit.
+                    return false;
+                }
+            return true;
         }
     } // namespace
 
@@ -192,7 +209,7 @@ namespace llmbridge::provider
                 if (role == "system")
                 {
                     if (has_system) system += "\\n"; // escaped newline in the output
-                    append_text(system, content);
+                    if (!append_text(system, content)) return {};
                     has_system = true;
                     continue;
                 }
@@ -217,7 +234,7 @@ namespace llmbridge::provider
                     messages += R"({"type":"tool_result","tool_use_id":)";
                     json::append_raw_string(messages, m.str_or("tool_call_id"));
                     messages += R"(,"content":")";
-                    append_text(messages, content);
+                    if (!append_text(messages, content)) return {};
                     messages += "\"}";
                     continue;
                 }
@@ -234,7 +251,7 @@ namespace llmbridge::provider
                     messages += R"({"role":"assistant","content":[)";
                     bool any = false;
                     std::string text;
-                    append_text(text, content);
+                    if (!append_text(text, content)) return {};
                     if (!text.empty())
                     {
                         messages += R"({"type":"text","text":")";
@@ -255,8 +272,38 @@ namespace llmbridge::provider
                         messages += ",\"name\":";
                         json::append_raw_string(messages, name);
                         // arguments (a JSON *string*) -> input (a JSON *object*).
-                        messages += ",\"input\":";
+                        //
+                        // Parsed before it is spliced. These bytes come from the
+                        // client, and appending them raw let a caller close our
+                        // object and append its own top-level members: an
+                        // `arguments` of `{}}]},{"role":"user",...}],"model":"theirs"`
+                        // produced a syntactically valid Anthropic body we did not
+                        // write. Non-JSON was worse in a quieter way: `"input":not
+                        // json` is a malformed body we then sent upstream, which is
+                        // sanitise-and-forward with the sanitising left out.
+                        //
+                        // rewrite_model refuses the same class three functions down;
+                        // this is the same rule applied to the same kind of input.
                         const std::string args = json::unescape_string(fn->str_or("arguments"));
+                        if (!args.empty())
+                        {
+                            bool arg_ok = false;
+                            const json::Value parsed = json::parse(args, arg_ok);
+                            if (!arg_ok || !parsed.is_object()) return {};
+                            // And nothing after it. The parser stops at the end of
+                            // the first value, so `{}}]},{...}` parses as a valid
+                            // empty object with the payload trailing behind it, and
+                            // checking only "is it an object" accepts exactly the
+                            // injection this refuses. `sv` spans the object's own
+                            // braces, so comparing it against the input is what
+                            // makes the whole string have to be that object.
+                            size_t end = args.size();
+                            while (end > 0 && (args[end - 1] == ' ' || args[end - 1] == '\t' ||
+                                               args[end - 1] == '\n' || args[end - 1] == '\r'))
+                                --end;
+                            if (parsed.sv.size() != end) return {};
+                        }
+                        messages += ",\"input\":";
                         messages += args.empty() ? "{}" : args;
                         messages += '}';
                     }
@@ -269,7 +316,7 @@ namespace llmbridge::provider
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
                 messages += ",\"content\":\"";
-                append_text(messages, content);
+                if (!append_text(messages, content)) return {};
                 messages += "\"}";
             }
             if (in_tool_results) messages += "]}"; // close a trailing tool_result turn
@@ -507,7 +554,7 @@ namespace llmbridge::provider
                 if (role == "system")
                 {
                     if (has_system) system += "\\n";
-                    append_text(system, content);
+                    if (!append_text(system, content)) return {};
                     has_system = true;
                     continue;
                 }
@@ -517,7 +564,7 @@ namespace llmbridge::provider
                 contents += "{\"role\":";
                 contents += role == "assistant" ? "\"model\"" : "\"user\"";
                 contents += ",\"parts\":[{\"text\":\"";
-                append_text(contents, content);
+                if (!append_text(contents, content)) return {};
                 contents += "\"}]}";
             }
         }
@@ -617,7 +664,7 @@ namespace llmbridge::provider
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
                 messages += ",\"content\":\"";
-                append_text(messages, content);
+                if (!append_text(messages, content)) return {};
                 messages += "\"}";
             }
         }

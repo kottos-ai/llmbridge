@@ -54,6 +54,38 @@
 
 namespace llmbridge
 {
+    /// What a refused request is told, in one place.
+    ///
+    /// Here and not as literals at the point of use, because a test that spells the
+    /// message out again is a second copy that can disagree with the first. One did:
+    /// the wording was shortened here and the test still looked for the old text, so
+    /// a correct gateway failed a stale expectation and the build that noticed was
+    /// CI's. The test reads these, so the wording lives in one file and editing it
+    /// cannot break a test that is still right.
+    namespace refuse
+    {
+        inline constexpr const char* kImage =
+            "request translate: image content is not supported";
+        inline constexpr const char* kAudio =
+            "request translate: audio content is not supported";
+        inline constexpr const char* kFile =
+            "request translate: file content is not supported";
+        inline constexpr const char* kPart =
+            "request translate: unsupported content part; only \"text\" parts are carried";
+        inline constexpr const char* kToolArgs =
+            "request translate: tool_calls[].function.arguments must be a JSON object "
+            "and nothing else";
+        inline constexpr const char* kCredential =
+            "a credential header holds bytes that cannot be forwarded "
+            "(control characters are refused)";
+        inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
+        inline constexpr const char* kNotObject =
+            "request translate: body is not a JSON object";
+        inline constexpr const char* kNoModel = "request translate: no \"model\" field";
+        inline constexpr const char* kNoMessages = "request translate: no \"messages\" field";
+        inline constexpr const char* kShape = "request translate: unsupported request shape";
+    } // namespace refuse
+
     // Dialect translation: None = byte-forward (OpenAI-compatible upstreams);
     // the rest translate OpenAI<->provider on the way out and back.
     enum class TranslateMode
@@ -686,7 +718,12 @@ namespace llmbridge
         /// the cause, logged with the request id: 28 call sites collapse into three
         /// status codes, so without it a log can say a request failed but never why,
         /// which is the question an incident actually asks.
-        void ep_error_respond(Connection* client, int code, const char* why) noexcept;
+        /// `why` is for the log. `detail` is what the client sees, and only a 4xx
+        /// shows it: pass one only when the reason is the caller's own request.
+        /// A policy's deny reason is not that, and telling a refused caller which
+        /// rule stopped them is free reconnaissance.
+        void ep_error_respond(Connection* client, int code, const char* why,
+                                 const char* detail = nullptr) noexcept;
 
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
@@ -799,7 +836,12 @@ namespace llmbridge
         bool ur_retry_upstream(Connection* u) noexcept;
         void ur_close(Connection* c) noexcept;
         void ur_abort_pair(Connection* client) noexcept;
-        void ur_error_respond(Connection* client, int code, const char* why) noexcept;
+        /// `why` is for the log. `detail` is what the client sees, and only a 4xx
+        /// shows it: pass one only when the reason is the caller's own request.
+        /// A policy's deny reason is not that, and telling a refused caller which
+        /// rule stopped them is free reconnaissance.
+        void ur_error_respond(Connection* client, int code, const char* why,
+                                 const char* detail = nullptr) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;

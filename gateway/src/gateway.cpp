@@ -83,11 +83,55 @@ namespace llmbridge
         {
             bool ok = false;
             const provider::json::Value v = provider::json::parse(body, ok);
-            if (!ok) return "request translate: body is not valid JSON";
-            if (!v.is_object()) return "request translate: body is not a JSON object";
-            if (!v.find("model")) return "request translate: no \"model\" field";
-            if (!v.find("messages")) return "request translate: no \"messages\" field";
-            return "request translate: unsupported request shape";
+            if (!ok) return refuse::kNotJson;
+            if (!v.is_object()) return refuse::kNotObject;
+            if (!v.find("model")) return refuse::kNoModel;
+            const provider::json::Value* msgs = v.find("messages");
+            if (!msgs) return refuse::kNoMessages;
+
+            // Name the part we could not carry. A caller who sends an image gets
+            // "vision is not implemented" instead of "unsupported request shape",
+            // which is the difference between reading the README and filing a bug.
+            if (msgs->is_array())
+                for (const provider::json::Value& m : msgs->arr)
+                {
+                    const provider::json::Value* c = m.find("content");
+                    if (!c || !c->is_array()) continue;
+                    for (const provider::json::Value& part : c->arr)
+                    {
+                        const std::string_view t = part.str_or("type");
+                        if (t == "text") continue;
+                        if (t == "image_url" || t == "image")
+                            return refuse::kImage;
+                        if (t == "input_audio" || t == "audio")
+                            return refuse::kAudio;
+                        if (t == "file" || t == "document")
+                            return refuse::kFile;
+                        return refuse::kPart;
+                    }
+                }
+
+            // Tool arguments are a JSON string that must decode to one object, and
+            // nothing else: see the splice in translate.cpp.
+            if (msgs->is_array())
+                for (const provider::json::Value& m : msgs->arr)
+                {
+                    const provider::json::Value* tcs = m.find("tool_calls");
+                    if (!tcs || !tcs->is_array()) continue;
+                    for (const provider::json::Value& call : tcs->arr)
+                    {
+                        const provider::json::Value* fn = call.find("function");
+                        if (!fn) continue;
+                        const std::string args =
+                            provider::json::unescape_string(fn->str_or("arguments"));
+                        if (args.empty()) continue;
+                        bool aok = false;
+                        const provider::json::Value parsed = provider::json::parse(args, aok);
+                        if (!aok || !parsed.is_object() || parsed.sv.size() != args.size())
+                            return refuse::kToolArgs;
+                    }
+                }
+            return refuse::kShape;
         }
 
         const char* translate_name(TranslateMode m) noexcept
@@ -314,7 +358,12 @@ namespace llmbridge
                     line[4] == ':';
                 const bool is_cl = net::http::detail::line_is(line, "content-length:");
                 if (is_cl) saw_cl = true;
-                if (is_host || is_cl || header_stripped(line, strip))
+                // Expect: 100-continue asks the upstream for an interim response we
+                // have no way to relay: parse_response refuses a 1xx, so forwarding
+                // the header turns a legal client request into a 502. Drop it and
+                // send the body, which is what we do anyway.
+                const bool is_expect = net::http::detail::line_is(line, "expect:");
+                if (is_host || is_cl || is_expect || header_stripped(line, strip))
                 {
                     out.append(msg.substr(run, start - run));
                     run = eol + 2;
@@ -845,10 +894,20 @@ namespace llmbridge
             }
         }
 
-        std::string build_error(int code)
+        // `detail` is shown to the client only for a 4xx, where the cause is the
+        // caller's own request and naming it is the difference between reading the
+        // README and filing a bug. A 5xx is ours or the provider's, and its reason
+        // stays in the log: a client has no use for our internals and an attacker
+        // has several.
+        //
+        // Every detail passed here is a string literal from this file, so nothing
+        // client-supplied is echoed back. Keep it that way: this string lands inside
+        // a JSON body with no escaping.
+        std::string build_error(int code, const char* detail = nullptr)
         {
             const auto [line, type, msg] = error_shape(code);
-            std::string body = std::string("{\"error\":{\"message\":\"") + msg + "\",\"type\":\"" + type + "\"}}";
+            const char* shown = (detail && code < 500) ? detail : msg;
+            std::string body = std::string("{\"error\":{\"message\":\"") + shown + "\",\"type\":\"" + type + "\"}}";
             std::string out;
             out.reserve(body.size() + 128);
             out.append(line);
@@ -959,6 +1018,22 @@ namespace llmbridge
             return scan_usage(c->stream_tail, 0); // already bounded to kUsageWindow
         }
 
+        // Did this stream end, or did it just stop? The two are not the same, and one
+        // Or between them was the whole defect: `chunkdec.done() || at_eof` let EOF
+        // override the framing even when the framing itself proves the stream was cut.
+        // The decoder only reports done() on the terminating 0-length chunk, so on a
+        // chunked stream that is the only honest end; EOF before it is a truncation, and
+        // finishing there emits a fabricated finish_reason "stop" and a [DONE] telling
+        // the client it received a complete answer.
+        //
+        // A close-delimited stream (no chunked framing) genuinely ends at EOF, and must
+        // still finish there.
+        bool stream_complete(const Connection* client, bool at_eof)
+        {
+            if (client->stream_chunked) return client->chunkdec.done();
+            return at_eof;
+        }
+
         // Outcome of one streaming translate step (shared by both backends).
         enum class StreamStep
         {
@@ -1007,12 +1082,15 @@ namespace llmbridge
                         client->ts_first_token = now_ns();
                     out.append(sse_in);
                 }
-                if (((client->stream_chunked && client->chunkdec.done()) || at_eof) &&
-                    !client->stream_ended)
+                if (stream_complete(client, at_eof) && !client->stream_ended)
                 {
                     client->stream_ended = true;
                     return StreamStep::Ended;
                 }
+                // EOF with the framing unfinished is the truncation. Reported, so the
+                // backends tear the stream down honestly; returning Ok here left the
+                // client holding an open connection that would never speak again.
+                if (at_eof && !client->stream_ended) return StreamStep::Corrupt;
                 return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
             }
 
@@ -1027,13 +1105,13 @@ namespace llmbridge
             if (client->ts_first_token == 0 && client->sse_xlate->content_started())
                 client->ts_first_token = now_ns();
 
-            const bool ended = (client->stream_chunked && client->chunkdec.done()) || at_eof;
-            if (ended && !client->stream_ended)
+            if (stream_complete(client, at_eof) && !client->stream_ended)
             {
                 if (!client->sse_xlate->finish(out)) return StreamStep::Failed;
                 client->stream_ended = true;
                 return StreamStep::Ended;
             }
+            if (at_eof && !client->stream_ended) return StreamStep::Corrupt; // see above
             return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
         }
 
@@ -1837,6 +1915,18 @@ namespace llmbridge
 #endif
         u->ts_pooled = now_ns(); // idle-eviction baseline
         ep_disarm_write(u);
+        // A pooled connection must be readable. A slow client pauses its upstream's
+        // reads, and ep_stream_flush's stream_ended branch returns before the resume
+        // below it, so an upstream can reach here with its interest mask at 0. Handed
+        // to the next client it would never report readable again: that client's
+        // request goes out, the response never arrives, and it hangs until the idle
+        // timeout. Resumed here, and not at that one call site, because this is
+        // the only door into the pool and the invariant is about what is in it.
+        //
+        // Not a repair for a reproduced failure: the interleaving needs the final
+        // flush to be the one that paused, and no test provokes it. It is an
+        // invariant, and pooling a read-disarmed connection cannot be right.
+        ep_resume_read(u);
         _idle_upstreams[static_cast<size_t>(u->upstream_slot)].push_back(u);
     }
 
@@ -1883,7 +1973,8 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ep_error_respond(Connection* client, int code, const char* why) noexcept
+    void Gateway::ep_error_respond(Connection* client, int code, const char* why,
+                                   const char* detail) noexcept
     {
         // Null-tolerant to match ur_error_respond exactly. Every current epoll call
         // site already guarantees non-null, but twins with different contracts are
@@ -1897,7 +1988,7 @@ namespace llmbridge
         else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
-        client->wbuf = build_error(code);
+        client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ep_finish_client closes once it flushes
         ++_stats.errors;
@@ -2193,8 +2284,14 @@ namespace llmbridge
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
-                if (why[0] == 't') ep_error_respond(c, 400, translate_failure(body));
-                else ep_error_respond(c, 400, "malformed credential");
+                if (why[0] == 't')
+                    ep_error_respond(c, 400, "translate", translate_failure(body));
+                // The caller's own header, so the caller is told. The value is
+                // never echoed: it is a credential, and this string lands in a JSON
+                // body with no escaping.
+                else
+                    ep_error_respond(c, 400, "malformed credential",
+                                     refuse::kCredential);
                 return;
             }
         }
@@ -2370,7 +2467,11 @@ namespace llmbridge
             else if (!ep_retry_upstream(u) && !ep_upstream_failed(client, 502, "upstream EOF")) ep_error_respond(client, 502, "upstream EOF, retry exhausted");
             return;
         }
-        if (client == nullptr) return; // stray bytes on an idle pooled conn
+        // Stray bytes on an idle pooled upstream. They are the tail of an exchange
+        // that is over, and ep_acquire_upstream does not clear rbuf, so leaving them
+        // hands one client's bytes to the next as the head of its response. The
+        // io_uring twin already closes here; this side kept the connection.
+        if (client == nullptr) { ep_close_upstream(u); return; }
         client->ts_up_activity = now_ns(); // upstream made progress
 
         // Mid-stream: pump the newly-arrived body bytes and return.
@@ -2487,7 +2588,16 @@ namespace llmbridge
             // re-framed with Content-Length instead of relayed verbatim; we have
             // already decoded it, and handing the client a chunked body we did not
             // re-verify would push our framing problem downstream.
-            if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
+            // The upstream's own status, not a hardcoded 200. Re-framing a chunked
+            // response used to relabel every one of them as success, so a provider's
+            // 429 reached the caller as a completion whose body happened to be a
+            // rate-limit error, with Retry-After dropped. The client cannot back off
+            // from a 200. Content-Length responses were relayed verbatim and were
+            // never affected, which is why it survived: only chunkedness triggers it.
+            if (h.chunked)
+                client->wbuf = build_http_status(h.status ? h.status : 200,
+                                                 reason_for(h.status ? h.status : 200),
+                                                 body_buf);
             else client->wbuf.assign(u->rbuf.data(), total_len);
         }
         client->woff = 0;
@@ -3238,13 +3348,14 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ur_error_respond(Connection* client, int code, const char* why) noexcept
+    void Gateway::ur_error_respond(Connection* client, int code, const char* why,
+                                   const char* detail) noexcept
     {
         if (!client || client->doomed) return;
         if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
-        client->wbuf = build_error(code);
+        client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
         ++_stats.errors;
@@ -3520,8 +3631,11 @@ namespace llmbridge
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
-                if (why[0] == 't') ur_error_respond(c, 400, translate_failure(body));
-                else ur_error_respond(c, 400, "malformed credential");
+                if (why[0] == 't')
+                    ur_error_respond(c, 400, "translate", translate_failure(body));
+                else
+                    ur_error_respond(c, 400, "malformed credential",
+                                     refuse::kCredential);
                 return;
             }
         }
@@ -3680,7 +3794,16 @@ namespace llmbridge
         {
             // See the epoll mirror: a decoded chunked body is re-framed with
             // Content-Length instead of relayed verbatim.
-            if (h.chunked) client->wbuf = build_http("HTTP/1.1 200 OK", body_buf);
+            // The upstream's own status, not a hardcoded 200. Re-framing a chunked
+            // response used to relabel every one of them as success, so a provider's
+            // 429 reached the caller as a completion whose body happened to be a
+            // rate-limit error, with Retry-After dropped. The client cannot back off
+            // from a 200. Content-Length responses were relayed verbatim and were
+            // never affected, which is why it survived: only chunkedness triggers it.
+            if (h.chunked)
+                client->wbuf = build_http_status(h.status ? h.status : 200,
+                                                 reason_for(h.status ? h.status : 200),
+                                                 body_buf);
             else client->wbuf.assign(u->rbuf.data(), total_len);
         }
         // Pool the upstream only if it will stay open: the response must say

@@ -985,3 +985,57 @@ TEST(RewriteModel, TheResultIsStillParseableAndCarriesTheNewModel)
     EXPECT_EQ(v.str_or("model"), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
     EXPECT_EQ(v.num_or("max_tokens"), "48");
 }
+
+// ── `arguments` is client-controlled, so it is parsed before it is spliced ────
+//
+// The value arrives as a JSON *string* and leaves as a JSON *object*, which means
+// its bytes are written into a body we construct. Appending them raw let the client
+// write the body instead of us.
+namespace
+{
+    std::string with_arguments(const std::string& escaped_args)
+    {
+        return R"({"model":"m","max_tokens":8,"messages":[
+          {"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"f","arguments":")" +
+               escaped_args + R"("}}]}]})";
+    }
+} // namespace
+
+TEST(ToolReqInjection, ArgumentsThatCloseOurObjectAreRefused)
+{
+    // Closes the tool_use object, the content array and the message, then appends
+    // members of its own. Before the fix this produced a valid Anthropic body whose
+    // top-level keys were model, max_tokens, messages, model, messages: the last
+    // model and messages are the caller's, appended after ours.
+    const std::string escaped =
+        R"({}}]},{\"role\":\"user\",\"content\":\"x\"}],\"model\":\"attacker-model\",\"messages\":[{)";
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments(escaped)).empty())
+        << "a caller wrote members into a body llmbridge constructed";
+}
+
+TEST(ToolReqInjection, ArgumentsThatAreNotJsonAreRefusedInsteadOfForwarded)
+{
+    // `"input":not json` is a malformed body that we would then send upstream. Fail
+    // closed: refuse the request, do not hand a provider something we broke.
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments("not json")).empty());
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments("[1,2,3]")).empty())
+        << "an array is not an input object";
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments("42")).empty());
+}
+
+TEST(ToolReqInjection, OrdinaryArgumentsStillTranslate)
+{
+    // The control. Refusing everything would pass the two tests above and break the
+    // agent loop, which is the feature this whole path exists for.
+    const Value v = P(openai_to_anthropic_request(
+        with_arguments(R"({\"city\":\"Paris\"})")));
+    const Value* input = v.find("messages")->arr[0].find("content")->arr[0].find("input");
+    ASSERT_TRUE(input && input->is_object());
+    EXPECT_EQ(input->str_or("city"), "Paris");
+    // An empty arguments string is the documented "no parameters" case and becomes {}.
+    const Value e = P(openai_to_anthropic_request(with_arguments("")));
+    const Value* empty_input = e.find("messages")->arr[0].find("content")->arr[0].find("input");
+    ASSERT_TRUE(empty_input && empty_input->is_object());
+    EXPECT_TRUE(empty_input->obj.empty());
+}
