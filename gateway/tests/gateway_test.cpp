@@ -89,6 +89,18 @@ namespace
             keep_alive);
     }
 
+    // A minimal Anthropic messages request: POST /v1/messages, the dialect Claude Code
+    // speaks. The target is what client_dialect_from_target reads.
+    std::string anthropic_request(const std::string& content, bool keep_alive = true)
+    {
+        const std::string body =
+            "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"" +
+            content + "\"}]}";
+        return "POST /v1/messages HTTP/1.1\r\nHost: x\r\n" +
+               std::string(keep_alive ? "" : "Connection: close\r\n") +
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+
     // Provider-dialect response bodies whose assistant text is `text`.
     std::string anthropic_resp_body(const std::string& text)
     {
@@ -4265,6 +4277,57 @@ TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
         << "the retry carried the FAILED venue's translation: " << up;
     EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
     plain.stop();
+}
+
+// An Anthropic-speaking client (Claude Code) against a venue whose mode is Anthropic
+// must byte-forward: same dialect on both sides, so there is nothing to translate. The
+// venue's Anthropic mode used to mean "translate an OpenAI client", which reshaped the
+// reply into OpenAI the caller could not parse. resolve_translation returns None here.
+TEST_P(ProxyRoute, AnthropicClientToAnthropicVenueByteForwards)
+{
+    TestBackend anth;
+    anth.set_response(http_ok(
+        R"({"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}]})"));
+    anth.start();
+    start({{"127.0.0.1", anth.port(), false, "", TranslateMode::Anthropic, ""}}, nullptr);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request("hi")));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+
+    // The client's own /v1/messages reached the venue unchanged, not a rebuilt request.
+    const std::string up = anth.last_request();
+    EXPECT_NE(up.find("POST /v1/messages"), std::string::npos) << up;
+    // The native Anthropic body came back verbatim: no OpenAI reshaping.
+    EXPECT_NE(resp.find("\"type\":\"message\""), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("chat.completion"), std::string::npos)
+        << "an Anthropic client got an OpenAI-shaped body: " << resp;
+    anth.stop();
+}
+
+// The mirror that must fail closed: an Anthropic client to an OpenAI venue is the
+// Anthropic-in direction, which has no translator. It is refused, and the venue is
+// never contacted, so no half-translated bytes reach an upstream.
+TEST_P(ProxyRoute, AnthropicClientToOpenAiVenueIsRefusedAndNothingIsSent)
+{
+    TestBackend oai;
+    oai.set_response(http_ok(R"({"id":"x","object":"chat.completion","choices":[]})"));
+    oai.start();
+    start({{"127.0.0.1", oai.port(), false, "", TranslateMode::None, ""}}, nullptr);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(anthropic_request("hi")));
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    c.close();
+    shutdown();
+
+    EXPECT_TRUE(oai.last_request().empty())
+        << "an unbuilt translation reached the upstream: " << oai.last_request();
+    oai.stop();
 }
 
 // The default on_failure must never retry. Pinned to venue 1 (dead) with venue 0

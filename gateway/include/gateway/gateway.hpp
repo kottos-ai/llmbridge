@@ -225,6 +225,9 @@ namespace llmbridge
         /// request in flight, which is how the response leg knows the dialect after the
         /// upstream went back to its pool.
         int upstream_slot = -1;
+        /// The translation resolved for the request in flight, from the client dialect
+        /// and the venue's, not the venue's alone. See gateway/dialect.hpp.
+        TranslateMode effective_translate = TranslateMode::None;
         // Log identity, distinct from `id` below: `id` is the client-map key and is 0
         // on every upstream, so it cannot name an upstream in a log line. This one is
         // process-unique for every Connection of either kind and never changes, which

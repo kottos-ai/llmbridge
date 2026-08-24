@@ -7,6 +7,8 @@
 
 #include "gateway/gateway.hpp"
 
+#include "gateway/dialect.hpp" // resolve_translation: client dialect x venue dialect
+
 #include "net/secure.hpp"
 #include "net/sigv4.hpp"
 // Only for translate_failure(): the error path re-parses a rejected body to
@@ -56,6 +58,17 @@ namespace llmbridge
             size_t n = eol == std::string_view::npos ? buf.size() : eol;
             if (n > kMax) n = kMax;
             return buf.substr(0, n);
+        }
+
+        /// The translation for a request, from the client's dialect (read off the request
+        /// line) and the venue's. Shared by both backends; the caller handles the refusal
+        /// so each can use its own error path. A free function, not a Gateway method,
+        /// because TranslationPlan lives in dialect.hpp which already includes gateway.hpp.
+        TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept
+        {
+            const std::string_view head(c->rbuf.data(), c->msg.header_len);
+            return resolve_translation(client_dialect_from_target(request_line(head)),
+                                       venue.translate);
         }
 
         /// Status code off the front of a response we are about to send. Reads the
@@ -683,12 +696,15 @@ namespace llmbridge
         /// One function because both event loops need identical behaviour on the
         /// credential path, and because the ordering matters: the body and target are
         /// built first, then signed, because a Bedrock signature covers both.
-        bool build_translated_request(const Upstream& up, std::string_view body,
-                                      std::string_view client_hdrs,
+        bool build_translated_request(const Upstream& up, TranslateMode mode,
+                                      std::string_view body, std::string_view client_hdrs,
                                       const std::vector<std::string>& strip,
                                       std::string& out, const char*& why,
                                       std::string_view model_override = {})
         {
+            // `mode` is the resolved per-request translation, not up.translate: they are
+            // equal whenever this is called (a byte-forward skips this function), but the
+            // caller passes it so the request path never re-derives it from the venue.
             // Before translating, so one rewrite serves every dialect: the Anthropic
             // and Bedrock translators both read the model out of the body, and Bedrock
             // then puts it in the request path.
@@ -702,14 +718,14 @@ namespace llmbridge
             std::string start_line_store;
             std::string_view start_line, target;
             const std::string tbody =
-                xlate_req(up.translate, body, up.base_path, up.query, start_line_store,
+                xlate_req(mode, body, up.base_path, up.query, start_line_store,
                           start_line, target);
             if (tbody.empty()) { why = "translate"; return false; }
 
             std::string auth_hdrs;
-            const bool ok = up.translate == TranslateMode::Bedrock
+            const bool ok = mode == TranslateMode::Bedrock
                                 ? sign_bedrock(up, client_hdrs, strip, target, tbody, auth_hdrs)
-                                : auth_headers_for(up.translate, client_hdrs, strip, auth_hdrs);
+                                : auth_headers_for(mode, client_hdrs, strip, auth_hdrs);
             if (!ok) { why = "credential"; return false; }
 
             out = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
@@ -2222,7 +2238,7 @@ namespace llmbridge
             // Valid only through the forward below, which runs in this call stack.
             c->model_override = d.model;
         }
-        ep_forward(c);
+        ep_forward(c); // resolves the translation for the chosen venue; see ep_forward
     }
 
     void Gateway::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
@@ -2281,7 +2297,7 @@ namespace llmbridge
         r.streamed = streamed;
         r.error_reply = !streamed && c->close_after_resp;
         r.truncated = streamed && c->close_after_resp;
-        r.translated = upstream_of(c).translate != TranslateMode::None;
+        r.translated = c->effective_translate != TranslateMode::None;
         r.backend = _active_backend;
         if (streamed && c->sse_xlate)
         {
@@ -2396,10 +2412,20 @@ namespace llmbridge
         // stamped on the client so the response leg can still find the dialect after
         // the upstream has been released back to its pool.
         const Upstream& up = upstream_of(c);
+        // Resolve the translation for the venue this attempt chose, on every forward, so a
+        // lands on a venue of a different dialect rebuilds correctly instead of reusing
+        // the first venue's mode. The client dialect is read off the request line, which
+        // is in rbuf on the initial call and restored there before a failover retry. An
+        // unbuilt client/venue pair is refused here, before anything reaches the upstream.
+        {
+            const TranslationPlan plan = resolve_dialect(c, up);
+            if (!plan.ok) { ep_error_respond(c, 400, plan.why); return; }
+            c->effective_translate = plan.mode;
+        }
         // Build the bytes to send upstream (translate first, before acquiring an
         // upstream, so a bad body can't leak a pooled connection).
         std::string upstream_bytes;
-        if (up.translate != TranslateMode::None)
+        if (c->effective_translate != TranslateMode::None)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             // Remember whether the client asked for a final usage chunk. The
@@ -2408,7 +2434,7 @@ namespace llmbridge
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             const char* why = "";
             // Either failure => 400, and nothing goes upstream.
-            if (!build_translated_request(up, body, client_hdrs, _strip_headers,
+            if (!build_translated_request(up, c->effective_translate, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
                 if (why[0] == 't')
@@ -2611,9 +2637,9 @@ namespace llmbridge
         // non-streaming here, so a stream from one of those would be forwarded in a
         // dialect the client cannot read; they keep falling through to the whole-body
         // path until their translators exist.
-        if (upstream_of(u).translate == TranslateMode::Anthropic ||
-            upstream_of(u).translate == TranslateMode::Azure ||
-            upstream_of(u).translate == TranslateMode::None)
+        if (client->effective_translate == TranslateMode::Anthropic ||
+            client->effective_translate == TranslateMode::Azure ||
+            client->effective_translate == TranslateMode::None)
         {
             net::http::ResponseHead h;
             const auto hs = net::http::parse_response_head(u->rbuf, h);
@@ -2657,7 +2683,7 @@ namespace llmbridge
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
 
-        if (upstream_of(u).translate != TranslateMode::None)
+        if (client->effective_translate != TranslateMode::None)
         {
             const std::string_view body = body_buf;
             // Relay a provider failure with its own status + message (rate limit,
@@ -2675,7 +2701,7 @@ namespace llmbridge
                 ep_respond(client);
                 return;
             }
-            std::string tbody = xlate_resp(upstream_of(u).translate, body);
+            std::string tbody = xlate_resp(client->effective_translate, body);
             // Scanned unconditionally, not only when --timing-headers is on: the
             // response header is one surface for these numbers and the log is
             // another, and a number that appears in one but not the other is the
@@ -2734,7 +2760,7 @@ namespace llmbridge
         // close); otherwise it's about to close, so drop it instead of reuse a
         // stale connection.
         const bool pool_upstream =
-            h.keep_alive && (upstream_of(u).translate != TranslateMode::None || client->msg.keep_alive);
+            h.keep_alive && (client->effective_translate != TranslateMode::None || client->msg.keep_alive);
         client->peer = nullptr;
         // Drop the framed message so a pipelined next response is not mis-read as
         // part of this one; anything left is the start of the next message.
@@ -2817,7 +2843,7 @@ namespace llmbridge
         stream_warn_if_encoded(client, h);
         // Only a dialect that needs translating gets a translator. Its absence is
         // what stream_step reads as "byte-forward", so this is the whole switch.
-        if (upstream_of(u).translate == TranslateMode::Anthropic)
+        if (client->effective_translate == TranslateMode::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
@@ -3670,9 +3696,9 @@ namespace llmbridge
             // chunked, unlike parse_request()); a text/event-stream response enters the
             // streaming pump, everything else the whole-body path below.
             // See the epoll mirror: translated or byte-forward, never Gemini/Cohere.
-            if (upstream_of(c).translate == TranslateMode::Anthropic ||
-                upstream_of(c).translate == TranslateMode::Azure ||
-                upstream_of(c).translate == TranslateMode::None)
+            if (c->peer->effective_translate == TranslateMode::Anthropic ||
+                c->peer->effective_translate == TranslateMode::Azure ||
+                c->peer->effective_translate == TranslateMode::None)
             {
                 net::http::ResponseHead h;
                 const auto hs = net::http::parse_response_head(c->rbuf, h);
@@ -3741,15 +3767,22 @@ namespace llmbridge
             // Valid only through the forward below, which runs in this call stack.
             c->model_override = d.model;
         }
-        ur_forward(c);
+        ur_forward(c); // resolves the translation for the chosen venue; see ur_forward
     }
 
     void Gateway::ur_forward(Connection* c) noexcept
     {
         // See the epoll mirror: the venue is stamped on the client before this runs.
         const Upstream& up = upstream_of(c);
+        // Resolve the translation for the venue this attempt chose, on every forward; see epoll
+        // for why it lives here and not at the decision point (failover changes venue).
+        {
+            const TranslationPlan plan = resolve_dialect(c, up);
+            if (!plan.ok) { ur_error_respond(c, 400, plan.why); return; }
+            c->effective_translate = plan.mode;
+        }
         std::string upstream_bytes;
-        if (up.translate != TranslateMode::None)
+        if (c->effective_translate != TranslateMode::None)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
@@ -3760,7 +3793,7 @@ namespace llmbridge
             // split. It was harmless by three accidents, and the prefixes turned it
             // into a grep; folding both loops onto one builder removes the chance of
             // the next such divergence entirely.)
-            if (!build_translated_request(up, body, client_hdrs, _strip_headers,
+            if (!build_translated_request(up, c->effective_translate, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
                 if (why[0] == 't')
@@ -3872,7 +3905,7 @@ namespace llmbridge
                                 std::string_view body_buf, size_t total_len) noexcept
     {
         Connection* client = u->peer;
-        if (upstream_of(u).translate != TranslateMode::None)
+        if (client->effective_translate != TranslateMode::None)
         {
             const std::string_view body = body_buf;
             // Relay a provider failure with its own status + message (see the epoll
@@ -3889,7 +3922,7 @@ namespace llmbridge
                 ur_client_send(client);
                 return;
             }
-            std::string tbody = xlate_resp(upstream_of(u).translate, body);
+            std::string tbody = xlate_resp(client->effective_translate, body);
             // Scanned unconditionally, not only when --timing-headers is on: the
             // response header is one surface for these numbers and the log is
             // another, and a number that appears in one but not the other is the
@@ -3943,7 +3976,7 @@ namespace llmbridge
         // forwarded verbatim) the client must not have asked to close. Otherwise the
         // upstream is about to close on us. Drop it instead of reusing a corpse.
         const bool pool_upstream =
-            h.keep_alive && (upstream_of(u).translate != TranslateMode::None || client->msg.keep_alive);
+            h.keep_alive && (client->effective_translate != TranslateMode::None || client->msg.keep_alive);
         client->woff = 0;
         client->peer = nullptr;
         // Drop the framed message; anything left is the next pipelined response.
@@ -4091,7 +4124,7 @@ namespace llmbridge
         stream_warn_if_encoded(client, h);
         // Only a dialect that needs translating gets a translator. Its absence is
         // what stream_step reads as "byte-forward", so this is the whole switch.
-        if (upstream_of(u).translate == TranslateMode::Anthropic)
+        if (client->effective_translate == TranslateMode::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {

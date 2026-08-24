@@ -8,6 +8,23 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.31.0]. 2026-08-24
+
+### Added
+
+- **Dialect resolution is wired into the request path (v0.30.0 added the resolver).** The
+  gateway resolves the translation per request from the client dialect and the venue's,
+  on both backends. The mode is resolved at forward time and re-resolved on a failover
+  that lands on a venue of a different dialect, stored on the client, and read by both the
+  request and response legs. An Anthropic client (Claude Code) to an Anthropic venue now
+  byte-forwards and gets a native Anthropic response instead of a mistranslated OpenAI one;
+  an unbuilt client/venue pair (the Anthropic-in direction) is refused with a 400 and the
+  upstream is never contacted. OpenAI-client behaviour is unchanged, because the resolver
+  returns the venue's own mode for an OpenAI caller. Tests cover both new paths on both
+  backends, and the refutation reproduces the exact OpenAI-shaped reply the old code sent
+  an Anthropic client.
+
+
 ## [0.30.0]. 2026-08-24
 
 ### Added
