@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.29.1]. 2026-08-24
+
+### Fixed
+
+- **A successful passthrough said `HTTP/1.1 200 Client Error`.** The reason-phrase
+  table listed only failures, so a 200 fell to its `status < 500` default.
+  Nothing broke, which is why it survived: RFC 9110 says clients ignore the reason
+  phrase, and the existing tests read the status code.
+
 ## [0.29.0]. 2026-08-24
 
 ### Added

@@ -1730,6 +1730,41 @@ TEST_P(ProxyChunkedResp, PassthroughChunkedResponseReframedWithContentLength)
     EXPECT_NE(r.find("Content-Length:"), std::string::npos) << r;
 }
 
+TEST_P(ProxyChunkedResp, TheStatusLineOfASuccessSaysOk)
+{
+    // Keeping the provider's status meant building the status line ourselves, and
+    // the reason phrase came from a table that only knew error codes: a 200 fell to
+    // its `status < 500` default and every successful passthrough answered
+    // "200 Client Error". Clients ignore the phrase, so nothing broke and nothing
+    // caught it; the first `curl -D-` against a live provider showed it.
+    const auto [backend, nchunks] = GetParam();
+    _backend.set_chunked_response(nchunks);
+    start(0, true, TranslateMode::None, backend);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.substr(0, r.find("\r\n")), "HTTP/1.1 200 OK") << r;
+}
+
+TEST_P(ProxyChunkedResp, AnErrorStatusKeepsItsOwnPhrase)
+{
+    const auto [backend, nchunks] = GetParam();
+    _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 2\r\nConnection: keep-alive\r\n\r\n{}");
+    _backend.set_chunked_response(nchunks);
+    start(0, true, TranslateMode::None, backend);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response();
+    ASSERT_FALSE(r.empty());
+    EXPECT_EQ(r.substr(0, r.find("\r\n")), "HTTP/1.1 429 Too Many Requests") << r;
+}
+
 TEST_P(ProxyChunkedResp, PooledConnectionSurvivesAChunkedResponse)
 {
     // The end of a chunked message is found by decoding, not by Content-Length. If

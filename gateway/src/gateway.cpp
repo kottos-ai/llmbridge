@@ -986,10 +986,21 @@ namespace llmbridge
         }
 
         // A short reason phrase for the codes providers actually return.
+        //
+        // The default classifies, and must never call a success an error: this table
+        // held only failures, so a 200 took the `< 500` branch and every successful
+        // passthrough went out as "200 Client Error" from v0.27.0, when keeping the
+        // provider's status first brought a 2xx here.
         const char* reason_for(int status)
         {
             switch (status)
             {
+                case 200: return "OK";
+                case 201: return "Created";
+                case 202: return "Accepted";
+                case 204: return "No Content";
+                case 206: return "Partial Content";
+                case 304: return "Not Modified";
                 case 400: return "Bad Request";
                 case 401: return "Unauthorized";
                 case 403: return "Forbidden";
@@ -1002,7 +1013,11 @@ namespace llmbridge
                 case 503: return "Service Unavailable";
                 case 504: return "Gateway Timeout";
                 case 529: return "Overloaded";
-                default: return status < 500 ? "Client Error" : "Server Error";
+                default:
+                    if (status < 200) return "Informational";
+                    if (status < 300) return "OK";
+                    if (status < 400) return "Redirection";
+                    return status < 500 ? "Client Error" : "Server Error";
             }
         }
 
