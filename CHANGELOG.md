@@ -8,6 +8,38 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.28.0]. 2026-08-24
+
+An agentic client can be measured, which it could not be before. Minor: usage is now
+recorded for a dialect that reported none, and one request header stops being
+forwarded.
+
+### Fixed
+
+- **Byte-forwarded streams are measured in the Anthropic dialect too.** The usage
+  scanner read `prompt_tokens` and `completion_tokens`; Anthropic says `input_tokens`
+  and `output_tokens`, and the first-token stamp looked for `"content":"` where
+  Anthropic sends `text_delta`.
+
+  Three things this needed beyond adding the field names:
+
+  - **The scan runs as the stream arrives, before the window is trimmed.** Anthropic
+    states input and cache tokens in `message_start`, at the very beginning.
+  - **`output_tokens` is taken from the last occurrence.** `message_start` carries a
+    placeholder `1` and `message_delta` the real total, so the first match reports
+    every answer as one token long.
+  - **`stream_options.include_usage` no longer gates the capture.** That is an OpenAI
+    option Anthropic does not have and this client never sends, so gating on it meant
+    no counts at all for the dialect being measured.
+
+- **`Accept-Encoding` is not forwarded, because a compressed body cannot be
+  measured.** The work above was verified with curl, which asks for no compression.
+
+  A provider that compresses unasked is now a warning naming the reason, not a dash
+  in the tape with nobody knowing why. `ResponseHead::encoded` carries the fact;
+  the framer records it and does not act on it, since where a body ends is a
+  different question from what it means.
+
 ## [0.27.0]. 2026-08-24
 
 Six defects found by an audit of the whole repository, five of them reachable from an

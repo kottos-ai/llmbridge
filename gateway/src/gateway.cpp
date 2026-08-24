@@ -363,7 +363,19 @@ namespace llmbridge
                 // the header turns a legal client request into a 502. Drop it and
                 // send the body, which is what we do anyway.
                 const bool is_expect = net::http::detail::line_is(line, "expect:");
-                if (is_host || is_cl || is_expect || header_stripped(line, strip))
+                // Accept-Encoding is dropped so the provider answers in plain text,
+                // because a compressed body is a body this gateway cannot measure.
+                // Every real client asks for gzip; curl does not, which is how this
+                // survived a live test. With it, an Anthropic stream recorded
+                // tokens_in=-1 while the identical request without it recorded 8.
+                //
+                // The cost is bandwidth on the provider leg, and it is the right
+                // trade for a gateway whose product is the measurement. Clients
+                // always accept identity, so nothing downstream breaks.
+                const bool is_accept_encoding =
+                    net::http::detail::line_is(line, "accept-encoding:");
+                if (is_host || is_cl || is_expect || is_accept_encoding ||
+                    header_stripped(line, strip))
                 {
                     out.append(msg.substr(run, start - run));
                     run = eol + 2;
@@ -795,8 +807,12 @@ namespace llmbridge
             BodyUsage u;
             const std::string_view tail =
                 (window && body.size() > window) ? body.substr(body.size() - window) : body;
-            const auto num_after = [&tail](std::string_view key) -> long long {
-                const size_t k = tail.find(key);
+            // `last` matters for one field only, and it is not a preference: an
+            // Anthropic stream states `output_tokens` twice, a placeholder 1 in
+            // message_start and the real total in message_delta. Taking the first
+            // match reports every answer as one token long.
+            const auto num_at = [&tail](std::string_view key, bool last) -> long long {
+                const size_t k = last ? tail.rfind(key) : tail.find(key);
                 if (k == std::string_view::npos) return -1;
                 size_t i = k + key.size();
                 while (i < tail.size() && (tail[i] == ':' || tail[i] == ' ')) ++i;
@@ -809,9 +825,24 @@ namespace llmbridge
                 }
                 return any ? v : -1;
             };
+            const auto num_after = [&num_at](std::string_view key) { return num_at(key, false); };
             u.in = num_after("\"prompt_tokens\"");
             u.out = num_after("\"completion_tokens\"");
             u.cached = num_after("\"cached_tokens\"");
+            if (u.in >= 0 || u.out >= 0) return u; // OpenAI shape, done
+
+            // Anthropic names the same three things differently, and a byte-forwarded
+            // stream is exactly where nothing translates them for us. Claude Code
+            // speaks this dialect, so without these its every request records zero
+            // tokens and therefore zero cost.
+            u.in = num_after("\"input_tokens\"");
+            u.out = num_at("\"output_tokens\"", /*last=*/true);
+            // Cache reads dominate an agent's input: the same system prompt and the
+            // same files, resent every turn. Counting them as ordinary input
+            // overstates the bill by a large multiple, and they are billed at a
+            // fraction of the rate. `cache_creation` is the write, charged at a
+            // premium and not a read, so only the read lands in `cached`.
+            u.cached = num_after("\"cache_read_input_tokens\"");
             return u;
         }
 
@@ -993,8 +1024,44 @@ namespace llmbridge
         /// copy would buy nothing.
         void stream_note_usage(Connection* client, std::string_view bytes) noexcept
         {
-            if (!client->wants_usage) return;
             client->stream_tail.append(bytes);
+
+            // Scanned as it arrives, not once at the end, because Anthropic reports
+            // input and cache tokens in `message_start`, at the very beginning of the
+            // stream. A tail window holds the last 2 KiB, so on any stream longer
+            // than that the input count had already scrolled out by the time anyone
+            // looked. OpenAI puts everything in one chunk before [DONE], which is why
+            // the tail was enough until this dialect arrived.
+            //
+            // The `wants_usage` gate went with it: that flag reads
+            // `stream_options.include_usage`, an OpenAI option Anthropic does not
+            // have and Claude Code never sends, so gating on it meant no counts at
+            // all for the dialect this exists to measure.
+            //
+            // Gated instead on a cheap search of the arriving bytes, so the hot path
+            // pays one substring scan per chunk. `_tokens` catches a usage block
+            // split across two reads: the half carrying the numbers triggers a
+            // rescan of the tail, which by then holds both halves.
+            //
+            // The scan runs before the window is trimmed, and that ordering is the
+            // whole fix. Trimming first discards whatever arrived earlier in the same
+            // read, and a mock or a fast provider delivers an entire stream in one
+            // read: message_start had already been cut away when the scan ran, so
+            // input and cache came back as "not reported" while output was found.
+            if (bytes.find("usage") != std::string_view::npos ||
+                bytes.find("_tokens") != std::string_view::npos)
+            {
+                const BodyUsage u = scan_usage(client->stream_tail, 0);
+            // Input and cache are first-wins: stated once, in message_start, and a
+            // later chunk mentioning them again is not a new fact. Output is
+            // last-wins: message_start carries a placeholder 1 and message_delta
+            // carries the real total.
+                if (client->usage_in < 0 && u.in >= 0) client->usage_in = u.in;
+                if (client->usage_cached < 0 && u.cached >= 0) client->usage_cached = u.cached;
+                if (u.out >= 0) client->usage_out = u.out;
+            }
+            // Trimmed last, so the buffer stays bounded across reads while every read
+            // is searched whole.
             if (client->stream_tail.size() > kUsageWindow)
                 client->stream_tail.erase(0, client->stream_tail.size() - kUsageWindow);
         }
@@ -1015,7 +1082,9 @@ namespace llmbridge
             if (c->sse_xlate)
                 return {c->sse_xlate->input_tokens(), c->sse_xlate->output_tokens(),
                         static_cast<long long>(c->sse_xlate->cached_tokens())};
-            return scan_usage(c->stream_tail, 0); // already bounded to kUsageWindow
+            // Accumulated by stream_note_usage as the stream ran. Reading the tail
+            // here instead would miss anything stated before the last 2 KiB.
+            return {c->usage_in, c->usage_out, c->usage_cached};
         }
 
         // Did this stream end, or did it just stop? The two are not the same, and one
@@ -1077,8 +1146,13 @@ namespace llmbridge
                     // TTFT on the first payload carrying content, so a role-only
                     // opening chunk does not claim the token arrived early. The
                     // quote before `content` keeps `reasoning_content` out of it.
+                    // The first content-bearing chunk in either dialect. OpenAI says
+                    // `"content":"`; Anthropic says `text_delta`, and its
+                    // `content_block_start` carries an empty `"text":""` that is not
+                    // a token, which is why the delta is what counts.
                     if (client->ts_first_token == 0 &&
-                        sse_in.find("\"content\":\"") != std::string::npos)
+                        (sse_in.find("\"content\":\"") != std::string::npos ||
+                         sse_in.find("\"text_delta\"") != std::string::npos))
                         client->ts_first_token = now_ns();
                     out.append(sse_in);
                 }
@@ -1431,6 +1505,19 @@ namespace llmbridge
 
     // Shared by both backends, hence no ep_/ur_ prefix: is this upstream carrying
     // TLS? Compiles to `false` in a build without TLS support.
+    // A compressed stream is forwarded correctly and measured not at all: the token
+    // counts live in bytes we cannot read. request_without drops Accept-Encoding so
+    // this should not happen, so if it does the provider compressed unasked and the
+    // operator needs to know why the tape went quiet, and not read a dash and guess.
+    void Gateway::stream_warn_if_encoded(const Connection* client,
+                                         const net::http::ResponseHead& h) noexcept
+    {
+        if (!h.encoded) return;
+        LB_WARN(ReqId{client->req_seq},
+                " upstream compressed the response, so token counts are not readable "
+                "for this request; Accept-Encoding was not forwarded");
+    }
+
     void Gateway::stream_truncate(Connection* client) noexcept
     {
         // Abort a stream honestly. No terminal [DONE] is emitted, deliberately:
@@ -2193,6 +2280,12 @@ namespace llmbridge
         c->sink_cap_len[0] = c->sink_cap_len[1] = 0;
         c->wall_t0 = 0;
         c->policy_tag = 0;
+        // Streaming usage, for the same reason and found by the same argument: a
+        // keep-alive client's second stream inherited the first one's token counts,
+        // because nothing cleared them between requests.
+        c->stream_tail.clear();
+        c->usage_in = c->usage_out = c->usage_cached = -1;
+        c->ts_first_token = 0;
     }
 
     Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
@@ -2687,6 +2780,7 @@ namespace llmbridge
         client->streaming = true;
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
+        stream_warn_if_encoded(client, h);
         // Only a dialect that needs translating gets a translator. Its absence is
         // what stream_step reads as "byte-forward", so this is the whole switch.
         if (upstream_of(u).translate == TranslateMode::Anthropic)
@@ -3956,6 +4050,7 @@ namespace llmbridge
         client->streaming = true;
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
+        stream_warn_if_encoded(client, h);
         // Only a dialect that needs translating gets a translator. Its absence is
         // what stream_step reads as "byte-forward", so this is the whole switch.
         if (upstream_of(u).translate == TranslateMode::Anthropic)

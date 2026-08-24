@@ -311,6 +311,7 @@ namespace llmbridge::net::http
         bool chunked = false;          // Transfer-Encoding: chunked
         bool event_stream = false;     // Content-Type: text/event-stream
         bool has_content_length = false;
+        bool encoded = false;          // Content-Encoding present and not identity
         size_t content_length = 0;
     };
 
@@ -406,6 +407,14 @@ namespace llmbridge::net::http
             else if (detail::line_is(line, "transfer-encoding:"))
             {
                 if (detail::contains_ci(value, "chunked")) out.chunked = true;
+            }
+            else if (detail::line_is(line, "content-encoding:"))
+            {
+                // Recorded, never acted on here: the framer's job is where the body
+                // ends, not what it means. The gateway warns, because a compressed
+                // body is one it cannot read token counts out of.
+                const std::string_view v = detail::ltrim(value);
+                out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
             }
             else if (detail::line_is(line, "content-type:"))
             {
