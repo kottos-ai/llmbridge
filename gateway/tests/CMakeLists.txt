@@ -10,6 +10,9 @@ target_link_libraries(gateway_stats_test PRIVATE gateway GTest::gtest_main)
 add_executable(gateway_test gateway_test.cpp)
 target_link_libraries(gateway_test PRIVATE gateway GTest::gtest_main)
 
+add_executable(gateway_dialect_test dialect_test.cpp)
+target_link_libraries(gateway_dialect_test PRIVATE gateway GTest::gtest_main)
+
 # 100 clients x 10 real question/answer pairs, on both event-loop backends.
 # The corpus is a recorded fixture (scripts/gen_qa_corpus.py); the test is
 # hermetic. LLMBRIDGE_TEST_DATA_DIR points at it so the test does not depend on
@@ -23,6 +26,7 @@ include(GoogleTest)
 gtest_discover_tests(gateway_metrics_test)
 gtest_discover_tests(gateway_stats_test)
 gtest_discover_tests(gateway_test)
+gtest_discover_tests(gateway_dialect_test)
 # 1000 requests per case; generous timeout so a slow CI runner does not flake it.
 # RUN_SERIAL: each case drives 1000 requests across 100 threads. Run concurrently
 # with the rest of the suite under `ctest -j`, it both flakes and reports

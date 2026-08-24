@@ -215,6 +215,50 @@ return a `std::string` (empty on parse failure, no exceptions). Coverage is the 
 chat path: model, system prompt, multi-turn messages, `max_tokens`/`temperature`/`top_p`;
 and on the response, content / finish-reason / usage.
 
+### Dialect resolution (client dialect x venue dialect)
+
+An earlier model folded two questions into the venue's `TranslateMode`: what the venue
+speaks, and what to translate. `Anthropic` did not mean "this venue speaks Anthropic",
+it meant "translate an OpenAI client to Anthropic". The OpenAI-client assumption was
+invisible and wrong for any caller that already speaks Anthropic: such a request was
+mistranslated into an OpenAI response the caller could not parse.
+
+The model separates the two axes:
+
+- **client dialect**: the wire format the caller speaks, read per request from the
+  target (`/v1/messages` is Anthropic, `/v1/chat/completions` is OpenAI, and so on).
+  The caller reveals it by which endpoint it calls; an unknown target defaults to
+  OpenAI so nothing that worked before changes.
+- **venue dialect**: the body format the venue speaks, a static property.
+
+The translation to run is a function of the pair (`resolve_translation`, in
+`gateway/dialect.hpp`), not of the venue alone:
+
+| client -> venue | result |
+|---|---|
+| same dialect (Anthropic->Anthropic, OpenAI->OpenAI) | `None`: byte-forward |
+| OpenAI -> Anthropic / Gemini / Cohere | the venue's mode: the built OpenAI-in path |
+| Anthropic (or other non-OpenAI) -> a different venue dialect | refused: the reverse translator is not built |
+
+The last row fails closed. It is the Anthropic-in direction (a caller speaking Anthropic
+against an OpenAI venue), which needs translators that synthesise structure where the
+OpenAI-in ones discard it, and those do not exist yet. Refusing beats mistranslating: the
+request never reaches the venue.
+
+**Body dialect is one axis of three, and `dialect.hpp` owns only the first.** A venue also
+has an auth scheme (Bearer, `x-api-key`, SigV4, `api-key`) and a URL layout (Bedrock puts
+the model in the path, Azure the deployment in the path and the api-version in the query).
+`Bedrock` and `Azure` in `TranslateMode` bundle those transport quirks over a body dialect
+(Anthropic and OpenAI respectively), so they cannot reduce to a plain byte-forward on a
+same-dialect match. They stay on their existing OpenAI-client path until a non-OpenAI
+client path is built for them, and `resolve_translation` refuses a non-OpenAI client to
+either, so the SigV4 or the URL rewrite is never dropped.
+
+Sequencing: phase one is the resolution above, which makes a same-dialect caller
+byte-forward (this is what lets an Anthropic client reach an Anthropic venue) and refuses
+the unbuilt pairs. Phase two builds the Anthropic-in translators and splits Bedrock/Azure
+transport out of the body-dialect axis.
+
 ## Error handling
 
 - **No exceptions on the hot path.** Errors flow through return codes / empty results;
