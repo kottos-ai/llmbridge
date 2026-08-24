@@ -28,7 +28,9 @@
 - **Tool calling**, declarations, `tool_choice`, parallel calls and `tool_result` round-trip, **streaming and non-streaming** (OpenAI ↔ Anthropic)
 - **TLS to the provider** (`--upstream https://...`, opt-in build) and **credential passthrough**, enough to front `api.anthropic.com` directly
 - **Per-request timing headers** (`--timing-headers`), what the gateway cost vs what the provider cost
-- Not yet shipped: vision, `cache_control`, streaming for Gemini/Cohere, Anthropic-in mode
+- Not yet shipped, and **refused with a message that says so** instead of ignored:
+  vision, audio and file content parts. Also not yet shipped: `cache_control`,
+  streaming for Gemini/Cohere, Anthropic-in mode
 
 ## Benchmarks
 

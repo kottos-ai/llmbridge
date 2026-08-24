@@ -5888,3 +5888,129 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamTruncation,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── what we cannot carry, the caller is told ─────────────────────────────────
+//
+// Until 2026-08-24 a non-text content part was dropped and the rest of the request
+// forwarded, so "what is in this image?" reached the provider with no image, came
+// back confident and wrong, and was billed at 200. An unsupported feature has to
+// look like one.
+class ProxyUnsupported : public ProxyIT,
+                         public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+  protected:
+    std::string refuse(const std::string& content_json)
+    {
+        _backend.set_response(http_ok(anthropic_resp_body("should never be reached")));
+        start(0, true, TranslateMode::Anthropic, GetParam());
+        Client c;
+        EXPECT_TRUE(c.connect(_proxy_port));
+        EXPECT_TRUE(c.send(make_request(
+            "{\"model\":\"gpt-4o\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\","
+            "\"content\":" + content_json + "}]}")));
+        const std::string resp = c.recv_response();
+        c.close();
+        shutdown();
+        return resp;
+    }
+};
+
+TEST_P(ProxyUnsupported, AnImageIsRefusedByName)
+{
+    const std::string resp = refuse(
+        R"([{"type":"text","text":"what is in this image?"},)"
+        R"({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}])");
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find("vision is not implemented"), std::string::npos) << resp;
+    // The request must not have reached the provider at all: a dropped image that is
+    // still charged for is the outcome this refusal exists to prevent.
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+TEST_P(ProxyUnsupported, AudioAndFilesAreRefusedByName)
+{
+    const std::string audio = refuse(
+        R"([{"type":"text","text":"transcribe"},)"
+        R"({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}])");
+    EXPECT_EQ(Client::status_of(audio), 400) << audio;
+    EXPECT_NE(audio.find("audio content is not supported"), std::string::npos) << audio;
+}
+
+TEST_P(ProxyUnsupported, AnUnknownPartTypeSaysWhatIsCarried)
+{
+    const std::string resp = refuse(R"([{"type":"quantum","text":"hi"}])");
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find("only \"text\" parts are carried"), std::string::npos) << resp;
+}
+
+// The control: an array of text parts is the multi-part shape we do carry, and it
+// must keep working. Refusing everything would pass the three tests above.
+TEST_P(ProxyUnsupported, TextPartsStillTranslate)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"gpt-4o\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"a \"},"
+        "{\"type\":\"text\",\"text\":\"b\"}]}]}")));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 200) << resp;
+    EXPECT_NE(body_of(_backend.last_request()).find("a b"), std::string::npos)
+        << _backend.last_request();
+}
+
+TEST_P(ProxyUnsupported, AMalformedCredentialHeaderSaysSoWithoutEchoingIt)
+{
+    // The caller's own header, so the caller is told. What must never come back is
+    // the value: it is a credential, and it would land in a JSON body unescaped.
+    _backend.set_response(http_ok(anthropic_resp_body("x")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // An 8-bit byte in the value: legal HTTP framing, so the request frames and the
+    // refusal comes from the credential check and not from the framer. The length is
+    // computed, because a hardcoded one that disagrees with the body leaves the
+    // gateway waiting for bytes that never come.
+    const std::string body =
+        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer sk-secret\xC3value\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find("credential header"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("sk-secret"), std::string::npos)
+        << "the credential came back in the error body";
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+TEST_P(ProxyUnsupported, MalformedToolArgumentsSayWhatIsWrong)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("x")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"gpt-4o\",\"max_tokens\":16,\"messages\":[{\"role\":\"assistant\","
+        "\"content\":null,\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\","
+        "\"function\":{\"name\":\"f\",\"arguments\":\"not json\"}}]}]}")));
+    const std::string resp = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find("must be a JSON object"), std::string::npos) << resp;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyUnsupported,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });

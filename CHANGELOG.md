@@ -80,6 +80,25 @@ carries the status the provider sent.
 
 ### Changed
 
+- **A request carrying an image, audio or a file is refused, not quietly stripped.**
+
+  The refusal names the part, because the point of an error is that the reader knows
+  what to do: "image content is not supported (vision is not implemented; see the
+  README)", and likewise for audio, files, and any part type that is not `text`.
+  Malformed tool `arguments` say what shape was expected. An array of text parts is
+  the multi-part shape we do carry and still works.
+
+  A malformed credential header says so too, without echoing the value: it is a
+  credential, and it would land in a JSON body unescaped. What a wrong or unfunded
+  key produces is unchanged and was never ours to write: that answer comes from the
+  provider, with its own status and its own message, relayed.
+
+  The message reaches the client, which took a second change: `why` went only to the
+  log and the client got a canned "malformed request". `{ep,ur}_error_respond` now
+  takes a separate `detail` shown only on a 4xx, **passed per call site and never
+  automatically**. A reason derived from the caller's own bytes is theirs to see; a
+  policy's deny reason is not.
+
 - **`BENCHMARKS.md` says which two tables have no committed data.** The
   concurrent-stream capacity table cited `bench/results/stream-steadystate.csv`, which
   is the 4,096-stream latency run and says so on its own first line. No tracked script

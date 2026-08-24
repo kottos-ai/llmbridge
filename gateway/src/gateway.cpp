@@ -86,7 +86,53 @@ namespace llmbridge
             if (!ok) return "request translate: body is not valid JSON";
             if (!v.is_object()) return "request translate: body is not a JSON object";
             if (!v.find("model")) return "request translate: no \"model\" field";
-            if (!v.find("messages")) return "request translate: no \"messages\" field";
+            const provider::json::Value* msgs = v.find("messages");
+            if (!msgs) return "request translate: no \"messages\" field";
+
+            // Name the part we could not carry. A caller who sends an image gets
+            // "vision is not implemented" instead of "unsupported request shape",
+            // which is the difference between reading the README and filing a bug.
+            if (msgs->is_array())
+                for (const provider::json::Value& m : msgs->arr)
+                {
+                    const provider::json::Value* c = m.find("content");
+                    if (!c || !c->is_array()) continue;
+                    for (const provider::json::Value& part : c->arr)
+                    {
+                        const std::string_view t = part.str_or("type");
+                        if (t == "text") continue;
+                        if (t == "image_url" || t == "image")
+                            return "request translate: image content is not supported";
+                        if (t == "input_audio" || t == "audio")
+                            return "request translate: audio content is not supported";
+                        if (t == "file" || t == "document")
+                            return "request translate: file content is not supported";
+                        return "request translate: unsupported content part; only "
+                               "\"text\" parts are carried";
+                    }
+                }
+
+            // Tool arguments are a JSON string that must decode to one object, and
+            // nothing else: see the splice in translate.cpp.
+            if (msgs->is_array())
+                for (const provider::json::Value& m : msgs->arr)
+                {
+                    const provider::json::Value* tcs = m.find("tool_calls");
+                    if (!tcs || !tcs->is_array()) continue;
+                    for (const provider::json::Value& call : tcs->arr)
+                    {
+                        const provider::json::Value* fn = call.find("function");
+                        if (!fn) continue;
+                        const std::string args =
+                            provider::json::unescape_string(fn->str_or("arguments"));
+                        if (args.empty()) continue;
+                        bool aok = false;
+                        const provider::json::Value parsed = provider::json::parse(args, aok);
+                        if (!aok || !parsed.is_object() || parsed.sv.size() != args.size())
+                            return "request translate: tool_calls[].function.arguments "
+                                   "must be a JSON object and nothing else";
+                    }
+                }
             return "request translate: unsupported request shape";
         }
 
@@ -850,10 +896,20 @@ namespace llmbridge
             }
         }
 
-        std::string build_error(int code)
+        // `detail` is shown to the client only for a 4xx, where the cause is the
+        // caller's own request and naming it is the difference between reading the
+        // README and filing a bug. A 5xx is ours or the provider's, and its reason
+        // stays in the log: a client has no use for our internals and an attacker
+        // has several.
+        //
+        // Every detail passed here is a string literal from this file, so nothing
+        // client-supplied is echoed back. Keep it that way: this string lands inside
+        // a JSON body with no escaping.
+        std::string build_error(int code, const char* detail = nullptr)
         {
             const auto [line, type, msg] = error_shape(code);
-            std::string body = std::string("{\"error\":{\"message\":\"") + msg + "\",\"type\":\"" + type + "\"}}";
+            const char* shown = (detail && code < 500) ? detail : msg;
+            std::string body = std::string("{\"error\":{\"message\":\"") + shown + "\",\"type\":\"" + type + "\"}}";
             std::string out;
             out.reserve(body.size() + 128);
             out.append(line);
@@ -1919,7 +1975,8 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ep_error_respond(Connection* client, int code, const char* why) noexcept
+    void Gateway::ep_error_respond(Connection* client, int code, const char* why,
+                                   const char* detail) noexcept
     {
         // Null-tolerant to match ur_error_respond exactly. Every current epoll call
         // site already guarantees non-null, but twins with different contracts are
@@ -1933,7 +1990,7 @@ namespace llmbridge
         else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
-        client->wbuf = build_error(code);
+        client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ep_finish_client closes once it flushes
         ++_stats.errors;
@@ -2229,8 +2286,15 @@ namespace llmbridge
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
-                if (why[0] == 't') ep_error_respond(c, 400, translate_failure(body));
-                else ep_error_respond(c, 400, "malformed credential");
+                if (why[0] == 't')
+                    ep_error_respond(c, 400, "translate", translate_failure(body));
+                // The caller's own header, so the caller is told. The value is
+                // never echoed: it is a credential, and this string lands in a JSON
+                // body with no escaping.
+                else
+                    ep_error_respond(c, 400, "malformed credential",
+                                     "a credential header holds bytes that cannot be "
+                                     "forwarded (control characters are refused)");
                 return;
             }
         }
@@ -3287,13 +3351,14 @@ namespace llmbridge
         ++_stats.errors;
     }
 
-    void Gateway::ur_error_respond(Connection* client, int code, const char* why) noexcept
+    void Gateway::ur_error_respond(Connection* client, int code, const char* why,
+                                   const char* detail) noexcept
     {
         if (!client || client->doomed) return;
         if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
-        client->wbuf = build_error(code);
+        client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
         ++_stats.errors;
@@ -3569,8 +3634,12 @@ namespace llmbridge
             if (!build_translated_request(up, body, client_hdrs, _strip_headers,
                                           upstream_bytes, why, c->model_override))
             {
-                if (why[0] == 't') ur_error_respond(c, 400, translate_failure(body));
-                else ur_error_respond(c, 400, "malformed credential");
+                if (why[0] == 't')
+                    ur_error_respond(c, 400, "translate", translate_failure(body));
+                else
+                    ur_error_respond(c, 400, "malformed credential",
+                                     "a credential header holds bytes that cannot be "
+                                     "forwarded (control characters are refused)");
                 return;
             }
         }

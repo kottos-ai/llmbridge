@@ -686,7 +686,12 @@ namespace llmbridge
         /// the cause, logged with the request id: 28 call sites collapse into three
         /// status codes, so without it a log can say a request failed but never why,
         /// which is the question an incident actually asks.
-        void ep_error_respond(Connection* client, int code, const char* why) noexcept;
+        /// `why` is for the log. `detail` is what the client sees, and only a 4xx
+        /// shows it: pass one only when the reason is the caller's own request.
+        /// A policy's deny reason is not that, and telling a refused caller which
+        /// rule stopped them is free reconnaissance.
+        void ep_error_respond(Connection* client, int code, const char* why,
+                                 const char* detail = nullptr) noexcept;
 
         bool ep_drain_read(Connection* c) noexcept;
         bool ep_pump_write(Connection* c, bool* done) noexcept;
@@ -799,7 +804,12 @@ namespace llmbridge
         bool ur_retry_upstream(Connection* u) noexcept;
         void ur_close(Connection* c) noexcept;
         void ur_abort_pair(Connection* client) noexcept;
-        void ur_error_respond(Connection* client, int code, const char* why) noexcept;
+        /// `why` is for the log. `detail` is what the client sees, and only a 4xx
+        /// shows it: pass one only when the reason is the caller's own request.
+        /// A policy's deny reason is not that, and telling a refused caller which
+        /// rule stopped them is free reconnaissance.
+        void ur_error_respond(Connection* client, int code, const char* why,
+                                 const char* detail = nullptr) noexcept;
         void ur_maybe_free(Connection* c) noexcept;
 
         net::uring::Ring _ring;

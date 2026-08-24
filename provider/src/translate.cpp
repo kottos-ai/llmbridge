@@ -23,13 +23,30 @@ namespace llmbridge::provider
         // surrounding quotes. Zero-copy passthrough: the input's escaping is exactly
         // the output's, so nothing is decoded or re-escaped; the bytes are viewed
         // straight out of the request/response buffer.
-        void append_text(std::string& out, const json::Value* c)
+        // False when the content holds a part this translator cannot carry, which is
+        // anything that is not text: an image, audio, a PDF.
+        //
+        // It used to skip those parts and keep the text, and that is worse than not
+        // supporting them. A vision request became "what is in this image?" with no
+        // image attached, the provider answered confidently about nothing, the caller
+        // was billed, and the status was 200. Dropping part of a request and
+        // forwarding the rest is the sanitise-and-forward this codebase refuses
+        // everywhere else; the caller has to be told, and the gateway names the part
+        // in the error it returns.
+        [[nodiscard]] bool append_text(std::string& out, const json::Value* c)
         {
-            if (!c) return;
-            if (c->is_string()) { out += c->sv; return; }
+            if (!c) return true;
+            if (c->is_string()) { out += c->sv; return true; }
             if (c->is_array())
                 for (const auto& part : c->arr)
-                    if (part.str_or("type") == "text") out += part.str_or("text");
+                {
+                    const std::string_view type = part.str_or("type");
+                    if (type == "text") { out += part.str_or("text"); continue; }
+                    // A part with no type at all is as unusable as an unknown one:
+                    // guessing it is text is the same silent edit.
+                    return false;
+                }
+            return true;
         }
     } // namespace
 
@@ -192,7 +209,7 @@ namespace llmbridge::provider
                 if (role == "system")
                 {
                     if (has_system) system += "\\n"; // escaped newline in the output
-                    append_text(system, content);
+                    if (!append_text(system, content)) return {};
                     has_system = true;
                     continue;
                 }
@@ -217,7 +234,7 @@ namespace llmbridge::provider
                     messages += R"({"type":"tool_result","tool_use_id":)";
                     json::append_raw_string(messages, m.str_or("tool_call_id"));
                     messages += R"(,"content":")";
-                    append_text(messages, content);
+                    if (!append_text(messages, content)) return {};
                     messages += "\"}";
                     continue;
                 }
@@ -234,7 +251,7 @@ namespace llmbridge::provider
                     messages += R"({"role":"assistant","content":[)";
                     bool any = false;
                     std::string text;
-                    append_text(text, content);
+                    if (!append_text(text, content)) return {};
                     if (!text.empty())
                     {
                         messages += R"({"type":"text","text":")";
@@ -299,7 +316,7 @@ namespace llmbridge::provider
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
                 messages += ",\"content\":\"";
-                append_text(messages, content);
+                if (!append_text(messages, content)) return {};
                 messages += "\"}";
             }
             if (in_tool_results) messages += "]}"; // close a trailing tool_result turn
@@ -537,7 +554,7 @@ namespace llmbridge::provider
                 if (role == "system")
                 {
                     if (has_system) system += "\\n";
-                    append_text(system, content);
+                    if (!append_text(system, content)) return {};
                     has_system = true;
                     continue;
                 }
@@ -547,7 +564,7 @@ namespace llmbridge::provider
                 contents += "{\"role\":";
                 contents += role == "assistant" ? "\"model\"" : "\"user\"";
                 contents += ",\"parts\":[{\"text\":\"";
-                append_text(contents, content);
+                if (!append_text(contents, content)) return {};
                 contents += "\"}]}";
             }
         }
@@ -647,7 +664,7 @@ namespace llmbridge::provider
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
                 messages += ",\"content\":\"";
-                append_text(messages, content);
+                if (!append_text(messages, content)) return {};
                 messages += "\"}";
             }
         }
