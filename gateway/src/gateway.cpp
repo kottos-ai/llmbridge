@@ -3356,16 +3356,16 @@ namespace llmbridge
         ++_stats.upstream_conns_opened;
 
         u->peer = nullptr;
-        ur_close(u); // discard the dead pooled connection
-        client->peer = uf;
-        uf->peer = client;
-        ++_stats.upstream_retries;
         // WARN, not DEBUG: it is not a cap, it is a recovered failure. A pooled
         // connection was dead when we used it, and the client never learns. That is
         // the point of the retry and also the reason it must be visible: a rising
         // rate here means the provider is dropping keep-alives faster than
         // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
+        ur_close(u); // discard the dead pooled connection
+        client->peer = uf;
+        uf->peer = client;
+        ++_stats.upstream_retries;
         ur_submit_connect(uf); // connect fresh, then send on completion
         return true;
     }
