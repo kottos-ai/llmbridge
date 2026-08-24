@@ -5891,6 +5891,11 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamTruncation,
 
 // ── what we cannot carry, the caller is told ─────────────────────────────────
 //
+// The expectations below read llmbridge::refuse::*, so they assert the message the
+// gateway actually returns. Spelling it out again here made the test a second copy
+// of the wording, and when the wording was shortened a correct gateway failed a
+// stale expectation.
+//
 // Until 2026-08-24 a non-text content part was dropped and the rest of the request
 // forwarded, so "what is in this image?" reached the provider with no image, came
 // back confident and wrong, and was billed at 200. An unsupported feature has to
@@ -5921,7 +5926,7 @@ TEST_P(ProxyUnsupported, AnImageIsRefusedByName)
         R"([{"type":"text","text":"what is in this image?"},)"
         R"({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}])");
     EXPECT_EQ(Client::status_of(resp), 400) << resp;
-    EXPECT_NE(resp.find("vision is not implemented"), std::string::npos) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kImage), std::string::npos) << resp;
     // The request must not have reached the provider at all: a dropped image that is
     // still charged for is the outcome this refusal exists to prevent.
     EXPECT_EQ(_backend.requests_seen(), 0);
@@ -5933,14 +5938,14 @@ TEST_P(ProxyUnsupported, AudioAndFilesAreRefusedByName)
         R"([{"type":"text","text":"transcribe"},)"
         R"({"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}])");
     EXPECT_EQ(Client::status_of(audio), 400) << audio;
-    EXPECT_NE(audio.find("audio content is not supported"), std::string::npos) << audio;
+    EXPECT_NE(audio.find(llmbridge::refuse::kAudio), std::string::npos) << audio;
 }
 
 TEST_P(ProxyUnsupported, AnUnknownPartTypeSaysWhatIsCarried)
 {
     const std::string resp = refuse(R"([{"type":"quantum","text":"hi"}])");
     EXPECT_EQ(Client::status_of(resp), 400) << resp;
-    EXPECT_NE(resp.find("only \"text\" parts are carried"), std::string::npos) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kPart), std::string::npos) << resp;
 }
 
 // The control: an array of text parts is the multi-part shape we do carry, and it
@@ -5985,7 +5990,7 @@ TEST_P(ProxyUnsupported, AMalformedCredentialHeaderSaysSoWithoutEchoingIt)
     c.close();
     shutdown();
     EXPECT_EQ(Client::status_of(resp), 400) << resp;
-    EXPECT_NE(resp.find("credential header"), std::string::npos) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kCredential), std::string::npos) << resp;
     EXPECT_EQ(resp.find("sk-secret"), std::string::npos)
         << "the credential came back in the error body";
     EXPECT_EQ(_backend.requests_seen(), 0);
@@ -6005,7 +6010,7 @@ TEST_P(ProxyUnsupported, MalformedToolArgumentsSayWhatIsWrong)
     c.close();
     shutdown();
     EXPECT_EQ(Client::status_of(resp), 400) << resp;
-    EXPECT_NE(resp.find("must be a JSON object"), std::string::npos) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kToolArgs), std::string::npos) << resp;
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyUnsupported,

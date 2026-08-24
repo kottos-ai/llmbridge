@@ -83,8 +83,8 @@ carries the status the provider sent.
 - **A request carrying an image, audio or a file is refused, not quietly stripped.**
 
   The refusal names the part, because the point of an error is that the reader knows
-  what to do: "image content is not supported (vision is not implemented; see the
-  README)", and likewise for audio, files, and any part type that is not `text`.
+  what to do: "image content is not supported", and likewise for audio, files, and
+  any part type that is not `text`.
   Malformed tool `arguments` say what shape was expected. An array of text parts is
   the multi-part shape we do carry and still works.
 

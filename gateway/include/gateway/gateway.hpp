@@ -54,6 +54,38 @@
 
 namespace llmbridge
 {
+    /// What a refused request is told, in one place.
+    ///
+    /// Here and not as literals at the point of use, because a test that spells the
+    /// message out again is a second copy that can disagree with the first. One did:
+    /// the wording was shortened here and the test still looked for the old text, so
+    /// a correct gateway failed a stale expectation and the build that noticed was
+    /// CI's. The test reads these, so the wording lives in one file and editing it
+    /// cannot break a test that is still right.
+    namespace refuse
+    {
+        inline constexpr const char* kImage =
+            "request translate: image content is not supported";
+        inline constexpr const char* kAudio =
+            "request translate: audio content is not supported";
+        inline constexpr const char* kFile =
+            "request translate: file content is not supported";
+        inline constexpr const char* kPart =
+            "request translate: unsupported content part; only \"text\" parts are carried";
+        inline constexpr const char* kToolArgs =
+            "request translate: tool_calls[].function.arguments must be a JSON object "
+            "and nothing else";
+        inline constexpr const char* kCredential =
+            "a credential header holds bytes that cannot be forwarded "
+            "(control characters are refused)";
+        inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
+        inline constexpr const char* kNotObject =
+            "request translate: body is not a JSON object";
+        inline constexpr const char* kNoModel = "request translate: no \"model\" field";
+        inline constexpr const char* kNoMessages = "request translate: no \"messages\" field";
+        inline constexpr const char* kShape = "request translate: unsupported request shape";
+    } // namespace refuse
+
     // Dialect translation: None = byte-forward (OpenAI-compatible upstreams);
     // the rest translate OpenAI<->provider on the way out and back.
     enum class TranslateMode

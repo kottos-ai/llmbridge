@@ -83,11 +83,11 @@ namespace llmbridge
         {
             bool ok = false;
             const provider::json::Value v = provider::json::parse(body, ok);
-            if (!ok) return "request translate: body is not valid JSON";
-            if (!v.is_object()) return "request translate: body is not a JSON object";
-            if (!v.find("model")) return "request translate: no \"model\" field";
+            if (!ok) return refuse::kNotJson;
+            if (!v.is_object()) return refuse::kNotObject;
+            if (!v.find("model")) return refuse::kNoModel;
             const provider::json::Value* msgs = v.find("messages");
-            if (!msgs) return "request translate: no \"messages\" field";
+            if (!msgs) return refuse::kNoMessages;
 
             // Name the part we could not carry. A caller who sends an image gets
             // "vision is not implemented" instead of "unsupported request shape",
@@ -102,13 +102,12 @@ namespace llmbridge
                         const std::string_view t = part.str_or("type");
                         if (t == "text") continue;
                         if (t == "image_url" || t == "image")
-                            return "request translate: image content is not supported";
+                            return refuse::kImage;
                         if (t == "input_audio" || t == "audio")
-                            return "request translate: audio content is not supported";
+                            return refuse::kAudio;
                         if (t == "file" || t == "document")
-                            return "request translate: file content is not supported";
-                        return "request translate: unsupported content part; only "
-                               "\"text\" parts are carried";
+                            return refuse::kFile;
+                        return refuse::kPart;
                     }
                 }
 
@@ -129,11 +128,10 @@ namespace llmbridge
                         bool aok = false;
                         const provider::json::Value parsed = provider::json::parse(args, aok);
                         if (!aok || !parsed.is_object() || parsed.sv.size() != args.size())
-                            return "request translate: tool_calls[].function.arguments "
-                                   "must be a JSON object and nothing else";
+                            return refuse::kToolArgs;
                     }
                 }
-            return "request translate: unsupported request shape";
+            return refuse::kShape;
         }
 
         const char* translate_name(TranslateMode m) noexcept
@@ -2293,8 +2291,7 @@ namespace llmbridge
                 // body with no escaping.
                 else
                     ep_error_respond(c, 400, "malformed credential",
-                                     "a credential header holds bytes that cannot be "
-                                     "forwarded (control characters are refused)");
+                                     refuse::kCredential);
                 return;
             }
         }
@@ -3638,8 +3635,7 @@ namespace llmbridge
                     ur_error_respond(c, 400, "translate", translate_failure(body));
                 else
                     ur_error_respond(c, 400, "malformed credential",
-                                     "a credential header holds bytes that cannot be "
-                                     "forwarded (control characters are refused)");
+                                     refuse::kCredential);
                 return;
             }
         }
