@@ -8,6 +8,23 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.30.0]. 2026-08-24
+
+### Added
+
+- **Dialect resolution: the translation to run is a function of the client dialect and
+  the venue dialect, not the venue alone.** `TranslateMode` folded two questions into one
+  field: what the venue speaks, and what to translate. `Anthropic` did not mean "this
+  venue speaks Anthropic", it meant "translate an OpenAI client to Anthropic", so a caller
+  that already speaks Anthropic was mistranslated into an OpenAI response it could not
+  parse. A new pure resolver (`gateway/dialect.hpp`) separates the axes: the client
+  dialect is read per request from the target (`/v1/messages` is Anthropic,
+  `/v1/chat/completions` is OpenAI), the venue dialect is a static property, and
+  `resolve_translation` maps the pair to a mode. Same dialect byte-forwards; an OpenAI
+  client keeps the existing path; an unbuilt pair (the Anthropic-in direction) is refused,
+  not mistranslated. Bedrock and Azure stay OpenAI-client-only because they bundle SigV4
+  and URL rewrites over their body dialect. See DESIGN.md "Dialect resolution".
+
 ## [0.29.1]. 2026-08-24
 
 ### Fixed
