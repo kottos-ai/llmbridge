@@ -8,6 +8,34 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.29.0]. 2026-08-24
+
+### Added
+
+- **Streamed requests appear in the latency profile, and a `first-token` line
+  reports the wait they actually cost.** A stream used to record nothing at all, on
+  the argument that "added latency" needs one instant the response was built. That
+  argument covers the response half and nothing else: request-path and the handshake
+  are the same measurements whatever shape the response takes. On the workload this
+  gateway is sold for, where nearly everything streams, the profile was measuring
+  almost nothing: a real Claude Code session logged seven requests and one sample,
+  taken from a rate-limit error.
+
+  `added-total` and `response-path` stay empty on a stream, deliberately, so the
+  headline number keeps meaning one comparable thing. `first-token` is printed
+  separately and only when it has samples, because it is mostly the provider's
+  prefill and not our work; folding it in would put half a second inside a number
+  whose purpose is to be microseconds. Live against Anthropic: 53 us of request path
+  inside a 510 ms wait.
+
+  It is built with 100 us buckets over 26.2 s. The first attempt reused the
+  handshake range and every live sample overflowed it, printing p50 = p99 = max =
+  680.69 ms, which is the clamped-maximum artifact LATENCY.md already documents for
+  `connect(TLS)`.
+
+  A truncated stream still records nothing, the same rule error replies follow: a
+  request that did not finish has no place in a percentile.
+
 ## [0.28.0]. 2026-08-24
 
 An agentic client can be measured, which it could not be before. Minor: usage is now

@@ -1518,6 +1518,25 @@ namespace llmbridge
                 "for this request; Accept-Encoding was not forwarded");
     }
 
+    // request-path and the handshake do not care what shape the response takes, so a
+    // stream records them like any other request. resp_path and added-total it cannot
+    // have: both end at the instant a response was built. See LATENCY.md section 4.
+    void Gateway::stream_record_latency(const Connection* client) noexcept
+    {
+        if (now_ns() - _t_start < _warmup_ns) return;
+        // t4 stands in for the absent t5; only the request-side fields are read.
+        const TimingSplit sp = timing_split(client->ts_req_recvd, client->ts_req_built,
+                                            client->ts_wire_ready, client->ts_up_sent,
+                                            client->ts_up_recvd, client->ts_up_recvd);
+        if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
+        if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));
+        // Zero means no content chunk ever arrived, not an instant answer.
+        if (client->ts_first_token > 0 && client->ts_req_recvd > 0 &&
+            client->ts_first_token >= client->ts_req_recvd)
+            _stats.first_token.record(
+                static_cast<uint64_t>(client->ts_first_token - client->ts_req_recvd));
+    }
+
     void Gateway::stream_truncate(Connection* client) noexcept
     {
         // Abort a stream honestly. No terminal [DONE] is emitted, deliberately:
@@ -2890,7 +2909,11 @@ namespace llmbridge
                  " on ", *client);
         // Only a stream that terminated cleanly counts as a served request; an
         // aborted one (close_after_resp) was already counted in _stats.errors.
-        if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
+        if (!client->close_after_resp)
+        {
+            ++_stats.requests;
+            stream_record_latency(client);
+        }
         if (_sink) sink_emit(client, 200, /*streamed=*/true);
         ep_close_client(client);
     }
@@ -4147,7 +4170,11 @@ namespace llmbridge
                  " tokens_out=", stream_tokens(client).out,
                  " on ", *client);
         // Only a cleanly-terminated stream counts as served (see the epoll mirror).
-        if (!client->close_after_resp) ++_stats.requests; // latency histograms N/A
+        if (!client->close_after_resp)
+        {
+            ++_stats.requests;
+            stream_record_latency(client);
+        }
         if (_sink) sink_emit(client, 200, /*streamed=*/true);
         ur_close(client);
     }

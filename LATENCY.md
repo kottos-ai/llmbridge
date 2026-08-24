@@ -313,6 +313,7 @@ added-total    count=...  p50=...  p99=...  p99.9=...  max=...
   request-path   ...
   connect(TLS)   ...
   response-path  ...
+first-token    ...          <- only when it has samples, i.e. only if traffic streamed
 accept(TLS)    ...          <- only when --listen-tls; see below
 ```
 
@@ -322,6 +323,7 @@ accept(TLS)    ...          <- only when --listen-tls; see below
 | `connect(TLS)` | (t2−t1) | handshake only: **no handshake at all** on a pooled connection, and this line existing separately is the point. See the note on resolution below |
 | `response-path` | t4 → t6 | translate-back **plus** the client write, through full flush |
 | `added-total` | request-path + response-path | everything the gateway did to this request; **both handshakes excluded** |
+| `first-token` | t0 → first content token | the client's real wait before anything appears, on a **streamed** request only. Mostly the provider's prefill, and almost none of it ours; see the note below on why it is reported and not folded in |
 | `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per connection, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,
@@ -331,9 +333,9 @@ distinction was documented wrongly here until 2026-08-12.
 
 ### The handshake histograms use a different range, and why
 
-`connect(TLS)` and `accept(TLS)` are built with **1 µs buckets over 262 ms**; the
-overhead lines keep the default 20 ns over 2.62 ms. Two failures bracket that
-choice, and both were live.
+`connect(TLS)` and `accept(TLS)` are built with **1 µs buckets over 262 ms**,
+`first-token` with **100 µs over 26.2 s**; the overhead lines keep the default
+20 ns over 2.62 ms. Two failures bracket that choice, and both were live.
 
 The default range is sized for a sub-millisecond overhead claim, but a cold
 handshake is 50–80 ms, twenty to thirty times the range. Every cold sample
@@ -349,6 +351,13 @@ on a pooled connection; it read **20 ns**, and nobody questioned it because 20 n
 reads as zero. At 10 µs buckets it would have read 10 µs, inventing handshake
 time that was never paid. 1 µs keeps the artifact below the noise while covering
 any real handshake.
+
+`first-token` sits at the far end of the same trade and repeated the first
+failure before shipping. It was built with `connect`'s range, and three live
+streamed turns printed `p50 = p99 = max = 680.69 ms  [overflow!]`: every sample
+past 262 ms, the clamped-maximum artifact again. 100 µs buckets cover 26.2 s,
+which is a long agent turn, and quantise a 680 ms sample by 0.015%. The memory
+is unchanged, since the bucket count is what costs, not the width.
 
 **So: `max()` is exact, percentiles are quantised upward by up to one bucket, and
 a pooled connection shows ≤ 1 µs, not a true zero.** The per-request
@@ -385,24 +394,41 @@ is not the request total. Two classes are excluded, on both backends:
   outage the failing requests **leave the latency distribution entirely**, so
   the histogram can look its best exactly when the gateway is serving worst.
   Read `errors` alongside it, never the percentiles alone.
-- **Streaming requests.** `{ep,ur}_finalize_stream` increments
-  `_stats.requests` but records no histogram sample ("latency histograms N/A"
-  in both). A stream has no meaningful single `resp_path`: t4 is the response
-  *head*, so t4→t6 would span the entire generation: seconds of provider
-  time booked as gateway overhead.
+- **The response half of a streamed request.** A stream has no meaningful
+  single `resp_path`: t4 is the response *head*, so t4→t6 would span the entire
+  generation, booking seconds of provider time as gateway overhead. With no
+  `resp_path` there is no `added-total` either, since one is defined from the
+  other. Both stay empty on streamed traffic and that is what
+  keeps the headline number one comparable thing.
 
-So on a purely streaming workload these histograms are **empty** while
-`requests` is large, and on mixed traffic `count` < `requests`. Verified
-2026-08-06, on three streamed requests against a local SSE mock:
+
+So `added-total` stays **empty** on a purely streaming workload while
+`requests` is large, and on mixed traffic its `count` < `requests`. Measured
+2026-08-24, three streamed requests against the live Anthropic API:
 
 ```
-requests=3  errors=0  upstream_conns_opened=3  reused=0  retries=0
+requests=3  errors=0  upstream_conns_opened=1  reused=2  retries=0
 added-total    count=0  (no samples)
-  request-path   count=0  (no samples)
+  request-path   count=3  p50=53.26 us  p99=60.84 us  max=113.24 us
+  connect(TLS)   count=3  p50=1000 ns   p99=1000 ns   max=57.97 ms
+  response-path  count=0  (no samples)
+first-token    count=3  p50=509.80 ms  p99=517.60 ms  max=671.79 ms
 ```
 
-That is correct behaviour, not a bug; streaming latency has to be measured
-externally, which is what the streaming benchmark in BENCHMARKS.md does.
+Read that profile the way the claim is phrased: 53 µs of ours sits inside a
+510 ms wait. `connect(TLS)` reading one bucket width at p50 with a 58 ms max is
+the pooling working, one cold handshake and two reuses, and §4's note on
+resolution explains why the reused samples read as a bucket instead of as zero.
+
+`first-token` is a **provider** measurement we happen to be positioned to take,
+not a gateway one, and it is printed on its own line at the top level for that
+reason: folding it into `added-total` would put the provider's prefill inside a
+number whose whole purpose is to be small. It is the only line here that is
+mostly not our work, and saying so is the same discipline as excluding the
+handshakes.
+
+Per-token cadence still has to be measured externally, which is what the
+streaming benchmark in BENCHMARKS.md does; this is time-to-first-token only.
 
 **An empty histogram prints `(no samples)`, never zeros.** It used to print
 `p50=0 ns  p99=0 ns`, which reads as a spectacular result instead of as

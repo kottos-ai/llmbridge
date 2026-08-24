@@ -460,6 +460,9 @@ namespace llmbridge
         // Same range as `connect`, and for the same reasons; see the note there.
         Histogram accept_tls{1'000, 262'144};
         Histogram resp_path; // upstream-recv -> client-sent
+        /// Time to first token, streamed requests only: t0 to the first content
+        /// chunk. See LATENCY.md section 4.
+        Histogram first_token{100'000, 262'144};
         uint64_t requests = 0;
         uint64_t errors = 0;
         uint64_t upstream_conns_opened = 0;
@@ -744,6 +747,10 @@ namespace llmbridge
         /// statement about the response, not about an I/O model.
         static void stream_warn_if_encoded(const Connection* client,
                                            const net::http::ResponseHead& h) noexcept;
+        /// A finished stream's contribution to the latency profile. Shared: a
+        /// histogram fed by one backend only is a percentile that means something
+        /// different per build.
+        void stream_record_latency(const Connection* client) noexcept;
         void stream_truncate(Connection* client) noexcept;
         bool upstream_is_tls(const Connection* u) const noexcept;
         // Has this upstream's request left the machine on every transport it uses? A
