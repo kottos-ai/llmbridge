@@ -440,6 +440,7 @@ static int run(int argc, char** argv)
         agg.connect.merge(s.connect);
         agg.accept_tls.merge(s.accept_tls);
         agg.resp_path.merge(s.resp_path);
+        agg.first_token.merge(s.first_token);
     }
     std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
@@ -464,6 +465,9 @@ static int run(int argc, char** argv)
     // missing measurement. This is the one handshake that is ours; see LATENCY.md 1.
     if (agg.accept_tls.total() > 0) agg.accept_tls.print(std::cerr, "accept(TLS)   ");
     agg.resp_path.print(std::cerr, "  response-path");
+    // Printed only when it has samples, like accept(TLS): absent here means
+    // inapplicable, not missing. Top level, since it is not part of added-total.
+    if (agg.first_token.total() > 0) agg.first_token.print(std::cerr, "first-token  ");
     return 0;
 }
 

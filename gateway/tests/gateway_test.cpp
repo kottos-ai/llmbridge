@@ -6192,3 +6192,76 @@ TEST_P(ProxyForwardStream, ACompressedStreamStillReachesTheClientAndInventsNoCou
     EXPECT_EQ(recs[0].r.tokens_in, -1);
     EXPECT_EQ(recs[0].r.tokens_out, -1);
 }
+
+// A stream records what is well defined for it (request path, handshake, first
+// token) and nothing else. See LATENCY.md section 4.
+class ProxyStreamLatency : public ProxyIT,
+                           public ::testing::WithParamInterface<llmbridge::IoBackend>
+{
+};
+
+TEST_P(ProxyStreamLatency, AStreamRecordsRequestPathAndFirstToken)
+{
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all(5000));
+    ASSERT_TRUE(s.done);
+    c.close();
+    shutdown();
+
+    EXPECT_EQ(_gw->stats().requests, 1u);
+    EXPECT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().first_token.total(), 1u) << "no time-to-first-token sample";
+    // A stream has no single instant its response was built, so added-total must
+    // stay empty or the headline number stops meaning one thing.
+    EXPECT_EQ(_gw->stats().overhead.total(), 0u)
+        << "a stream must not contribute to added-total";
+    EXPECT_EQ(_gw->stats().resp_path.total(), 0u);
+}
+
+TEST_P(ProxyStreamLatency, ABufferedRequestIsUnchanged)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("pong")));
+    start(0, true, TranslateMode::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().overhead.total(), 1u);
+    EXPECT_EQ(_gw->stats().req_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().resp_path.total(), 1u);
+    EXPECT_EQ(_gw->stats().first_token.total(), 0u) << "a buffered reply has no stream";
+}
+
+TEST_P(ProxyStreamLatency, ATruncatedStreamRecordsNothing)
+{
+    // A request that did not finish has no place in a percentile.
+    const std::string whole = anthropic_sse_events();
+    std::string enc = sse_chunk_encode(whole.substr(0, whole.find("event: message_delta")), 64);
+    enc.erase(enc.size() - 5); // drop the 0-length terminator
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + enc);
+    _backend.set_close_after_first(true);
+    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    (void)c.recv_all(5000);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().first_token.total(), 0u)
+        << "a truncated stream contributed a latency sample";
+    EXPECT_EQ(_gw->stats().req_path.total(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamLatency,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring),
+                         [](const auto& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
+                         });
