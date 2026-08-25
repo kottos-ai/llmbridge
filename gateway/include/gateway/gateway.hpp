@@ -218,6 +218,10 @@ namespace llmbridge
         int64_t wall_t0 = 0;
         char sink_cap[kSinkCaptureMax][kSinkCaptureBytes];
         uint8_t sink_cap_len[kSinkCaptureMax] = {};
+        /// The client's model, for the sink. 64 bytes because the longest name in
+        /// play is Bedrock's 43-character form, and a model name is not a prompt.
+        char sink_model[64] = {};
+        uint8_t sink_model_len = 0;
 
         /// Index into the upstream table, -1 when none applies. Two readings that agree
         /// by construction: on an upstream connection the venue this socket talks to, so

@@ -48,6 +48,8 @@ namespace llmbridge
         bool truncated = false;   ///< stream ended without a clean finish
         bool translated = false;  ///< dialect translation ran for the serving venue
         uint8_t backend = 0;      ///< 1 = epoll, 2 = io_uring
+        /// The model the client asked for, empty when the body named none.
+        std::string_view model;
         /// Valid only during on_request: they point into the connection. Copy out.
         std::string_view captured[kSinkCaptureMax];
     };
