@@ -50,7 +50,7 @@
 
 using llmbridge::Gateway;
 using llmbridge::TlsConfig;
-using llmbridge::TranslateMode;
+using llmbridge::UpstreamDialect;
 using llmbridge::Upstream;
 using llmbridge::Policy;
 using llmbridge::Decision;
@@ -714,7 +714,7 @@ namespace
 class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
 {
   protected:
-    void start(TranslateMode mode = TranslateMode::None, const std::string& backend_mode = "json",
+    void start(UpstreamDialect mode = UpstreamDialect::OpenAI, const std::string& backend_mode = "json",
                const std::string& sni = kHost, int handshake_delay_ms = 0,
                bool timing_headers = false)
     {
@@ -734,7 +734,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     /// `setup_ns` is applied before the loop thread starts. Setting it afterwards
     /// writes state the loop thread reads in sweep_idle, which is a genuine data
     /// race that TSan reports; the seam is not for live reconfiguration.
-    void start_inbound(TranslateMode mode = TranslateMode::None,
+    void start_inbound(UpstreamDialect mode = UpstreamDialect::OpenAI,
                        const std::string& backend_mode = "json", int64_t setup_ns = 0)
     {
         _backend.start(_id, backend_mode, 0);
@@ -758,7 +758,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     /// terminating TLS at the edge in front of a local model looks like, and it is
     /// the configuration where a leg mix-up in tls_required() or wbuf_on_wire()
     /// would show, because the two legs disagree.
-    void start_client_tls_only(TranslateMode mode = TranslateMode::None,
+    void start_client_tls_only(UpstreamDialect mode = UpstreamDialect::OpenAI,
                                const std::string& backend_mode = "json")
     {
         _plain.start(backend_mode);
@@ -863,7 +863,7 @@ namespace
 
 TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectNonStreaming)
 {
-    start(TranslateMode::Anthropic, "anthropic-json", kHost, kHandshakeStallMs,
+    start(UpstreamDialect::Anthropic, "anthropic-json", kHost, kHandshakeStallMs,
           /*timing_headers=*/true);
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -876,7 +876,7 @@ TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectNonStreaming)
 
 TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectStreaming)
 {
-    start(TranslateMode::Anthropic, "sse", kHost, kHandshakeStallMs,
+    start(UpstreamDialect::Anthropic, "sse", kHost, kHandshakeStallMs,
           /*timing_headers=*/true);
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -912,7 +912,7 @@ TEST_P(GatewayTls, PooledConnectionSkipsSecondHandshake)
 
 TEST_P(GatewayTls, SseStreamsThroughTlsWithTranslation)
 {
-    start(TranslateMode::Anthropic, "sse");
+    start(UpstreamDialect::Anthropic, "sse");
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true,"messages":[]})")));
@@ -930,7 +930,7 @@ TEST_P(GatewayTls, HostnameMismatchYields502NotPlaintextFallback)
     // The client must see a structured 502, and the provider must see zero
     // completed handshakes and zero requests (nothing was sent to an unverified
     // peer, which is the security property the whole TLS layer exists for).
-    start(TranslateMode::None, "json", "wrong.test");
+    start(UpstreamDialect::OpenAI, "json", "wrong.test");
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -953,7 +953,7 @@ TEST_P(GatewayTls, ConcurrentTlsStreamsAllComplete)
     // is the test that catches cross-session state bleed (a Session mistakenly
     // shared or a tls_out written by the wrong conn); any mixing corrupts a
     // record and kills at least one stream.
-    start(TranslateMode::Anthropic, "sse");
+    start(UpstreamDialect::Anthropic, "sse");
     constexpr int kStreams = 16;
     std::vector<std::unique_ptr<Client>> clients;
     for (int i = 0; i < kStreams; ++i)
@@ -980,7 +980,7 @@ TEST_P(GatewayTls, CorruptRecordMidStreamAbortsWithoutDone)
     // provider writes raw garbage on the wire. The client must get the partial
     // stream and a hard close, never a well-formed [DONE]: finalizing a
     // corrupted stream as clean would hide the corruption entirely.
-    start(TranslateMode::Anthropic, "sse-corrupt");
+    start(UpstreamDialect::Anthropic, "sse-corrupt");
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true,"messages":[]})")));
@@ -996,7 +996,7 @@ TEST_P(GatewayTls, ProviderClosingPooledConnDoesNotBreakNextRequest)
     // close, rude but real). Whichever way the gateway learns (pool eviction on
     // EOF, or stale-conn retry at reuse time), the next request must still get a
     // 200 on a fresh session. Guards the retry/eviction paths' TLS attach.
-    start(TranslateMode::None, "close1");
+    start(UpstreamDialect::OpenAI, "close1");
     for (int i = 0; i < 3; ++i)
     {
         Client c;
@@ -1014,7 +1014,7 @@ TEST_P(GatewayTls, UpstreamClosingMidHandshakeYields502)
 {
     // TCP accept then immediate close: the gateway's ClientHello meets an EOF.
     // Must surface as a structured 502, not a hang or a plaintext retry.
-    start(TranslateMode::None, "reset");
+    start(UpstreamDialect::OpenAI, "reset");
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -1119,9 +1119,9 @@ class GatewayCrossVenueTls : public ::testing::TestWithParam<llmbridge::IoBacken
         tls.ca_file = write_ca_bundle(_id0, _id1); // trust both leaves
         std::vector<Upstream> table = {
             Upstream{.ip = "127.0.0.1", .port = _b0.port(), .tls = true, .sni_host = kHost,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
             Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
         };
         _policy = std::make_unique<PinnedPolicy>(route_to);
         _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
@@ -1194,9 +1194,9 @@ TEST_P(GatewayCrossVenueTls, FailoverBuildsANewSessionForTheNewVenue)
     const uint16_t dead = closed_port();
     std::vector<Upstream> table = {
         Upstream{.ip = "127.0.0.1", .port = dead, .tls = true, .sni_host = kHost,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
         Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
     };
     TlsFailoverPolicy pol(0, 1);
     _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
@@ -1233,9 +1233,9 @@ TEST_P(GatewayCrossVenueTls, AFailoverTargetIsStillVerified)
     const uint16_t dead = closed_port();
     std::vector<Upstream> table = {
         Upstream{.ip = "127.0.0.1", .port = dead, .tls = true, .sni_host = kHost,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
         Upstream{.ip = "127.0.0.1", .port = _b1.port(), .tls = true, .sni_host = kHostTwo,
-                 .translate = TranslateMode::None},
+                 .dialect = UpstreamDialect::OpenAI},
     };
     TlsFailoverPolicy pol(0, 1);
     _gw = std::make_unique<Gateway>(uint16_t{0}, std::move(table), int64_t{0}, GetParam(),
@@ -1303,7 +1303,7 @@ TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)
     // Anthropic mode on purpose: translation parses the body, so a malformed or
     // truncated request fails here instead of being byte-forwarded to a mock that
     // answers 200 to anything.
-    start_inbound(TranslateMode::Anthropic);
+    start_inbound(UpstreamDialect::Anthropic);
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1456,7 +1456,7 @@ TEST_P(GatewayTls, ManyConcurrentInboundTlsClientsAllComplete)
 
 TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
 {
-    start_inbound(TranslateMode::Anthropic, "sse");
+    start_inbound(UpstreamDialect::Anthropic, "sse");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1483,7 +1483,7 @@ TEST_P(GatewayTls, InboundTlsStreamsSseEndToEnd)
 // buffer were unbounded the peak would track what was produced.
 TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
 {
-    start_inbound(TranslateMode::Anthropic, "sse-flood");
+    start_inbound(UpstreamDialect::Anthropic, "sse-flood");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1532,7 +1532,7 @@ TEST_P(GatewayTls, ClientThatNeverReadsCannotGrowUsWithoutBound)
 // stream and asserts megabytes arrive.
 TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
 {
-    start_inbound(TranslateMode::Anthropic, "sse-flood");
+    start_inbound(UpstreamDialect::Anthropic, "sse-flood");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1562,7 +1562,7 @@ TEST_P(GatewayTls, TheFloodControlActuallyDelivers)
 // to touch".
 TEST_P(GatewayTls, HandshakingClientCannotReachThePooledUpstream)
 {
-    start_inbound(TranslateMode::Anthropic);
+    start_inbound(UpstreamDialect::Anthropic);
 
     // Put exactly one upstream in the pool via a completed request. Release runs
     // synchronously with the response the client just read, so no polling is needed,
@@ -1619,7 +1619,7 @@ TEST_P(GatewayTls, InboundTlsEmitsNoKeyMaterialAnywhere)
     ASSERT_GE(::dup2(capfd, STDERR_FILENO), 0);
 
     std::string client_bytes;
-    start_inbound(TranslateMode::Anthropic);
+    start_inbound(UpstreamDialect::Anthropic);
     {
         // (a) a healthy request
         TlsClient ok;
@@ -1688,7 +1688,7 @@ TEST_P(GatewayTls, InboundTlsEmitsNoKeyMaterialAnywhere)
 // request), and it stays empty when the listener is plaintext.
 TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
 {
-    start_inbound(TranslateMode::Anthropic);
+    start_inbound(UpstreamDialect::Anthropic);
     for (int i = 0; i < 3; ++i)
     {
         TlsClient c;
@@ -1714,7 +1714,7 @@ TEST_P(GatewayTls, InboundHandshakeIsRecordedInAcceptTls)
 
 TEST_P(GatewayTls, AcceptTlsStaysEmptyOnAPlaintextListener)
 {
-    start(TranslateMode::Anthropic); // TLS upstream, plaintext listener
+    start(UpstreamDialect::Anthropic); // TLS upstream, plaintext listener
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -1746,7 +1746,7 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamRoundTrips)
 
 TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 {
-    start_client_tls_only(TranslateMode::Anthropic, "sse");
+    start_client_tls_only(UpstreamDialect::Anthropic, "sse");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1785,7 +1785,7 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 // than "verified" and should not be written up as one.
 TEST_P(GatewayTls, SlowClientReceivesAFullLargeBodyThroughTls)
 {
-    start_inbound(TranslateMode::None, "big");
+    start_inbound(UpstreamDialect::OpenAI, "big");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());
@@ -1819,7 +1819,7 @@ TEST_P(GatewayTls, SlowClientReceivesAFullLargeBodyThroughTls)
 TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
 {
     // 300 ms deadline, applied before the loop thread starts. See start_inbound().
-    start_inbound(TranslateMode::None, "json", 300 * 1000 * 1000LL);
+    start_inbound(UpstreamDialect::OpenAI, "json", 300 * 1000 * 1000LL);
 
     // Connect and send a fragment that can never frame as a request. On a TLS
     // listener these never even finish a handshake, which is the case that used to
@@ -1869,7 +1869,7 @@ TEST_P(GatewayTls, HalfOpenClientsAreDroppedAtTheSetupDeadline)
 // behaviours differ.
 TEST_P(GatewayTls, CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient)
 {
-    start_inbound(TranslateMode::Anthropic, "sse-badchunk-hold");
+    start_inbound(UpstreamDialect::Anthropic, "sse-badchunk-hold");
     TlsClient c;
     ASSERT_TRUE(c.connect(_port, _ca_path));
     ASSERT_TRUE(c.handshake());

@@ -178,7 +178,7 @@ DBG_PORT=$MOCK_PORT DBG_FORMAT=$PROVIDER DBG_OUT="$WORK" python3 "$WORK/dbgmock.
 MOCK_PID=$!
 sleep 0.4
 
-GW_ARGS=(--listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --translate "$PROVIDER" --workers 1)
+GW_ARGS=(--listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --upstream-dialect "$PROVIDER" --workers 1)
 
 case "$MODE" in
   trace)

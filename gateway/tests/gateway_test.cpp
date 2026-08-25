@@ -38,7 +38,7 @@
 #include "provider/json.hpp" // reassemble the streamed OpenAI chunks
 
 using llmbridge::Gateway;
-using llmbridge::TranslateMode;
+using llmbridge::UpstreamDialect;
 
 namespace
 {
@@ -576,7 +576,7 @@ namespace
     {
     protected:
         void start(int64_t warmup_ns = 0, bool with_backend = true,
-                   TranslateMode translate = TranslateMode::None,
+                   UpstreamDialect dialect = UpstreamDialect::OpenAI,
                    llmbridge::IoBackend backend = llmbridge::IoBackend::Epoll,
                    int64_t upstream_idle_ns = Gateway::kDefaultUpstreamIdleNs,
                    unsigned uring_buf_count = 0, bool timing_headers = false,
@@ -595,7 +595,7 @@ namespace
             // `_policy` is a member: start() already takes nine positional args and a
             // tenth is how a caller silently passes the wrong one. Set before start().
             if (_upstreams.empty())
-                _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, translate,
+                _gw = std::make_unique<Gateway>(0, "127.0.0.1", up_port, warmup_ns, dialect,
                                                 backend, upstream_idle_ns, llmbridge::TlsConfig{},
                                                 timing_headers, _policy, _strip_headers);
             else
@@ -682,7 +682,7 @@ class ProxyPoolIdle : public ProxyIT,
 
 TEST_P(ProxyPoolIdle, ShortWindowReapsThePooledUpstream)
 {
-    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
           -1, 200 * 1000 * 1000LL); // 200 ms pool window
     {
         Client c;
@@ -700,7 +700,7 @@ TEST_P(ProxyPoolIdle, ShortWindowReapsThePooledUpstream)
 // attributable to the flag and not to the connection dying on its own.
 TEST_P(ProxyPoolIdle, DefaultWindowKeepsItPooled)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     {
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port));
@@ -716,7 +716,7 @@ TEST_P(ProxyPoolIdle, DefaultWindowKeepsItPooled)
 // than pay reconnects.
 TEST_P(ProxyPoolIdle, ZeroDisablesPoolReaping)
 {
-    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
           -1, 0);
     {
         Client c;
@@ -738,7 +738,7 @@ class ProxyClientIdle : public ProxyIT,
 TEST_P(ProxyClientIdle, QuietEstablishedClientIsReaped)
 {
     // 300 ms, applied before the loop thread starts; see start().
-    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
           300 * 1000 * 1000LL);
 
     Client c;
@@ -759,7 +759,7 @@ TEST_P(ProxyClientIdle, QuietEstablishedClientIsReaped)
 TEST_P(ProxyClientIdle, InFlightRequestIsNotReaped)
 {
     _backend.set_stall(1); // read the request, never reply
-    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false,
           300 * 1000 * 1000LL);
 
     Client c;
@@ -776,7 +776,7 @@ TEST_P(ProxyClientIdle, InFlightRequestIsNotReaped)
 // And it must be disableable, because a loopback sidecar has no reason to pay for it.
 TEST_P(ProxyClientIdle, ZeroDisablesTheReaper)
 {
-    start(0, true, TranslateMode::None, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false, 0);
+    start(0, true, UpstreamDialect::OpenAI, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, false, 0);
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -797,7 +797,7 @@ TEST_P(ProxyEarlyResponse, PooledUpstreamStaysUsable)
 {
     _backend.set_small_rcvbuf(4096); // gateway's write blocks after a few hundred KB
     _backend.set_reply_before_read(true);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
 
     // Larger than any socket buffer, so the send cannot have completed.
     const std::string big(8 * 1024 * 1024, 'x');
@@ -959,23 +959,23 @@ TEST_F(ProxyIT, ConnectionCloseHeaderClosesClientAfterResponse)
 
 namespace
 {
-    std::string provider_resp_body(TranslateMode m, const std::string& text)
+    std::string provider_resp_body(UpstreamDialect m, const std::string& text)
     {
         switch (m)
         {
-            case TranslateMode::Anthropic: return anthropic_resp_body(text);
-            case TranslateMode::Gemini: return gemini_resp_body(text);
-            case TranslateMode::Cohere: return cohere_resp_body(text);
+            case UpstreamDialect::Anthropic: return anthropic_resp_body(text);
+            case UpstreamDialect::Gemini: return gemini_resp_body(text);
+            case UpstreamDialect::Cohere: return cohere_resp_body(text);
             default: return {};
         }
     }
-    const char* mode_name(TranslateMode m)
+    const char* mode_name(UpstreamDialect m)
     {
         switch (m)
         {
-            case TranslateMode::Anthropic: return "Anthropic";
-            case TranslateMode::Gemini: return "Gemini";
-            case TranslateMode::Cohere: return "Cohere";
+            case UpstreamDialect::Anthropic: return "Anthropic";
+            case UpstreamDialect::Gemini: return "Gemini";
+            case UpstreamDialect::Cohere: return "Cohere";
             default: return "None";
         }
     }
@@ -989,11 +989,11 @@ namespace
 } // namespace
 
 // ── Translation round-trips: OpenAI in, provider out, OpenAI back ──────────────
-class ProxyTranslateMode : public ProxyIT, public ::testing::WithParamInterface<TranslateMode> {};
+class ProxyDialect : public ProxyIT, public ::testing::WithParamInterface<UpstreamDialect> {};
 
-TEST_P(ProxyTranslateMode, RoundTripsToOpenAIShape)
+TEST_P(ProxyDialect, RoundTripsToOpenAIShape)
 {
-    const TranslateMode mode = GetParam();
+    const UpstreamDialect mode = GetParam();
     _backend.set_response(http_ok(provider_resp_body(mode, "pong")));
     start(0, true, mode);
 
@@ -1011,9 +1011,9 @@ TEST_P(ProxyTranslateMode, RoundTripsToOpenAIShape)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
-TEST_P(ProxyTranslateMode, ForwardsTranslatedRequestUpstream)
+TEST_P(ProxyDialect, ForwardsTranslatedRequestUpstream)
 {
-    const TranslateMode mode = GetParam();
+    const UpstreamDialect mode = GetParam();
     _backend.set_response(http_ok(provider_resp_body(mode, "ok")));
     start(0, true, mode);
 
@@ -1025,15 +1025,15 @@ TEST_P(ProxyTranslateMode, ForwardsTranslatedRequestUpstream)
 
     // Upstream saw the provider-shaped, content-preserving request.
     EXPECT_NE(upstream.find("unique-marker-content"), std::string::npos) << upstream;
-    if (mode == TranslateMode::Anthropic)
+    if (mode == UpstreamDialect::Anthropic)
     {
         EXPECT_NE(upstream.find("/v1/messages"), std::string::npos);
     }
-    if (mode == TranslateMode::Gemini)
+    if (mode == UpstreamDialect::Gemini)
     {
         EXPECT_NE(upstream.find("generateContent"), std::string::npos);
     }
-    if (mode == TranslateMode::Cohere)
+    if (mode == UpstreamDialect::Cohere)
     {
         EXPECT_NE(upstream.find("/v2/chat"), std::string::npos);
     }
@@ -1041,10 +1041,10 @@ TEST_P(ProxyTranslateMode, ForwardsTranslatedRequestUpstream)
     shutdown();
 }
 
-INSTANTIATE_TEST_SUITE_P(Dialects, ProxyTranslateMode,
-                         ::testing::Values(TranslateMode::Anthropic, TranslateMode::Gemini,
-                                           TranslateMode::Cohere),
-                         [](const testing::TestParamInfo<TranslateMode>& i) { return mode_name(i.param); });
+INSTANTIATE_TEST_SUITE_P(Dialects, ProxyDialect,
+                         ::testing::Values(UpstreamDialect::Anthropic, UpstreamDialect::Gemini,
+                                           UpstreamDialect::Cohere),
+                         [](const testing::TestParamInfo<UpstreamDialect>& i) { return mode_name(i.param); });
 
 // ── Auth-header passthrough (translate modes rebuild the upstream request,
 //     so credentials must be explicitly mapped across the dialect boundary) ────
@@ -1054,7 +1054,7 @@ class ProxyStrip : public ProxyIT, public ::testing::WithParamInterface<llmbridg
 TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-test-123\r\n")));
@@ -1074,7 +1074,7 @@ TEST_P(ProxyAuth, BearerTokenMapsToAnthropicApiKey)
 TEST_P(ProxyAuth, XApiKeyWinsOverBearerSoATenantTokenNeverReachesTheProvider)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
@@ -1094,7 +1094,7 @@ TEST_P(ProxyAuth, XApiKeyWinsOverBearerSoATenantTokenNeverReachesTheProvider)
 TEST_P(ProxyAuth, PassthroughForwardsEveryHeaderIncludingATenantToken)
 {
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
@@ -1115,7 +1115,7 @@ TEST_P(ProxyStrip, PassthroughDropsTheNamedHeader)
 {
     _strip_headers = {"Authorization"}; // mixed case on purpose: names are normalized
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n"
@@ -1134,7 +1134,7 @@ TEST_P(ProxyStrip, TranslatedRequestNeverMapsAStrippedTokenOntoTheProviderKey)
 {
     _strip_headers = {"authorization"};
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer kb_live_TENANT\r\n")));
@@ -1151,7 +1151,7 @@ TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
 {
     _strip_headers = {"x-drop-me"};
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     const std::string body = "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"xyz\"}]}";
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1174,7 +1174,7 @@ TEST_P(ProxyStrip, BodyAndFramingSurviveTheRewrite)
 TEST_P(ProxyStrip, EmptyListChangesOnlyTheHost)
 {
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     const std::string req = openai_request_hdrs("hi", "Authorization: Bearer keep\r\n"
                                                       "X-Odd-Header: v\r\n");
     Client c;
@@ -1206,7 +1206,7 @@ TEST_P(ProxyStrip, EmptyListChangesOnlyTheHost)
 TEST_P(ProxyStrip, ByteForwardHostNamesTheVenueNotTheClient)
 {
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     // Two Host lines, the shape a confused client or a smuggling attempt produces.
     const std::string req = openai_request_hdrs("hi", "Host: someone-elses-name\r\n");
     Client c;
@@ -1232,7 +1232,7 @@ TEST_P(ProxyStrip, StrippingIsExactNotAPrefix)
 {
     _strip_headers = {"x-drop"};
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "X-Drop: gone\r\nX-Dropper: kept\r\n")));
@@ -1259,21 +1259,21 @@ class ProxyBasePath : public ProxyIT,
                       public ::testing::WithParamInterface<llmbridge::IoBackend>
 {
   protected:
-    void start_with_base(const std::string& base, TranslateMode mode)
+    void start_with_base(const std::string& base, UpstreamDialect mode)
     {
         _backend.start();
         _upstreams.push_back(llmbridge::Upstream{.ip = "127.0.0.1",
                                                  .port = _backend.port(),
-                                                 .translate = mode,
+                                                 .dialect = mode,
                                                  .base_path = base});
-        start(0, false, TranslateMode::None, GetParam());
+        start(0, false, UpstreamDialect::OpenAI, GetParam());
     }
 };
 
 TEST_P(ProxyBasePath, ByteForwardPrefixesTheClientsOwnTarget)
 {
     _backend.set_response(http_ok("{}"));
-    start_with_base("/openai", TranslateMode::None);
+    start_with_base("/openai", UpstreamDialect::OpenAI);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
@@ -1285,7 +1285,7 @@ TEST_P(ProxyBasePath, ByteForwardPrefixesTheClientsOwnTarget)
 TEST_P(ProxyBasePath, TranslatePrefixesOurOwnTarget)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start_with_base("/openai", TranslateMode::Anthropic);
+    start_with_base("/openai", UpstreamDialect::Anthropic);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-test-123\r\n")));
@@ -1299,7 +1299,7 @@ TEST_P(ProxyBasePath, TranslatePrefixesOurOwnTarget)
 TEST_P(ProxyBasePath, NoBasePathChangesNothing)
 {
     _backend.set_response(http_ok("{}"));
-    start_with_base("", TranslateMode::None);
+    start_with_base("", UpstreamDialect::OpenAI);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
@@ -1316,7 +1316,7 @@ TEST_P(ProxyBasePath, NoBasePathChangesNothing)
 TEST_P(ProxyBasePath, ANonOriginFormTargetIsRefusedAndNeverForwarded)
 {
     _backend.set_response(http_ok("{}"));
-    start_with_base("/openai", TranslateMode::None);
+    start_with_base("/openai", UpstreamDialect::OpenAI);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"m","messages":[]})";
@@ -1350,7 +1350,7 @@ TEST_P(ProxyAuth, UpstreamBodyShorterThanContentLengthNeverBecomesASuccess)
                        "Content-Length: 4096\r\n\r\n{\"partial\":true}";
     _backend.set_response(resp);
     _backend.set_close_mid_response(true);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "")));
@@ -1373,7 +1373,7 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
                        "\r\nConnection: keep-alive\r\n\r\n" + body +
                        "X-Injected: yes\r\nTRAILING-GARBAGE\r\n";
     _backend.set_response(resp);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     Client c1;
     ASSERT_TRUE(c1.connect(_proxy_port));
@@ -1430,7 +1430,7 @@ TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
     // and sends N plus something that looks like another request. Exactly one
     // request may reach the provider.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
 
@@ -1459,7 +1459,7 @@ TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
     static constexpr const char* kCanary = "sk-canary-DO-NOT-LEAVE-IN-THE-POOL";
 
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1490,7 +1490,7 @@ TEST_P(ProxyAuth, CredentialIsScrubbedFromAPooledUpstreamBuffer)
 TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1506,7 +1506,7 @@ TEST_P(ProxyAuth, NativeApiKeyAndVersionForwardVerbatim)
 TEST_P(ProxyAuth, NoCredentialMeansNoAuthHeaderUpstream)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -1522,7 +1522,7 @@ TEST_P(ProxyAuth, UnrelatedClientHeadersDoNotCross)
     // Whitelist semantics: a rebuilt request must not echo arbitrary client
     // headers; that is the smuggling surface the rebuild exists to close.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1539,7 +1539,7 @@ TEST_P(ProxyAuth, RebuiltRequestCarriesHostHeader)
     // HTTP/1.1 requires Host; mocks tolerate its absence, api.anthropic.com
     // does not. Without TlsConfig the gateway falls back to ip:port.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -1550,8 +1550,8 @@ TEST_P(ProxyAuth, RebuiltRequestCarriesHostHeader)
 
 TEST_P(ProxyAuth, BearerTokenMapsToGoogApiKeyForGemini)
 {
-    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Gemini, "ok")));
-    start(0, true, TranslateMode::Gemini, GetParam());
+    _backend.set_response(http_ok(provider_resp_body(UpstreamDialect::Gemini, "ok")));
+    start(0, true, UpstreamDialect::Gemini, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer AIza-test\r\n")));
@@ -1563,8 +1563,8 @@ TEST_P(ProxyAuth, BearerTokenMapsToGoogApiKeyForGemini)
 
 TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
 {
-    _backend.set_response(http_ok(provider_resp_body(TranslateMode::Cohere, "ok")));
-    start(0, true, TranslateMode::Cohere, GetParam());
+    _backend.set_response(http_ok(provider_resp_body(UpstreamDialect::Cohere, "ok")));
+    start(0, true, UpstreamDialect::Cohere, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer co-test-9\r\n")));
@@ -1581,7 +1581,7 @@ TEST_P(ProxyAuth, BearerForwardsVerbatimForCohere)
 TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1598,7 +1598,7 @@ TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
 TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1617,7 +1617,7 @@ TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)
 TEST_P(ProxyAuth, OversizedCredentialRejected)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs(
@@ -1631,7 +1631,7 @@ TEST_P(ProxyAuth, OversizedCredentialRejected)
 TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     std::string hdr = "Authorization: Bearer sk";
@@ -1652,7 +1652,7 @@ TEST_P(ProxyAuth, CredentialWithControlCharsIsRejectedNotForwarded)
 TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     // Client A authenticates. Its upstream connection goes back to the pool.
     {
@@ -1684,7 +1684,7 @@ TEST_P(ProxyAuth, CredentialDoesNotLeakToAnotherClientOnPooledConnection)
 TEST_P(ProxyAuth, DifferentClientsCredentialsNeverCross)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     for (const char* key : {"sk-AAA", "sk-BBB", "sk-CCC"})
     {
         Client c;
@@ -1709,7 +1709,7 @@ TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
     // A credential must not come back in any response body/headers, not even in an error
     // path that echoed the request would leak it into client-side logs.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Authorization: Bearer sk-ECHO-ME\r\n")));
@@ -1720,7 +1720,7 @@ TEST_P(ProxyAuth, ClientCredentialNeverReturnedToTheClient)
 TEST_P(ProxyAuth, MalformedRequestErrorDoesNotEchoCredential)
 {
     // Same, on the 400 path: the most likely place for a "helpful" echo.
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     // Valid framing, body that fails translation -> 400 built by the gateway.
@@ -1756,7 +1756,7 @@ TEST_P(ProxyChunkedResp, TranslatedChunkedResponseRoundTrips)
     const auto [backend, nchunks] = GetParam();
     _backend.set_response(http_ok(anthropic_resp_body("chunked-pong")));
     _backend.set_chunked_response(nchunks);
-    start(0, true, TranslateMode::Anthropic, backend);
+    start(0, true, UpstreamDialect::Anthropic, backend);
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1771,7 +1771,7 @@ TEST_P(ProxyChunkedResp, PassthroughChunkedResponseReframedWithContentLength)
 {
     const auto [backend, nchunks] = GetParam();
     _backend.set_chunked_response(nchunks);
-    start(0, true, TranslateMode::None, backend);
+    start(0, true, UpstreamDialect::OpenAI, backend);
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1794,7 +1794,7 @@ TEST_P(ProxyChunkedResp, TheStatusLineOfASuccessSaysOk)
     // caught it; the first `curl -D-` against a live provider showed it.
     const auto [backend, nchunks] = GetParam();
     _backend.set_chunked_response(nchunks);
-    start(0, true, TranslateMode::None, backend);
+    start(0, true, UpstreamDialect::OpenAI, backend);
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1810,7 +1810,7 @@ TEST_P(ProxyChunkedResp, AnErrorStatusKeepsItsOwnPhrase)
     _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
                           "Content-Length: 2\r\nConnection: keep-alive\r\n\r\n{}");
     _backend.set_chunked_response(nchunks);
-    start(0, true, TranslateMode::None, backend);
+    start(0, true, UpstreamDialect::OpenAI, backend);
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -1828,7 +1828,7 @@ TEST_P(ProxyChunkedResp, PooledConnectionSurvivesAChunkedResponse)
     const auto [backend, nchunks] = GetParam();
     _backend.set_response(http_ok(anthropic_resp_body("again")));
     _backend.set_chunked_response(nchunks);
-    start(0, true, TranslateMode::Anthropic, backend);
+    start(0, true, UpstreamDialect::Anthropic, backend);
 
     for (int i = 0; i < 3; ++i)
     {
@@ -1898,7 +1898,7 @@ TEST_F(ProxyIT, LargeTranslateRoundTrip)
 {
     const std::string long_reply(40000, 'Z');
     _backend.set_response(http_ok(anthropic_resp_body(long_reply)));
-    start(0, true, TranslateMode::Anthropic);
+    start(0, true, UpstreamDialect::Anthropic);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request(std::string(20000, 'U'))));
@@ -1981,7 +1981,7 @@ TEST_F(ProxyIT, MalformedRequestClosedAndGatewaySurvives)
 
 TEST_F(ProxyIT, MalformedTranslateBodyClosedAndGatewaySurvives)
 {
-    start(0, true, TranslateMode::Anthropic);
+    start(0, true, UpstreamDialect::Anthropic);
     {
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
@@ -2056,7 +2056,7 @@ TEST_F(ProxyIT, ConnectionChurnNoLeak)
 TEST_F(ProxyIT, EscapedContentSurvivesTranslateForward)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic);
+    start(0, true, UpstreamDialect::Anthropic);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     // Content with escaped quotes, backslash and newline.
@@ -2072,7 +2072,7 @@ TEST_F(ProxyIT, EscapedContentSurvivesTranslateForward)
 TEST_F(ProxyIT, EmptyContentTranslateRoundTrip)
 {
     _backend.set_response(http_ok(anthropic_resp_body("")));
-    start(0, true, TranslateMode::Anthropic);
+    start(0, true, UpstreamDialect::Anthropic);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("")));
@@ -2099,7 +2099,7 @@ class ProxyBackend : public ProxyIT, public ::testing::WithParamInterface<llmbri
 
 TEST_P(ProxyBackend, RoundTripAndKeepAlive)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     for (int i = 0; i < 5; ++i)
@@ -2115,7 +2115,7 @@ TEST_P(ProxyBackend, RoundTripAndKeepAlive)
 
 TEST_P(ProxyBackend, MultipleClients)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     std::vector<std::unique_ptr<Client>> cs;
     for (int i = 0; i < 12; ++i)
     {
@@ -2135,7 +2135,7 @@ TEST_P(ProxyBackend, LargeResponseAndRequest)
 {
     const std::string big(64 * 1024, 'Z');
     _backend.set_response(http_ok(big));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string req = make_request(std::string(64 * 1024, 'Q'));
@@ -2152,7 +2152,7 @@ TEST_P(ProxyBackend, LargeResponseAndRequest)
 
 TEST_P(ProxyBackend, Pipelining)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     std::string burst;
@@ -2168,7 +2168,7 @@ TEST_P(ProxyBackend, Pipelining)
 TEST_P(ProxyBackend, TranslateRoundTripAndForward)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("unique-xyz")));
@@ -2185,7 +2185,7 @@ TEST_P(ProxyBackend, TranslateRoundTripAndForward)
 TEST_P(ProxyBackend, TrickledClientAndUpstream)
 {
     _backend.set_trickle(3); // backend dribbles its reply
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send_trickle(make_request("dribble"), 1)); // client dribbles its request
@@ -2197,7 +2197,7 @@ TEST_P(ProxyBackend, TrickledClientAndUpstream)
 
 TEST_P(ProxyBackend, MalformedRequestSurvives)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     {
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
@@ -2218,7 +2218,7 @@ TEST_P(ProxyBackend, MalformedRequestSurvives)
 
 TEST_P(ProxyBackend, MalformedTranslateBodySurvives)
 {
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     {
         Client bad;
         ASSERT_TRUE(bad.connect(_proxy_port));
@@ -2240,7 +2240,7 @@ TEST_P(ProxyBackend, MalformedTranslateBodySurvives)
 TEST_P(ProxyBackend, UpstreamClosesMidResponseAborts)
 {
     _backend.set_close_mid_response(true);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
@@ -2252,7 +2252,7 @@ TEST_P(ProxyBackend, UpstreamClosesMidResponseAborts)
 
 TEST_P(ProxyBackend, ConnectionCloseHonored)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("bye", /*keep_alive=*/false)));
@@ -2268,7 +2268,7 @@ TEST_P(ProxyBackend, ShutdownMidRequestIsClean)
     // Hold the upstream so the request is in flight when we tear down, which exercises
     // the drain path (and, under ASan, the no-UAF-on-pending-completion property).
     _backend.set_trickle(2);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
@@ -2279,7 +2279,7 @@ TEST_P(ProxyBackend, ShutdownMidRequestIsClean)
 
 TEST_P(ProxyBackend, ConnectRefusedAbortsClient)
 {
-    start(0, /*with_backend=*/false, TranslateMode::None, GetParam()); // no upstream listener
+    start(0, /*with_backend=*/false, UpstreamDialect::OpenAI, GetParam()); // no upstream listener
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("hi")));
@@ -2293,7 +2293,7 @@ TEST_P(ProxyBackend, ConnectRefusedAbortsClient)
 
 TEST_P(ProxyBackend, ClientDisconnectsBeforeReadingSurvives)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     for (int i = 0; i < 12; ++i)
     {
         Client c;
@@ -2313,7 +2313,7 @@ TEST_P(ProxyBackend, ClientDisconnectsBeforeReadingSurvives)
 
 TEST_P(ProxyBackend, SequentialPoolReuse)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     for (int i = 0; i < 12; ++i)
     {
         Client c;
@@ -2329,7 +2329,7 @@ TEST_P(ProxyBackend, SequentialPoolReuse)
 
 TEST_P(ProxyBackend, ConnectionChurn)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     for (int i = 0; i < 80; ++i)
     {
         Client c;
@@ -2346,7 +2346,7 @@ TEST_P(ProxyBackend, HighConcurrency)
 {
     const int n = 100;
     const std::string body(4096, 'B');
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     std::vector<std::unique_ptr<Client>> cs;
     for (int i = 0; i < n; ++i)
     {
@@ -2366,7 +2366,7 @@ TEST_P(ProxyBackend, VeryLargeBodyMultiOp)
 {
     const std::string big(512 * 1024, 'Z'); // 32 recv chunks + many partial sends
     _backend.set_response(http_ok(big));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string sent_body(512 * 1024, 'Q');
@@ -2383,7 +2383,7 @@ TEST_P(ProxyBackend, VeryLargeBodyMultiOp)
 
 TEST_P(ProxyBackend, DeepKeepAlive)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     for (int i = 0; i < 64; ++i)
@@ -2398,7 +2398,7 @@ TEST_P(ProxyBackend, DeepKeepAlive)
 
 TEST_P(ProxyBackend, WarmupGating)
 {
-    start(5'000'000'000LL, true, TranslateMode::None, GetParam());
+    start(5'000'000'000LL, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     for (int i = 0; i < 3; ++i)
@@ -2414,7 +2414,7 @@ TEST_P(ProxyBackend, WarmupGating)
 TEST_P(ProxyBackend, ShutdownWithManyInFlightIsClean)
 {
     _backend.set_trickle(4); // slow replies so requests are still in flight at teardown
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     std::vector<std::unique_ptr<Client>> cs;
     for (int i = 0; i < 30; ++i)
     {
@@ -2432,7 +2432,7 @@ TEST_P(ProxyBackend, ShutdownWithManyInFlightIsClean)
 // 300/200 iterations so a single reuse-of-corpse trips an assertion.
 TEST_P(ProxyBackend, StaleUpstreamNeverReused_ClientClose)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     for (int i = 0; i < 300; ++i) // each request forwards Connection: close -> backend closes
     {
         Client c;
@@ -2449,7 +2449,7 @@ TEST_P(ProxyBackend, StaleUpstreamNeverReused_ClientClose)
 TEST_P(ProxyBackend, StaleUpstreamNeverReused_BackendClose)
 {
     _backend.set_response(http_close(kRespBody)); // upstream declares Connection: close
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     for (int i = 0; i < 200; ++i) // keep-alive clients, but the upstream closes each time
     {
         Client c;
@@ -2471,7 +2471,7 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnection)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
     _backend.set_close_after_first(true); // respond keep-alive, then drop the connection
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     for (int i = 0; i < 60; ++i)
     {
         Client c;
@@ -2496,7 +2496,7 @@ TEST_P(ProxyBackend, RetriesOnStalePooledConnectionPipelined)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
     _backend.set_close_after_first(true);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string burst = openai_request("one") + openai_request("two");
@@ -2533,7 +2533,7 @@ TEST(GatewayLeak, FreesAllConnectionsOnDestroy)
             TestBackend be;
             be.set_trickle(4); // slow replies so requests are still in flight at teardown
             be.start();
-            Gateway gw(0, "127.0.0.1", be.port(), 0, TranslateMode::None, backend);
+            Gateway gw(0, "127.0.0.1", be.port(), 0, UpstreamDialect::OpenAI, backend);
             const uint16_t port = gw.bound_port();
             std::thread t([&] { gw.run(); });
 
@@ -2569,7 +2569,7 @@ TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
         std::vector<std::unique_ptr<Gateway>> gws;
         for (int i = 0; i < 2; ++i)
             gws.push_back(std::make_unique<Gateway>(port, "127.0.0.1", be.port(), 0,
-                                                    TranslateMode::None, llmbridge::IoBackend::Epoll));
+                                                    UpstreamDialect::OpenAI, llmbridge::IoBackend::Epoll));
         std::vector<std::thread> ths;
         for (auto& g : gws) ths.emplace_back([gp = g.get()] { gp->run(); });
 
@@ -2600,7 +2600,7 @@ TEST(GatewayMultiWorker, ShardedConcurrentClientsNoRaceNoLeak)
 // Translation parity across both backends and all three dialects (2 x 3 = 6).
 class ProxyXlate
     : public ProxyIT,
-      public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, TranslateMode>>
+      public ::testing::WithParamInterface<std::tuple<llmbridge::IoBackend, UpstreamDialect>>
 {
 };
 TEST_P(ProxyXlate, RoundTripAndForward)
@@ -2622,12 +2622,12 @@ TEST_P(ProxyXlate, RoundTripAndForward)
 INSTANTIATE_TEST_SUITE_P(
     Matrix, ProxyXlate,
     ::testing::Combine(::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
-                       ::testing::Values(TranslateMode::Anthropic, TranslateMode::Gemini,
-                                         TranslateMode::Cohere)),
-    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, TranslateMode>>& i) {
+                       ::testing::Values(UpstreamDialect::Anthropic, UpstreamDialect::Gemini,
+                                         UpstreamDialect::Cohere)),
+    [](const testing::TestParamInfo<std::tuple<llmbridge::IoBackend, UpstreamDialect>>& i) {
         std::string n = be_name(std::get<0>(i.param));
-        const TranslateMode m = std::get<1>(i.param);
-        n += m == TranslateMode::Anthropic ? "_anthropic" : m == TranslateMode::Gemini ? "_gemini" : "_cohere";
+        const UpstreamDialect m = std::get<1>(i.param);
+        n += m == UpstreamDialect::Anthropic ? "_anthropic" : m == UpstreamDialect::Gemini ? "_gemini" : "_cohere";
         return n;
     });
 
@@ -2785,7 +2785,7 @@ class ProxyStream : public ProxyIT, public ::testing::WithParamInterface<llmbrid
 TEST_P(ProxyStream, TranslatesAnthropicSseToOpenAiChunks)
 {
     _backend.set_response(sse_chunked_response(4096)); // whole event body in one chunk
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2810,7 +2810,7 @@ TEST_P(ProxyStream, TranslatesAnthropicSseToOpenAiChunks)
 TEST_P(ProxyStream, SurvivesTinyUpstreamChunks)
 {
     _backend.set_response(sse_chunked_response(5)); // 5-byte chunks: many decode/translate boundaries
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2826,7 +2826,7 @@ TEST_P(ProxyStream, SurvivesTrickledUpstream)
 {
     _backend.set_response(sse_chunked_response(9));
     _backend.set_trickle(2); // dribble the whole chunked response 2 bytes at a time
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2844,7 +2844,7 @@ TEST_P(ProxyStream, NonChunkedCloseDelimitedUpstream)
 {
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Connection: close\r\n\r\n" + anthropic_sse_events());
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2864,7 +2864,7 @@ TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Connection: close\r\n\r\n" + cut);
     _backend.set_close_after_first(true); // the upstream really drops the connection
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2886,7 +2886,7 @@ TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
     wire += "ZZZZ\r\ngarbage\r\n"; // invalid chunk-size line -> decoder error
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + wire);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2903,7 +2903,7 @@ TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
 TEST_P(ProxyStream, StreamRequestWithNonStreamingUpstreamFallsBack)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -2919,7 +2919,7 @@ TEST_P(ProxyStream, ClientDisconnectsMidStreamSurvives)
 {
     _backend.set_response(sse_chunked_response(5));
     _backend.set_trickle(2); // slow: the client leaves while the stream is live
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     for (int i = 0; i < 5; ++i)
     {
         Client c;
@@ -2955,7 +2955,7 @@ TEST_P(ProxyUpstreamError, RelaysStatusAndMessage)
     _backend.set_response("HTTP/1.1 " + std::to_string(status) + " Err\r\n"
                           "Content-Type: application/json\r\nConnection: keep-alive\r\n"
                           "Content-Length: " + std::to_string(err.size()) + "\r\n\r\n" + err);
-    start(0, true, TranslateMode::Anthropic, backend);
+    start(0, true, UpstreamDialect::Anthropic, backend);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -2978,7 +2978,7 @@ TEST_P(ProxyUpstreamError, EventStreamErrorIsNotLaunderedTo200)
     _backend.set_response("HTTP/1.1 " + std::to_string(status) + " Err\r\n"
                           "Content-Type: text/event-stream\r\nConnection: keep-alive\r\n"
                           "Content-Length: " + std::to_string(err.size()) + "\r\n\r\n" + err);
-    start(0, true, TranslateMode::Anthropic, backend);
+    start(0, true, UpstreamDialect::Anthropic, backend);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3012,7 +3012,7 @@ TEST_P(ProxyStream, IncludeUsageEmitsFinalUsageChunk)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(ev, 4096));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
@@ -3035,7 +3035,7 @@ TEST_P(ProxyStream, IncludeUsageEmitsFinalUsageChunk)
 TEST_P(ProxyStream, NoUsageChunkWhenNotRequested)
 {
     _backend.set_response(sse_chunked_response(4096));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
@@ -3052,7 +3052,7 @@ TEST_P(ProxyStream, NoUsageChunkWhenNotRequested)
 TEST_P(ProxyStream, StalledUpstreamTimesOutWith504)
 {
     _backend.set_stall(1); // read the request, never answer
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/300'000'000LL); // 300 ms
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/300'000'000LL); // 300 ms
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -3066,7 +3066,7 @@ TEST_P(ProxyStream, StalledMidStreamTimesOutAndTruncates)
 {
     _backend.set_response(sse_chunked_response(64));
     _backend.set_stall(2); // send half the stream, then hang
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/300'000'000LL);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/300'000'000LL);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3084,7 +3084,7 @@ TEST_P(ProxyStream, HealthyStreamIsNotTimedOut)
     // progressing) upstream must complete even with a short idle timeout.
     _backend.set_response(sse_chunked_response(16));
     _backend.set_trickle(4); // slow but continuously progressing
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/1'000'000'000LL); // 1 s
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/1'000'000'000LL); // 1 s
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3115,7 +3115,7 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(ev, 16384));
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0); // no timeout: client is slow on purpose
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0); // no timeout: client is slow on purpose
 
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096)); // tiny window
@@ -3160,7 +3160,7 @@ class ProxyStreamPool : public ProxyIT, public ::testing::WithParamInterface<llm
 TEST_P(ProxyStreamPool, ReusesUpstreamAcrossSequentialStreams)
 {
     _backend.set_response(sse_chunked_response(4096)); // chunked + Connection: keep-alive
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     // Three sequential streams, each on its own client connection: only the
     // upstream side should be reused.
@@ -3188,7 +3188,7 @@ TEST_P(ProxyStreamPool, ReusedUpstreamCarriesNoStreamStateIntoTheNextRequest)
     // half-finished SSE translator or undrained chunk decoder would splice one
     // stream's bytes into the next. Distinct payloads make that visible.
     _backend.set_response(sse_chunked_response(5)); // tiny chunks: many decoder boundaries
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     std::string first, second;
     for (std::string* out : {&first, &second})
@@ -3220,7 +3220,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolWhenUpstreamSaysConnectionClose)
     resp.replace(at, ka.size(), "Connection: close\r\n");
 
     _backend.set_response(resp);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     for (int i = 0; i < 2; ++i)
     {
         Client c;
@@ -3243,7 +3243,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolACloseDelimitedStream)
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n\r\n" + anthropic_sse_events());
     _backend.set_close_after_first(true); // close-delimited: EOF is what ends it
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     // Two requests: with only one, upstream_reused is trivially 0 and the test
     // proves nothing. The second request is what would consume a wrongly-pooled
@@ -3267,7 +3267,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolAnAbortedStream)
     // dropped instead of handed to the next request.
     _backend.set_response(sse_chunked_response(4096));
     _backend.set_close_mid_response(true);
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
 
     // Two requests, for the same reason as the close-delimited case: a single
     // request can never observe a bad pooling decision.
@@ -3313,7 +3313,7 @@ TEST_F(ProxyIT, UringSurvivesProvidedBufferExhaustion)
     // Small upstream chunks => many separate arrivals => many buffer acquisitions,
     // across 8 concurrent streams sharing a pool of exactly one buffer.
     _backend.set_response(sse_chunked_response(5));
-    start(0, true, TranslateMode::Anthropic, llmbridge::IoBackend::Uring,
+    start(0, true, UpstreamDialect::Anthropic, llmbridge::IoBackend::Uring,
           Gateway::kDefaultUpstreamIdleNs, /*uring_buf_count=*/1);
 
     std::vector<std::unique_ptr<Client>> cs;
@@ -3358,7 +3358,7 @@ TEST_P(ProxyTiming, OffByDefaultNoHeadersAppear)
 {
     // Default must stay byte-identical: a header is a visible API change.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -3369,7 +3369,7 @@ TEST_P(ProxyTiming, OffByDefaultNoHeadersAppear)
 TEST_P(ProxyTiming, EmitsOrderableT0AndDurations)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -3391,7 +3391,7 @@ TEST_P(ProxyTiming, T0IsStrictlyIncreasingAcrossRequests)
     // the system clock is disciplined mid-run, which is why t0 is an anchored
     // monotonic value instead of a raw CLOCK_REALTIME read.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     long long prev = 0;
     for (int i = 0; i < 5; ++i)
     {
@@ -3411,7 +3411,7 @@ TEST_P(ProxyTiming, BodyIsUnchangedWhenHeadersAreOn)
 {
     // The headers must be additive: the JSON a client parses cannot differ.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -3425,7 +3425,7 @@ TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
     // A stream cannot know total gateway time when headers go out, so it must
     // report TTFB instead, and must not claim a gateway-total it cannot have.
     _backend.set_response(sse_chunked_response(64));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3443,7 +3443,7 @@ TEST_P(ProxyTiming, SeqIsUniqueAndIncreasingUnderConcurrency)
     // and a non-atomic increment would hand two requests the same number, and the one
     // failure this must never have.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
 
     std::mutex m;
     std::vector<long long> seqs;
@@ -3475,7 +3475,7 @@ TEST_P(ProxyTiming, TokenCountsComeFromTheProviderNotEstimated)
 {
     // Counts must match the upstream's own usage exactly; we never estimate.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -3506,7 +3506,7 @@ TEST_P(ProxyTiming, StreamingHasNoTokenHeaders)
     // Deliberate absence: token totals and chunk counts are end-of-stream facts and
     // headers precede the body. Inventing them would be worse than omitting them.
     _backend.set_response(sse_chunked_response(64));
-    start(0, true, TranslateMode::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), Gateway::kDefaultUpstreamIdleNs, 0, true);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3556,7 +3556,7 @@ namespace
 TEST_P(ProxyTools, ToolCallRoundTripsThroughTheGateway)
 {
     _backend.set_response(http_ok(anthropic_tool_use_body()));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(tool_request()));
@@ -3572,7 +3572,7 @@ TEST_P(ProxyTools, ToolCallRoundTripsThroughTheGateway)
 TEST_P(ProxyTools, UpstreamReceivesAnthropicToolShape)
 {
     _backend.set_response(http_ok(anthropic_tool_use_body()));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(tool_request()));
@@ -3591,7 +3591,7 @@ TEST_P(ProxyTools, ToolsAndAuthHeadersCoexist)
     // Both features rebuild the upstream request. This is the test that would catch
     // one clobbering the other.
     _backend.set_response(http_ok(anthropic_tool_use_body()));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(tool_request("Authorization: Bearer sk-tools-1\r\n")));
@@ -3609,7 +3609,7 @@ TEST_P(ProxyTools, ToolResultTurnForwardsCorrectly)
 {
     // The second half of an agent loop: the client returns the tool result.
     _backend.set_response(http_ok(anthropic_resp_body("18C in Paris")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     const std::string body =
         R"({"model":"claude","max_tokens":64,"messages":[)"
         R"({"role":"user","content":"weather?"},)"
@@ -3636,7 +3636,7 @@ TEST_P(ProxyTools, StreamingRequestWithToolsStillStreams)
     // are not implemented yet; this asserts the stream still works when tools are
     // merely declared, which is the case that would silently regress.)
     _backend.set_response(sse_chunked_response(64));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     const std::string body =
         R"({"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}],)"
         R"("tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]})";
@@ -3668,7 +3668,7 @@ TEST_P(ProxyTools, LargeSchemaSurvivesFraming)
         R"({"model":"claude","max_tokens":8,"messages":[{"role":"user","content":"hi"}],)"
         R"("tools":[{"type":"function","function":{"name":"big","parameters":)" + schema + "}}]}";
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
@@ -3699,7 +3699,7 @@ TEST_P(ProxyToolStream, ToolCallsStreamAndReassemble)
 {
     const auto [backend, chunk] = GetParam();
     _backend.set_response(sse_tool_response(chunk));
-    start(0, true, TranslateMode::Anthropic, backend);
+    start(0, true, UpstreamDialect::Anthropic, backend);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -3782,7 +3782,7 @@ namespace
 // ever read as "deny when absent", which would brick every OSS deployment.
 TEST_P(ProxyPolicy, NoPolicyInstalledForwardsEverything)
 {
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -3799,7 +3799,7 @@ TEST_P(ProxyPolicy, AllowForwardsUnchanged)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = true}};
     _policy = &pol;
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -3818,7 +3818,7 @@ TEST_P(ProxyPolicy, DenyAnswersTheClientAndContactsNoUpstream)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 401, .reason = "no token"}};
     _policy = &pol;
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -3843,7 +3843,7 @@ TEST_P(ProxyPolicy, ValueInitialisedDecisionRefuses)
 {
     RecordingPolicy pol{llmbridge::Decision{}};
     _policy = &pol;
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -3862,7 +3862,7 @@ TEST_P(ProxyPolicy, OutOfRangeDenyStatusStillRefuses)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 9000, .reason = "bad status"}};
     _policy = &pol;
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -3879,7 +3879,7 @@ TEST_P(ProxyPolicy, FactsCarryTheHeadersAndTheBodySize)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = true}};
     _policy = &pol;
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     const std::string body = "{\"hello\":\"world\"}";
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
@@ -3995,8 +3995,8 @@ TEST_P(ProxyRoute, ThePolicyChoosesWhichVenueServes)
     a.start("alpha");
     b.start("bravo");
     PinnedPolicy pol(0);
-    start({{"127.0.0.1", a.port(), false, "", TranslateMode::None, ""},
-           {"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c1;
     ASSERT_TRUE(c1.connect(_port));
@@ -4028,8 +4028,8 @@ TEST_P(ProxyRoute, APooledConnectionIsNeverHandedToAnotherVenue)
     a.start("alpha");
     b.start("bravo");
     PinnedPolicy pol(0);
-    start({{"127.0.0.1", a.port(), false, "", TranslateMode::None, ""},
-           {"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     for (int round = 0; round < 3; ++round)
         for (int idx : {0, 1})
@@ -4061,8 +4061,8 @@ TEST_P(ProxyRoute, AnUnsetOrOutOfRangeIndexMeansTheFirstUpstream)
     for (int idx : {-1, 7, 99})
     {
         PinnedPolicy pol(idx);
-        start({{"127.0.0.1", a.port(), false, "", TranslateMode::None, ""},
-               {"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol);
+        start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+               {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
         Client c;
         ASSERT_TRUE(c.connect(_port));
         ASSERT_TRUE(c.send(make_request()));
@@ -4088,8 +4088,8 @@ TEST_P(ProxyRoute, ARetryStaysOnTheSameVenue)
     b.start("bravo");
     b.close_first_connection_only(); // its first pooled connection goes stale
     PinnedPolicy pol(1);
-    start({{"127.0.0.1", a.port(), false, "", TranslateMode::None, ""},
-           {"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     // Pipelined on one connection, as ProxyBackend.RetriesOnStalePooledConnection does:
     // the second request reuses the pooled upstream before the loop has noticed it
@@ -4142,7 +4142,7 @@ TEST_P(ProxyRoute, SingleUpstreamConstructorKeepsSniHost)
     llmbridge::TlsConfig tls;
     tls.upstream_tls = false;
     tls.sni_host = "regress.example";
-    Gateway gw(0, "127.0.0.1", 9, 0, TranslateMode::None, GetParam(),
+    Gateway gw(0, "127.0.0.1", 9, 0, UpstreamDialect::OpenAI, GetParam(),
                Gateway::kDefaultUpstreamIdleNs, tls);
     EXPECT_EQ(gw.upstream_sni_host(0), "regress.example")
         << "the delegating constructor dropped sni_host (read-after-move)";
@@ -4212,8 +4212,8 @@ TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
     const DeadPort dead_sock; // held open, so nothing can take the port mid-test
     const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4240,8 +4240,8 @@ TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4261,10 +4261,10 @@ TEST_P(ProxyRoute, TheFailoverChainIsBounded)
     const DeadPort s1, s2, s3, s4;
     const uint16_t d1 = s1.port(), d2 = s2.port(), d3 = s3.port(), d4 = s4.port();
     FailoverPolicy pol(0, {1, 2, 3}); // every one of them is dead
-    start({{"127.0.0.1", d1, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", d2, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", d3, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", d4, false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", d1, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", d2, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", d3, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", d4, false, "", UpstreamDialect::OpenAI, ""}}, &pol);
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -4283,8 +4283,8 @@ TEST_P(ProxyRoute, RetryingTheSameVenueIsRefused)
     NamedBackend good;
     good.start("bravo");
     FailoverPolicy pol(0, {0}); // "retry venue 0", which is the one that failed
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -4307,8 +4307,8 @@ TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
-           {"127.0.0.1", plain.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", plain.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4337,7 +4337,7 @@ TEST_P(ProxyRoute, AnthropicClientToAnthropicVenueByteForwards)
     anth.set_response(http_ok(
         R"({"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}]})"));
     anth.start();
-    start({{"127.0.0.1", anth.port(), false, "", TranslateMode::Anthropic, ""}}, nullptr);
+    start({{"127.0.0.1", anth.port(), false, "", UpstreamDialect::Anthropic, ""}}, nullptr);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4364,7 +4364,7 @@ TEST_P(ProxyRoute, AnthropicClientToOpenAiVenueIsRefusedAndNothingIsSent)
     TestBackend oai;
     oai.set_response(http_ok(R"({"id":"x","object":"chat.completion","choices":[]})"));
     oai.start();
-    start({{"127.0.0.1", oai.port(), false, "", TranslateMode::None, ""}}, nullptr);
+    start({{"127.0.0.1", oai.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4388,8 +4388,8 @@ TEST_P(ProxyRoute, TheDefaultOnFailureNeverRetries)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     NoFailoverPolicy pol(1);
-    start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
-           {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", healthy.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""}}, &pol);
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -4411,8 +4411,8 @@ TEST_P(ProxyRoute, ThePolicyIsToldWhichVenueFailed)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(1, {0}); // start on venue 1, which is dead
-    start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
-           {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", healthy.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""}}, &pol);
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -4435,8 +4435,8 @@ TEST_P(ProxyRoute, EachRequestGetsItsOwnFailoverBudgetAndBytes)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4477,8 +4477,8 @@ TEST_P(ProxyRoute, AStreamingClientIsNeverFailedOver)
     FailoverPolicy pol(0, {1});
     _gw = std::make_unique<Gateway>(
         0, std::vector<llmbridge::Upstream>{
-               {"127.0.0.1", sse.port(), false, "", TranslateMode::Anthropic, ""},
-               {"127.0.0.1", dead, false, "", TranslateMode::None, ""}},
+               {"127.0.0.1", sse.port(), false, "", UpstreamDialect::Anthropic, ""},
+               {"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""}},
         0, GetParam(), 200'000'000LL /* 200 ms idle */, llmbridge::TlsConfig{}, false, &pol,
         std::vector<std::string>{});
     _port = _gw->bound_port();
@@ -4509,8 +4509,8 @@ TEST_P(ProxyRoute, AStreamingRequestFailsOverBeforeItsFirstByte)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
-           {"127.0.0.1", sse.port(), false, "", TranslateMode::Anthropic, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::Anthropic, ""},
+           {"127.0.0.1", sse.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4550,8 +4550,8 @@ TEST_P(ProxyRoute, ConcurrentWorkersShareOnePolicyAndAllFailOver)
         gws.push_back(std::make_unique<Gateway>(
             uint16_t{0},
             std::vector<llmbridge::Upstream>{
-                {"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-                {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}},
+                {"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+                {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}},
             int64_t{0}, GetParam(), Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{},
             false, &pol, std::vector<std::string>{}));
         ports.push_back(gws.back()->bound_port());
@@ -4655,8 +4655,8 @@ TEST_P(ProxyRoute, TheTagSetAtDecideArrivesAtTheFailure)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     TaggingPolicy pol({0}, {1}); // venue 0 is dead; retry on venue 1
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4680,9 +4680,9 @@ TEST_P(ProxyRoute, TheTagIsStableAcrossTheFailoverChain)
     const DeadPort s1, s2;
     const uint16_t dead1 = s1.port(), dead2 = s2.port();
     TaggingPolicy pol({0}, {1, 2}); // dead -> dead -> healthy
-    start({{"127.0.0.1", dead1, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", dead2, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead1, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", dead2, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4709,8 +4709,8 @@ TEST_P(ProxyRoute, AKeepAliveConnectionCarriesEachRequestsOwnTag)
     const uint16_t dead = dead_sock.port();
     // Request 0 -> venue 1 (healthy, no failure). Request 1 -> venue 0 (dead).
     TaggingPolicy pol({1, 0}, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4737,8 +4737,8 @@ TEST_P(ProxyRoute, APolicyThatNeverTagsSeesZeroAtTheFailure)
     const DeadPort dead_sock;
     const uint16_t dead = dead_sock.port();
     TagRecordingPolicy pol(0, 1);
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4798,7 +4798,7 @@ TEST_P(ProxyRoute, TheSinkSeesACompletedRequestWithItsCapturedHeaders)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
           {"x-kottos-run", "x-kottos-step"});
 
     Client c;
@@ -4850,7 +4850,7 @@ TEST_P(ProxyRoute, TheSinkSeesGatewayGeneratedErrorReplies)
             return {.allow = false, .deny_status = 429, .reason = "test"};
         }
     } pol;
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4878,8 +4878,8 @@ TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
     const uint16_t dead = dead_sock.port();
     RecordingSink sink;
     TaggingPolicy pol({0}, {1});
-    start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
-           {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+    start({{"127.0.0.1", dead, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -4904,7 +4904,7 @@ TEST_P(ProxyRoute, AKeepAliveConnectionEmitsOneRecordPerRequest)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
           {"x-kottos-run"});
 
     Client c;
@@ -4938,7 +4938,7 @@ TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
           {"x-kottos-run"});
 
     Client c;
@@ -4972,7 +4972,7 @@ TEST_P(ProxyRoute, ACaptureConfiguredButAbsentIsEmptyAndNotUndefined)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
           {"x-kottos-run", "x-kottos-step"});
 
     Client c;
@@ -4998,7 +4998,7 @@ TEST_P(ProxyRoute, ACapturedHeaderIsBoundedAtTheCap)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink,
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
           {"x-kottos-run"});
 
     const std::string longv(200, 'r');
@@ -5028,7 +5028,7 @@ TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
     // The tool stream, because it is the mock that carries usage (9 in, 14 out);
     // the plain text mock has none, and 0 would prove nothing.
     _backend.set_response(sse_tool_response(4096));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -5112,7 +5112,7 @@ TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
     // Byte-for-byte: a venue that already speaks the client's dialect must not have
     // its stream rewritten, including its own terminal [DONE].
     _backend.set_response(openai_sse_response(4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
@@ -5134,7 +5134,7 @@ TEST_P(ProxyForwardStream, ItStreamsRatherThanBufferingToTheEnd)
     // has framed the entire response, so its first write would carry the [DONE] too.
     _backend.set_trickle(8);
     _backend.set_response(openai_sse_response(4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
@@ -5156,7 +5156,7 @@ TEST_P(ProxyForwardStream, TheSinkGetsTheProvidersTokenCountsIncludingCached)
     RecordingSink sink;
     _sink = &sink;
     _backend.set_response(openai_sse_response(4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
@@ -5191,7 +5191,7 @@ TEST_P(ProxyForwardStream, NothingIsInventedFromNothing)
                           sse_chunk_encode(
                               "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
                               "data: [DONE]\n\n", 4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -5214,7 +5214,7 @@ TEST_P(ProxyForwardStream, UsageIsRecordedWhetherOrNotTheClientAskedForIt)
     RecordingSink sink;
     _sink = &sink;
     _backend.set_response(openai_sse_response(4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
@@ -5252,7 +5252,7 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
         "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
         sse_chunk_encode(events, 4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
@@ -5288,7 +5288,7 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(events, 4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -5331,8 +5331,8 @@ class ProxyBedrock : public ProxyIT,
         _upstreams.push_back(llmbridge::Upstream{.ip = "127.0.0.1",
                                                  .port = _backend.port(),
                                                  .sni_host = host,
-                                                 .translate = TranslateMode::Bedrock});
-        start(0, false, TranslateMode::None, GetParam());
+                                                 .dialect = UpstreamDialect::Bedrock});
+        start(0, false, UpstreamDialect::OpenAI, GetParam());
     }
 
     /// An OpenAI request naming a versioned Bedrock model, with AWS credentials in
@@ -5517,10 +5517,10 @@ class ProxyAzure : public ProxyIT,
             .ip = "127.0.0.1",
             .port = _backend.port(),
             .sni_host = "example.openai.azure.com",
-            .translate = TranslateMode::Azure,
+            .dialect = UpstreamDialect::Azure,
             .base_path = "/openai/deployments/gpt-4o",
             .query = "api-version=2024-02-01"});
-        start(0, false, TranslateMode::None, GetParam());
+        start(0, false, UpstreamDialect::OpenAI, GetParam());
     }
 };
 
@@ -5605,7 +5605,7 @@ TEST_P(ProxyAzure, AQueryOnAVenueThatCannotUseItIsRefusedAtStartup)
         llmbridge::Upstream{.ip = "127.0.0.1",
                             .port = _backend.port(),
                             .sni_host = "example.openai.azure.com",
-                            .translate = TranslateMode::None,
+                            .dialect = UpstreamDialect::OpenAI,
                             .query = "api-version=2024-02-01"}};
     EXPECT_THROW(
         Gateway(0, bad, 0, GetParam(), Gateway::kDefaultUpstreamIdleNs,
@@ -5653,7 +5653,7 @@ TEST_P(ProxyLength, ExactlyOneContentLengthReachesTheVenue)
     // Two would be a framing ambiguity the upstream resolves however it likes, which
     // on a pooled connection is a desync affecting the next client.
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"gpt-4o","messages":[]})";
@@ -5677,7 +5677,7 @@ TEST_P(ProxyLength, TheLengthIsDerivedFromTheBodyAndNotCopied)
     // the bytes that followed the blank line, which is the invariant a body edit must
     // never break.
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"gpt-4o","messages":[{"role":"user","content":"x"}]})";
@@ -5698,7 +5698,7 @@ TEST_P(ProxyLength, AStrippedHeaderDoesNotShiftTheLength)
     // Stripping shortens the headers, never the body, so the length must not move.
     _strip_headers = {"x-secret"};
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"m","messages":[]})";
@@ -5720,7 +5720,7 @@ TEST_P(ProxyLength, ADuplicateLengthIsCollapsedAndNotEchoed)
     // lines to the venue; deriving emits exactly one. This is the case that tells the
     // two apart, since for a body we do not edit they otherwise agree.
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"m","messages":[]})";
@@ -5782,7 +5782,7 @@ TEST_P(ProxyModelRewrite, ByteForwardSplicesTheModelAndKeepsTheLengthHonest)
     ModelPolicy pol("us.anthropic.claude-haiku-4-5-20251001-v1:0");
     _policy = &pol;
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body =
@@ -5824,7 +5824,7 @@ TEST_P(ProxyModelRewrite, ATranslatedVenueGetsTheRewrittenModelToo)
     ModelPolicy pol("claude-haiku-4-5");
     _policy = &pol;
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -5839,7 +5839,7 @@ TEST_P(ProxyModelRewrite, NoPolicyMeansNoRewrite)
 {
     // The default. A stock build must put the client's bytes on the wire unchanged.
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"gpt-4o","messages":[]})";
@@ -5859,7 +5859,7 @@ TEST_P(ProxyModelRewrite, ARewriteThatCannotBeDoneRefusesInsteadOfSendingTheOldM
     ModelPolicy pol("bad\"model");
     _policy = &pol;
     _backend.set_response(http_ok("{}"));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     const std::string body = R"({"model":"gpt-4o","messages":[]})";
@@ -5895,7 +5895,7 @@ TEST_P(ProxyPoolHygiene, BytesArrivingOnAnIdlePooledUpstreamDropTheConnection)
     // rbuf and left them there; ep_acquire_upstream does not clear rbuf, so client B
     // was served this. The io_uring twin already closed the connection here.
     _backend.set_late_bytes("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nLEAKED!!!", 50);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     {
         Client a;
         ASSERT_TRUE(a.connect(_proxy_port));
@@ -5935,7 +5935,7 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(ev, 16384));
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     {
         Client a;
         ASSERT_TRUE(a.connect(_proxy_port, /*rcvbuf=*/4096));
@@ -5985,7 +5985,7 @@ TEST_P(ProxyStatusRelay, AChunkedProviderErrorKeepsItsStatus)
                           "Retry-After: 30\r\nContent-Length: 26\r\n\r\n"
                           "{\"error\":\"rate_limited\"}");
     _backend.set_chunked_response(3);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -6002,7 +6002,7 @@ TEST_P(ProxyStatusRelay, ALengthFramedProviderErrorWasAlwaysRelayed)
 {
     _backend.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
                           "Content-Length: 24\r\n\r\n{\"error\":\"rate_limited\"}");
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -6016,7 +6016,7 @@ TEST_P(ProxyStatusRelay, AChunkedSuccessIsStillA200)
 {
     _backend.set_response(http_ok("{\"ok\":true}"));
     _backend.set_chunked_response(2);
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
@@ -6066,7 +6066,7 @@ TEST_P(ProxyStreamTruncation, AChunkedStreamCutBeforeItsTerminatorIsNotFinished)
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + enc);
     _backend.set_close_after_first(true); // EOF right after the truncated body
 
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6084,7 +6084,7 @@ TEST_P(ProxyStreamTruncation, ACloseDelimitedStreamStillFinishesAtEof)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Connection: close\r\n\r\n" + anthropic_sse_events());
     _backend.set_close_after_first(true);
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6098,7 +6098,7 @@ TEST_P(ProxyStreamTruncation, ACloseDelimitedStreamStillFinishesAtEof)
 TEST_P(ProxyStreamTruncation, ACompleteChunkedStreamStillFinishes)
 {
     _backend.set_response(sse_chunked_response(64));
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6134,7 +6134,7 @@ class ProxyUnsupported : public ProxyIT,
     std::string refuse(const std::string& content_json)
     {
         _backend.set_response(http_ok(anthropic_resp_body("should never be reached")));
-        start(0, true, TranslateMode::Anthropic, GetParam());
+        start(0, true, UpstreamDialect::Anthropic, GetParam());
         Client c;
         EXPECT_TRUE(c.connect(_proxy_port));
         EXPECT_TRUE(c.send(make_request(
@@ -6180,7 +6180,7 @@ TEST_P(ProxyUnsupported, AnUnknownPartTypeSaysWhatIsCarried)
 TEST_P(ProxyUnsupported, TextPartsStillTranslate)
 {
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
@@ -6200,7 +6200,7 @@ TEST_P(ProxyUnsupported, AMalformedCredentialHeaderSaysSoWithoutEchoingIt)
     // The caller's own header, so the caller is told. What must never come back is
     // the value: it is a credential, and it would land in a JSON body unescaped.
     _backend.set_response(http_ok(anthropic_resp_body("x")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     // An 8-bit byte in the value: legal HTTP framing, so the request frames and the
@@ -6226,7 +6226,7 @@ TEST_P(ProxyUnsupported, AMalformedCredentialHeaderSaysSoWithoutEchoingIt)
 TEST_P(ProxyUnsupported, MalformedToolArgumentsSayWhatIsWrong)
 {
     _backend.set_response(http_ok(anthropic_resp_body("x")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
@@ -6290,7 +6290,7 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsRecordedAcrossTheWholeStream)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(anthropic_passthrough_events(60), 256));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
@@ -6319,7 +6319,7 @@ TEST_P(ProxyForwardStream, AnthropicFirstTokenIsTheFirstTextDelta)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(anthropic_passthrough_events(3), 128));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
@@ -6347,7 +6347,7 @@ TEST_P(ProxyForwardStream, AnthropicFirstTokenIsTheFirstTextDelta)
 TEST_P(ProxyForwardStream, AcceptEncodingIsNotForwarded)
 {
     _backend.set_response(openai_sse_response(4096));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     // The length is computed: a hardcoded one that disagrees with the body leaves the
@@ -6378,7 +6378,7 @@ TEST_P(ProxyForwardStream, ACompressedStreamStillReachesTheClientAndInventsNoCou
                           "Content-Encoding: gzip\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode("\x1f\x8b\x08 not really gzip, opaque bytes\n\n", 64));
-    start(0, true, TranslateMode::None, GetParam());
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6402,7 +6402,7 @@ class ProxyStreamLatency : public ProxyIT,
 TEST_P(ProxyStreamLatency, AStreamRecordsRequestPathAndFirstToken)
 {
     _backend.set_response(sse_chunked_response(64));
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6424,7 +6424,7 @@ TEST_P(ProxyStreamLatency, AStreamRecordsRequestPathAndFirstToken)
 TEST_P(ProxyStreamLatency, ABufferedRequestIsUnchanged)
 {
     _backend.set_response(http_ok(anthropic_resp_body("pong")));
-    start(0, true, TranslateMode::Anthropic, GetParam());
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_request("hi")));
@@ -6446,7 +6446,7 @@ TEST_P(ProxyStreamLatency, ATruncatedStreamRecordsNothing)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" + enc);
     _backend.set_close_after_first(true);
-    start(0, true, TranslateMode::Anthropic, GetParam(), /*idle=*/0);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
@@ -6476,7 +6476,7 @@ TEST_P(ProxyRoute, TheSinkSeesTheModelTheClientAskedFor)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -6502,7 +6502,7 @@ TEST_P(ProxyRoute, ANestedModelKeyIsNotTheModel)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
 
     Client c;
     ASSERT_TRUE(c.connect(_port));
@@ -6527,7 +6527,7 @@ TEST_P(ProxyRoute, ABodyThatNamesNoModelLeavesItEmpty)
     b.start("alpha");
     RecordingSink sink;
     NoFailoverPolicy pol(0);
-    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
 
     Client c;
     ASSERT_TRUE(c.connect(_port));

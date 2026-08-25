@@ -71,7 +71,7 @@ fi
 MOCK_PID=$!
 wait_port "$MOCK_PORT" || { echo "mock failed" >&2; exit 1; }
 
-"$BIN/llmbridge" --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --translate anthropic \
+"$BIN/llmbridge" --listen "$GW_PORT" --upstream "127.0.0.1:$MOCK_PORT" --upstream-dialect anthropic \
         --workers 1 --io "$IO" >"$RESDIR/sat-gw-$STAMP.log" 2>&1 &
 GW_PID=$!
 wait_port "$GW_PORT" || { echo "llmbridge failed" >&2; exit 1; }

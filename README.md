@@ -148,11 +148,11 @@ Also available: `openai_to_gemini_request` / `gemini_to_openai_response` and
 Run the binary in front of an upstream and translate on the fly:
 
 ```sh
-llmbridge --listen 8088 --upstream 127.0.0.1:9001 --translate anthropic
+llmbridge --listen 8088 --upstream 127.0.0.1:9001 --upstream-dialect anthropic
 #          --upstream also takes HOST:PORT or http(s)://HOST[:PORT][/BASE]
 #                                (resolved at startup; /BASE for providers serving
 #                                 an OpenAI-compatible API below the root)
-#                                                  --translate none|anthropic|gemini|cohere
+#                                                  --upstream-dialect openai|anthropic|gemini|cohere
 #          --upstream-timeout 120   # seconds of upstream silence before aborting (0 = off)
 ```
 
@@ -165,7 +165,7 @@ dialect and back.
 cmake -B build -DLLMBRIDGE_TLS=ON        # OpenSSL ≥ 3.0; OFF by default so the
 cmake --build build -j                   # default build stays dependency-free
 
-llmbridge --upstream https://api.anthropic.com --translate anthropic --listen 8088
+llmbridge --upstream https://api.anthropic.com --upstream-dialect anthropic --listen 8088
 ```
 
 Your client keeps sending its own key as `Authorization: Bearer ...`; the gateway maps it
@@ -232,7 +232,7 @@ endpoint instead of only a loopback sidecar:
 
 ```sh
 llmbridge --listen 8443 --listen-tls --tls-cert cert.pem --tls-key key.pem \
-          --upstream https://api.anthropic.com --translate anthropic
+          --upstream https://api.anthropic.com --upstream-dialect anthropic
 ```
 
 **One listener, one mode.** `--listen-tls` makes the single listener TLS-only; there is
@@ -265,7 +265,7 @@ Python (`pybind11`), Go (`cgo`), and Rust (FFI) bindings are on the roadmap and
 
 ## What's supported
 
-Today. **chat completions**, via `--translate` or the `provider::` API:
+Today. **chat completions**, via `--upstream-dialect` or the `provider::` API:
 
 | Provider dialect | OpenAI → provider | provider → OpenAI |
 |---|---|---|
@@ -326,8 +326,8 @@ dialects, and Anthropic-in mode. Google Vertex additionally needs OAuth2 request
 signing. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
 AWS Bedrock (SigV4, v0.23.0) and Azure OpenAI (v0.24.0, including the `api-version`
-query on the upstream target) already ship: `--translate bedrock` and
-`--translate azure`. This section said otherwise until 2026-08-24, which `--help`
+query on the upstream target) already ship: `--upstream-dialect bedrock` and
+`--upstream-dialect azure`. This section said otherwise until 2026-08-24, which `--help`
 contradicted on line one.
 
 ## Installation

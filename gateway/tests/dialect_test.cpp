@@ -12,7 +12,7 @@
 using llmbridge::client_dialect_from_target;
 using llmbridge::Dialect;
 using llmbridge::resolve_translation;
-using llmbridge::TranslateMode;
+using llmbridge::UpstreamDialect;
 using llmbridge::TranslationPlan;
 using llmbridge::venue_body_dialect;
 
@@ -30,12 +30,12 @@ TEST(Dialect, TargetNamesTheClientDialect)
 
 TEST(Dialect, VenueModeCarriesABodyDialect)
 {
-    EXPECT_EQ(venue_body_dialect(TranslateMode::None), Dialect::OpenAI);
-    EXPECT_EQ(venue_body_dialect(TranslateMode::Anthropic), Dialect::Anthropic);
-    EXPECT_EQ(venue_body_dialect(TranslateMode::Gemini), Dialect::Gemini);
-    EXPECT_EQ(venue_body_dialect(TranslateMode::Cohere), Dialect::Cohere);
-    EXPECT_EQ(venue_body_dialect(TranslateMode::Bedrock), Dialect::Anthropic);
-    EXPECT_EQ(venue_body_dialect(TranslateMode::Azure), Dialect::OpenAI);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::OpenAI), Dialect::OpenAI);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::Anthropic), Dialect::Anthropic);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::Gemini), Dialect::Gemini);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::Cohere), Dialect::Cohere);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::Bedrock), Dialect::Anthropic);
+    EXPECT_EQ(venue_body_dialect(UpstreamDialect::Azure), Dialect::OpenAI);
 }
 
 // The fix this whole change exists for: an Anthropic caller against an Anthropic venue
@@ -43,23 +43,24 @@ TEST(Dialect, VenueModeCarriesABodyDialect)
 // so the caller got an OpenAI response it could not parse.
 TEST(Dialect, SameDialectByteForwards)
 {
-    auto p = resolve_translation(Dialect::Anthropic, TranslateMode::Anthropic, /*stream=*/false);
+    auto p = resolve_translation(Dialect::Anthropic, UpstreamDialect::Anthropic, /*stream=*/false);
     EXPECT_TRUE(p.ok);
-    EXPECT_EQ(p.mode, TranslateMode::None) << "Anthropic->Anthropic must not translate";
+    EXPECT_FALSE(p.translate) << "Anthropic->Anthropic must not translate";
 
-    auto q = resolve_translation(Dialect::OpenAI, TranslateMode::None, /*stream=*/false);
+    auto q = resolve_translation(Dialect::OpenAI, UpstreamDialect::OpenAI, /*stream=*/false);
     EXPECT_TRUE(q.ok);
-    EXPECT_EQ(q.mode, TranslateMode::None);
+    EXPECT_FALSE(q.translate);
 }
 
 // The built OpenAI-in path is untouched: an OpenAI caller still gets the venue's mode.
 TEST(Dialect, OpenAiClientKeepsTheExistingTranslation)
 {
-    for (TranslateMode v : {TranslateMode::Anthropic, TranslateMode::Gemini, TranslateMode::Cohere})
+    for (UpstreamDialect v : {UpstreamDialect::Anthropic, UpstreamDialect::Gemini, UpstreamDialect::Cohere})
     {
         auto p = resolve_translation(Dialect::OpenAI, v, /*stream=*/false);
         EXPECT_TRUE(p.ok);
-        EXPECT_EQ(p.mode, v);
+        EXPECT_TRUE(p.translate);
+        EXPECT_EQ(p.venue, v);
     }
 }
 
@@ -67,11 +68,11 @@ TEST(Dialect, OpenAiClientKeepsTheExistingTranslation)
 // request must never reach the venue.
 TEST(Dialect, UnbuiltPairsFailClosed)
 {
-    auto p = resolve_translation(Dialect::Anthropic, TranslateMode::None, /*stream=*/false); // -> OpenAI venue
+    auto p = resolve_translation(Dialect::Anthropic, UpstreamDialect::OpenAI, /*stream=*/false); // -> OpenAI venue
     EXPECT_FALSE(p.ok);
     EXPECT_NE(std::string(p.why).find("no translator"), std::string::npos);
 
-    auto q = resolve_translation(Dialect::Gemini, TranslateMode::Anthropic, /*stream=*/false);
+    auto q = resolve_translation(Dialect::Gemini, UpstreamDialect::Anthropic, /*stream=*/false);
     EXPECT_FALSE(q.ok);
 }
 
@@ -80,11 +81,12 @@ TEST(Dialect, UnbuiltPairsFailClosed)
 // failure this guards.
 TEST(Dialect, BedrockAndAzureStayOpenAiOnly)
 {
-    for (TranslateMode v : {TranslateMode::Bedrock, TranslateMode::Azure})
+    for (UpstreamDialect v : {UpstreamDialect::Bedrock, UpstreamDialect::Azure})
     {
         auto ok = resolve_translation(Dialect::OpenAI, v, /*stream=*/false);
         EXPECT_TRUE(ok.ok);
-        EXPECT_EQ(ok.mode, v) << "OpenAI client must keep the transport-bundled mode";
+        EXPECT_TRUE(ok.translate);
+        EXPECT_EQ(ok.venue, v) << "OpenAI client must keep the transport-bundled mode";
 
         auto no = resolve_translation(Dialect::Anthropic, v, /*stream=*/false);
         EXPECT_FALSE(no.ok) << "a non-OpenAI client must not silently drop SigV4/URL rewrite";
@@ -99,11 +101,11 @@ TEST(Dialect, BedrockAndAzureStayOpenAiOnly)
 TEST(Dialect, BedrockRefusesAStreamedRequest)
 {
     const TranslationPlan p =
-        resolve_translation(Dialect::OpenAI, TranslateMode::Bedrock, /*stream=*/true);
+        resolve_translation(Dialect::OpenAI, UpstreamDialect::Bedrock, /*stream=*/true);
     EXPECT_FALSE(p.ok);
     EXPECT_STREQ(p.why, "bedrock venue cannot stream");
     // And the same venue still serves a non-streamed request.
-    EXPECT_TRUE(resolve_translation(Dialect::OpenAI, TranslateMode::Bedrock,
+    EXPECT_TRUE(resolve_translation(Dialect::OpenAI, UpstreamDialect::Bedrock,
                                     /*stream=*/false).ok);
 }
 
@@ -111,17 +113,18 @@ TEST(Dialect, StreamingChangesNothingForEveryOtherVenue)
 {
     // The flag is a Bedrock fact, not a general one: every other venue streams, and a
     // guard that quietly refused elsewhere would break the workload we are built for.
-    for (TranslateMode v : {TranslateMode::None, TranslateMode::Anthropic,
-                            TranslateMode::Gemini, TranslateMode::Cohere,
-                            TranslateMode::Azure})
+    for (UpstreamDialect v : {UpstreamDialect::OpenAI, UpstreamDialect::Anthropic,
+                            UpstreamDialect::Gemini, UpstreamDialect::Cohere,
+                            UpstreamDialect::Azure})
     {
         const TranslationPlan s = resolve_translation(Dialect::OpenAI, v, /*stream=*/true);
         const TranslationPlan n = resolve_translation(Dialect::OpenAI, v, /*stream=*/false);
         EXPECT_EQ(s.ok, n.ok) << static_cast<int>(v);
         EXPECT_TRUE(s.ok) << static_cast<int>(v);
-        EXPECT_EQ(s.mode, n.mode) << static_cast<int>(v);
+        EXPECT_EQ(s.translate, n.translate) << static_cast<int>(v);
+        EXPECT_EQ(s.venue, n.venue) << static_cast<int>(v);
     }
     // An Anthropic client streaming to an Anthropic venue is the Claude Code path.
-    EXPECT_TRUE(resolve_translation(Dialect::Anthropic, TranslateMode::Anthropic,
+    EXPECT_TRUE(resolve_translation(Dialect::Anthropic, UpstreamDialect::Anthropic,
                                     /*stream=*/true).ok);
 }

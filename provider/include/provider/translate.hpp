@@ -18,7 +18,7 @@
 //   - Cohere Chat v2             (messages, top_p -> "p", content blocks)
 // OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral,
 // Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need no body translation because
-// the gateway byte-forwards them (TranslateMode::None) and only rewrites
+// the gateway byte-forwards them (UpstreamDialect::OpenAI) and only rewrites
 // auth/endpoint. So this module covers the cases where the body actually changes.
 //
 // Scope per target: the common chat path (model, system, user/assistant turns,
