@@ -23,6 +23,11 @@ venue cannot serve. Breaking: `resolve_translation` takes a third argument.
 - **Every refusal is logged, at WARN.** `error_respond` logged 4xx at `LB_DEBUG`, and
   `LB_DEBUG` sits below `LLMBRIDGE_LOG_COMPILE_LEVEL` in every build, so it was
   compiled out and `--log-level debug` could not bring it back.
+  
+- **A failover test could fail in CI because its dead venue came alive.** The helper
+  that picked an unreachable port bound an ephemeral one, read the number and closed
+  the socket, so between that and the gateway's connect the port belonged to whoever
+  asked first.
 
 ### Added
 

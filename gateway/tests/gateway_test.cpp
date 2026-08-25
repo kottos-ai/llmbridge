@@ -121,6 +121,42 @@ namespace
                "\"usage\":{\"tokens\":{\"input_tokens\":3,\"output_tokens\":5}}}";
     }
 
+    // A port that refuses every connection for as long as this object lives.
+    //
+    // free_port() returns a number and closes the socket, so the port is free for
+    // anyone to take. Under `ctest -j` another test's backend can bind it between the
+    // call and the connect, and the venue a failover test needs dead comes alive: no
+    // failure fires, and the assertion reads as a routing bug. It failed in CI exactly
+    // once, on one backend, which is what a race looks like.
+    //
+    // Bound and never listened: Linux answers a connect with ECONNREFUSED when there
+    // is no listen queue, and a second bind gets EADDRINUSE. Both verified before this
+    // was written, not assumed.
+    class DeadPort
+    {
+      public:
+        DeadPort()
+        {
+            _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = 0;
+            ::bind(_fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            socklen_t len = sizeof(a);
+            ::getsockname(_fd, reinterpret_cast<sockaddr*>(&a), &len);
+            _port = ntohs(a.sin_port);
+        }
+        ~DeadPort() { if (_fd >= 0) ::close(_fd); }
+        DeadPort(const DeadPort&) = delete;
+        DeadPort& operator=(const DeadPort&) = delete;
+        uint16_t port() const noexcept { return _port; }
+
+      private:
+        int _fd = -1;
+        uint16_t _port = 0;
+    };
+
     uint16_t free_port()
     {
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -548,7 +584,13 @@ namespace
         {
             uint16_t up_port;
             if (with_backend) { _backend.start(); up_port = _backend.port(); }
-            else up_port = free_port(); // nothing listening -> connection refused
+            else
+            {
+                // Held for the fixture's lifetime, so the port cannot be taken by a
+                // parallel test between here and the connect. See DeadPort.
+                _dead = std::make_unique<DeadPort>();
+                up_port = _dead->port();
+            }
 
             // `_policy` is a member: start() already takes nine positional args and a
             // tenth is how a caller silently passes the wrong one. Set before start().
@@ -594,6 +636,7 @@ namespace
         uint16_t _proxy_port = 0;
         bool _shut = false;
         llmbridge::Policy* _policy = nullptr; // null = stock build, no seam consulted
+        std::unique_ptr<DeadPort> _dead; // only when start() was asked for no backend
         llmbridge::RequestSink* _sink = nullptr; // set before start(), like _policy
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
@@ -4166,7 +4209,8 @@ TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port(); // nothing listening: connect refused
+    const DeadPort dead_sock; // held open, so nothing can take the port mid-test
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
            {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4193,7 +4237,8 @@ TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     NoFailoverPolicy pol(0);
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
            {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4213,7 +4258,8 @@ TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
 // walk the table on every failure, turning one dead provider into a latency multiplier.
 TEST_P(ProxyRoute, TheFailoverChainIsBounded)
 {
-    const uint16_t d1 = free_port(), d2 = free_port(), d3 = free_port(), d4 = free_port();
+    const DeadPort s1, s2, s3, s4;
+    const uint16_t d1 = s1.port(), d2 = s2.port(), d3 = s3.port(), d4 = s4.port();
     FailoverPolicy pol(0, {1, 2, 3}); // every one of them is dead
     start({{"127.0.0.1", d1, false, "", TranslateMode::None, ""},
            {"127.0.0.1", d2, false, "", TranslateMode::None, ""},
@@ -4232,7 +4278,8 @@ TEST_P(ProxyRoute, TheFailoverChainIsBounded)
 // policy accidentally writes an infinite loop. Refused, and the client gets the error.
 TEST_P(ProxyRoute, RetryingTheSameVenueIsRefused)
 {
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     NamedBackend good;
     good.start("bravo");
     FailoverPolicy pol(0, {0}); // "retry venue 0", which is the one that failed
@@ -4257,7 +4304,8 @@ TEST_P(ProxyRoute, FailoverAcrossDialectsRebuildsTheRequest)
     TestBackend plain;
     plain.set_response(http_ok(R"({"id":"x","object":"chat.completion","choices":[]})"));
     plain.start();
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
            {"127.0.0.1", plain.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4337,7 +4385,8 @@ TEST_P(ProxyRoute, TheDefaultOnFailureNeverRetries)
 {
     NamedBackend healthy;
     healthy.start("alpha");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     NoFailoverPolicy pol(1);
     start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
            {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
@@ -4359,7 +4408,8 @@ TEST_P(ProxyRoute, ThePolicyIsToldWhichVenueFailed)
 {
     NamedBackend healthy;
     healthy.start("alpha");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(1, {0}); // start on venue 1, which is dead
     start({{"127.0.0.1", healthy.port(), false, "", TranslateMode::None, ""},
            {"127.0.0.1", dead, false, "", TranslateMode::None, ""}}, &pol);
@@ -4382,7 +4432,8 @@ TEST_P(ProxyRoute, EachRequestGetsItsOwnFailoverBudgetAndBytes)
     TestBackend good;
     good.set_response(http_ok(R"({"ok":true})"));
     good.start();
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
            {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4421,7 +4472,8 @@ TEST_P(ProxyRoute, AStreamingClientIsNeverFailedOver)
                      "{\"input_tokens\":1,\"output_tokens\":0}}}\n\n");
     sse.set_stall(2); // half a response, then hold the connection open forever
     sse.start();
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
     _gw = std::make_unique<Gateway>(
         0, std::vector<llmbridge::Upstream>{
@@ -4454,7 +4506,8 @@ TEST_P(ProxyRoute, AStreamingRequestFailsOverBeforeItsFirstByte)
     TestBackend sse;
     sse.set_response(sse_chunked_response(64));
     sse.start();
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::Anthropic, ""},
            {"127.0.0.1", sse.port(), false, "", TranslateMode::Anthropic, ""}}, &pol);
@@ -4482,7 +4535,8 @@ TEST_P(ProxyRoute, ConcurrentWorkersShareOnePolicyAndAllFailOver)
     constexpr int kPerWorker = 25;
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     FailoverPolicy pol(0, {1});
 
     std::vector<std::unique_ptr<Gateway>> gws;
@@ -4598,7 +4652,8 @@ TEST_P(ProxyRoute, TheTagSetAtDecideArrivesAtTheFailure)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     TaggingPolicy pol({0}, {1}); // venue 0 is dead; retry on venue 1
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
            {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4622,7 +4677,8 @@ TEST_P(ProxyRoute, TheTagIsStableAcrossTheFailoverChain)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead1 = free_port(), dead2 = free_port();
+    const DeadPort s1, s2;
+    const uint16_t dead1 = s1.port(), dead2 = s2.port();
     TaggingPolicy pol({0}, {1, 2}); // dead -> dead -> healthy
     start({{"127.0.0.1", dead1, false, "", TranslateMode::None, ""},
            {"127.0.0.1", dead2, false, "", TranslateMode::None, ""},
@@ -4649,7 +4705,8 @@ TEST_P(ProxyRoute, AKeepAliveConnectionCarriesEachRequestsOwnTag)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     // Request 0 -> venue 1 (healthy, no failure). Request 1 -> venue 0 (dead).
     TaggingPolicy pol({1, 0}, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
@@ -4677,7 +4734,8 @@ TEST_P(ProxyRoute, APolicyThatNeverTagsSeesZeroAtTheFailure)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     TagRecordingPolicy pol(0, 1);
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
            {"127.0.0.1", good.port(), false, "", TranslateMode::None, ""}}, &pol);
@@ -4816,7 +4874,8 @@ TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
 {
     NamedBackend good;
     good.start("bravo");
-    const uint16_t dead = free_port();
+    const DeadPort dead_sock;
+    const uint16_t dead = dead_sock.port();
     RecordingSink sink;
     TaggingPolicy pol({0}, {1});
     start({{"127.0.0.1", dead, false, "", TranslateMode::None, ""},
@@ -6527,4 +6586,32 @@ TEST_P(ProxyBedrock, ANonStreamedRequestIsUnaffected)
     // matters here either way is that the refusal is not the streaming one.
     EXPECT_EQ(Client::status_of(r), 400) << r;
 #endif
+}
+
+// The property every failover test leans on: a dead venue stays dead.
+//
+// free_port() closes its socket before returning the number, so between that and the
+// gateway's connect the port belongs to whoever asks first. Under `ctest -j` that is
+// sometimes another test's backend, and a test asserting "the policy was told venue 1
+// failed" then fails because venue 1 answered. This pins the replacement's two
+// properties instead of trusting them.
+TEST(DeadPort, RefusesConnectionsAndCannotBeTakenWhileHeld)
+{
+    DeadPort dead;
+    ASSERT_NE(dead.port(), 0);
+
+    const int c = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(dead.port());
+    EXPECT_EQ(::connect(c, reinterpret_cast<sockaddr*>(&a), sizeof(a)), -1);
+    EXPECT_EQ(errno, ECONNREFUSED) << "a bound socket with no listen queue must refuse";
+    ::close(c);
+
+    // And nobody can bind it out from under the test that is relying on it.
+    const int t = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_EQ(::bind(t, reinterpret_cast<sockaddr*>(&a), sizeof(a)), -1);
+    EXPECT_EQ(errno, EADDRINUSE);
+    ::close(t);
 }
