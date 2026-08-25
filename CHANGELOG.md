@@ -8,6 +8,14 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.35.2]. 2026-08-25
+
+### Fixed
+
+- **A same-dialect stream was translated, so an Anthropic client got OpenAI chunks.**
+  The SSE translator was installed by asking the venue's dialect alone, and the venue
+  is Anthropic whether or not we translate into it.
+
 ## [0.35.1]. 2026-08-25
 
 ### Fixed
