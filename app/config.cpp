@@ -192,12 +192,21 @@ namespace llmbridge::app
             {
                 if (!e.is_object())
                     return fail(err, "config: each entry in \"upstream\" must be an object");
-                if (!only(e, "upstream", {"url", "translate", "strip_headers"}, err)) return false;
+                if (!only(e, "upstream", {"url", "dialect", "translate", "strip_headers"}, err))
+                    return false;
                 ConfigFile::UpstreamEntry ue;
                 if (!want_str(e, "upstream", "url", ue.url, err)) return false;
-                if (!want_str(e, "upstream", "translate", ue.translate, err)) return false;
-                if (!one_of(ue.translate, "upstream", "translate",
-                            {"none", "anthropic", "gemini", "cohere"}, err))
+                // The old spellings, "translate" for the key and "none" for the value,
+                // are refused by name instead of quietly accepted.
+                if (e.find("translate") != nullptr)
+                    return fail(err, "config: \"translate\" is now \"dialect\", and names what "
+                                     "the venue speaks");
+                if (!want_str(e, "upstream", "dialect", ue.dialect, err)) return false;
+                if (ue.dialect == "none")
+                    return fail(err, "config: upstream dialect \"none\" is now \"openai\": it "
+                                     "names an OpenAI-compatible venue, never an absence");
+                if (!one_of(ue.dialect, "upstream", "dialect",
+                            {"openai", "anthropic", "gemini", "cohere"}, err))
                     return false;
                 if (ue.url.empty() && entries.size() > 1)
                     return fail(err, "config: every entry in an \"upstream\" array needs a url");

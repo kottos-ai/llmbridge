@@ -88,9 +88,9 @@ namespace llmbridge
 
     // Dialect translation: None = byte-forward (OpenAI-compatible upstreams);
     // the rest translate OpenAI<->provider on the way out and back.
-    enum class TranslateMode
+    enum class UpstreamDialect
     {
-        None,
+        OpenAI,
         Anthropic,
         Gemini,
         Cohere,
@@ -159,7 +159,7 @@ namespace llmbridge
         bool tls = false;     ///< originate TLS to this venue
         std::string sni_host{}; ///< DNS name for SNI and hostname verification, and the
                               ///< Host header. Empty for the bare IP:PORT form.
-        TranslateMode translate = TranslateMode::None;
+        UpstreamDialect dialect = UpstreamDialect::OpenAI;
         /// Prefixed to this venue's request target, for providers serving below the
         /// root (Groq /openai, OpenRouter /api). Empty, or "/..." with no trailing
         /// slash; net::parse_upstream is what enforces that, and a request whose own
@@ -231,7 +231,10 @@ namespace llmbridge
         int upstream_slot = -1;
         /// The translation resolved for the request in flight, from the client dialect
         /// and the venue's, not the venue's alone. See gateway/dialect.hpp.
-        TranslateMode effective_translate = TranslateMode::None;
+        /// The venue shape this request is being translated into, meaningful only
+        /// when `translate_body`.
+        UpstreamDialect effective_dialect = UpstreamDialect::OpenAI;
+        bool translate_body = false;
         // Log identity, distinct from `id` below: `id` is the client-map key and is 0
         // on every upstream, so it cannot name an upstream in a log line. This one is
         // process-unique for every Connection of either kind and never changes, which
@@ -548,7 +551,7 @@ namespace llmbridge
         // `policy` is non-owning and must outlive the Gateway; null (the default)
         // means none is consulted. Last parameter so no existing call changes meaning.
         Gateway(uint16_t listen_port, std::string upstream_ip, uint16_t upstream_port,
-                int64_t warmup_ns = 0, TranslateMode translate = TranslateMode::None,
+                int64_t warmup_ns = 0, UpstreamDialect dialect = UpstreamDialect::OpenAI,
                 IoBackend io = IoBackend::Auto,
                 int64_t upstream_idle_ns = kDefaultUpstreamIdleNs,
                 TlsConfig tls = {}, bool timing_headers = false,

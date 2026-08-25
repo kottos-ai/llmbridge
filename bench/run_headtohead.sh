@@ -12,7 +12,7 @@
 # around), against the same mock backend, same open-loop loadgen.
 #
 #   - mock_provider.py --format anthropic        (returns an Anthropic Messages body)
-#   - llmbridge:  --translate anthropic             (OpenAI in -> Anthropic upstream -> OpenAI out)
+#   - llmbridge:  --upstream-dialect anthropic             (OpenAI in -> Anthropic upstream -> OpenAI out)
 #   - LiteLLM: litellm_config_anthropic.yaml     (anthropic/* model -> same mock)
 #
 # Per RPS we measure with the same loadgen: direct-to-mock (baseline), through
@@ -105,7 +105,7 @@ for RPS in "${RPS_LIST[@]}"; do
   : "${d50:=0}" "${d99:=0}" "${d999:=0}" "${dmax:=0}"
 
   # (2) through llmbridge (fresh per RPS; translate anthropic = equal work)
-  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --translate anthropic --io uring --workers 1 \
+  $BIN/llmbridge --listen $LLMBRIDGE_PORT --upstream 127.0.0.1:$MOCK_PORT --upstream-dialect anthropic --io uring --workers 1 \
       --duration $((DUR + WARMUP + 3)) --warmup "$WARMUP" >"$RESDIR/h2h-llmbridge-$RPS-$STAMP.log" 2>&1 &
   KP=$!
   sleep 1

@@ -18,14 +18,14 @@
   },
 
   "_upstream_table": "An OBJECT for one venue, as below, or an ARRAY of the same object for several. With an array, a policy installed by a consuming program selects the index per request; llmbridge itself always uses the first, because choosing needs measurements it does not collect. Order is the contract: the index a policy returns is a position in this list. strip_headers is gateway-wide and is read from the object form only.",
-  "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"translate\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"translate\": \"none\"} ]",
+  "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"dialect\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"dialect\": \"openai\"} ]",
 
   "upstream": {
     "_url": "IP:PORT, HOST:PORT, or http(s)://HOST[:PORT]. https:// needs a TLS build and verifies both the chain and the hostname, with no way to disable it. A non-loopback plaintext upstream warns at startup, because a forwarded credential would cross the network in the clear.",
     "url": "127.0.0.1:9001",
 
-    "_translate": "none | anthropic | gemini | cohere. 'none' is byte passthrough, no body translation.",
-    "translate": "none",
+    "_dialect": "What this venue speaks: openai | anthropic | gemini | cohere. A client already speaking the venue's dialect is byte-forwarded, whichever it is. The old key name \"translate\" and the old value \"none\" still parse.",
+    "dialect": "openai",
 
     "_strip_headers": "Header names removed from every request before it is forwarded, matched case-insensitively and exactly. Empty by default, which leaves passthrough a single memcpy. Use it when a client header must not reach a third-party provider: an internal routing header, or an identity token meant for THIS gateway and nobody else. Translating modes already rebuild from a whitelist; this also stops a stripped Authorization being promoted to the provider credential.",
     "strip_headers": []

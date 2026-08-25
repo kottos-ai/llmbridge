@@ -29,7 +29,7 @@ TEST(Config, FullFileAppliesEveryGroup)
     const std::string text = R"({
       "_note": "comments are keys beginning with underscore",
       "listen":   { "port": 8443, "tls": true, "cert": "/c.pem", "key": "/k.pem" },
-      "upstream": { "url": "https://api.anthropic.com", "translate": "anthropic",
+      "upstream": { "url": "https://api.anthropic.com", "dialect": "anthropic",
                     "strip_headers": ["authorization", "X-Internal"] },
       "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
@@ -47,7 +47,7 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_EQ(c.tls_key, "/k.pem");
     ASSERT_EQ(c.upstreams.size(), 1u); // the object form is one entry
     EXPECT_EQ(c.upstreams[0].url, "https://api.anthropic.com");
-    EXPECT_EQ(c.upstreams[0].translate, "anthropic");
+    EXPECT_EQ(c.upstreams[0].dialect, "anthropic");
     EXPECT_TRUE(c.has_upstream_s);
     EXPECT_DOUBLE_EQ(c.upstream_s, 90);
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
@@ -104,9 +104,9 @@ TEST(Config, AbsentKeysAreNotApplied)
 TEST(Config, UpstreamArrayBecomesATableInOrder)
 {
     const char* text = R"({
-      "upstream": [ { "url": "127.0.0.1:9001", "translate": "anthropic" },
-                    { "url": "127.0.0.1:9002", "translate": "none" },
-                    { "url": "https://api.anthropic.com", "translate": "anthropic" } ]
+      "upstream": [ { "url": "127.0.0.1:9001", "dialect": "anthropic" },
+                    { "url": "127.0.0.1:9002", "dialect": "openai" },
+                    { "url": "https://api.anthropic.com", "dialect": "anthropic" } ]
     })";
     ConfigFile c;
     std::string err;
@@ -117,8 +117,8 @@ TEST(Config, UpstreamArrayBecomesATableInOrder)
     EXPECT_EQ(c.upstreams[2].url, "https://api.anthropic.com");
     // Order is the contract: a policy selects by index, so a table that reorders
     // silently sends requests to the wrong venue.
-    EXPECT_EQ(c.upstreams[1].translate, "none");
-    EXPECT_EQ(c.upstreams[2].translate, "anthropic");
+    EXPECT_EQ(c.upstreams[1].dialect, "openai");
+    EXPECT_EQ(c.upstreams[2].dialect, "anthropic");
 }
 
 TEST(Config, EachEntryValidatesLikeTheObjectForm)
@@ -126,10 +126,10 @@ TEST(Config, EachEntryValidatesLikeTheObjectForm)
     ConfigFile c;
     std::string err;
     // A misspelling inside an array entry must fail exactly as it does in an object.
-    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","translat":"none"}]})", c, err));
-    EXPECT_NE(err.find("translat"), std::string::npos) << err;
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialec":"openai"}]})", c, err));
+    EXPECT_NE(err.find("dialec"), std::string::npos) << err;
     err.clear();
-    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","translate":"claude"}]})", c, err));
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialect":"claude"}]})", c, err));
     EXPECT_NE(err.find("must be one of"), std::string::npos) << err;
 }
 
@@ -159,7 +159,7 @@ INSTANTIATE_TEST_SUITE_P(
         // non-object entry is a typo that must not silently become one venue.
         std::make_pair(R"({"upstream":[]})", "must not be an empty array"),
         std::make_pair(R"({"upstream":[1,2]})", "must be an object"),
-        std::make_pair(R"({"upstream":[{"translate":"none"},{"url":"x:1"}]})", "needs a url"),
+        std::make_pair(R"({"upstream":[{"dialect":"openai"},{"url":"x:1"}]})", "needs a url"),
         std::make_pair(R"({"upstream":"127.0.0.1:9001"})", "object or an array"),
         // A bare string where a list was meant must not quietly become a no-op on a
         // header the operator believes is being dropped.
@@ -168,7 +168,7 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(R"({"upstream":{"strip_headers":[""]}})", "empty string"),
         std::make_pair(R"({"listen":"8443"})", "must be an object"),
         // bad enum values, and the message lists what is allowed
-        std::make_pair(R"({"upstream":{"translate":"claude"}})", "must be one of"),
+        std::make_pair(R"({"upstream":{"dialect":"claude"}})", "must be one of"),
         std::make_pair(R"({"runtime":{"io":"kqueue"}})", "must be one of"),
         std::make_pair(R"({"runtime":{"log_level":"verbose"}})", "must be one of"),
         // out of range: a typo meaning milliseconds must not disable a timeout
@@ -218,7 +218,7 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_TRUE(c.tls_key.empty());
     ASSERT_EQ(c.upstreams.size(), 1u);
     EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
-    EXPECT_EQ(c.upstreams[0].translate, "none");
+    EXPECT_EQ(c.upstreams[0].dialect, "openai");
     EXPECT_DOUBLE_EQ(c.upstream_s,
                      static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9);
     EXPECT_DOUBLE_EQ(c.client_idle_s,
@@ -237,4 +237,53 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
                 c.has_client_idle_s && c.has_pool_idle_s && c.has_workers &&
                 c.has_timing_headers && c.has_duration_s && c.has_warmup_s)
         << "the example is missing a key it is supposed to document";
+}
+
+// ── The venue dialect: its name, its old name, and its old value ─────────────
+//
+// "translate" named an action the gateway may not even perform, since a matching
+// pair byte-forwards, and "none" read as "do not translate" while meaning "this
+// venue speaks OpenAI". That misreading is what made an Anthropic client
+// unserviceable against a venue configured this way. Both are refused by name: the
+// config and the binary ship together here, so an alias would buy nothing and keep
+// the old model alive.
+TEST(Config, DialectIsTheName)
+{
+    ConfigFile c;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "anthropic"}})",
+                             c, err))
+        << err;
+    EXPECT_EQ(c.upstreams[0].dialect, "anthropic");
+}
+
+TEST(Config, TheOldKeyIsRefusedByName)
+{
+    // Not accepted as an alias. The word said the field decided an action when it
+    // names what the venue speaks, so a config still using it holds the old model,
+    // and an alias would let that survive with nobody told.
+    ConfigFile c;
+    std::string err;
+    EXPECT_FALSE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "translate": "anthropic"}})",
+                              c, err));
+    EXPECT_NE(err.find("dialect"), std::string::npos) << err;
+}
+
+TEST(Config, TheOldValueIsRefusedByName)
+{
+    ConfigFile c;
+    std::string err;
+    EXPECT_FALSE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "none"}})",
+                              c, err));
+    // The pointed message, not the generic "must be one of" list: that one also
+    // names openai, so asserting on it would pass with the guard removed entirely.
+    EXPECT_NE(err.find("never an absence"), std::string::npos) << err;
+}
+
+TEST(Config, AnUnknownDialectIsRefused)
+{
+    ConfigFile c;
+    std::string err;
+    EXPECT_FALSE(parse_config(
+        R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "anthropc"}})", c, err));
 }

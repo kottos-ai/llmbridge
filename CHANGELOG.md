@@ -8,6 +8,45 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.35.0]. 2026-08-25
+
+Breaking, and deliberately loud: the field that says what a venue speaks was called
+`translate`, and its OpenAI value was called `none`. Both named an action the gateway
+often does not perform, and that misreading cost a day.
+
+### Fixed
+
+- **A failover test could fail in CI because its dead venue came alive.** The helper
+  that picked an unreachable port bound an ephemeral one, read the number and closed
+  the socket, so between that and the gateway's connect the port belonged to whoever
+  asked first. Under `ctest -j` that is sometimes another test's backend: the venue
+  answered, no failure fired, and the assertion read as a routing bug. It failed once
+  in CI, on one backend, which is what a race looks like.
+
+  `DeadPort` holds the socket bound and never listens. Linux answers a connect with
+  ECONNREFUSED when there is no listen queue, and a second bind gets EADDRINUSE, so
+  the venue stays dead and the port stays reserved. Both properties are measured in a
+  test, and both fail if the helper goes back to closing the socket.
+
+### Changed
+
+- **`TranslateMode` is `UpstreamDialect`, and `None` is `OpenAI`.** The field is a
+  property of the far end, like its URL and its auth scheme, and it decides three
+  things: the target path, the credential header, and the body shape.
+
+- **`--translate` is `--upstream-dialect`; the config key `translate` is `dialect`.**
+  Both old spellings are refused by name, with the replacement in the message, rather
+  than accepted as aliases.
+
+- **An unknown dialect is refused instead of defaulted.** `--translate anthropc`
+  silently became an OpenAI venue, so a typo turned an Anthropic upstream into a
+  mistranslated request carrying a live credential.
+
+- **`TranslationPlan` carries `translate` and `venue`, where it carried one enum.**
+  This is the part that makes the rename honest instead of cosmetic. The old field
+  answered two questions with one value: which dialect, and whether to translate at
+  all.
+
 ## [0.34.0]. 2026-08-25
 
 A gateway that refuses a request now says why, and stops signing one it knows the

@@ -65,17 +65,16 @@ namespace
         return 2;
     }
 
-    /// "anthropic" | "gemini" | "cohere" | "bedrock" | "azure" | else -> None. Both
-    /// the config parser and --translate validate the string, so an unknown one
-    /// cannot arrive.
-    llmbridge::TranslateMode translate_from(const std::string& s)
+    /// A venue dialect by name, or OpenAI for "openai" and its old spelling "none".
+    /// Callers validate first: an unknown string must be refused, never defaulted.
+    llmbridge::UpstreamDialect dialect_from(const std::string& s)
     {
-        return s == "anthropic" ? llmbridge::TranslateMode::Anthropic
-               : s == "gemini"  ? llmbridge::TranslateMode::Gemini
-               : s == "cohere"  ? llmbridge::TranslateMode::Cohere
-               : s == "bedrock" ? llmbridge::TranslateMode::Bedrock
-               : s == "azure"   ? llmbridge::TranslateMode::Azure
-                                : llmbridge::TranslateMode::None;
+        return s == "anthropic" ? llmbridge::UpstreamDialect::Anthropic
+               : s == "gemini"  ? llmbridge::UpstreamDialect::Gemini
+               : s == "cohere"  ? llmbridge::UpstreamDialect::Cohere
+               : s == "bedrock" ? llmbridge::UpstreamDialect::Bedrock
+               : s == "azure"   ? llmbridge::UpstreamDialect::Azure
+                                : llmbridge::UpstreamDialect::OpenAI;
     }
 
     std::vector<std::unique_ptr<llmbridge::Gateway>>* g_gateways = nullptr;
@@ -111,7 +110,7 @@ static int run(int argc, char** argv)
     // line. There is deliberately no second plaintext port.
     bool listen_tls = false;
     std::string tls_cert, tls_key;
-    llmbridge::TranslateMode translate = llmbridge::TranslateMode::None;
+    llmbridge::UpstreamDialect dialect = llmbridge::UpstreamDialect::OpenAI;
     llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
 
     // --config is applied first and flags overwrite it, so the CLI always wins and a
@@ -170,7 +169,7 @@ static int run(int argc, char** argv)
         if (!cfg.upstreams.empty())
         {
             if (!cfg.upstreams[0].url.empty()) upstream_arg = cfg.upstreams[0].url;
-            if (!cfg.upstreams[0].translate.empty()) translate = translate_from(cfg.upstreams[0].translate);
+            if (!cfg.upstreams[0].dialect.empty()) dialect = dialect_from(cfg.upstreams[0].dialect);
             extra_upstreams.assign(cfg.upstreams.begin() + 1, cfg.upstreams.end());
         }
         if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
@@ -212,17 +211,24 @@ static int run(int argc, char** argv)
         else if (a == "--tls-cert") { if (const char* v = nextarg()) tls_cert = v; }
         else if (a == "--tls-key")  { if (const char* v = nextarg()) tls_key = v; }
         else if (a == "--translate")
+            return refuse("--translate is now --upstream-dialect, and names what the "
+                          "venue speaks instead of an action we may not perform");
+        else if (a == "--upstream-dialect")
         {
-            if (const char* v = nextarg())
-            {
-                std::string mode(v);
-                if (mode == "anthropic") translate = llmbridge::TranslateMode::Anthropic;
-                else if (mode == "gemini") translate = llmbridge::TranslateMode::Gemini;
-                else if (mode == "cohere") translate = llmbridge::TranslateMode::Cohere;
-                else if (mode == "bedrock") translate = llmbridge::TranslateMode::Bedrock;
-                else if (mode == "azure") translate = llmbridge::TranslateMode::Azure;
-                else translate = llmbridge::TranslateMode::None;
-            }
+            const char* v = nextarg();
+            if (v == nullptr) return refuse(std::string(a) + " needs a dialect");
+            const std::string mode(v);
+            // Validated, never defaulted: an unknown value used to become an
+            // OpenAI venue silently, so a typo turned an Anthropic upstream into a
+            // mistranslated request carrying a live credential.
+            if (mode == "none")
+                return refuse("upstream dialect 'none' is now 'openai': it names an "
+                              "OpenAI-compatible venue, never an absence");
+            if (mode != "openai" && mode != "anthropic" && mode != "gemini" &&
+                mode != "cohere" && mode != "bedrock" && mode != "azure")
+                return refuse("unknown upstream dialect '" + mode +
+                              "'; use openai|anthropic|gemini|cohere|bedrock|azure");
+            dialect = dialect_from(mode);
         }
         else if (a == "--io")
         {
@@ -239,7 +245,7 @@ static int run(int argc, char** argv)
             std::printf("usage: %s [--listen PORT] "
                         "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
                         "[--duration SECONDS] [--warmup SECONDS] "
-                        "[--translate none|anthropic|gemini|cohere|bedrock|azure] "
+                        "[--upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
                         "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
@@ -336,7 +342,7 @@ static int run(int argc, char** argv)
                             .port = upstream_port,
                             .tls = up.tls,
                             .sni_host = up.host,
-                            .translate = translate,
+                            .dialect = dialect,
                             .base_path = up.path,
                             .query = up.query});
     for (const auto& e : extra_upstreams)
@@ -362,7 +368,7 @@ static int run(int argc, char** argv)
                                                      .port = s2.port,
                                                      .tls = s2.tls,
                                                      .sni_host = s2.host,
-                                                     .translate = translate_from(e.translate),
+                                                     .dialect = dialect_from(e.dialect),
                                                      .base_path = s2.path,
                                                      .query = s2.query});
     }

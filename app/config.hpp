@@ -50,7 +50,7 @@ namespace llmbridge::app
         struct UpstreamEntry
         {
             std::string url;       // IP:PORT, HOST:PORT or http(s)://HOST[:PORT]
-            std::string translate; // "none" | "anthropic" | "gemini" | "cohere"
+            std::string dialect; // "openai" | "anthropic" | "gemini" | "cohere"
         };
         std::vector<UpstreamEntry> upstreams;
         std::vector<std::string> strip_headers; // dropped from upstream requests

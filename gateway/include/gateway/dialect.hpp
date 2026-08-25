@@ -9,17 +9,20 @@
 
 #include <string_view>
 
-#include "gateway/gateway.hpp" // TranslateMode
+#include "gateway/gateway.hpp" // UpstreamDialect
 
 /// @file
 /// The translation to run is a function of two dialects, not one: what the caller
-/// speaks and what the venue speaks. `TranslateMode` alone answered only the second
-/// while assuming the first was OpenAI, which mistranslated any Anthropic-speaking
-/// client. These pure functions resolve the pair. See DESIGN.md "Dialect resolution".
+/// speaks and what the venue speaks. The venue's dialect alone answered only the
+/// second while assuming the first was OpenAI, which mistranslated any
+/// Anthropic-speaking client. These pure functions resolve the pair, and the plan
+/// they return separates "does a translator run" from "into which shape", because a
+/// same-dialect pair byte-forwards and no dialect value can say that.
+/// See DESIGN.md "Dialect resolution".
 namespace llmbridge
 {
     /// A body wire format. This is the payload shape only; a venue's auth scheme and
-    /// URL layout are separate axes that `TranslateMode`'s Bedrock/Azure still carry.
+    /// URL layout are separate axes that `UpstreamDialect`'s Bedrock/Azure still carry.
     enum class Dialect
     {
         OpenAI,
@@ -44,19 +47,19 @@ namespace llmbridge
     /// The body dialect a venue speaks. Bedrock carries an Anthropic body under SigV4;
     /// Azure carries an OpenAI body under a rewritten URL; None is an OpenAI-compatible
     /// venue.
-    [[nodiscard]] inline Dialect venue_body_dialect(TranslateMode venue) noexcept
+    [[nodiscard]] inline Dialect venue_body_dialect(UpstreamDialect venue) noexcept
     {
         switch (venue)
         {
-            case TranslateMode::Anthropic:
-            case TranslateMode::Bedrock:
+            case UpstreamDialect::Anthropic:
+            case UpstreamDialect::Bedrock:
                 return Dialect::Anthropic;
-            case TranslateMode::Gemini:
+            case UpstreamDialect::Gemini:
                 return Dialect::Gemini;
-            case TranslateMode::Cohere:
+            case UpstreamDialect::Cohere:
                 return Dialect::Cohere;
-            case TranslateMode::None:
-            case TranslateMode::Azure:
+            case UpstreamDialect::OpenAI:
+            case UpstreamDialect::Azure:
                 return Dialect::OpenAI;
         }
         return Dialect::OpenAI;
@@ -68,28 +71,33 @@ namespace llmbridge
     struct TranslationPlan
     {
         bool ok = false;
-        TranslateMode mode = TranslateMode::None;
+        /// Whether a translator runs at all.
+        bool translate = false;
+        /// The venue shape to translate into, meaningful only when `translate`.
+        UpstreamDialect venue = UpstreamDialect::OpenAI;
         const char* why = "";
     };
 
     [[nodiscard]] inline TranslationPlan resolve_translation(Dialect client,
-                                                             TranslateMode venue,
+                                                             UpstreamDialect venue,
                                                              bool stream) noexcept
     {
         // Bedrock streams from /model/{id}/invoke-with-response-stream, which answers
         // in AWS event-stream framing, not SSE, and none of that is built.
-        if (venue == TranslateMode::Bedrock && stream)
-            return {false, venue, "bedrock venue cannot stream"};
+        if (venue == UpstreamDialect::Bedrock && stream)
+            return {false, false, venue, "bedrock venue cannot stream"};
         // Bedrock and Azure run SigV4 or a URL rewrite that a same-dialect byte-forward
         // would drop, and both are built for an OpenAI caller only. Leave them as they
         // are; refuse any other caller so no unsigned or mis-targeted bytes are sent.
-        if (venue == TranslateMode::Bedrock || venue == TranslateMode::Azure)
+        if (venue == UpstreamDialect::Bedrock || venue == UpstreamDialect::Azure)
         {
-            if (client == Dialect::OpenAI) return {true, venue, ""};
-            return {false, venue, "venue needs an OpenAI-dialect client"};
+            if (client == Dialect::OpenAI) return {true, true, venue, ""};
+            return {false, false, venue, "venue needs an OpenAI-dialect client"};
         }
-        if (client == venue_body_dialect(venue)) return {true, TranslateMode::None, ""};
-        if (client == Dialect::OpenAI) return {true, venue, ""};
-        return {false, venue, "no translator for this client dialect to this venue"};
+        // Same dialect on both sides: forward the bytes. This is the case the old
+        // single field could not express honestly.
+        if (client == venue_body_dialect(venue)) return {true, false, venue, ""};
+        if (client == Dialect::OpenAI) return {true, true, venue, ""};
+        return {false, false, venue, "no translator for this client dialect to this venue"};
     }
 } // namespace llmbridge

@@ -108,7 +108,7 @@
 
 using llmbridge::Gateway;
 using llmbridge::IoBackend;
-using llmbridge::TranslateMode;
+using llmbridge::UpstreamDialect;
 namespace json = llmbridge::provider::json;
 namespace http = llmbridge::net::http;
 
@@ -689,7 +689,7 @@ namespace
         {
             _backend.start(&_answers);
             _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), /*warmup*/ 0,
-                                            TranslateMode::Anthropic, GetParam(),
+                                            UpstreamDialect::Anthropic, GetParam(),
                                             Gateway::kDefaultUpstreamIdleNs,
                                             llmbridge::TlsConfig{}, /*timing_headers*/ false);
             _port = _gw->bound_port();
@@ -1065,7 +1065,7 @@ TEST_P(CorpusIT, ConcurrencySweepSeparatesQueueingFromGatewayCost)
     {
         const int per = std::max(4, 400 / nclients);
         auto gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0,
-                                            TranslateMode::Anthropic, GetParam(),
+                                            UpstreamDialect::Anthropic, GetParam(),
                                             Gateway::kDefaultUpstreamIdleNs,
                                             llmbridge::TlsConfig{}, false);
         const uint16_t port = gw->bound_port();

@@ -26,7 +26,7 @@ provider/   dialect translation (OpenAI ⇄ Anthropic / Gemini / Cohere)   (no I
   ├─ json.hpp        hand-rolled, scoped JSON parser + escaping builder
   └─ translate.{hpp,cpp}   string→string translation functions
 gateway/    the event-loop proxy that ties net + provider together
-app/        the CLI daemon (llmbridge --listen ... --upstream ... --translate ...)
+app/        the CLI daemon (llmbridge --listen ... --upstream ... --upstream-dialect ...)
 ```
 
 `provider/` is completely I/O-free and trivially embeddable/bindable; it is the
@@ -217,9 +217,10 @@ and on the response, content / finish-reason / usage.
 
 ### Dialect resolution (client dialect x venue dialect)
 
-An earlier model folded two questions into the venue's `TranslateMode`: what the venue
-speaks, and what to translate. `Anthropic` did not mean "this venue speaks Anthropic",
-it meant "translate an OpenAI client to Anthropic". The OpenAI-client assumption was
+An earlier model folded two questions into the venue's dialect field, then called it
+`TranslateMode`: what the venue speaks, and what to translate. `Anthropic` did not mean
+"this venue speaks Anthropic", it meant "translate an OpenAI client to Anthropic", and
+`None` meant "do not translate" where the venue was in fact OpenAI-compatible. The OpenAI-client assumption was
 invisible and wrong for any caller that already speaks Anthropic: such a request was
 mistranslated into an OpenAI response the caller could not parse.
 
@@ -232,12 +233,16 @@ The model separates the two axes:
 - **venue dialect**: the body format the venue speaks, a static property.
 
 The translation to run is a function of the pair (`resolve_translation`, in
-`gateway/dialect.hpp`), not of the venue alone:
+`gateway/dialect.hpp`), not of the venue alone. It answers with a `TranslationPlan`
+carrying two fields, because one cannot say this: `translate` is whether a translator
+runs, `venue` is the shape to translate into. A same-dialect pair byte-forwards, and
+there is no dialect value meaning "no translation": spelling it `OpenAI` would claim an
+Anthropic passthrough was OpenAI.
 
 | client -> venue | result |
 |---|---|
-| same dialect (Anthropic->Anthropic, OpenAI->OpenAI) | `None`: byte-forward |
-| OpenAI -> Anthropic / Gemini / Cohere | the venue's mode: the built OpenAI-in path |
+| same dialect (Anthropic->Anthropic, OpenAI->OpenAI) | `translate = false`: byte-forward |
+| OpenAI -> Anthropic / Gemini / Cohere | `translate = true`, `venue` names the shape: the built OpenAI-in path |
 | Anthropic (or other non-OpenAI) -> a different venue dialect | refused: the reverse translator is not built |
 
 The last row fails closed. It is the Anthropic-in direction (a caller speaking Anthropic
@@ -248,7 +253,7 @@ request never reaches the venue.
 **Body dialect is one axis of three, and `dialect.hpp` owns only the first.** A venue also
 has an auth scheme (Bearer, `x-api-key`, SigV4, `api-key`) and a URL layout (Bedrock puts
 the model in the path, Azure the deployment in the path and the api-version in the query).
-`Bedrock` and `Azure` in `TranslateMode` bundle those transport quirks over a body dialect
+`Bedrock` and `Azure` in `UpstreamDialect` bundle those transport quirks over a body dialect
 (Anthropic and OpenAI respectively), so they cannot reduce to a plain byte-forward on a
 same-dialect match. They stay on their existing OpenAI-client path until a non-OpenAI
 client path is built for them, and `resolve_translation` refuses a non-OpenAI client to
@@ -343,7 +348,7 @@ applies in two places, and the second is easy to miss: the passthrough copy, and
 credential scan, so a stripped `Authorization` is never promoted onto the provider key.
 
 Empty by default, which keeps passthrough a single memcpy. It exists because
-`TranslateMode::None` forwarded the client's bytes verbatim, headers included, which is
+a byte-forward carried the client's bytes verbatim, headers included, which is
 the "echo" this repo's own rule forbids: a header meant for this gateway, or an internal
 routing header, reached a third-party provider. Translating modes were never affected;
 they rebuild from a whitelist already.
