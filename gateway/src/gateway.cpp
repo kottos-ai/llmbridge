@@ -67,8 +67,9 @@ namespace llmbridge
         TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept
         {
             const std::string_view head(c->rbuf.data(), c->msg.header_len);
+            const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             return resolve_translation(client_dialect_from_target(request_line(head)),
-                                       venue.translate);
+                                       venue.translate, provider::wants_stream(body));
         }
 
         /// Status code off the front of a response we are about to send. Reads the
@@ -2128,8 +2129,7 @@ namespace llmbridge
         // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
         // Getting that backwards means drowning in 4xx noise at scale or missing an
         // outage, so the level is derived from the code, never chosen per site.
-        if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
-        else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
         client->wbuf = build_error(code, detail);
@@ -3532,8 +3532,7 @@ namespace llmbridge
                                    const char* detail) noexcept
     {
         if (!client || client->doomed) return;
-        if (code >= 500) LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
-        else LB_DEBUG(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
         client->wbuf = build_error(code, detail);
         client->woff = 0;

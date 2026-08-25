@@ -73,8 +73,13 @@ namespace llmbridge
     };
 
     [[nodiscard]] inline TranslationPlan resolve_translation(Dialect client,
-                                                             TranslateMode venue) noexcept
+                                                             TranslateMode venue,
+                                                             bool stream) noexcept
     {
+        // Bedrock streams from /model/{id}/invoke-with-response-stream, which answers
+        // in AWS event-stream framing, not SSE, and none of that is built.
+        if (venue == TranslateMode::Bedrock && stream)
+            return {false, venue, "bedrock venue cannot stream"};
         // Bedrock and Azure run SigV4 or a URL rewrite that a same-dialect byte-forward
         // would drop, and both are built for an OpenAI caller only. Leave them as they
         // are; refuse any other caller so no unsigned or mis-targeted bytes are sent.

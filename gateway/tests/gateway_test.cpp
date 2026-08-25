@@ -6483,3 +6483,48 @@ TEST_P(ProxyRoute, ABodyThatNamesNoModelLeavesItEmpty)
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_TRUE(recs[0].model.empty()) << "invented a model: " << recs[0].model;
 }
+
+// A streamed request never reaches a Bedrock venue. Bedrock streams from a different
+// endpoint in a different framing, so `stream:true` used to be signed, sent to
+// /invoke, and rejected by AWS: a provider error for a request the gateway knew it
+// could not serve. Fail closed instead, and prove nothing was sent.
+TEST_P(ProxyBedrock, AStreamedRequestIsRefusedAndNeverSigned)
+{
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        R"({"model":"anthropic.claude-3-5-sonnet-20240620-v1:0","stream":true,)"
+        R"("messages":[{"role":"user","content":"ping"}]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer AKIDEXAMPLE:secret\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string r = c.recv_response();
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+    c.close();
+    shutdown();
+    EXPECT_TRUE(_backend.last_request().empty())
+        << "a request we cannot serve still reached the venue: " << _backend.last_request();
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 0u);
+}
+
+TEST_P(ProxyBedrock, ANonStreamedRequestIsUnaffected)
+{
+    // The control. A guard that refused everything would pass the test above.
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
+    const std::string r = c.recv_response();
+    c.close();
+    shutdown();
+#ifdef LLMBRIDGE_HAVE_TLS
+    EXPECT_EQ(Client::status_of(r), 200) << r;
+    EXPECT_FALSE(_backend.last_request().empty());
+#else
+    // No OpenSSL means no signature, so this build refuses for its own reason. What
+    // matters here either way is that the refusal is not the streaming one.
+    EXPECT_EQ(Client::status_of(r), 400) << r;
+#endif
+}

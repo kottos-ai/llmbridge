@@ -8,6 +8,35 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.34.0]. 2026-08-25
+
+A gateway that refuses a request now says why, and stops signing one it knows the
+venue cannot serve. Breaking: `resolve_translation` takes a third argument.
+
+### Fixed
+
+- **A streamed request to a Bedrock venue is refused instead of sent.** Bedrock
+  streams from `/model/{id}/invoke-with-response-stream` in AWS event-stream framing,
+  which is a different endpoint and a different wire protocol from the `/invoke` this
+  builds.
+
+- **Every refusal is logged, at WARN.** `error_respond` logged 4xx at `LB_DEBUG`, and
+  `LB_DEBUG` sits below `LLMBRIDGE_LOG_COMPILE_LEVEL` in every build, so it was
+  compiled out and `--log-level debug` could not bring it back.
+
+### Added
+
+- **`provider::wants_stream`**, whether a body asks for a streamed response. The
+  gateway otherwise learns that a response streams from the response itself, which is
+  too late to refuse a venue that cannot stream at all.
+
+### Changed
+
+- **Breaking: `resolve_translation(client, venue, stream)`.** The third argument has
+  no default on purpose: a venue can speak the right dialect and still be unable to
+  serve a shape of request, and every caller should have to say which it is asking
+  about.
+
 ## [0.33.0]. 2026-08-25
 
 ### Changed
