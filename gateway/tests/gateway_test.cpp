@@ -6615,3 +6615,66 @@ TEST(DeadPort, RefusesConnectionsAndCannotBeTakenWhileHeld)
     EXPECT_EQ(errno, EADDRINUSE);
     ::close(t);
 }
+
+// ── A byte-forwarded reply still reports what it cost ────────────────────────
+//
+// Only the translating branch scanned the response body, so a same-dialect request
+// reported no tokens at all: the sink saw -1 and a tape recorded a request that cost
+// zero tokens at a real price, which reads as free instead of as unmeasured. Since
+// same-dialect clients stopped being translated, that is most of an Anthropic
+// customer's traffic, and it is how two live requests came back `in 0 out 0`.
+TEST_P(ProxyRoute, AByteForwardedReplyReportsItsTokens)
+{
+    TestBackend b;
+    b.set_response(http_ok(anthropic_resp_body("pong"))); // usage: 3 in, 5 out
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string body = R"({"model":"claude-haiku-4-5","max_tokens":8,)"
+                             R"("messages":[{"role":"user","content":"hi"}]})";
+    // /v1/messages from an Anthropic client to an Anthropic venue: nothing is
+    // translated, which is exactly the case that reported nothing.
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    EXPECT_EQ(Client::status_of(c.recv_response()), 200);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_FALSE(recs[0].r.streamed) << "this test is about the non-streamed path";
+    EXPECT_EQ(recs[0].r.tokens_in, 3) << "a byte-forwarded reply reported no input tokens";
+    EXPECT_EQ(recs[0].r.tokens_out, 5) << "a byte-forwarded reply reported no output tokens";
+}
+
+TEST_P(ProxyRoute, AByteForwardedReplyWithNoUsageStaysUnknown)
+{
+    // -1, never 0. A body that states no usage is unmeasured, and a tape that wrote
+    // zero there would price a real request at nothing and look like a cheap one.
+    TestBackend b;
+    b.set_response(http_ok(R"({"id":"msg_x","content":[{"type":"text","text":"hi"}]})"));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string body = R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, -1);
+    EXPECT_EQ(recs[0].r.tokens_out, -1);
+}
