@@ -4713,12 +4713,14 @@ namespace
             c.r = r;
             for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
                 c.cap[i].assign(r.captured[i]); // the views die with the call
+            c.model.assign(r.model);            // and so does this one
             _records.push_back(std::move(c));
         }
         struct Copy
         {
             llmbridge::RequestRecord r;
             std::string cap[llmbridge::kSinkCaptureMax];
+            std::string model;
         };
         std::vector<Copy> records()
         {
@@ -6363,3 +6365,81 @@ INSTANTIATE_TEST_SUITE_P(Backends, ProxyStreamLatency,
                          [](const auto& i) {
                              return i.param == llmbridge::IoBackend::Epoll ? "Epoll" : "Uring";
                          });
+
+// ── The model the client asked for reaches the sink ──────────────────────────
+//
+// Without it a sink records the venue it routed to and has no way to know what was
+// actually bought, so a tape names whatever product the route sells whether or not
+// the request asked for it.
+TEST_P(ProxyRoute, TheSinkSeesTheModelTheClientAskedFor)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string body = R"({"model":"claude-opus-5","max_tokens":8})";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    EXPECT_FALSE(c.recv_response().empty());
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].model, "claude-opus-5");
+}
+
+TEST_P(ProxyRoute, ANestedModelKeyIsNotTheModel)
+{
+    // The byte-forward path never parsed a body before this. A textual match would
+    // take the first `"model"` in the bytes, and a tool schema or a metadata block
+    // puts one there ahead of the request's own.
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string body =
+        R"({"metadata":{"model":"decoy"},"messages":[{"role":"user","content":"hi"}],)"
+        R"("model":"claude-haiku-4-5"})";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].model, "claude-haiku-4-5");
+}
+
+TEST_P(ProxyRoute, ABodyThatNamesNoModelLeavesItEmpty)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", TranslateMode::None, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: 2\r\n\r\n{}"));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].model.empty()) << "invented a model: " << recs[0].model;
+}

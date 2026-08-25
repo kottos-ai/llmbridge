@@ -376,6 +376,98 @@ namespace llmbridge::provider
     }
     } // namespace
 
+    namespace
+    {
+        // Past one JSON value, without building it. npos on malformed input, which
+        // the caller reads as "no model": a body we cannot walk is one whose
+        // top-level keys we do not know.
+        //
+        // By value shape, because the three cases end differently: a string at its
+        // closing quote, a container at depth zero, a scalar at the delimiter after
+        // it. One fused loop got the string wrong and it took a test to see.
+        size_t skip_value(std::string_view b, size_t i) noexcept
+        {
+            constexpr size_t kBad = std::string_view::npos;
+            if (i >= b.size()) return kBad;
+            if (b[i] == '"')
+            {
+                for (++i; i < b.size(); ++i)
+                {
+                    if (b[i] == '\\') { ++i; continue; }
+                    if (b[i] == '"') return i + 1;
+                }
+                return kBad;
+            }
+            if (b[i] == '{' || b[i] == '[')
+            {
+                int depth = 0;
+                bool in_str = false;
+                for (; i < b.size(); ++i)
+                {
+                    const char c = b[i];
+                    if (in_str)
+                    {
+                        if (c == '\\') ++i;
+                        else if (c == '"') in_str = false;
+                        continue;
+                    }
+                    if (c == '"') in_str = true;
+                    else if (c == '{' || c == '[') ++depth;
+                    else if ((c == '}' || c == ']') && --depth == 0) return i + 1;
+                }
+                return kBad;
+            }
+            while (i < b.size() && b[i] != ',' && b[i] != '}') ++i; // number, bool, null
+            return i;
+        }
+
+        size_t skip_ws(std::string_view b, size_t i) noexcept
+        {
+            while (i < b.size() && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r'))
+                ++i;
+            return i;
+        }
+    } // namespace
+
+    std::string_view model_of(std::string_view body) noexcept
+    {
+        size_t i = skip_ws(body, 0);
+        if (i >= body.size() || body[i] != '{') return {};
+        ++i;
+        while (true)
+        {
+            i = skip_ws(body, i);
+            if (i >= body.size() || body[i] != '"') return {}; // '}' included: no model
+            const size_t kb = ++i;
+            while (i < body.size() && body[i] != '"')
+            {
+                if (body[i] == '\\') ++i;
+                ++i;
+            }
+            if (i >= body.size()) return {};
+            const std::string_view key = body.substr(kb, i - kb);
+            i = skip_ws(body, i + 1);
+            if (i >= body.size() || body[i] != ':') return {};
+            i = skip_ws(body, i + 1);
+            if (key == "model")
+            {
+                if (i >= body.size() || body[i] != '"') return {};
+                const size_t vb = ++i;
+                while (i < body.size() && body[i] != '"')
+                {
+                    if (body[i] == '\\') return {}; // escaped: not a name we can match
+                    ++i;
+                }
+                return i < body.size() ? body.substr(vb, i - vb) : std::string_view{};
+            }
+            i = skip_value(body, i);
+            if (i == std::string_view::npos) return {};
+            i = skip_ws(body, i);
+            if (i >= body.size() || body[i] != ',') return {};
+            ++i;
+        }
+    }
+
     std::string rewrite_model(std::string_view openai_body, std::string_view model)
     {
         if (model.empty()) return {};

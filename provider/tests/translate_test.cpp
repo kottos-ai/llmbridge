@@ -1039,3 +1039,70 @@ TEST(ToolReqInjection, OrdinaryArgumentsStillTranslate)
     ASSERT_TRUE(empty_input && empty_input->is_object());
     EXPECT_TRUE(empty_input->obj.empty());
 }
+
+// ── model_of: the client's model, from the top level only ────────────────────
+TEST(ModelOf, ReadsATopLevelModel)
+{
+    EXPECT_EQ(llmbridge::provider::model_of(R"({"model":"claude-opus-5","max_tokens":8})"),
+              "claude-opus-5");
+    EXPECT_EQ(llmbridge::provider::model_of("{ \"model\" : \"gpt-4o\" }"), "gpt-4o");
+}
+
+TEST(ModelOf, ReadsItAfterOtherKeys)
+{
+    // Claude Code puts model first; nothing requires that, and a scanner that only
+    // works for one client is a scanner that silently mislabels the others.
+    EXPECT_EQ(llmbridge::provider::model_of(
+                  R"({"max_tokens":8,"stream":true,"messages":[{"role":"user",)"
+                  R"("content":"hi"}],"model":"claude-haiku-4-5"})"),
+              "claude-haiku-4-5");
+}
+
+TEST(ModelOf, ANestedModelKeyIsNotTheModel)
+{
+    // The reason this is a parser and not a find(). A quote inside a JSON string is
+    // escaped, so prompt text cannot forge a key; a nested key is unescaped and can.
+    // Anything the client nests, metadata, a tool schema, a provider block, carries
+    // real `"model"` keys, and the first textual match is whichever comes first in
+    // the body, not whichever is the request's own.
+    EXPECT_EQ(llmbridge::provider::model_of(
+                  R"({"metadata":{"model":"decoy"},"model":"claude-opus-5"})"),
+              "claude-opus-5");
+    EXPECT_EQ(llmbridge::provider::model_of(
+                  R"({"tools":[{"input_schema":{"properties":{"model":{"type":"string"}}}}],)"
+                  R"("model":"claude-haiku-4-5"})"),
+              "claude-haiku-4-5");
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"metadata":{"model":"decoy"}})").empty())
+        << "a nested key is not the request's model";
+}
+
+TEST(ModelOf, AModelInsideAPromptIsText)
+{
+    EXPECT_EQ(llmbridge::provider::model_of(
+                  R"({"messages":[{"role":"user","content":"use {\"model\":\"evil\"} here"}],)"
+                  R"("model":"claude-opus-5"})"),
+              "claude-opus-5");
+    EXPECT_TRUE(llmbridge::provider::model_of(
+                    R"({"messages":[{"role":"user","content":"\"model\": \"evil\""}]})")
+                    .empty());
+}
+
+TEST(ModelOf, RefusesWhatItCannotCompare)
+{
+    EXPECT_TRUE(llmbridge::provider::model_of("").empty());
+    EXPECT_TRUE(llmbridge::provider::model_of("[]").empty());
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"model":7})").empty());
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"model":null})").empty());
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"model":"a\\b"})").empty())
+        << "an escaped name is not one we can compare against a configured string";
+    EXPECT_TRUE(llmbridge::provider::model_of(R"({"messages":[{"a":1},)").empty())
+        << "a truncated body must not yield a model";
+}
+
+TEST(ModelOf, SkipsEveryValueShape)
+{
+    EXPECT_EQ(llmbridge::provider::model_of(
+                  R"({"a":{"b":[1,2,{"c":"}"}]},"b":[[]],"c":null,"d":true,"e":-1.5e3,)"
+                  R"("f":"a\"b","model":"m"})"),
+              "m");
+}

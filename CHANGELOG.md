@@ -8,6 +8,29 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.32.0]. 2026-08-24
+
+### Added
+
+- **The model the client asked for reaches the sink.** A sink knew which venue served
+  a request and had no way to know what was bought, so an integrator recording a
+  request could only name the product its own routing intended, never the one the
+  body named. Those differ whenever a client picks its own model, which is what every
+  coding agent does.
+
+  `RequestRecord::model`, copied at framing like the captured headers, bounded to 64
+  bytes and dropped instead of truncated: a sink compares this against configured
+  names, and half a name matches none of them, so a truncation would be
+  indistinguishable from a real disagreement.
+
+- **`provider::model_of`**, the top-level `model` of a request body, as a view.
+
+  A parser, not a search. A quote inside a JSON string is escaped, so prompt text
+  cannot forge a key, but a nested key is unescaped and can: a tool schema with a
+  `model` property, or a metadata block, puts a real `"model"` in the bytes ahead of
+  the request's own, and the first textual match takes it. The tests attack exactly
+  that, and a naive `find` fails six of them.
+
 ## [0.31.0]. 2026-08-24
 
 ### Added

@@ -2276,6 +2276,20 @@ namespace llmbridge
             if (n) std::memcpy(c->sink_cap[i], v.data(), n);
             c->sink_cap_len[i] = static_cast<uint8_t>(n);
         }
+        // The one body read on the byte-forward path, and it happens only with a sink
+        // installed. A stock build parses nothing here, as before.
+        //
+        // Dropped instead of truncated when it does not fit: a sink compares this
+        // against configured names, and half a name matches none of them, so a
+        // truncation would be indistinguishable from a real mismatch.
+        c->sink_model_len = 0;
+        const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
+        const std::string_view model = provider::model_of(body);
+        if (!model.empty() && model.size() <= sizeof(c->sink_model))
+        {
+            std::memcpy(c->sink_model, model.data(), model.size());
+            c->sink_model_len = static_cast<uint8_t>(model.size());
+        }
     }
 
     void Gateway::sink_emit(Connection* c, int status, bool streamed) noexcept
@@ -2299,6 +2313,7 @@ namespace llmbridge
         r.truncated = streamed && c->close_after_resp;
         r.translated = c->effective_translate != TranslateMode::None;
         r.backend = _active_backend;
+        r.model = std::string_view(c->sink_model, c->sink_model_len);
         if (streamed && c->sse_xlate)
         {
             r.tokens_in = c->sse_xlate->input_tokens();

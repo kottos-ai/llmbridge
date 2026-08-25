@@ -51,6 +51,15 @@ namespace llmbridge::provider
     /// escaping of a string that lands in a request body is how an injection starts.
     std::string rewrite_model(std::string_view openai_body, std::string_view model);
 
+    /// The model the client asked for, as a view into `body`. Empty when the body is
+    /// not an object, names no top-level `model`, or spells it with anything other
+    /// than a plain string.
+    ///
+    /// Top-level only. A value carrying a backslash is refused instead of unescaped: this is compared
+    /// against configured names, an escape means it was never one of them, and
+    /// unescaping here would need an allocation on a path that has none.
+    std::string_view model_of(std::string_view body) noexcept;
+
     std::string openai_to_anthropic_request(std::string_view openai_body);
 
     /// The same Messages body as Bedrock wants it, and the model id it names.
