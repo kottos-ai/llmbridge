@@ -6678,3 +6678,54 @@ TEST_P(ProxyRoute, AByteForwardedReplyWithNoUsageStaysUnknown)
     EXPECT_EQ(recs[0].r.tokens_in, -1);
     EXPECT_EQ(recs[0].r.tokens_out, -1);
 }
+
+// ── A same-dialect stream is forwarded, never translated ─────────────────────
+//
+// The translator was installed by asking the venue's dialect alone, and the venue is
+// Anthropic whether or not we translate into it. So an Anthropic client streaming
+// from an Anthropic venue got OpenAI chunks and `data: [DONE]`, which it cannot
+// parse: Claude Code reports "streaming response ended before any complete data was
+// received" and silently retries without streaming, paying for the turn twice. Every
+// existing test passed with the bug in place, because none read the bytes the client
+// actually received on that path.
+TEST_P(ProxyStreamLatency, ASameDialectStreamKeepsTheVenuesOwnEvents)
+{
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"claude-haiku-4-5","max_tokens":8,"stream":true,)"
+                             R"("messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string got = c.recv_all(5000);
+    c.close();
+    shutdown();
+
+    EXPECT_NE(got.find("event: message_start"), std::string::npos)
+        << "the client asked in Anthropic and got: " << got.substr(0, 400);
+    EXPECT_NE(got.find("content_block_delta"), std::string::npos);
+    EXPECT_EQ(got.find("\"choices\""), std::string::npos)
+        << "an OpenAI chunk stream was put in front of an Anthropic client";
+    EXPECT_EQ(got.find("data: [DONE]"), std::string::npos)
+        << "[DONE] is OpenAI's terminator; Anthropic ends with message_stop";
+}
+
+TEST_P(ProxyStreamLatency, AnOpenAiClientStillGetsTheTranslatedStream)
+{
+    // The control: the built OpenAI-in path must keep translating, or a fix that
+    // simply stopped installing the translator would pass the test above.
+    _backend.set_response(sse_chunked_response(64));
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string got = c.recv_all(5000);
+    c.close();
+    shutdown();
+
+    EXPECT_NE(got.find("\"choices\""), std::string::npos) << got.substr(0, 300);
+    EXPECT_NE(got.find("data: [DONE]"), std::string::npos);
+    EXPECT_EQ(got.find("event: message_start"), std::string::npos)
+        << "Anthropic events reached a client that speaks OpenAI";
+}

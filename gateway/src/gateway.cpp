@@ -2871,9 +2871,8 @@ namespace llmbridge
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         stream_warn_if_encoded(client, h);
-        // Only a dialect that needs translating gets a translator. Its absence is
-        // what stream_step reads as "byte-forward", so this is the whole switch.
-        if (client->effective_dialect == UpstreamDialect::Anthropic)
+        // Only a request that needs translating gets a translator.
+        if (client->translate_body && client->effective_dialect == UpstreamDialect::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
@@ -4159,9 +4158,8 @@ namespace llmbridge
         client->stream_chunked = h.chunked;
         client->stream_keep_alive = h.keep_alive; // decides poolability at stream end
         stream_warn_if_encoded(client, h);
-        // Only a dialect that needs translating gets a translator. Its absence is
-        // what stream_step reads as "byte-forward", so this is the whole switch.
-        if (client->effective_dialect == UpstreamDialect::Anthropic)
+        // Only a request that needs translating gets a translator.
+        if (client->translate_body && client->effective_dialect == UpstreamDialect::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
         if (_timing_headers)
         {
