@@ -429,43 +429,53 @@ namespace llmbridge::provider
         }
     } // namespace
 
-    std::string_view model_of(std::string_view body) noexcept
+    namespace
     {
-        size_t i = skip_ws(body, 0);
-        if (i >= body.size() || body[i] != '{') return {};
-        ++i;
-        while (true)
+        std::string_view top_level_value(std::string_view body, std::string_view key) noexcept
         {
-            i = skip_ws(body, i);
-            if (i >= body.size() || body[i] != '"') return {}; // '}' included: no model
-            const size_t kb = ++i;
-            while (i < body.size() && body[i] != '"')
+            size_t i = skip_ws(body, 0);
+            if (i >= body.size() || body[i] != '{') return {};
+            ++i;
+            while (true)
             {
-                if (body[i] == '\\') ++i;
-                ++i;
-            }
-            if (i >= body.size()) return {};
-            const std::string_view key = body.substr(kb, i - kb);
-            i = skip_ws(body, i + 1);
-            if (i >= body.size() || body[i] != ':') return {};
-            i = skip_ws(body, i + 1);
-            if (key == "model")
-            {
-                if (i >= body.size() || body[i] != '"') return {};
-                const size_t vb = ++i;
+                i = skip_ws(body, i);
+                if (i >= body.size() || body[i] != '"') return {}; // '}' included: absent
+                const size_t kb = ++i;
                 while (i < body.size() && body[i] != '"')
                 {
-                    if (body[i] == '\\') return {}; // escaped: not a name we can match
+                    if (body[i] == '\\') ++i;
                     ++i;
                 }
-                return i < body.size() ? body.substr(vb, i - vb) : std::string_view{};
+                if (i >= body.size()) return {};
+                const std::string_view k = body.substr(kb, i - kb);
+                i = skip_ws(body, i + 1);
+                if (i >= body.size() || body[i] != ':') return {};
+                i = skip_ws(body, i + 1);
+                const size_t vb = i;
+                i = skip_value(body, i);
+                if (i == std::string_view::npos) return {};
+                if (k == key) return body.substr(vb, i - vb);
+                i = skip_ws(body, i);
+                if (i >= body.size() || body[i] != ',') return {};
+                ++i;
             }
-            i = skip_value(body, i);
-            if (i == std::string_view::npos) return {};
-            i = skip_ws(body, i);
-            if (i >= body.size() || body[i] != ',') return {};
-            ++i;
         }
+    } // namespace
+
+    std::string_view model_of(std::string_view body) noexcept
+    {
+        const std::string_view v = top_level_value(body, "model");
+        // A string, and one we can compare byte for byte against a configured name.
+        // An escape means it was never one of those, and unescaping here would need an
+        // allocation on a path that has none.
+        if (v.size() < 2 || v.front() != '"' || v.back() != '"') return {};
+        const std::string_view inner = v.substr(1, v.size() - 2);
+        return inner.find('\\') == std::string_view::npos ? inner : std::string_view{};
+    }
+
+    bool wants_stream(std::string_view body) noexcept
+    {
+        return top_level_value(body, "stream") == "true";
     }
 
     std::string rewrite_model(std::string_view openai_body, std::string_view model)

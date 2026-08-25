@@ -60,6 +60,9 @@ namespace llmbridge::provider
     /// unescaping here would need an allocation on a path that has none.
     std::string_view model_of(std::string_view body) noexcept;
 
+    /// Whether the request body asks for a streamed response: top-level `stream: true`.
+    bool wants_stream(std::string_view body) noexcept;
+
     std::string openai_to_anthropic_request(std::string_view openai_body);
 
     /// The same Messages body as Bedrock wants it, and the model id it names.
