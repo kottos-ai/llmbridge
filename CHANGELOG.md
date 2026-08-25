@@ -8,6 +8,18 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.35.1]. 2026-08-25
+
+### Fixed
+
+- **A byte-forwarded reply reported no tokens.** Only the translating branch scanned
+  the response body, so a same-dialect request left `tokens_in`, `tokens_out` and
+  `cached_tokens` at -1. The counts now come from the venue's own body on that path too,
+  the same `scan_usage` the translated path has always used, on both backends.
+
+  The streamed twin of this was fixed in v0.28.0 by scanning the stream tail; the
+  non-streamed one was missed.
+
 ## [0.35.0]. 2026-08-25
 
 Breaking, and deliberately loud: the field that says what a venue speaks was called

@@ -2775,6 +2775,13 @@ namespace llmbridge
                                                  reason_for(h.status ? h.status : 200),
                                                  body_buf);
             else client->wbuf.assign(u->rbuf.data(), total_len);
+            // The counts, from the venue's own body. Only the translated branch above
+            // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
+            // recorded a request that cost zero tokens at a real price.
+            const BodyUsage bu = scan_usage(body_buf);
+            client->tok_in = bu.in;
+            client->tok_out = bu.out;
+            client->tok_cached = bu.cached;
         }
         client->woff = 0;
 
@@ -3993,6 +4000,13 @@ namespace llmbridge
                                                  reason_for(h.status ? h.status : 200),
                                                  body_buf);
             else client->wbuf.assign(u->rbuf.data(), total_len);
+            // The counts, from the venue's own body. Only the translated branch above
+            // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
+            // recorded a request that cost zero tokens at a real price.
+            const BodyUsage bu = scan_usage(body_buf);
+            client->tok_in = bu.in;
+            client->tok_out = bu.out;
+            client->tok_cached = bu.cached;
         }
         // Pool the upstream only if it will stay open: the response must say
         // keep-alive and (for passthrough, where the client's Connection header was
