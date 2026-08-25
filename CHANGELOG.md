@@ -8,6 +8,30 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.33.0]. 2026-08-25
+
+### Changed
+
+- **Anthropic token usage is normalized to the OpenAI convention, so `tokens_in` means
+  the same thing whatever the venue.** OpenAI reports `prompt_tokens` as the whole prompt
+  with `cached_tokens` a subset of it; Anthropic reports `input_tokens` as the fresh part
+  only, with cache reads and the cache-creation write counted separately. The scanner now
+  adds those back: `in` is the whole prompt (fresh + cache read + cache write) and `cached`
+  is the read subset of it, so `in - cached` is the full-rate part on both dialects.
+
+  The same normalization applies on the **translated** path (OpenAI-in mode): the
+  Anthropic->OpenAI response and stream translators now emit `prompt_tokens` as the whole
+  prompt, so a translated Anthropic response agrees with a byte-forwarded one and an
+  OpenAI client sees the `prompt_tokens` its own convention expects (cached included).
+
+  This changes the recorded value: a cache-heavy Anthropic request (every Claude Code turn)
+  previously logged a tiny `tokens_in` (the fresh part) with thousands of cache reads
+  reported only in `cached`; it now logs the whole prompt in `tokens_in`. A consumer that
+  read `tokens_in` as "the billable fresh input" for Anthropic must switch to `in - cached`.
+  The premium cache-creation write is folded into `tokens_in` but not separated (no field
+  for it), so first-turn cost is still undercounted.
+
+
 ## [0.32.0]. 2026-08-24
 
 ### Added

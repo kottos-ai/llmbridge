@@ -425,7 +425,8 @@ TEST(SseUsage, CacheReadTokensSurfaceInAccessorAndUsageChunk)
 {
     const char* stream =
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"model\":\"claude-3-5-sonnet\","
-        "\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":80}}}\n\n"
+        "\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_read_input_tokens\":80,"
+        "\"cache_creation_input_tokens\":20}}}\n\n"
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
         "data: {\"type\":\"message_stop\"}\n\n";
@@ -433,12 +434,17 @@ TEST(SseUsage, CacheReadTokensSurfaceInAccessorAndUsageChunk)
     std::string out;
     t.feed(stream, out);
     t.finish(out);
-    EXPECT_EQ(t.cached_tokens(), 80);  // the accessor the tape reads
+    // input_tokens is the whole prompt (fresh 100 + read 80 + write 20), OpenAI's
+    // convention, so the tape agrees with a byte-forwarded stream. cached is the read
+    // subset the accessor exposes.
+    EXPECT_EQ(t.input_tokens(), 200); // the accessor the tape reads for tokens_in
+    EXPECT_EQ(t.cached_tokens(), 80);
 
     const auto p = data_payloads(out);
     Value u = P(p[p.size() - 2]);
     const Value* usage = u.find("usage");
     ASSERT_NE(usage, nullptr);
+    EXPECT_EQ(usage->num_or("prompt_tokens"), "200");
     const Value* det = usage->find("prompt_tokens_details");
     ASSERT_NE(det, nullptr);
     EXPECT_EQ(det->num_or("cached_tokens"), "80");

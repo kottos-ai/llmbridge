@@ -851,14 +851,21 @@ namespace llmbridge
             // stream is exactly where nothing translates them for us. Claude Code
             // speaks this dialect, so without these its every request records zero
             // tokens and therefore zero cost.
-            u.in = num_after("\"input_tokens\"");
+            const long long fresh = num_after("\"input_tokens\"");
             u.out = num_at("\"output_tokens\"", /*last=*/true);
-            // Cache reads dominate an agent's input: the same system prompt and the
-            // same files, resent every turn. Counting them as ordinary input
-            // overstates the bill by a large multiple, and they are billed at a
-            // fraction of the rate. `cache_creation` is the write, charged at a
-            // premium and not a read, so only the read lands in `cached`.
-            u.cached = num_after("\"cache_read_input_tokens\"");
+            if (fresh < 0) return u; // no Anthropic usage block either
+            // Normalize to the OpenAI convention so `in` and `cached` mean the same thing
+            // whatever the venue. OpenAI's `prompt_tokens` is the entire prompt with
+            // `cached_tokens` a subset of it; Anthropic's `input_tokens` is the fresh
+            // part only, with cache reads and the cache-creation write reported
+            // separately. Add them back: `in` is the whole prompt, `cached` is the
+            // discounted read subset of it, so `in - cached` is the full-rate part on
+            // both. The creation write is premium-priced and folded into `in` but not
+            // separated; the tape has no field for it, and first-turn cost undercounts.
+            const long long read = num_after("\"cache_read_input_tokens\"");
+            const long long write = num_after("\"cache_creation_input_tokens\"");
+            u.cached = read > 0 ? read : 0;
+            u.in = fresh + u.cached + (write > 0 ? write : 0);
             return u;
         }
 

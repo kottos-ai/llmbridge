@@ -289,11 +289,15 @@ TEST(RespXlate, UsageMapsAndSumsTotal)
 TEST(RespXlate, CacheReadTokensBecomePromptTokensDetails)
 {
     std::string in = R"({"content":[{"type":"text","text":"x"}],
-        "usage":{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":80}})";
+        "usage":{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":80,
+        "cache_creation_input_tokens":20}})";
     Value out = P(anthropic_to_openai_response(in));
     const Value* u = out.find("usage");
     ASSERT_NE(u, nullptr);
-    EXPECT_EQ(u->num_or("prompt_tokens"), "100");
+    // prompt_tokens is the whole prompt, OpenAI's convention: fresh 100 + read 80 +
+    // write 20. Anthropic reports those three separately; a translated response must
+    // sum them so it agrees with a byte-forwarded one.
+    EXPECT_EQ(u->num_or("prompt_tokens"), "200");
     const Value* det = u->find("prompt_tokens_details");
     ASSERT_NE(det, nullptr);
     EXPECT_EQ(det->num_or("cached_tokens"), "80");

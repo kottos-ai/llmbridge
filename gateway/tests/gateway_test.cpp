@@ -5208,6 +5208,44 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
     EXPECT_EQ(recs[0].r.cached_tokens, 7);
 }
 
+// Anthropic reports the prompt as fresh `input_tokens` plus separate
+// `cache_read_input_tokens` and `cache_creation_input_tokens`. scan_usage normalizes to
+// the OpenAI convention so `tokens_in` means the same thing on both: the whole prompt,
+// with `cached` the read subset of it. Before, tokens_in was the fresh part alone, so a
+// cache-heavy Claude Code turn logged in=10 against 3000 hidden reads.
+TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
+{
+    const std::string events =
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\","
+        "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":3000,"
+        "\"cache_creation_input_tokens\":500,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_delta\n"
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":19}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(events, 4096));
+    start(0, true, TranslateMode::None, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.tokens_in, 10 + 3000 + 500) << "in must be the whole prompt, not fresh alone";
+    EXPECT_EQ(r.cached_tokens, 3000) << "cached is the read subset of in";
+    EXPECT_EQ(r.tokens_out, 19);
+    EXPECT_EQ(r.tokens_in - r.cached_tokens, 510) << "in - cached is the full-rate part";
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
@@ -6205,11 +6243,13 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsRecordedAcrossTheWholeStream)
 
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
-    EXPECT_EQ(recs[0].r.tokens_in, 137) << "message_start scrolled out of the window";
+    // Normalized to the whole prompt: fresh 137 + read 9021 + write 40. Before this,
+    // tokens_in was the fresh 137 alone, hiding 9021 cache reads behind a tiny number.
+    EXPECT_EQ(recs[0].r.tokens_in, 137 + 9021 + 40) << "message_start scrolled out of the window";
     EXPECT_EQ(recs[0].r.tokens_out, 312) << "message_delta carries the real total";
-    // Cache reads, not cache creation: the read is what an agent does every turn and
-    // is billed at a fraction of the input rate. Counting the write here would
-    // overstate the discount.
+    // cached is the read subset only: the read is what an agent does every turn, billed
+    // at a fraction of the input rate. The write is premium-priced, folded into tokens_in
+    // above but not counted as a discount here.
     EXPECT_EQ(recs[0].r.cached_tokens, 9021);
 }
 

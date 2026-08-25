@@ -179,9 +179,16 @@ namespace llmbridge::provider
                 _model = sanitized(m->str_or("model"));
                 if (const json::Value* u = m->find("usage"))
                 {
-                    _in_tok = detail::to_ll(u->num_or("input_tokens", "0"));
+                    // prompt_tokens is OpenAI's whole-prompt count, so add back the cache
+                    // read and write legs Anthropic reports separately from input_tokens;
+                    // cached_tokens stays the read subset. Matches scan_usage so a
+                    // translated stream and a byte-forwarded one agree.
+                    const long long fresh = detail::to_ll(u->num_or("input_tokens", "0"));
                     _out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
                     _cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
+                    const long long write =
+                        detail::to_ll(u->num_or("cache_creation_input_tokens", "0"));
+                    _in_tok = fresh + _cached_tok + write;
                 }
             }
             ensure_created();
