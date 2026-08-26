@@ -8,6 +8,20 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.36.0]. 2026-08-26
+
+### Added
+
+- **`cache_control` survives the translation.** Anthropic caches what precedes a block
+  marked `cache_control` and nothing at all without one.
+
+### Changed
+
+- **Breaking: the JSON DOM's nodes live in one arena per document, and a `Value`
+  cannot be copied.** `Value::arr` and `Value::obj` are `Span`s over arena storage
+  instead of `std::vector`s, object members are a `Member` struct and no longer a
+  `std::pair`, and the copy constructor is deleted.
+
 ## [0.35.4]. 2026-08-26
 
 ### Changed

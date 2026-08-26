@@ -1134,3 +1134,115 @@ TEST(WantsStream, OnlyATopLevelTrueCounts)
     EXPECT_FALSE(wants_stream(R"({"tools":[{"input_schema":{"properties":{"stream":true}}}]})"));
     EXPECT_TRUE(wants_stream(R"({"tools":[{"input_schema":{"properties":{"stream":true}}}],"stream":true})"));
 }
+
+// ── cache_control ───────────────────────────────────────────────────────────
+//
+// Anthropic caches what precedes a block marked `cache_control`, and nothing at all
+// without one: an identical prompt sent a hundred times is a hundred full-price
+// prompts. The translator used to flatten every content part into one string, which
+// carried the text and dropped the breakpoint, so an OpenAI-dialect client could not
+// reach the discount at all while an Anthropic client got it by byte-forward. Cached
+// reads are a tenth of the input price, so on an agent loop that is the difference
+// between the two paths.
+
+TEST(CacheControl, ContentWithABreakpointBecomesBlocks)
+{
+    Value out = P(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"user","content":[
+            {"type":"text","text":"the long prefix","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"the tail"}]}]})"));
+    const Value* msgs = out.find("messages");
+    ASSERT_NE(msgs, nullptr);
+    ASSERT_EQ(msgs->arr.size(), 1u);
+    const Value* content = msgs->arr[0].find("content");
+    ASSERT_NE(content, nullptr);
+    ASSERT_TRUE(content->is_array()) << "a breakpoint cannot survive the string form";
+    ASSERT_EQ(content->arr.size(), 2u) << "one block per part, so the mark keeps its place";
+    EXPECT_EQ(content->arr[0].str_or("text"), "the long prefix");
+    const Value* cc = content->arr[0].find("cache_control");
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->str_or("type"), "ephemeral");
+    // The unmarked part must not acquire one: which block carries it is the meaning.
+    EXPECT_EQ(content->arr[1].find("cache_control"), nullptr);
+    EXPECT_EQ(content->arr[1].str_or("text"), "the tail");
+}
+
+TEST(CacheControl, ContentWithoutOneKeepsTheStringForm)
+{
+    // The shape every request that does not ask for caching still gets. Asserted so a
+    // future change cannot quietly turn every message into blocks, which would be a
+    // different request to send to a provider for no reason.
+    Value out = P(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]})"));
+    const Value* content = out.find("messages")->arr[0].find("content");
+    ASSERT_NE(content, nullptr);
+    EXPECT_TRUE(content->is_string()) << "parts with no breakpoint still flatten";
+    EXPECT_EQ(content->sv, "ab");
+}
+
+TEST(CacheControl, SystemWithABreakpointBecomesABlockArray)
+{
+    Value out = P(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"system","content":[
+            {"type":"text","text":"you are terse","cache_control":{"type":"ephemeral"}}]},
+        {"role":"user","content":"hi"}]})"));
+    const Value* sys = out.find("system");
+    ASSERT_NE(sys, nullptr);
+    ASSERT_TRUE(sys->is_array()) << "Anthropic only carries a breakpoint in the array form";
+    ASSERT_EQ(sys->arr.size(), 1u);
+    EXPECT_EQ(sys->arr[0].str_or("text"), "you are terse");
+    EXPECT_EQ(sys->arr[0].find("cache_control")->str_or("type"), "ephemeral");
+}
+
+TEST(CacheControl, SystemWithoutOneStaysAString)
+{
+    Value out = P(openai_to_anthropic_request(
+        R"({"model":"m","messages":[{"role":"system","content":"be terse"},
+                                    {"role":"user","content":"hi"}]})"));
+    EXPECT_EQ(out.find("system")->sv, "be terse");
+    EXPECT_TRUE(out.find("system")->is_string());
+}
+
+TEST(CacheControl, ATollDefinitionCanCarryOne)
+{
+    // Long, identical every turn, and ahead of the conversation: the other prefix
+    // worth caching. Accepted on the tool object or on the function inside it,
+    // because clients write it both ways.
+    for (const char* body : {
+        R"({"model":"m","messages":[],"tools":[{"type":"function","cache_control":{"type":"ephemeral"},
+             "function":{"name":"f","parameters":{"type":"object"}}}]})",
+        R"({"model":"m","messages":[],"tools":[{"type":"function",
+             "function":{"name":"f","cache_control":{"type":"ephemeral"},"parameters":{"type":"object"}}}]})"})
+    {
+        Value out = P(openai_to_anthropic_request(body));
+        const Value* tools = out.find("tools");
+        ASSERT_NE(tools, nullptr) << body;
+        ASSERT_EQ(tools->arr.size(), 1u);
+        const Value* cc = tools->arr[0].find("cache_control");
+        ASSERT_NE(cc, nullptr) << "the breakpoint was dropped: " << body;
+        EXPECT_EQ(cc->str_or("type"), "ephemeral");
+    }
+}
+
+TEST(CacheControl, AMalformedBreakpointIsRefused)
+{
+    // Fail closed. Forwarding it would make the provider reject the request, and the
+    // caller would read a 400 from Anthropic about a field they did not know we
+    // touched. The schema of the object is the provider's business; whether it is an
+    // object at all is ours.
+    EXPECT_TRUE(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"user","content":[{"type":"text","text":"x","cache_control":"ephemeral"}]}]})").empty());
+    EXPECT_TRUE(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"system","content":[{"type":"text","text":"x","cache_control":7}]},
+        {"role":"user","content":"hi"}]})").empty());
+}
+
+TEST(CacheControl, ANonTextPartIsStillRefusedInTheBlockForm)
+{
+    // The block path must refuse exactly what the flattening path refuses: an image
+    // dropped from a cached request is the same silent edit, cached or not.
+    EXPECT_TRUE(openai_to_anthropic_request(R"({"model":"m","messages":[
+        {"role":"user","content":[
+            {"type":"text","text":"x","cache_control":{"type":"ephemeral"}},
+            {"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]})").empty());
+}

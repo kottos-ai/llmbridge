@@ -23,8 +23,8 @@
 //
 // Scope per target: the common chat path (model, system, user/assistant turns,
 // max_tokens/temperature/top_p; response content / finish-reason / usage).
-// Representative, not 100% provider-complete: streaming deltas, tool-calling,
-// vision, and cache_control are Phase B. Operates on the JSON *body* (the
+// Representative, not 100% provider-complete: streaming deltas, tool-calling and
+// cache_control are built; vision is not. Operates on the JSON *body* (the
 // gateway handles HTTP re-framing). Returns "" on parse failure so the caller
 // can fail the request.
 

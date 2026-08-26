@@ -9,15 +9,18 @@
 
 // Minimal, zero-dependency JSON for the llmbridge provider-translation layer.
 //
-// Deliberately hand-rolled, no library: a tiny, allocation-light parser (the
-// DOM does allocate its node vectors, but string values are zero-copy views into
-// the input): a recursive-descent parser into an ordered DOM, plus a
+// Deliberately hand-rolled, no library: a tiny, allocation-light parser (one arena
+// per document holds every node, and string values are zero-copy views into the
+// input): a recursive-descent parser into an ordered DOM, plus a
 // string-append builder with escaping. Scope is "enough to translate chat
 // completion request/response bodies between provider dialects": objects,
 // arrays, strings, numbers, bools, null, and the common escape sequences. Not a
 // general-purpose JSON library; it is fast and correct for the shapes we move.
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <new>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +28,131 @@
 
 namespace llmbridge::provider::json
 {
+    class Value;
+    struct Member;
+
+    namespace detail
+    {
+        // One document, one allocation chain.
+        //
+        // Every object and array used to own a std::vector, which is two allocations
+        // per node once growth is counted. Parsing a 287 KB agent request made 7,192
+        // of them and 1.54 MB of node storage, and cost 1.07 ms of the 1.58 ms the
+        // whole translation took.
+        class BlockPool
+        {
+        public:
+            std::unique_ptr<char[]> take(size_t& size)
+            {
+                for (size_t k = 0; k < _free.size(); ++k)
+                    if (_free[k].second >= size)
+                    {
+                        auto block = std::move(_free[k].first);
+                        size = _free[k].second;
+                        _held -= size;
+                        _free.erase(_free.begin() + static_cast<long>(k));
+                        return block;
+                    }
+                return std::unique_ptr<char[]>(new char[size]);
+            }
+
+            void give(std::unique_ptr<char[]> block, size_t size)
+            {
+                // Bounded, so one pathological document cannot pin memory for the
+                // life of the thread.
+                if (_held + size > kMaxHeld) return;
+                _held += size;
+                _free.emplace_back(std::move(block), size);
+            }
+
+            ~BlockPool() = default;
+
+        private:
+            static constexpr size_t kMaxHeld = size_t{4} << 20;
+            std::vector<std::pair<std::unique_ptr<char[]>, size_t>> _free;
+            size_t _held = 0;
+        };
+
+        inline BlockPool& block_pool() noexcept
+        {
+            thread_local BlockPool p;
+            return p;
+        }
+
+        class Arena
+        {
+        public:
+            // `hint` is the document's byte count.
+            explicit Arena(size_t hint = 0) noexcept
+            {
+                if (hint) _next = hint < 4096 ? 4096 : (hint > (size_t{1} << 20) ? (size_t{1} << 20) : hint);
+            }
+            Arena(const Arena&) = delete;
+            Arena& operator=(const Arena&) = delete;
+
+            ~Arena()
+            {
+                for (auto& [block, size] : _blocks) block_pool().give(std::move(block), size);
+            }
+
+            // Raw space for `n` T, uninitialized: the caller constructs into it. Sizes
+            // are rounded to 16 so the bump pointer stays aligned for anything we put
+            // in here, and `new char[]` already returns memory aligned that far.
+            template <class T>
+            T* alloc_n(size_t n)
+            {
+                static_assert(alignof(T) <= 16, "arena aligns to 16");
+                if (n == 0) return nullptr;
+                const size_t want = (n * sizeof(T) + 15) & ~static_cast<size_t>(15);
+                if (want > _left) grow(want);
+                char* const p = _cur;
+                _cur += want;
+                _left -= want;
+                return reinterpret_cast<T*>(p);
+            }
+
+        private:
+            void grow(size_t at_least)
+            {
+                // Blocks double up to a cap, so a big document does not pay a block
+                // per node and a small one does not reserve a megabyte.
+                size_t sz = _next > at_least ? _next : at_least;
+                auto block = block_pool().take(sz); // sz becomes the block's real size
+                _cur = block.get();
+                _left = sz;
+                _blocks.emplace_back(std::move(block), sz);
+                if (_next < (size_t{1} << 20)) _next *= 2;
+            }
+
+            std::vector<std::pair<std::unique_ptr<char[]>, size_t>> _blocks;
+            char* _cur = nullptr;
+            size_t _left = 0;
+            size_t _next = 4096;
+        };
+    } // namespace detail
+
+    // A run of nodes owned by the document's arena. Read-only by construction: the
+    // parser fills it once and nothing downstream mutates a parsed DOM.
+    template <class T>
+    class Span
+    {
+    public:
+        Span() = default;
+        Span(const T* p, uint32_t n) noexcept : _p(p), _n(n) {}
+
+        [[nodiscard]] const T* begin() const noexcept { return _p; }
+        [[nodiscard]] const T* end() const noexcept { return _p + _n; }
+        [[nodiscard]] size_t size() const noexcept { return _n; }
+        [[nodiscard]] bool empty() const noexcept { return _n == 0; }
+        const T& operator[](size_t k) const noexcept { return _p[k]; }
+        const T& front() const noexcept { return _p[0]; }
+        const T& back() const noexcept { return _p[_n - 1]; }
+
+    private:
+        const T* _p = nullptr;
+        uint32_t _n = 0;
+    };
+
     class Value
     {
     public:
@@ -42,57 +170,88 @@ namespace llmbridge::provider::json
         // Schema we must pass through unaltered, and re-serialising from the DOM
         // would risk changing it (number formatting, escape forms, key order).
         std::string_view sv;
-        std::vector<Value> arr;                                  // Array elements
-        std::vector<std::pair<std::string_view, Value>> obj;     // Object members, insertion order
+        Span<Value> arr;      // Array elements
+        Span<Member> obj;     // Object members, insertion order
 
-        // Value is self-referential (arr/obj hold Value), so its special members are
-        // declared here and defaulted out-of-line (just below the class). Defined
-        // inline, clang + libstdc++ eagerly instantiate the recursive vector/pair
-        // traits on an *incomplete* Value and hard-error; GCC defers, so it only
-        // breaks the clang CI leg. Out-of-line = instantiated once Value is complete.
-        Value();
-        Value(const Value&);
+        // Defined out-of-line, below, where Value and Member are complete: the type
+        // is self-referential, and clang instantiates eagerly where GCC defers, so
+        // an inline definition here breaks only the clang CI leg.
+        Value() noexcept = default;
         Value(Value&&) noexcept;
-        Value& operator=(const Value&);
         Value& operator=(Value&&) noexcept;
         ~Value();
+        // Deleted, not defaulted.
+        Value(const Value&) = delete;
+        Value& operator=(const Value&) = delete;
 
         [[nodiscard]] bool is_object() const { return type == Type::Object; }
         [[nodiscard]] bool is_array() const { return type == Type::Array; }
         [[nodiscard]] bool is_string() const { return type == Type::String; }
 
         // Object lookup; returns nullptr if absent or not an object.
-        [[nodiscard]] const Value* find(std::string_view key) const
-        {
-            if (type != Type::Object) return nullptr;
-            for (const auto& [k, v] : obj)
-                if (k == key) return &v;
-            return nullptr;
-        }
+        [[nodiscard]] const Value* find(std::string_view key) const;
 
         // A string member's raw (still-escaped) span, or `def`. Returns a view.
         // `def` and the parsed input must outlive the result.
-        [[nodiscard]] std::string_view str_or(std::string_view key, std::string_view def = "") const
-        {
-            const Value* v = find(key);
-            return (v && v->type == Type::String) ? v->sv : def;
-        }
+        [[nodiscard]] std::string_view str_or(std::string_view key, std::string_view def = "") const;
         // A number member's raw text (e.g. "256", "0.7"), or `def`.
-        [[nodiscard]] std::string_view num_or(std::string_view key, std::string_view def = "") const
-        {
-            const Value* v = find(key);
-            return (v && v->type == Type::Number) ? v->sv : def;
-        }
+        [[nodiscard]] std::string_view num_or(std::string_view key, std::string_view def = "") const;
+
+    private:
+        friend Value parse(std::string_view, bool&);
+        // Set on the root only, and only by parse(). Every node below it points into
+        // this arena, so the root outliving them is the whole contract of the DOM.
+        detail::Arena* _arena = nullptr;
     };
 
-    // Out-of-line so the recursive vector<Value>/vector<pair<...,Value>> special
-    // members are only instantiated here, where Value is a complete type.
-    inline Value::Value() = default;
-    inline Value::Value(const Value&) = default;
-    inline Value::Value(Value&&) noexcept = default;
-    inline Value& Value::operator=(const Value&) = default;
-    inline Value& Value::operator=(Value&&) noexcept = default;
-    inline Value::~Value() = default;
+    // One object member. A struct, not std::pair, so that `Member*` can appear
+    // in Value above while Value is still incomplete; structured bindings over it
+    // read the same at the call sites.
+    struct Member
+    {
+        std::string_view key;
+        Value value;
+    };
+
+    inline Value::~Value() { delete _arena; }
+
+    inline Value::Value(Value&& o) noexcept
+        : type(o.type), boolean(o.boolean), sv(o.sv), arr(o.arr), obj(o.obj), _arena(o._arena)
+    {
+        o._arena = nullptr; // the arena has exactly one owner at all times
+    }
+
+    inline Value& Value::operator=(Value&& o) noexcept
+    {
+        if (this != &o)
+        {
+            delete _arena;
+            type = o.type; boolean = o.boolean; sv = o.sv; arr = o.arr; obj = o.obj;
+            _arena = o._arena;
+            o._arena = nullptr;
+        }
+        return *this;
+    }
+
+    inline const Value* Value::find(std::string_view key) const
+    {
+        if (type != Type::Object) return nullptr;
+        for (const auto& [k, v] : obj)
+            if (k == key) return &v;
+        return nullptr;
+    }
+
+    inline std::string_view Value::str_or(std::string_view key, std::string_view def) const
+    {
+        const Value* v = find(key);
+        return (v && v->type == Type::String) ? v->sv : def;
+    }
+
+    inline std::string_view Value::num_or(std::string_view key, std::string_view def) const
+    {
+        const Value* v = find(key);
+        return (v && v->type == Type::Number) ? v->sv : def;
+    }
 
     namespace detail
     {
@@ -102,12 +261,57 @@ namespace llmbridge::provider::json
         // headroom while capping recursion at a safe, small stack footprint.
         inline constexpr int kMaxDepth = 64;
 
+        // The parser's scratch stacks, kept alive between documents for the same
+        // reason the arena blocks are: they grow to the width of the widest array in
+        // the document (a megabyte on an agent request). `busy` guards the one
+        // case that would corrupt them, a parse starting while another is running on
+        // this thread.
+        struct Scratch
+        {
+            std::vector<Value> values;
+            std::vector<Member> members;
+            bool busy = false;
+        };
+
+        inline Scratch& scratch() noexcept
+        {
+            thread_local Scratch s;
+            return s;
+        }
+
         struct Parser
         {
             std::string_view s;
+            Arena& a;
+            std::vector<Value>& vstack;
+            std::vector<Member>& mstack;
             size_t i = 0;
             bool ok = true;
             int depth = 0; // current object/array nesting; bounded by kMaxDepth
+
+            // Children are parsed onto these stacks and copied into the arena in one
+            // exactly-sized run when the closing bracket arrives, because the count is
+            // not known before then.
+            Span<Value> commit_values(size_t mark)
+            {
+                const size_t n = vstack.size() - mark;
+                if (n == 0) return {};
+                Value* p = a.alloc_n<Value>(n);
+                for (size_t k = 0; k < n; ++k) new (p + k) Value(std::move(vstack[mark + k]));
+                vstack.resize(mark);
+                return Span<Value>(p, static_cast<uint32_t>(n));
+            }
+
+            Span<Member> commit_members(size_t mark)
+            {
+                const size_t n = mstack.size() - mark;
+                if (n == 0) return {};
+                Member* p = a.alloc_n<Member>(n);
+                for (size_t k = 0; k < n; ++k) new (p + k) Member{mstack[mark + k].key,
+                                                                  std::move(mstack[mark + k].value)};
+                mstack.resize(mark);
+                return Span<Member>(p, static_cast<uint32_t>(n));
+            }
 
             void ws()
             {
@@ -252,21 +456,25 @@ namespace llmbridge::provider::json
                 return v;
             }
 
+            // Every exit truncates the stack back to this level's mark, the failing
+            // ones included: a level that returned without doing so would leave its
+            // half-parsed children to be committed as its parent's.
             Value parse_array()
             {
                 Value v; v.type = Value::Type::Array;
                 ++i; // [
                 ws();
                 if (i < s.size() && s[i] == ']') { ++i; return v; }
+                const size_t mark = vstack.size();
                 while (i < s.size())
                 {
-                    v.arr.push_back(parse_value());
+                    vstack.push_back(parse_value());
                     ws();
                     if (i < s.size() && s[i] == ',') { ++i; continue; }
-                    if (i < s.size() && s[i] == ']') { ++i; return v; }
-                    ok = false; return v;
+                    if (i < s.size() && s[i] == ']') { ++i; v.arr = commit_values(mark); return v; }
+                    ok = false; v.arr = commit_values(mark); return v;
                 }
-                ok = false; return v;
+                ok = false; v.arr = commit_values(mark); return v;
             }
 
             Value parse_object()
@@ -275,21 +483,22 @@ namespace llmbridge::provider::json
                 ++i; // {
                 ws();
                 if (i < s.size() && s[i] == '}') { ++i; return v; }
+                const size_t mark = mstack.size();
                 while (i < s.size())
                 {
                     ws();
-                    if (i >= s.size() || s[i] != '"') { ok = false; return v; }
+                    if (i >= s.size() || s[i] != '"') { ok = false; v.obj = commit_members(mark); return v; }
                     std::string_view key = parse_string();
                     ws();
-                    if (i >= s.size() || s[i] != ':') { ok = false; return v; }
+                    if (i >= s.size() || s[i] != ':') { ok = false; v.obj = commit_members(mark); return v; }
                     ++i; // :
-                    v.obj.emplace_back(key, parse_value());
+                    mstack.push_back(Member{key, parse_value()});
                     ws();
                     if (i < s.size() && s[i] == ',') { ++i; continue; }
-                    if (i < s.size() && s[i] == '}') { ++i; return v; }
-                    ok = false; return v;
+                    if (i < s.size() && s[i] == '}') { ++i; v.obj = commit_members(mark); return v; }
+                    ok = false; v.obj = commit_members(mark); return v;
                 }
-                ok = false; return v;
+                ok = false; v.obj = commit_members(mark); return v;
             }
         };
     } // namespace detail
@@ -298,9 +507,27 @@ namespace llmbridge::provider::json
     // parsed so far (callers should check ok).
     inline Value parse(std::string_view text, bool& ok)
     {
-        detail::Parser p{text};
+        // The arena is handed to the root even when the parse fails, because a failed
+        // parse still returns whatever it built and those nodes live in here.
+        auto* arena = new detail::Arena(text.size());
+        detail::Scratch& sc = detail::scratch();
+        const bool reentrant = sc.busy;
+        std::vector<Value> own_values;
+        std::vector<Member> own_members;
+        sc.busy = true;
+        detail::Parser p{text, *arena,
+                         reentrant ? own_values : sc.values,
+                         reentrant ? own_members : sc.members};
         Value v = p.parse_value();
         ok = p.ok;
+        if (!reentrant)
+        {
+            // Emptied, not shrunk: the capacity is the point of keeping them.
+            sc.values.clear();
+            sc.members.clear();
+            sc.busy = false;
+        }
+        v._arena = arena;
         return v;
     }
 
