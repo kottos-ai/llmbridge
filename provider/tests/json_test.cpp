@@ -418,3 +418,142 @@ TEST(JsonNumbers, WhatParsesAlsoConvertsWithStrtod)
         EXPECT_EQ(*end, '\0') << "parsed as a Number but strtod stopped early: " << n;
     }
 }
+
+// ── the arena: what the node storage change can break ───────────────────────
+//
+// Nodes live in one arena the root owns, and children are parsed onto a scratch
+// stack that is shared by every nesting level and truncated back to each level's
+// mark. Both of those have a failure mode that ordinary parsing tests would not
+// notice: storage shared between documents, and a level committing entries that
+// belong to its parent.
+
+TEST(JsonArena, NestedArraysKeepOnlyTheirOwnElements)
+{
+    // The scratch stack holds the outer array's elements while the inner arrays are
+    // being parsed, so a level that committed from the wrong mark would hand the
+    // outer array the inner one's entries, or lose its own. Uneven widths, so an
+    // off-by-one shows up as a wrong count instead of a coincidence.
+    bool ok = false;
+    const std::string doc = R"([[1],[2,3],[4,5,6],[[7,8],[9]],10])";
+    const auto v = llmbridge::provider::json::parse(doc, ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(v.arr.size(), 5u);
+    EXPECT_EQ(v.arr[0].arr.size(), 1u);
+    EXPECT_EQ(v.arr[1].arr.size(), 2u);
+    EXPECT_EQ(v.arr[2].arr.size(), 3u);
+    ASSERT_EQ(v.arr[3].arr.size(), 2u);
+    EXPECT_EQ(v.arr[3].arr[0].arr.size(), 2u);
+    EXPECT_EQ(v.arr[3].arr[1].arr.size(), 1u);
+    EXPECT_EQ(v.arr[4].num_or("", "x"), "x"); // a number, not an array
+    EXPECT_EQ(v.arr[2].arr[2].sv, "6");
+}
+
+TEST(JsonArena, NestedObjectsKeepOnlyTheirOwnMembers)
+{
+    bool ok = false;
+    const std::string doc = R"({"a":{"x":1},"b":{"y":2,"z":3},"c":4})";
+    const auto v = llmbridge::provider::json::parse(doc, ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(v.obj.size(), 3u);
+    EXPECT_EQ(v.find("a")->obj.size(), 1u);
+    EXPECT_EQ(v.find("b")->obj.size(), 2u);
+    EXPECT_EQ(v.find("b")->num_or("z"), "3");
+    EXPECT_EQ(v.num_or("c"), "4");
+}
+
+TEST(JsonArena, TwoLiveDocumentsDoNotShareStorage)
+{
+    // Each root owns its own arena. Parsed one after the other and read afterwards,
+    // so a shared or recycled buffer would show up as the second document's contents
+    // appearing in the first.
+    const std::string a = R"({"who":"first","n":[1,2,3]})";
+    const std::string b = R"({"who":"second","n":[4,5,6,7]})";
+    bool ok1 = false, ok2 = false;
+    const auto va = llmbridge::provider::json::parse(a, ok1);
+    const auto vb = llmbridge::provider::json::parse(b, ok2);
+    ASSERT_TRUE(ok1);
+    ASSERT_TRUE(ok2);
+    EXPECT_EQ(va.str_or("who"), "first");
+    EXPECT_EQ(vb.str_or("who"), "second");
+    EXPECT_EQ(va.find("n")->arr.size(), 3u);
+    EXPECT_EQ(vb.find("n")->arr.size(), 4u);
+    EXPECT_EQ(va.find("n")->arr[0].sv, "1");
+    EXPECT_EQ(vb.find("n")->arr[0].sv, "4");
+}
+
+TEST(JsonArena, MovingTheRootKeepsEveryNodeReadable)
+{
+    // The arena moves with the root. If it did not, the moved-to value's children
+    // would point into storage the moved-from destructor released.
+    const std::string doc = R"({"messages":[{"role":"user","content":"hi"}]})";
+    bool ok = false;
+    llmbridge::provider::json::Value moved;
+    {
+        llmbridge::provider::json::Value v = llmbridge::provider::json::parse(doc, ok);
+        ASSERT_TRUE(ok);
+        moved = std::move(v);
+    } // v is destroyed here; the nodes must not be
+    ASSERT_EQ(moved.find("messages")->arr.size(), 1u);
+    EXPECT_EQ(moved.find("messages")->arr[0].str_or("content"), "hi");
+}
+
+TEST(JsonArena, AWideArraySurvivesScratchGrowth)
+{
+    // Wider than any scratch vector's initial capacity, so the stack reallocates
+    // mid-parse and every element must survive being moved.
+    std::string doc = "[";
+    for (int i = 0; i < 5000; ++i) doc += std::to_string(i) + ",";
+    doc.back() = ']';
+    bool ok = false;
+    const auto v = llmbridge::provider::json::parse(doc, ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(v.arr.size(), 5000u);
+    EXPECT_EQ(v.arr[0].sv, "0");
+    EXPECT_EQ(v.arr[4999].sv, "4999");
+    EXPECT_EQ(v.arr[2500].sv, "2500");
+}
+
+TEST(JsonArena, AFailedParseLeavesWhatItBuiltReadable)
+{
+    // parse() documents that it returns the partial DOM on failure, and the arena
+    // goes to the root either way, so reading the partial result must not touch
+    // freed storage. ASan is the real assertion here.
+    bool ok = true;
+    const std::string doc = R"([{"a":1},{"b":2},)";
+    const auto v = llmbridge::provider::json::parse(doc, ok);
+    EXPECT_FALSE(ok);
+    for (const auto& e : v.arr) EXPECT_TRUE(e.is_object());
+}
+
+TEST(JsonArena, AFailedInnerArrayDoesNotDonateItsElementsToItsParent)
+{
+    // The failure path has to truncate the scratch stack exactly like the success
+    // path. If it returns without doing so, the inner array's three entries are still
+    // sitting above the outer array's mark, and the outer array commits them as its
+    // own: one element becomes four, on malformed input, which is the input that
+    // arrives from outside.
+    bool ok = true;
+    const std::string doc = "[[1,2,3";
+    const auto v = llmbridge::provider::json::parse(doc, ok);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(v.arr.size(), 1u) << "the outer array holds one thing: the inner array";
+    ASSERT_EQ(v.arr.size(), 1u);
+    EXPECT_TRUE(v.arr[0].is_array());
+}
+
+TEST(JsonArena, AFailedInnerObjectDoesNotDonateItsMembersToItsParent)
+{
+    // Each way an object can fail needs its own case, because each is a separate
+    // return and any one of them can forget to truncate: running out of input, a
+    // member with no colon, and a member whose name is not a string.
+    for (const char* doc : {R"({"a":{"x":1,"y":2)",      // ends mid-object
+                            R"({"a":{"x":1,"y" 2}})",     // no colon after "y"
+                            R"({"a":{"x":1,2:3}})"})      // a name that is not a string
+    {
+        bool ok = true;
+        const std::string d = doc;
+        const auto v = llmbridge::provider::json::parse(d, ok);
+        EXPECT_FALSE(ok) << d;
+        EXPECT_EQ(v.obj.size(), 1u) << "the outer object holds one member, \"a\": " << d;
+    }
+}

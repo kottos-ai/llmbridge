@@ -184,12 +184,20 @@ namespace llmbridge::app
                 !want_str_array(*g, "upstream", "strip_headers", out.strip_headers, err))
                 return false;
 
-            const std::vector<json::Value> one{*g};
-            const std::vector<json::Value>& entries = g->is_array() ? g->arr : one;
+            // "upstream" is either one object or an array of them. Collected as
+            // pointers because a parsed node cannot be copied: its children live in
+            // the document's arena, so the single-object case borrows instead of
+            // duplicating.
+            std::vector<const json::Value*> entries;
+            if (g->is_array())
+                for (const json::Value& e : g->arr) entries.push_back(&e);
+            else
+                entries.push_back(g);
             if (g->is_array() && entries.empty())
                 return fail(err, "config: \"upstream\" must not be an empty array");
-            for (const json::Value& e : entries)
+            for (const json::Value* entry : entries)
             {
+                const json::Value& e = *entry;
                 if (!e.is_object())
                     return fail(err, "config: each entry in \"upstream\" must be an object");
                 if (!only(e, "upstream", {"url", "dialect", "translate", "strip_headers"}, err))

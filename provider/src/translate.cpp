@@ -26,13 +26,33 @@ namespace llmbridge::provider
         // False when the content holds a part this translator cannot carry, which is
         // anything that is not text: an image, audio, a PDF.
         //
-        // It used to skip those parts and keep the text, and that is worse than not
-        // supporting them. A vision request became "what is in this image?" with no
-        // image attached, the provider answered confidently about nothing, the caller
-        // was billed, and the status was 200. Dropping part of a request and
-        // forwarding the rest is the sanitise-and-forward this codebase refuses
-        // everywhere else; the caller has to be told, and the gateway names the part
-        // in the error it returns.
+        // A content part's `cache_control`, forwarded byte for byte like a tool's
+        // schema: it is the caller's field, and re-encoding it could only change it.
+        [[nodiscard]] bool part_cache_control(const json::Value& part, std::string_view& out)
+        {
+            const json::Value* cc = part.find("cache_control");
+            if (!cc) return true;
+            if (!cc->is_object()) return false;
+            out = cc->sv;
+            return true;
+        }
+
+        // Whether any part of this content carries a breakpoint, and refusal if one is
+        // malformed. Scanned before emitting anything, because the answer decides
+        // which of the two shapes below the content takes.
+        [[nodiscard]] bool content_cache_state(const json::Value* c, bool& any)
+        {
+            any = false;
+            if (!c || !c->is_array()) return true;
+            for (const auto& part : c->arr)
+            {
+                std::string_view cc;
+                if (!part_cache_control(part, cc)) return false;
+                if (!cc.empty()) any = true;
+            }
+            return true;
+        }
+
         [[nodiscard]] bool append_text(std::string& out, const json::Value* c)
         {
             if (!c) return true;
@@ -46,6 +66,43 @@ namespace llmbridge::provider
                     // guessing it is text is the same silent edit.
                     return false;
                 }
+            return true;
+        }
+
+        // The whole Anthropic `content` value, quotes included, in whichever of the
+        // two shapes the input needs.
+        [[nodiscard]] bool append_content(std::string& out, const json::Value* c)
+        {
+            bool cached = false;
+            if (!content_cache_state(c, cached)) return false;
+            if (!cached)
+            {
+                out += '"';
+                if (!append_text(out, c)) return false;
+                out += '"';
+                return true;
+            }
+            out += '[';
+            bool first = true;
+            for (const auto& part : c->arr)
+            {
+                // Same refusal as the flattening path: a part this translator cannot
+                // carry is refused by name, never dropped.
+                if (part.str_or("type") != "text") return false;
+                if (!first) out += ',';
+                first = false;
+                out += R"({"type":"text","text":)";
+                json::append_raw_string(out, part.str_or("text"));
+                std::string_view cc;
+                (void)part_cache_control(part, cc); // already validated above
+                if (!cc.empty())
+                {
+                    out += ",\"cache_control\":";
+                    out.append(cc);
+                }
+                out += '}';
+            }
+            out += ']';
             return true;
         }
     } // namespace
@@ -145,6 +202,18 @@ namespace llmbridge::provider
                     out.append(params->sv);
                 else
                     out += R"({"type":"object","properties":{}})";
+                // A breakpoint on a tool caches the definitions above it, which is
+                // the other prefix worth caching in an agent loop.
+                std::string_view cc;
+                if (const json::Value* fcc = fn->find("cache_control"); fcc && fcc->is_object())
+                    cc = fcc->sv;
+                else if (const json::Value* tcc = tl.find("cache_control"); tcc && tcc->is_object())
+                    cc = tcc->sv;
+                if (!cc.empty())
+                {
+                    out += ",\"cache_control\":";
+                    out.append(cc);
+                }
                 out += '}';
             }
             out += ']';
@@ -203,9 +272,11 @@ namespace llmbridge::provider
             *wants_stream_usage = iu && iu->type == json::Value::Type::Bool && iu->boolean;
         }
 
-        std::string system;        // collected system content (raw), joined by \n
+        std::string system;             // collected system content (raw), joined by \n
+        std::string_view system_cache;  // its `cache_control`, if a part carried one
         bool has_system = false;
         std::string messages = "["; // anthropic user/assistant turns
+        messages.reserve(openai_body.size() + 256);
         bool first = true;
         if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
         {
@@ -218,6 +289,15 @@ namespace llmbridge::provider
                 {
                     if (has_system) system += "\\n"; // escaped newline in the output
                     if (!append_text(system, content)) return {};
+                    // Anthropic's `system` takes a string or an array of blocks, and
+                    // only the array form carries a breakpoint.
+                    if (content && content->is_array())
+                        for (const auto& part : content->arr)
+                        {
+                            std::string_view cc;
+                            if (!part_cache_control(part, cc)) return {};
+                            if (!cc.empty()) system_cache = cc;
+                        }
                     has_system = true;
                     continue;
                 }
@@ -323,9 +403,9 @@ namespace llmbridge::provider
                 first = false;
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
-                messages += ",\"content\":\"";
-                if (!append_text(messages, content)) return {};
-                messages += "\"}";
+                messages += ",\"content\":";
+                if (!append_content(messages, content)) return {};
+                messages += "}";
             }
             if (in_tool_results) messages += "]}"; // close a trailing tool_result turn
         }
@@ -334,6 +414,7 @@ namespace llmbridge::provider
         const std::string_view model = v.str_or("model", "claude-3-5-sonnet-latest");
         if (model_out) model_out->assign(model);
         std::string out = "{";
+        out.reserve(messages.size() + system.size() + 512); // same reason as `messages`
         if (bedrock)
         {
             // Not a version we choose: Bedrock rejects a Messages body without it,
@@ -350,9 +431,20 @@ namespace llmbridge::provider
         out += v.num_or("max_tokens", "1024");
         if (has_system)
         {
-            out += ",\"system\":\"";
-            out += system;
-            out += '"';
+            if (system_cache.empty())
+            {
+                out += ",\"system\":\"";
+                out += system;
+                out += '"';
+            }
+            else
+            {
+                out += ",\"system\":[{\"type\":\"text\",\"text\":\"";
+                out += system;
+                out += "\",\"cache_control\":";
+                out.append(system_cache);
+                out += "}]";
+            }
         }
         if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
         if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"top_p\":"; out += p; }
