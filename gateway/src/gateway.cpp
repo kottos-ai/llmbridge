@@ -68,8 +68,13 @@ namespace llmbridge
         {
             const std::string_view head(c->rbuf.data(), c->msg.header_len);
             const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
+            // Whether the client asked to stream is consulted for one venue only,
+            // because Bedrock cannot stream from this endpoint, and answering it means walking
+            // the body to its top-level `stream` key.
+            const bool stream_matters = venue.dialect == UpstreamDialect::Bedrock;
             return resolve_translation(client_dialect_from_target(request_line(head)),
-                                       venue.dialect, provider::wants_stream(body));
+                                       venue.dialect,
+                                       stream_matters && provider::wants_stream(body));
         }
 
         /// Status code off the front of a response we are about to send. Reads the
