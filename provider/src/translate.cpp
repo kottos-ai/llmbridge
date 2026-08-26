@@ -189,11 +189,19 @@ namespace llmbridge::provider
     /// wants `anthropic_version` in the JSON where Anthropic wants it in a header.
     /// Everything between those two is identical.
     std::string messages_request(std::string_view openai_body, bool bedrock,
-                                 std::string* model_out)
+                                 std::string* model_out, bool* wants_stream_usage = nullptr)
     {
         bool ok = false;
         json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
+
+        // Read off the DOM we already have.
+        if (wants_stream_usage)
+        {
+            const json::Value* so = v.find("stream_options");
+            const json::Value* iu = so && so->is_object() ? so->find("include_usage") : nullptr;
+            *wants_stream_usage = iu && iu->type == json::Value::Type::Bool && iu->boolean;
+        }
 
         std::string system;        // collected system content (raw), joined by \n
         bool has_system = false;
@@ -510,9 +518,10 @@ namespace llmbridge::provider
         return out;
     }
 
-    std::string openai_to_anthropic_request(std::string_view openai_body)
+    std::string openai_to_anthropic_request(std::string_view openai_body,
+                                            bool* wants_stream_usage)
     {
-        return messages_request(openai_body, false, nullptr);
+        return messages_request(openai_body, false, nullptr, wants_stream_usage);
     }
 
     std::string openai_to_bedrock_request(std::string_view openai_body,
@@ -625,20 +634,6 @@ namespace llmbridge::provider
         detail::append_sanitized(out, type);
         out += "\",\"code\":null}}";
         return out;
-    }
-
-    bool openai_wants_stream_usage(std::string_view openai_body)
-    {
-        // Fail fast: the field is absent from virtually every request, and a
-        // substring miss costs one scan instead of a full parse.
-        if (openai_body.find("include_usage") == std::string_view::npos) return false;
-        bool ok = false;
-        json::Value v = json::parse(openai_body, ok);
-        if (!ok || !v.is_object()) return false;
-        const json::Value* so = v.find("stream_options");
-        if (!so || !so->is_object()) return false;
-        const json::Value* iu = so->find("include_usage");
-        return iu && iu->type == json::Value::Type::Bool && iu->boolean;
     }
 
     // ── Google Gemini (generateContent) ─────────────────────────────────────

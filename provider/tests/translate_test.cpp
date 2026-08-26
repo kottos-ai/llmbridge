@@ -143,21 +143,32 @@ TEST(ReqXlate, OmitsStreamWhenAbsentOrFalse)
 }
 
 // ── stream_options.include_usage detection ──────────────────────────────────
+//
+// The flag is an output of the request translation, because that is where the body
+// is parsed. It used to have a function of its own, which scanned the whole body and
+// then parsed all of it a second time to answer what one key of an existing DOM
+// answers: 796 us on a 287 KB request, measured on the reference server.
 TEST(StreamUsageFlag, DetectsIncludeUsage)
 {
-    using llmbridge::provider::openai_wants_stream_usage;
-    EXPECT_TRUE(openai_wants_stream_usage(
+    auto wants = [](std::string_view body) {
+        bool wu = false;
+        openai_to_anthropic_request(body, &wu);
+        return wu;
+    };
+    EXPECT_TRUE(wants(
         R"({"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[]})"));
-    EXPECT_FALSE(openai_wants_stream_usage(
+    EXPECT_FALSE(wants(
         R"({"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]})"));
-    EXPECT_FALSE(openai_wants_stream_usage(R"({"model":"m","stream":true,"messages":[]})"));
-    EXPECT_FALSE(openai_wants_stream_usage(R"({"model":"m","stream_options":{},"messages":[]})"));
+    EXPECT_FALSE(wants(R"({"model":"m","stream":true,"messages":[]})"));
+    EXPECT_FALSE(wants(R"({"model":"m","stream_options":{},"messages":[]})"));
     // Not a bool -> not a request for usage (no coercion).
-    EXPECT_FALSE(openai_wants_stream_usage(
-        R"({"stream_options":{"include_usage":"true"},"messages":[]})"));
-    // Garbage must not throw or crash.
-    EXPECT_FALSE(openai_wants_stream_usage("include_usage but not json"));
-    EXPECT_FALSE(openai_wants_stream_usage(""));
+    EXPECT_FALSE(wants(R"({"stream_options":{"include_usage":"true"},"messages":[]})"));
+    // Nested is not top-level: a tool schema may name anything it likes.
+    EXPECT_FALSE(wants(
+        R"({"model":"m","messages":[],"tools":[{"stream_options":{"include_usage":true}}]})"));
+    // Garbage must not throw or crash, and leaves the caller's flag alone.
+    EXPECT_FALSE(wants("include_usage but not json"));
+    EXPECT_FALSE(wants(""));
 }
 
 // ── upstream error passthrough ──────────────────────────────────────────────

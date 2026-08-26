@@ -6312,6 +6312,65 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsRecordedAcrossTheWholeStream)
     EXPECT_EQ(recs[0].r.cached_tokens, 9021);
 }
 
+namespace
+{
+    // A turn whose whole output is a tool call: no text block, no text_delta, ever.
+    // This is what an agent sends back most of the time, and it is the shape that
+    // recorded output tokens and no time-to-first-token at all.
+    std::string anthropic_tool_only_events()
+    {
+        return "event: message_start\n"
+               "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\","
+               "\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":11,"
+               "\"output_tokens\":1}}}\n\n"
+               "event: content_block_start\n"
+               "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":"
+               "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\"}}\n\n"
+               "event: content_block_delta\n"
+               "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+               "{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n"
+               "event: content_block_delta\n"
+               "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+               "{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.txt\\\"}\"}}\n\n"
+               "event: content_block_stop\n"
+               "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+               "event: message_delta\n"
+               "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},"
+               "\"usage\":{\"output_tokens\":57}}\n\n"
+               "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    }
+} // namespace
+
+// A tool call is a token like any other, and the translated path has always said so
+// (sse.cpp: "a tool call is the first token of a tool-only reply"). Byte-forward
+// looked for text and nothing else, so an agent turn that only called tools recorded
+// its output tokens and no first-token time: the tape showed a dash where the number
+// belongs, on the majority of an agentic session's requests.
+TEST_P(ProxyForwardStream, AnthropicFirstTokenCountsAToolCall)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(anthropic_tool_only_events(), 128));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"read a.txt\"}]}")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_GT(recs[0].r.tokens_out, 0u) << "the tokens were always counted";
+    EXPECT_GT(recs[0].r.ts_first_token, 0)
+        << "a tool-only reply produced tokens but no first-token time";
+    EXPECT_GE(recs[0].r.ts_first_token, recs[0].r.ts_up_recvd);
+}
+
 TEST_P(ProxyForwardStream, AnthropicFirstTokenIsTheFirstTextDelta)
 {
     RecordingSink sink;
@@ -6750,4 +6809,31 @@ TEST_P(ProxyBedrock, AStreamIsRefusedEvenWhenTheFlagIsLastInTheBody)
     c.close();
     shutdown();
     EXPECT_TRUE(_backend.last_request().empty()) << "a stream reached a Bedrock venue";
+}
+
+// The saved failover copy became a swap, and a swap is only safe if a pipelining
+// client's next request survives it: the bytes handed over are the whole read buffer,
+// and only this message belongs to the failover slot. Two requests written at once,
+// with distinct bodies, is what makes a lost or duplicated tail visible.
+TEST_P(ProxyRoute, PipelinedRequestsSurviveTheFailoverHandover)
+{
+    NamedBackend b;
+    b.start("alpha");
+    NoFailoverPolicy pol(0);
+    // Two venues, so the failover slot is actually filled.
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request("FIRST-BODY") + make_request("SECOND-BODY")));
+    const std::string first = c.recv_response();
+    const std::string second = c.recv_response();
+    EXPECT_FALSE(first.empty());
+    EXPECT_FALSE(second.empty()) << "the pipelined request was lost in the handover";
+    c.close();
+    shutdown();
+    b.stop();
+    EXPECT_EQ(_gw->stats().requests, 2u) << "both pipelined requests must be served";
+    EXPECT_EQ(_gw->stats().errors, 0u);
 }

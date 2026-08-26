@@ -358,8 +358,11 @@ namespace llmbridge
             // interleaved rounds: +86/89/99 ns at 1/4/16 KB bodies, so the cost is
             // the header scan and is flat in body size. Per-line appends cost ~45 ns
             // more again.
-            std::string out;
-            out.reserve(msg.size());
+            // The HEAD is built on its own, and the body is appended once at the end.
+            // Host and Content-Length are inserted just after the request line.
+            std::string head;
+            head.reserve(header_len + 128);
+            std::string& out = head; // the loop below builds the head, unchanged
             bool saw_cl = false;
             size_t start = 0, run = 0;
             while (start < header_len)
@@ -407,7 +410,6 @@ namespace llmbridge
             out.append(msg.substr(run, header_len - run));
             const std::string_view body =
                 body_override.empty() ? msg.substr(header_len) : body_override;
-            out.append(body);
             // Ours, from the body we are actually sending. Emitted when the client
             // framed a body or there is one to frame; a bodyless request that carried
             // no length keeps carrying none.
@@ -429,7 +431,12 @@ namespace llmbridge
                                "Host: " + std::string(host_hdr) + "\r\n");
             }
             if (!prefix_target(out, base_path)) return {};
-            return out;
+            // The head is final: the body joins it once, and nothing shifts it after.
+            std::string full;
+            full.reserve(head.size() + body.size());
+            full.append(head);
+            full.append(body);
+            return full;
         }
 
         AuthHeaders scan_auth_headers(std::string_view headers,
@@ -558,7 +565,8 @@ namespace llmbridge
         std::string xlate_req(UpstreamDialect mode, std::string_view body,
                               std::string_view base_path, std::string_view query,
                               std::string& start_line_store,
-                              std::string_view& start_line, std::string_view& target_out)
+                              std::string_view& start_line, std::string_view& target_out,
+                              bool* wants_stream_usage = nullptr)
         {
             std::string target_store;
             std::string_view target;
@@ -567,7 +575,7 @@ namespace llmbridge
             {
                 case UpstreamDialect::Anthropic:
                     target = "/v1/messages";
-                    out = provider::openai_to_anthropic_request(body);
+                    out = provider::openai_to_anthropic_request(body, wants_stream_usage);
                     break;
                 case UpstreamDialect::Gemini:
                     target = "/v1beta/models/gemini:generateContent";
@@ -706,7 +714,8 @@ namespace llmbridge
                                       std::string_view body, std::string_view client_hdrs,
                                       const std::vector<std::string>& strip,
                                       std::string& out, const char*& why,
-                                      std::string_view model_override = {})
+                                      std::string_view model_override = {},
+                                      bool* wants_stream_usage = nullptr)
         {
             // `mode` is the resolved per-request translation, not up.dialect: they are
             // equal whenever this is called (a byte-forward skips this function), but the
@@ -725,7 +734,7 @@ namespace llmbridge
             std::string_view start_line, target;
             const std::string tbody =
                 xlate_req(mode, body, up.base_path, up.query, start_line_store,
-                          start_line, target);
+                          start_line, target, wants_stream_usage);
             if (tbody.empty()) { why = "translate"; return false; }
 
             std::string auth_hdrs;
@@ -1194,9 +1203,13 @@ namespace llmbridge
                     // `"content":"`; Anthropic says `text_delta`, and its
                     // `content_block_start` carries an empty `"text":""` that is not
                     // a token, which is why the delta is what counts.
+                    //
+                    // A tool call counts too.
                     if (client->ts_first_token == 0 &&
                         (sse_in.find("\"content\":\"") != std::string::npos ||
-                         sse_in.find("\"text_delta\"") != std::string::npos))
+                         sse_in.find("\"text_delta\"") != std::string::npos ||
+                         sse_in.find("\"type\":\"tool_use\"") != std::string::npos ||
+                         sse_in.find("\"tool_calls\"") != std::string::npos))
                         client->ts_first_token = now_ns();
                     out.append(sse_in);
                 }
@@ -2363,6 +2376,9 @@ namespace llmbridge
         c->stream_tail.clear();
         c->usage_in = c->usage_out = c->usage_cached = -1;
         c->ts_first_token = 0;
+        // Defensive, not a fixed bug: the only reader of `wants_usage` runs on a
+        // translated Anthropic request, and that translation writes the field.
+        c->wants_usage = false;
     }
 
     Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
@@ -2458,12 +2474,14 @@ namespace llmbridge
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
             // Remember whether the client asked for a final usage chunk. The
             // request bytes are consumed below, but the stream needs it later.
-            c->wants_usage = provider::openai_wants_stream_usage(body);
+            // `wants_usage` is an output of the translation below, not a separate
+            // question: the translator parses this body anyway.
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             const char* why = "";
             // Either failure => 400, and nothing goes upstream.
             if (!build_translated_request(up, c->effective_dialect, body, client_hdrs, _strip_headers,
-                                          upstream_bytes, why, c->model_override))
+                                          upstream_bytes, why, c->model_override,
+                                          &c->wants_usage))
             {
                 if (why[0] == 't')
                     ep_error_respond(c, 400, "translate", translate_failure(body));
@@ -2478,11 +2496,9 @@ namespace llmbridge
         }
         else
         {
-            // Byte-forward needs this too: it is what decides whether a streamed
-            // response keeps its tail for the usage chunk. Set on the translated path
-            // only until 2026-08-21, when byte-forward could not stream at all.
-            c->wants_usage = provider::openai_wants_stream_usage(
-                std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
+            // No `wants_usage` on this path, deliberately. Its only reader is the
+            // Anthropic-to-OpenAI SSE translator, built only when `translate_body`
+            // is set.
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             // Byte-forward rewrites the model by splicing the value, so every other
@@ -2522,8 +2538,13 @@ namespace llmbridge
         // above was translated for this venue's dialect, so it cannot be resent to a
         // different one. One copy per in-flight request, and only where it can pay off.
         if (_policy && _upstreams.size() > 1 && c->failover_req.empty())
-            c->failover_req.assign(c->rbuf, 0, c->msg.total_len);
-        c->rbuf.erase(0, c->msg.total_len);
+        {
+            const size_t extra = c->rbuf.size() - c->msg.total_len;
+            c->failover_req.swap(c->rbuf);
+            c->rbuf.assign(c->failover_req, c->msg.total_len, extra);
+            c->failover_req.resize(c->msg.total_len);
+        }
+        else c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
         c->ever_framed = true;        // past the setup deadline for good
@@ -3819,7 +3840,6 @@ namespace llmbridge
         if (c->translate_body)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-            c->wants_usage = provider::openai_wants_stream_usage(body); // see epoll mirror
             const std::string_view client_hdrs(c->rbuf.data(), c->msg.header_len);
             const char* why = "";
             // Either failure => 400, and nothing goes upstream.
@@ -3828,7 +3848,8 @@ namespace llmbridge
             // into a grep; folding both loops onto one builder removes the chance of
             // the next such divergence entirely.)
             if (!build_translated_request(up, c->effective_dialect, body, client_hdrs, _strip_headers,
-                                          upstream_bytes, why, c->model_override))
+                                          upstream_bytes, why, c->model_override,
+                                          &c->wants_usage))
             {
                 if (why[0] == 't')
                     ur_error_respond(c, 400, "translate", translate_failure(body));
@@ -3840,11 +3861,9 @@ namespace llmbridge
         }
         else
         {
-            // Byte-forward needs this too: it is what decides whether a streamed
-            // response keeps its tail for the usage chunk. Set on the translated path
-            // only until 2026-08-21, when byte-forward could not stream at all.
-            c->wants_usage = provider::openai_wants_stream_usage(
-                std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len));
+            // No `wants_usage` on this path, deliberately. Its only reader is the
+            // Anthropic-to-OpenAI SSE translator, built only when `translate_body`
+            // is set.
             // Byte-forward still rebuilds, even with nothing to strip: Host must name
             // the venue, not the client's idea of us.
             // Byte-forward rewrites the model by splicing the value, so every other
@@ -3884,8 +3903,13 @@ namespace llmbridge
         // above was translated for this venue's dialect, so it cannot be resent to a
         // different one. One copy per in-flight request, and only where it can pay off.
         if (_policy && _upstreams.size() > 1 && c->failover_req.empty())
-            c->failover_req.assign(c->rbuf, 0, c->msg.total_len);
-        c->rbuf.erase(0, c->msg.total_len);
+        {
+            const size_t extra = c->rbuf.size() - c->msg.total_len;
+            c->failover_req.swap(c->rbuf);
+            c->rbuf.assign(c->failover_req, c->msg.total_len, extra);
+            c->failover_req.resize(c->msg.total_len);
+        }
+        else c->rbuf.erase(0, c->msg.total_len);
         c->peer = u;
         u->peer = c;
         c->ever_framed = true;        // past the setup deadline for good
