@@ -308,6 +308,10 @@ namespace llmbridge
         net::http::Message msg{};
 
         // Latency stamps (ns), held on the client conn for the active request.
+        // The first byte of this request that the gateway saw, and t0 minus it: how
+        // long the request took to arrive (the arrival is the client's network and not our work).
+        int64_t ts_first_byte = 0;
+        int64_t client_upload_ns = 0;
         int64_t ts_req_recvd = 0;
         // When the upstream request bytes were built (translated + auth applied),
         // i.e. the end of our request-side compute. Separates our work from the

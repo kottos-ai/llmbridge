@@ -4896,6 +4896,43 @@ TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
     good.stop();
 }
 
+// The arrival stamp is re-armed per request. Without that, the second request on a
+// connection inherits the first one's stamp and reports the whole idle gap between
+// them as its upload: a client that thinks for a second between turns would look like
+// a second of network. Agentic clients hold one connection open for a session, so
+// this is the normal case and not an edge one.
+TEST_P(ProxyRoute, TheUploadSpanDoesNotLeakAcrossAKeepAliveConnection)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                            "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    ASSERT_TRUE(c.send(req));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    // Idle, the way a client is while a person reads the previous answer. Long, and
+    // the threshold far below it, because this runs alongside seven other test
+    // binaries: the gap has to be decided by the leak and not by how promptly this
+    // process was scheduled.
+    timespec ts{0, 300 * 1000 * 1000};
+    nanosleep(&ts, nullptr);
+    ASSERT_TRUE(c.send(req));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_LT(recs[1].r.client_upload_ns, 100 * 1000 * 1000)
+        << "the second request's arrival must not include the 300 ms it waited";
+}
+
 // Two requests on one keep-alive connection: one record each, with each request's
 // Own captured headers, because the capture is per request, not per connection.
 TEST_P(ProxyRoute, AKeepAliveConnectionEmitsOneRecordPerRequest)
@@ -6346,6 +6383,63 @@ namespace
 // looked for text and nothing else, so an agent turn that only called tools recorded
 // its output tokens and no first-token time: the tape showed a dash where the number
 // belongs, on the majority of an agentic session's requests.
+// ── the upload span ─────────────────────────────────────────────────────────
+//
+// t0 starts when a request is whole, so everything the client spent putting it on the
+// wire is invisible to every number in the t0..t6 scheme. That is right for measuring
+// the gateway and wrong for explaining a wall clock: a 287 KB prompt from another
+// continent can spend half a second arriving before this gateway has anything to do,
+// and without this field that half second is unaccounted for in the tape while being
+// plainly visible to the client.
+TEST_P(ProxyForwardStream, ARequestThatArrivesInPiecesRecordsHowLongItTook)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 2\r\n\r\n{}");
+    start(0, false, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // 64 bytes at a time with a pause between, so the framer takes the NeedMore path
+    // repeatedly and the arrival genuinely spans milliseconds.
+    const std::string body =
+        "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"" +
+        std::string(3000, 'x') + "\"}]}";
+    ASSERT_TRUE(c.send_trickle(make_request(body), 64));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_GT(recs[0].r.client_upload_ns, 0)
+        << "a request delivered over many reads arrived over a measurable span";
+    // The arrival ends where t0 begins, so it cannot reach past it.
+    EXPECT_LT(recs[0].r.client_upload_ns, recs[0].r.ts_done - recs[0].r.ts_req_recvd + recs[0].r.client_upload_ns + 1);
+}
+
+TEST_P(ProxyForwardStream, ARequestThatArrivesAtOnceRecordsNoUploadSpan)
+{
+    // The other half of the definition, and the common case: a small request that
+    // lands in a single read has no arrival span to report, and must report zero
+    // instead of a stamp left over from the connection or from the request before it.
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 2\r\n\r\n{}");
+    start(0, false, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_LT(recs[0].r.client_upload_ns, 2000000) << "a one-read request should show ~0, not milliseconds";
+}
+
 TEST_P(ProxyForwardStream, AnthropicFirstTokenCountsAToolCall)
 {
     RecordingSink sink;

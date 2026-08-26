@@ -29,6 +29,9 @@ namespace llmbridge
     {
         uint64_t seq = 0;         ///< the global request sequencer
         int64_t wall_t0_ns = 0;   ///< CLOCK_REALTIME at framing; the cross-process merge key
+        /// How long the request took to arrive: t0 minus the first byte seen. Zero
+        /// when it arrived in one read.
+        int64_t client_upload_ns = 0;
         int64_t ts_req_recvd = 0;  ///< t0
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
