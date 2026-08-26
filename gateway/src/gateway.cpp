@@ -347,6 +347,11 @@ namespace llmbridge
         ///
         /// Unambiguous because parse_request refuses Transfer-Encoding outright, so
         /// every request here is either Content-Length framed or has no body at all.
+        [[nodiscard]] int64_t span_since(int64_t start, int64_t end) noexcept
+        {
+            return (start > 0 && end >= start) ? end - start : 0;
+        }
+
         std::string request_without(std::string_view msg, size_t header_len,
                                     const std::vector<std::string>& strip,
                                     std::string_view host_hdr, std::string_view base_path,
@@ -886,7 +891,8 @@ namespace llmbridge
 
         void append_timing_headers(std::string& out, int64_t t0, int64_t gateway_us,
                                    int64_t connect_us, int64_t upwrite_us,
-                                   int64_t upstream_us, const char* upstream_key, uint64_t seq)
+                                   int64_t upstream_us, const char* upstream_key, uint64_t seq,
+                                   int64_t client_upload_us)
         {
             const auto add = [&out](const char* k, int64_t v) {
                 if (v < 0) return; // a stamp we never took; omit instead of lie
@@ -904,6 +910,10 @@ namespace llmbridge
             // one meaning, on both surfaces -- see timing_split().
             add("x-llmbridge-connect-us", connect_us);
             add("x-llmbridge-upwrite-us", upwrite_us);
+            // Outside `added` on purpose: it is the client's own upload, measured from
+            // the first byte this gateway saw to the last. Not the time since the
+            // client pressed send, which needs two clocks that agree.
+            add("x-llmbridge-client-upload-us", client_upload_us);
             add(upstream_key, upstream_us);
         }
 
@@ -1512,6 +1522,7 @@ namespace llmbridge
             ssize_t n = ::read(c->fd, tmp, sizeof(tmp));
             if (n > 0)
             {
+                if (c->ts_first_byte == 0) c->ts_first_byte = now_ns();
                 c->rbuf.append(tmp, static_cast<size_t>(n));
                 pulled += static_cast<size_t>(n);
                 // Level-triggered: whatever is left re-notifies. Stopping here is what
@@ -1792,7 +1803,13 @@ namespace llmbridge
         uint8_t buf[16384];
         size_t r;
         while ((r = u->tls->read_plaintext({buf, sizeof buf})) > 0)
+        {
+            // Client-side TLS lands here too, so the arrival stamp belongs here as
+            // much as on the plaintext reads. Harmless on an upstream connection,
+            // whose `client_upload_ns` nobody reads.
+            if (u->ts_first_byte == 0) u->ts_first_byte = now_ns();
             u->rbuf.append(reinterpret_cast<const char*>(buf), r);
+        }
         if (u->tls->want() == net::tls::Want::Error)
         {
             LB_WARN("TLS read failed ", *u, " err=", u->tls->last_error());
@@ -2228,6 +2245,10 @@ namespace llmbridge
 
         c->msg = m;
         c->ts_req_recvd = t0;
+        c->client_upload_ns = span_since(c->ts_first_byte, t0);
+        // A pipelining client's next request is already here, so its arrival begins
+        // now; otherwise the next read stamps it.
+        c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
         // One assignment point for the sequencer, here and not later: the upstream
         // and status lines below quote it, and ep_forward erases the request out of
         // rbuf, so a log placed after it prints an empty request line and a stale seq.
@@ -2322,6 +2343,7 @@ namespace llmbridge
         RequestRecord r;
         r.seq = c->req_seq;
         r.wall_t0_ns = c->wall_t0;
+        r.client_upload_ns = c->client_upload_ns;
         r.ts_req_recvd = c->ts_req_recvd;
         r.ts_req_built = c->ts_req_built;
         r.ts_wire_ready = c->ts_wire_ready;
@@ -2779,7 +2801,7 @@ namespace llmbridge
                 append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                       sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                       sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
-                                      client->req_seq);
+                                      client->req_seq, client->client_upload_ns / 1000);
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -2912,7 +2934,7 @@ namespace llmbridge
             append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
-                                  client->req_seq);
+                                  client->req_seq, client->client_upload_ns / 1000);
             client->wbuf.assign(sse_head_with_timing(timing));
         }
         else
@@ -3704,7 +3726,10 @@ namespace llmbridge
                 tls_ok = tls_feed(c, _bufring.data(bid), static_cast<size_t>(res));
             else
 #endif
+            {
+                if (c->ts_first_byte == 0) c->ts_first_byte = now_ns();
                 c->rbuf.append(_bufring.data(bid), static_cast<size_t>(res));
+            }
             _bufring.recycle(bid);
         }
         if (!armed) ur_arm_recv(c); // kernel ended the multishot (pool pressure) -> re-arm
@@ -3790,6 +3815,8 @@ namespace llmbridge
         if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400, "request framing"); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
+        c->client_upload_ns = span_since(c->ts_first_byte, c->ts_req_recvd);
+        c->ts_first_byte = c->rbuf.size() > m.total_len ? c->ts_req_recvd : 0; // see epoll mirror
         // See the epoll mirror: assigned here, before forward touches rbuf.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);
         // A new request: the previous one's saved copy and failover budget are spent.
@@ -4008,7 +4035,7 @@ namespace llmbridge
                 append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                       sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                       sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
-                                      client->req_seq);
+                                      client->req_seq, client->client_upload_ns / 1000);
                 append_usage_headers(timing, tbody);
             }
             client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
@@ -4202,7 +4229,7 @@ namespace llmbridge
             append_timing_headers(timing, client->ts_req_recvd, sp.compute_ns / 1000,
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
-                                  client->req_seq);
+                                  client->req_seq, client->client_upload_ns / 1000);
             client->wpending.assign(sse_head_with_timing(timing));
         }
         else

@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.37.0]. 2026-08-26
+
+### Added
+
+- **`client_upload_ns`: how long a request took to arrive.** Measured from the 
+  first byte of the request this gateway saw to the last, on the read path so it 
+  covers plaintext and TLS on both backends. Reported to a sink as
+  `client_upload_ns` and as `x-llmbridge-client-upload-us`.
+
 ## [0.36.0]. 2026-08-26
 
 ### Added
