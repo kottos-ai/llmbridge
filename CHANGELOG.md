@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.38.0]. 2026-08-26
+
+### Added
+
+- **`request_bytes` and `client_encoded` on the sink record.**
+
+### Changed
+
+- **Breaking: a request body with a `Content-Encoding` other than `identity` is
+  refused with 415, and the upstream is never contacted.**
+
 ## [0.37.0]. 2026-08-26
 
 ### Added

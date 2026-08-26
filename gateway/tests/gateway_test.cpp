@@ -1593,6 +1593,97 @@ TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
     EXPECT_TRUE(_backend.last_request().empty()) << "request reached upstream despite bad credential";
 }
 
+// ── a compressed request body is refused, never forwarded ───────────────────
+//
+// Nothing here inflates a body, and every reader downstream scans bytes assuming
+// JSON: wants_stream, model_of and the translator. Accepting one meant forwarding a
+// request whose stream flag and model name had been read out of a gzip stream, so
+// the symptom was a stream served as a non-stream and a model recorded as empty.
+// Fail closed instead, and do not contact the provider.
+TEST_P(ProxyAuth, CompressedRequestBodyIsRefusedAndNeverForwarded)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Real gzip member bytes, not a stand-in: the point is that a body the parser
+    // cannot read is refused on the header alone, before anything reads the body.
+    const std::string body("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xae\x05\x00", 14);
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer sk-test\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Encoding: gzip\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("415"), std::string::npos) << resp;
+    // 415 is in neither status table by default, and an unlisted code falls through
+    // to 502 Bad Gateway. Pin the phrase, or a refusal silently blames the upstream.
+    EXPECT_NE(resp.find("Unsupported Media Type"), std::string::npos) << resp;
+    EXPECT_TRUE(_backend.last_request().empty())
+        << "a body the gateway cannot read reached the provider:\n" << _backend.last_request();
+}
+
+// identity is not a compression, so it must still be served. A gateway that refuses
+// it turns a legal header into an outage for a client that spells out the default.
+TEST_P(ProxyAuth, IdentityEncodingIsStillServed)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request_hdrs("hi", "Content-Encoding: identity\r\n")));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200"), std::string::npos) << resp;
+    EXPECT_FALSE(_backend.last_request().empty()) << "identity was refused as if compressed";
+}
+
+// ── a compressed request body is refused, never guessed at ──────────────────
+//
+// Nothing here inflates a body, and every reader downstream scans bytes assuming
+// JSON: wants_stream, model_of and the translator. Accepting one meant forwarding a
+// request whose stream flag and model name had been read out of a gzip stream, and
+// the visible symptom was a stream served as a non-stream. It is refused instead.
+TEST_P(ProxyAuth, CompressedRequestBodyIsRefusedAndNeverReachesUpstream)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Real gzip magic, so this is the request a compressing client actually sends
+    // and not a header with JSON behind it.
+    const std::string body = std::string("\x1f\x8b\x08\x00\x00\x00\x00\x00", 8) + "payload";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer sk-test\r\n"
+                       "Content-Encoding: gzip\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("415"), std::string::npos) << resp;
+    EXPECT_NE(resp.find("Unsupported Media Type"), std::string::npos)
+        << "415 is absent from the status tables, so it answered as something else:\n" << resp;
+    EXPECT_TRUE(_backend.last_request().empty())
+        << "a body the gateway cannot read reached the upstream:\n" << _backend.last_request();
+}
+
+// identity is the explicit no-op coding. Refusing it would reject a correct request.
+TEST_P(ProxyAuth, IdentityEncodingIsAccepted)
+{
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer sk-test\r\n"
+                       "Content-Encoding: identity\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200"), std::string::npos) << resp;
+    EXPECT_FALSE(_backend.last_request().empty()) << "identity was refused";
+}
+
 // A second Authorization header cannot smuggle past the check by hiding behind a
 // clean first one (first-wins means only the first is ever emitted).
 TEST_P(ProxyAuth, SecondCredentialHeaderCannotBypassValidation)

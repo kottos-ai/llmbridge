@@ -963,6 +963,7 @@ namespace llmbridge
                 case 403: return {"HTTP/1.1 403 Forbidden", "permission_error", "forbidden"};
                 case 404: return {"HTTP/1.1 404 Not Found", "invalid_request_error", "not found"};
                 case 413: return {"HTTP/1.1 413 Content Too Large", "invalid_request_error", "request too large"};
+                case 415: return {"HTTP/1.1 415 Unsupported Media Type", "invalid_request_error", "compressed request body is not supported"};
                 case 429: return {"HTTP/1.1 429 Too Many Requests", "rate_limit_error", "rate limit exceeded"};
                 case 503: return {"HTTP/1.1 503 Service Unavailable", "service_error", "service unavailable"};
                 case 504: return {"HTTP/1.1 504 Gateway Timeout", "timeout_error", "upstream timed out"};
@@ -1055,6 +1056,7 @@ namespace llmbridge
                 case 404: return "Not Found";
                 case 408: return "Request Timeout";
                 case 413: return "Payload Too Large";
+                case 415: return "Unsupported Media Type";
                 case 429: return "Too Many Requests";
                 case 500: return "Internal Server Error";
                 case 502: return "Bad Gateway";
@@ -2258,6 +2260,10 @@ namespace llmbridge
         // places one can end.
         c->failover_req.clear();
         c->failover_attempts = 0;
+        // Fail closed on a body we cannot read. Nothing here inflates, and every
+        // reader downstream scans bytes assuming JSON: wants_stream, model_of and
+        // the translator.
+        if (c->msg.encoded) { ep_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
@@ -2344,6 +2350,8 @@ namespace llmbridge
         r.seq = c->req_seq;
         r.wall_t0_ns = c->wall_t0;
         r.client_upload_ns = c->client_upload_ns;
+        r.request_bytes = c->msg.total_len;
+        r.client_encoded = c->msg.encoded;
         r.ts_req_recvd = c->ts_req_recvd;
         r.ts_req_built = c->ts_req_built;
         r.ts_wire_ready = c->ts_wire_ready;
@@ -3824,6 +3832,10 @@ namespace llmbridge
         // places one can end.
         c->failover_req.clear();
         c->failover_attempts = 0;
+        // Fail closed on a body we cannot read. Nothing here inflates, and every
+        // reader downstream scans bytes assuming JSON: wants_stream, model_of and
+        // the translator.
+        if (c->msg.encoded) { ur_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);

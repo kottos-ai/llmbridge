@@ -33,6 +33,7 @@ namespace llmbridge::net::http
         size_t body_len = 0;   // Content-Length value (0 if absent)
         size_t total_len = 0;  // header_len + body_len: full message size
         bool keep_alive = true;
+        bool encoded = false;  // Content-Encoding present and not identity
     };
 
     // The framing tri-state, shared by every parse entry point in this header.
@@ -54,6 +55,20 @@ namespace llmbridge::net::http
         constexpr char lc(char c) noexcept
         {
             return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+        }
+
+        // Case-insensitive substring search (small, for header values).
+        inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept
+        {
+            if (needle.empty() || hay.size() < needle.size()) return needle.empty();
+            for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
+            {
+                size_t j = 0;
+                for (; j < needle.size(); ++j)
+                    if (lc(hay[i + j]) != needle[j]) break;
+                if (j == needle.size()) return true;
+            }
+            return false;
         }
 
         // Case-insensitive prefix test: `name` must be lower-case, and callers that
@@ -276,6 +291,14 @@ namespace llmbridge::net::http
                 // risk a TE/CL desync against a TE-honouring upstream.
                 return FrameStatus::Error;
             }
+            else if (detail::line_is(line, "content-encoding:"))
+            {
+                // Recorded, never acted on: framing is by Content-Length either way.
+                // It matters upstream of here because every body-reading caller
+                // assumes JSON, and a compressed body is not JSON.
+                const std::string_view v = detail::ltrim(value);
+                out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
+            }
             else if (detail::line_is(line, "connection:"))
             {
                 std::string_view v = detail::ltrim(value);
@@ -318,19 +341,6 @@ namespace llmbridge::net::http
 
     namespace detail
     {
-        // Case-insensitive substring search (small, for header values).
-        inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept
-        {
-            if (needle.empty() || hay.size() < needle.size()) return needle.empty();
-            for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
-            {
-                size_t j = 0;
-                for (; j < needle.size(); ++j)
-                    if (lc(hay[i + j]) != needle[j]) break;
-                if (j == needle.size()) return true;
-            }
-            return false;
-        }
     } // namespace detail
 
     // Parse a response header block. Unlike parse(), this tolerates chunked

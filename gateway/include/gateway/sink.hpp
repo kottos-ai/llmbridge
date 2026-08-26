@@ -32,6 +32,10 @@ namespace llmbridge
         /// How long the request took to arrive: t0 minus the first byte seen. Zero
         /// when it arrived in one read.
         int64_t client_upload_ns = 0;
+        /// Total request bytes on the wire, head plus body. Paired with
+        /// client_upload_ns it gives effective upload throughput, which is what
+        /// separates a full pipe from a congestion window still opening.
+        uint64_t request_bytes = 0;
         int64_t ts_req_recvd = 0;  ///< t0
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
@@ -47,6 +51,9 @@ namespace llmbridge
         int32_t tokens_out = -1;
         int32_t cached_tokens = -1; ///< input tokens the provider served from cache; -1 unknown
         bool streamed = false;
+        /// The client sent a Content-Encoding other than identity. Every body-reading
+        /// caller here assumes JSON, so this request was parsed as something it is not.
+        bool client_encoded = false;
         bool error_reply = false; ///< the gateway generated the reply; stamps unset
         bool truncated = false;   ///< stream ended without a clean finish
         bool translated = false;  ///< dialect translation ran for the serving venue

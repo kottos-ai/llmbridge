@@ -694,3 +694,55 @@ TEST(ResponseFraming, AFramedResponseIsUnaffected)
                        "2\r\nhi\r\n0\r\n\r\n"),
               llmbridge::net::http::FrameStatus::Complete);
 }
+
+// Content-Encoding on a request body. Recorded, never acted on: framing is by
+// Content-Length either way, so detecting it must not change a single accept or
+// refuse decision. What it buys is that the gateway can say so, instead of parsing
+// a gzip stream as JSON and reporting nothing.
+TEST(HttpRequestEncoding, PlainRequestIsNotEncoded)
+{
+    const std::string req = "POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                            "Content-Length: 2\r\n\r\n{}";
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(req, m),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_FALSE(m.encoded);
+}
+
+TEST(HttpRequestEncoding, GzipIsFlagged)
+{
+    const std::string req = "POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                            "Content-Encoding: gzip\r\n"
+                            "Content-Length: 2\r\n\r\n\x1f\x8b";
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(req, m),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_TRUE(m.encoded);
+    // Still framed by Content-Length, and still accepted: this commit observes,
+    // it does not change behaviour.
+    EXPECT_EQ(m.body_len, 2u);
+}
+
+TEST(HttpRequestEncoding, IdentityIsNotEncoded)
+{
+    const std::string req = "POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                            "Content-Encoding: identity\r\n"
+                            "Content-Length: 2\r\n\r\n{}";
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(req, m),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_FALSE(m.encoded);
+}
+
+// Case-insensitive field name and value, per RFC 9110. A client writing it in capitals
+// must not read as plain, or the warning goes missing exactly when it is needed.
+TEST(HttpRequestEncoding, CaseInsensitive)
+{
+    const std::string req = "POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                            "CONTENT-ENCODING: GZIP\r\n"
+                            "Content-Length: 2\r\n\r\n\x1f\x8b";
+    llmbridge::net::http::Message m;
+    ASSERT_EQ(llmbridge::net::http::parse_request(req, m),
+              llmbridge::net::http::FrameStatus::Complete);
+    EXPECT_TRUE(m.encoded);
+}
