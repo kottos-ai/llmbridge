@@ -8,6 +8,35 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.35.4]. 2026-08-26
+
+### Changed
+
+- **Two fewer passes over the request body.** Both are per-byte work on a path that
+  a coding agent hits with a few hundred KB per turn.
+
+  `request_without` inserted `Host` and `Content-Length` just after the request line
+  **after** the body was already in the buffer, and an insert near the front memmoves
+  everything behind it. The head is assembled first now and the body is appended once.
+
+  The failover copy saved the whole request so a failed venue could be retried, and it
+  ran the moment a deployment had more than one venue, which is every routed one. The
+  read buffer is cleared on the next line either way, so it is handed over instead of
+  copied.
+
+- **Breaking: `openai_wants_stream_usage` is gone, and nothing scans a body to
+  answer it any more.** `stream_options.include_usage` is now an optional output of
+  `openai_to_anthropic_request`.
+
+- **A byte-forwarded request no longer scans its own body for an OpenAI field it
+  cannot contain.**
+
+### Fixed
+
+- **A tool call now counts as the first token on a byte-forwarded stream.** An agent
+  turn whose entire output is a tool call emits no text delta ever, and the
+  byte-forward path looked for `"content":"` or `"text_delta"` and nothing else.
+
 ## [0.35.3]. 2026-08-25
 
 ### Changed

@@ -63,7 +63,10 @@ namespace llmbridge::provider
     /// Whether the request body asks for a streamed response: top-level `stream: true`.
     bool wants_stream(std::string_view body) noexcept;
 
-    std::string openai_to_anthropic_request(std::string_view openai_body);
+    /// `wants_stream_usage`, when given, reports the request's top-level
+    /// `stream_options.include_usage`.
+    std::string openai_to_anthropic_request(std::string_view openai_body,
+                                            bool* wants_stream_usage = nullptr);
 
     /// The same Messages body as Bedrock wants it, and the model id it names.
     ///
@@ -85,12 +88,6 @@ namespace llmbridge::provider
     // An unparseable/foreign body still yields a valid envelope carrying `fallback`
     // as the type, so the caller can always relay the upstream's status code.
     std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
-
-    // True if a streaming OpenAI request asked for the final usage chunk
-    // (`stream_options: {"include_usage": true}`). Cheap on the hot path: a
-    // substring pre-check short-circuits the parse for the common case where the
-    // field is absent entirely.
-    bool openai_wants_stream_usage(std::string_view openai_body);
 
     // ── Google Gemini (generateContent) ─────────────────────────────────────
     // OpenAI chat-completion request body  ->  Gemini generateContent body.
