@@ -1110,3 +1110,16 @@ TEST(ModelOf, SkipsEveryValueShape)
                   R"("f":"a\"b","model":"m"})"),
               "m");
 }
+
+TEST(WantsStream, OnlyATopLevelTrueCounts)
+{
+    using llmbridge::provider::wants_stream;
+    EXPECT_TRUE(wants_stream(R"({"model":"m","messages":[],"stream":true})"));
+    EXPECT_FALSE(wants_stream(R"({"model":"m","stream":false})"));
+    EXPECT_FALSE(wants_stream(R"({"model":"m","messages":[]})"));
+    // The cheap reject must not change the answer for a nested key, which is the
+    // whole reason this is a parser: a tool schema with a `stream` property is not
+    // the request asking to stream.
+    EXPECT_FALSE(wants_stream(R"({"tools":[{"input_schema":{"properties":{"stream":true}}}]})"));
+    EXPECT_TRUE(wants_stream(R"({"tools":[{"input_schema":{"properties":{"stream":true}}}],"stream":true})"));
+}

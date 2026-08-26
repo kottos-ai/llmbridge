@@ -6729,3 +6729,25 @@ TEST_P(ProxyStreamLatency, AnOpenAiClientStillGetsTheTranslatedStream)
     EXPECT_EQ(got.find("event: message_start"), std::string::npos)
         << "Anthropic events reached a client that speaks OpenAI";
 }
+
+// The stream flag is read only for the venue that can be refused for it, so the one
+// case that still needs the answer must keep getting it wherever the key sits in the
+// body. A client that puts `stream` after a large `messages` array is the ordinary
+// case, and it is exactly the one a short-circuit could silently skip.
+TEST_P(ProxyBedrock, AStreamIsRefusedEvenWhenTheFlagIsLastInTheBody)
+{
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        R"({"model":"anthropic.claude-3-5-sonnet-20240620-v1:0",)"
+        R"("messages":[{"role":"user","content":"ping"}],"max_tokens":8,"stream":true})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Authorization: Bearer AKIDEXAMPLE:secret\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    EXPECT_EQ(Client::status_of(c.recv_response()), 400);
+    c.close();
+    shutdown();
+    EXPECT_TRUE(_backend.last_request().empty()) << "a stream reached a Bedrock venue";
+}

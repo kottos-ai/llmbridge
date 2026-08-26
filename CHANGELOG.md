@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.35.3]. 2026-08-25
+
+### Changed
+
+- **The `stream` flag is read only where it can change the answer, cutting the
+  request path 3x on an agent-sized prompt.**
+
+  `wants_stream` also rejects cheaply before walking: a body with no `"stream"`
+  anywhere cannot have a top-level one, and `find` runs at memchr speed. The nested
+  case is still decided by the parser, which a test pins.
+
 ## [0.35.2]. 2026-08-25
 
 ### Fixed

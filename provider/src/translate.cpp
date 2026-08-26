@@ -475,6 +475,8 @@ namespace llmbridge::provider
 
     bool wants_stream(std::string_view body) noexcept
     {
+        // Reject cheaply before walking.
+        if (body.find("\"stream\"") == std::string_view::npos) return false;
         return top_level_value(body, "stream") == "true";
     }
 
