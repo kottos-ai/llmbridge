@@ -81,6 +81,10 @@ namespace llmbridge::provider
         /// usage.cache_creation_input_tokens. Billed above the input rate, so it is
         /// reported separately instead of disappearing into the prompt total.
         [[nodiscard]] long long cache_write_tokens() const noexcept { return _cache_write_tok; }
+        /// The cache-creation write split by entry lifetime, from message_start's
+        /// usage.cache_creation.
+        [[nodiscard]] long long cache_write_5m_tokens() const noexcept { return _cw_5m; }
+        [[nodiscard]] long long cache_write_1h_tokens() const noexcept { return _cw_1h; }
 
         /// True once the first content chunk has been emitted (a text delta, or a
         /// tool call's name/arguments).
@@ -138,5 +142,7 @@ namespace llmbridge::provider
         long long _out_tok = 0; // message_delta:  usage.output_tokens (cumulative)
         long long _cached_tok = 0; // message_start: usage.cache_read_input_tokens
         long long _cache_write_tok = 0; // message_start: usage.cache_creation_input_tokens
+        long long _cw_5m = -1; // usage.cache_creation.ephemeral_5m_input_tokens
+        long long _cw_1h = -1; // usage.cache_creation.ephemeral_1h_input_tokens
     };
 } // namespace llmbridge::provider

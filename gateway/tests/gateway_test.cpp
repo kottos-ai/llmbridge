@@ -5372,7 +5372,9 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
         "event: message_start\n"
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\","
         "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":3000,"
-        "\"cache_creation_input_tokens\":500,\"output_tokens\":1}}}\n\n"
+        "\"cache_creation_input_tokens\":500,"
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":320,"
+        "\"ephemeral_1h_input_tokens\":180},\"output_tokens\":1}}}\n\n"
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
         "event: message_delta\n"
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":19}}\n\n"
@@ -5401,6 +5403,11 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
     // and 2x at one hour, so folding it into the prompt total prices a first turn low.
     // Without this it read -1 and the 500 was indistinguishable from fresh input.
     EXPECT_EQ(r.cache_write_tokens, 500) << "the cache-creation write is reported on its own";
+    // The five-minute entry bills at 1.25x the input rate and the one-hour entry at 2x,
+    // so the total alone cannot be costed. They must sum to it or one of the three lies.
+    EXPECT_EQ(r.cache_write_5m_tokens, 320);
+    EXPECT_EQ(r.cache_write_1h_tokens, 180);
+    EXPECT_EQ(r.cache_write_5m_tokens + r.cache_write_1h_tokens, r.cache_write_tokens);
     EXPECT_EQ(r.tokens_in - r.cached_tokens - r.cache_write_tokens, 10)
         << "what is left is the genuinely fresh input";
 }
@@ -5415,7 +5422,9 @@ TEST_P(ProxyForwardStream, AByteForwardedStreamReportsTheCacheWriteToo)
         "event: message_start\n"
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\","
         "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":3000,"
-        "\"cache_creation_input_tokens\":500,\"output_tokens\":1}}}\n\n"
+        "\"cache_creation_input_tokens\":500,"
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":320,"
+        "\"ephemeral_1h_input_tokens\":180},\"output_tokens\":1}}}\n\n"
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
         "event: message_delta\n"
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":19}}\n\n"
@@ -5445,6 +5454,94 @@ TEST_P(ProxyForwardStream, AByteForwardedStreamReportsTheCacheWriteToo)
     EXPECT_EQ(r.tokens_in, 10 + 3000 + 500);
     EXPECT_EQ(r.cached_tokens, 3000);
     EXPECT_EQ(r.cache_write_tokens, 500) << "byte-forward must match the translated path";
+    EXPECT_EQ(r.cache_write_5m_tokens, 320) << "scan_usage must read the split too";
+    EXPECT_EQ(r.cache_write_1h_tokens, 180);
+}
+
+
+// A provider may state the write total and no breakdown. That is a different fact from
+// a breakdown of zero, and pricing it as all five-minute would undercount every
+// one-hour entry, so it stays -1 and the reader decides what to do about it.
+// A keep-alive client's second request must not inherit the first one's token counts.
+//
+// The non-streaming counters are assigned only where a response body is scanned, so a
+// request that fails before that (here, the provider answering 500, which is relayed
+// without translating) left tok_in/tok_out/tok_cached holding the previous request's
+// numbers. The streaming twins of these fields were reset for exactly this reason and
+// the non-streaming ones were never added to that block. A token count is a bill.
+class ProxyUsage : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyUsage, KeepAliveDoesNotInheritTheLastRequestsTokenCounts)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+
+    // Same client connection, and now the provider fails.
+    const std::string err = R"({"type":"error","error":{"message":"boom"}})";
+    _backend.set_response("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+                          "Connection: keep-alive\r\nContent-Length: " +
+                          std::to_string(err.size()) + "\r\n\r\n" + err);
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].r.tokens_in, 3) << "the first request did report counts";
+    EXPECT_EQ(recs[0].r.tokens_out, 5);
+    EXPECT_EQ(recs[1].r.tokens_in, -1) << "the second scanned no body, so it reported nothing";
+    EXPECT_EQ(recs[1].r.tokens_out, -1);
+    EXPECT_EQ(recs[1].r.cached_tokens, -1);
+    EXPECT_EQ(recs[1].r.cache_write_tokens, -1);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyUsage,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
+
+TEST_P(ProxyForwardStream, ACacheWriteWithNoBreakdownStaysUnsplit)
+{
+    const std::string events =
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\","
+        "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,"
+        "\"cache_creation_input_tokens\":500,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_delta\n"
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":19}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(events, 4096));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":64,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.cache_write_tokens, 500);
+    EXPECT_EQ(recs[0].r.cache_write_5m_tokens, -1) << "absent is not zero";
+    EXPECT_EQ(recs[0].r.cache_write_1h_tokens, -1);
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,
