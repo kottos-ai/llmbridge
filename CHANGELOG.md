@@ -8,6 +8,20 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.41.0]. 2026-08-27
+
+### Added
+
+- **`RequestFacts::model`: the model the client asked for, at the policy seam.** A
+  routing decision keyed on the model had no way to see one.
+
+### Changed
+
+- **`RequestFacts` gains a field, which is a source break for positional
+  initialisation.** `RequestFacts{head, bytes}` still compiles; a build with
+  `-Werror=missing-field-initializers` refuses it, and that is how the two in-tree
+  consumers surfaced. Designated initialisers and `{}` are unaffected.
+
 ## [0.40.0]. 2026-08-27
 
 ### Added

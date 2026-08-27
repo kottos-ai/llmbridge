@@ -3820,11 +3820,12 @@ namespace
             const std::string_view spoofable = llmbridge::net::http::find_header(f.head, "x-tenant");
             seen_spoofable.assign(spoofable.data(), spoofable.size());
             seen_body_bytes = f.body_bytes;
+            seen_model.assign(f.model.data(), f.model.size());
             return _d;
         }
 
         std::atomic<int> calls{0};
-        std::string seen_head, seen_auth, seen_spoofable;
+        std::string seen_head, seen_auth, seen_spoofable, seen_model;
         size_t seen_body_bytes = 0;
 
     private:
@@ -7132,4 +7133,66 @@ TEST_P(ProxyRoute, PipelinedRequestsSurviveTheFailoverHandover)
     b.stop();
     EXPECT_EQ(_gw->stats().requests, 2u) << "both pipelined requests must be served";
     EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// ── the model reaches the policy, and nothing else from the body does ────────
+//
+// A routing decision keyed on the model had no way to see it: RequestFacts carried
+// the head and a byte count, and the model lives in the body. The alternative was to
+// make the caller state the same fact twice, once in the body and once in a header,
+// and keep them consistent on every request.
+TEST_P(ProxyPolicy, ThePolicySeesTheModelTheClientAsked)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.seen_model, "gpt-4o") << "the policy cannot route on what it cannot see";
+}
+
+// The guard is `_sink || _policy`, and a policy-only build is the case that would
+// regress silently: the extraction used to run under `if (_sink)` alone, so a
+// deployment with a policy and no sink would read an empty model and route on it.
+TEST_P(ProxyPolicy, TheModelIsCapturedWithNoSinkInstalled)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    _sink = nullptr; // explicit: this is the configuration under test
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.seen_model, "gpt-4o");
+}
+
+// The line where "metadata only, no prompt text" is true or not. The model crosses
+// because it is a bounded id; the prompt must not follow it.
+TEST_P(ProxyPolicy, ThePromptStillDoesNotReachThePolicy)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body =
+        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"SECRETPROMPT\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.seen_model, "gpt-4o");
+    EXPECT_EQ(pol.seen_head.find("SECRETPROMPT"), std::string::npos) << pol.seen_head;
+    EXPECT_EQ(pol.seen_model.find("SECRETPROMPT"), std::string::npos);
 }
