@@ -3110,6 +3110,21 @@ namespace llmbridge
         if (now - _last_sweep_ns < 50'000'000LL) return; // at most ~20 sweeps/sec
         _last_sweep_ns = now;
 
+        // Placed above every return below, so a build with the idle timeouts off still
+        // reports. One line per interval against ~20 sweeps a second: the comparison is
+        // the cost, and the write(2) happens 0.003 times a second.
+        if (_heartbeat_ns > 0 &&
+            (_last_heartbeat_ns == 0 || now - _last_heartbeat_ns >= _heartbeat_ns))
+        {
+            _last_heartbeat_ns = now;
+            size_t in_flight = 0;
+            for (const auto& [id, c] : _clients)
+                if (!c->doomed && (c->peer != nullptr || c->streaming)) ++in_flight;
+            LB_INFO("heartbeat clients=", _clients.size(), " in_flight=", in_flight,
+                    " pooled_upstreams=", pooled_upstream_count(),
+                    " requests=", _stats.requests);
+        }
+
         // Reap idle pooled upstreams. Providers close idle keep-alives on their own
         // schedule, and discovering a corpse costs a request its retry, so drop them
         // first. Pooled conns have peer == nullptr, so the in-flight scan below skips

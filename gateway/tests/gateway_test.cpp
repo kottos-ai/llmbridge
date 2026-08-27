@@ -608,6 +608,7 @@ namespace
             // state sweep_idle reads, which is a genuine data race TSan reports.
             if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
             if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
+            if (_heartbeat_ns >= 0) _gw->set_heartbeat_ns(_heartbeat_ns);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -638,6 +639,9 @@ namespace
         llmbridge::Policy* _policy = nullptr; // null = stock build, no seam consulted
         std::unique_ptr<DeadPort> _dead; // only when start() was asked for no backend
         llmbridge::RequestSink* _sink = nullptr; // set before start(), like _policy
+        /// Heartbeat interval, -1 leaving the 5 minute default. A member and not a
+        /// tenth positional argument, for the reason start() already gives.
+        int64_t _heartbeat_ns = -1;
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -7195,4 +7199,63 @@ TEST_P(ProxyPolicy, ThePromptStillDoesNotReachThePolicy)
     EXPECT_EQ(pol.seen_model, "gpt-4o");
     EXPECT_EQ(pol.seen_head.find("SECRETPROMPT"), std::string::npos) << pol.seen_head;
     EXPECT_EQ(pol.seen_model.find("SECRETPROMPT"), std::string::npos);
+}
+
+namespace
+{
+    /// Collects finished log lines. The loop thread writes them, so every assertion
+    /// below runs after shutdown() has joined it.
+    class HeartbeatSink final : public llmbridge::net::log::Sink
+    {
+    public:
+        void write(llmbridge::net::log::Level, std::string_view line) noexcept override
+        {
+            text.append(line);
+        }
+        std::string text;
+    };
+} // namespace
+
+class ProxyHeartbeat : public ProxyIT,
+                       public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyHeartbeat,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
+// ── the gateway says what it is holding, on a schedule ──────────────────────
+//
+// accept and close are LB_DEBUG, and Release compiles the Debug floor out, so a
+// shipped gateway said nothing about its own connections. An operator draining a node
+// before an upgrade had nothing to watch, which is the whole reason this exists, so
+// the level matters as much as the content.
+TEST_P(ProxyHeartbeat, TheHeartbeatReportsConnectionsAtInfo)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    _heartbeat_ns = 1'000'000; // 1 ms; the sweep's own 50 ms gate paces it
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // several 200 ms ticks
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+
+    EXPECT_NE(sink.text.find("heartbeat"), std::string::npos) << sink.text;
+    // Every field, because a heartbeat missing the one an operator drains on is worse
+    // than none: it reads as reassurance.
+    for (const char* field : {"clients=", "in_flight=", "pooled_upstreams=", "requests="})
+        EXPECT_NE(sink.text.find(field), std::string::npos) << field << " in:\n" << sink.text;
+}
+
+// 0 is off. An operator who does not want the line must be able to silence it without
+// patching the binary, and a test that never checks the off switch leaves it unproven.
+TEST_P(ProxyHeartbeat, AZeroIntervalSilencesTheHeartbeat)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    _heartbeat_ns = 0;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+
+    EXPECT_EQ(sink.text.find("heartbeat"), std::string::npos) << sink.text;
 }
