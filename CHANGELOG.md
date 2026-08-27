@@ -8,6 +8,37 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.40.0]. 2026-08-27
+
+### Added
+
+- **`cache_write_5m_tokens` and `cache_write_1h_tokens`: the cache-creation write split
+  by the entry's lifetime.** v0.39.0 reported the total, and the total cannot be costed:
+  Anthropic bills a five-minute entry at 1.25x the input rate and a one-hour entry at
+  2x.
+
+  Read from `usage.cache_creation` (`ephemeral_5m_input_tokens`,
+  `ephemeral_1h_input_tokens`) on all four paths: the SSE translator parses the nested
+  object, `scan_usage` finds the keys in a byte-forwarded stream's tail, and both
+  non-streaming paths read them per backend. Both stay -1 when the provider states a
+  total and no breakdown, which is not a breakdown of zero.
+
+  On a translated non-streaming response they come from the provider's own body.
+  OpenAI defines no field for a cache-creation write, so scanning the translated body
+  finds nothing and reports -1 without saying so.
+
+### Fixed
+
+- **v0.39.0's `cache_write_tokens` was never assigned on the non-streaming path.** The
+  field was declared and read, and nothing set it, so every non-streamed request
+  reported -1.
+
+- **A keep-alive client's request could report the previous request's token counts.**
+  `tok_in`, `tok_out` and `tok_cached` are assigned only where a response body is
+  scanned and were missing from the per-request reset, so a second request that fails
+  before the scan carried the first one's numbers. The streaming twins were reset for
+  exactly this reason. A token count is a bill, not a log line.
+
 ## [0.39.0]. 2026-08-27
 
 ### Added

@@ -188,6 +188,14 @@ namespace llmbridge::provider
                     _cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
                     _cache_write_tok =
                         detail::to_ll(u->num_or("cache_creation_input_tokens", "0"));
+                    // The write is priced by the entry's lifetime, so the total cannot
+                    // be costed on its own. Absent breakdown stays -1, which is not the
+                    // same fact as a breakdown of zero.
+                    if (const json::Value* cc = u->find("cache_creation"))
+                    {
+                        _cw_5m = detail::to_ll(cc->num_or("ephemeral_5m_input_tokens", "0"));
+                        _cw_1h = detail::to_ll(cc->num_or("ephemeral_1h_input_tokens", "0"));
+                    }
                     _in_tok = fresh + _cached_tok + _cache_write_tok;
                 }
             }
