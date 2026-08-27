@@ -27,6 +27,9 @@ namespace llmbridge
     {
         std::string_view head;  ///< request line + headers, through the CRLFCRLF
         size_t body_bytes = 0;  ///< Content-Length as framed. Bytes, not tokens
+        /// The top-level `model` the client asked for, empty when the body named none
+        /// or spelled it as anything but a plain string.
+        std::string_view model;
     };
 
     struct Decision

@@ -677,6 +677,9 @@ namespace llmbridge
         /// sink_capture runs at framing (bounded header copies + wall clock);
         /// sink_emit at every completion, streams and error replies included.
         void sink_capture(Connection* c) noexcept;
+        /// The client's model id into `sink_model`. Shared, and separate from
+        /// sink_capture because the policy reads it before deciding.
+        void capture_model(Connection* c) noexcept;
         void sink_emit(Connection* c, int status, bool streamed) noexcept;
 
         /// Ask the policy for another venue and re-dispatch there. True when the

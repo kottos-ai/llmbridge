@@ -2293,6 +2293,7 @@ namespace llmbridge
         if (c->msg.encoded) { ep_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
+        if (_sink || _policy) capture_model(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam, one call site per backend. Here because framing has
         // succeeded but nothing is translated, no credential mapped and no upstream
@@ -2355,12 +2356,14 @@ namespace llmbridge
             if (n) std::memcpy(c->sink_cap[i], v.data(), n);
             c->sink_cap_len[i] = static_cast<uint8_t>(n);
         }
-        // The one body read on the byte-forward path, and it happens only with a sink
-        // installed. A stock build parses nothing here, as before.
-        //
-        // Dropped instead of truncated when it does not fit: a sink compares this
-        // against configured names, and half a name matches none of them, so a
-        // truncation would be indistinguishable from a real mismatch.
+    }
+
+    // The one body read on the byte-forward path, and it happens only with a sink or
+    // a policy installed. A stock build parses nothing here, as before.
+    // Split out of sink_capture because a policy needs it too and needs it before the
+    // decision, while sink_capture's other work is only ever read at the end.
+    void Gateway::capture_model(Connection* c) noexcept
+    {
         c->sink_model_len = 0;
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
         const std::string_view model = provider::model_of(body);
@@ -2455,9 +2458,10 @@ namespace llmbridge
 
     Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
     {
-        // Head only. The body is deliberately unreachable from RequestFacts: this is
-        // the line where "metadata only, no prompt text" is either true or not.
-        const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len};
+        // Head, plus the model identifier and nothing else from the body. This is the
+        // line where "metadata only, no prompt text".
+        const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len,
+                                 std::string_view(c->sink_model, c->sink_model_len)};
 
         Decision d = _policy->decide(facts);
         if (d.allow)
@@ -3889,6 +3893,7 @@ namespace llmbridge
         if (c->msg.encoded) { ur_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
+        if (_sink || _policy) capture_model(c);
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam; see the epoll mirror for why it sits exactly here.
         // Default to the first upstream, so a build with no policy, and a policy that
