@@ -1593,7 +1593,7 @@ TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
     EXPECT_TRUE(_backend.last_request().empty()) << "request reached upstream despite bad credential";
 }
 
-// ── a compressed request body is refused, never forwarded ───────────────────
+// ── a compressed request body is refused, never forwarded ───────────────
 //
 // Nothing here inflates a body, and every reader downstream scans bytes assuming
 // JSON: wants_stream, model_of and the translator. Accepting one meant forwarding a
@@ -1602,25 +1602,38 @@ TEST_P(ProxyAuth, CredentialWithBareCrCannotInjectUpstreamHeader)
 // Fail closed instead, and do not contact the provider.
 TEST_P(ProxyAuth, CompressedRequestBodyIsRefusedAndNeverForwarded)
 {
+    // Both request shapes, because the refusal must land before dialect resolution:
+    // /v1/messages to an Anthropic venue byte-forwards, /v1/chat/completions to the
+    // same venue translates. A check that drifted after the resolver would refuse
+    // one and forward the other, and one shape alone would not notice.
+    //
+    // One gateway, a fresh connection per shape: a 415 closes the connection, and
+    // restarting the fixture inside the test aborts in teardown.
     _backend.set_response(http_ok(anthropic_resp_body("ok")));
     start(0, true, UpstreamDialect::Anthropic, GetParam());
-    Client c;
-    ASSERT_TRUE(c.connect(_proxy_port));
-    // Real gzip member bytes, not a stand-in: the point is that a body the parser
-    // cannot read is refused on the header alone, before anything reads the body.
-    const std::string body("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xae\x05\x00", 14);
-    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
-                       "Authorization: Bearer sk-test\r\n"
-                       "Content-Type: application/json\r\n"
-                       "Content-Encoding: gzip\r\n"
-                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
-    const std::string resp = c.recv_response();
-    EXPECT_NE(resp.find("415"), std::string::npos) << resp;
-    // 415 is in neither status table by default, and an unlisted code falls through
-    // to 502 Bad Gateway. Pin the phrase, or a refusal silently blames the upstream.
-    EXPECT_NE(resp.find("Unsupported Media Type"), std::string::npos) << resp;
-    EXPECT_TRUE(_backend.last_request().empty())
-        << "a body the gateway cannot read reached the provider:\n" << _backend.last_request();
+    for (const char* target : {"/v1/messages", "/v1/chat/completions"})
+    {
+        SCOPED_TRACE(target);
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        // A real gzip member, not a stand-in: the point is that a body the parser
+        // cannot read is refused on the header alone, before anything reads the body.
+        const std::string body("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xae\x05\x00", 14);
+        ASSERT_TRUE(c.send(std::string("POST ") + target + " HTTP/1.1\r\nHost: x\r\n"
+                           "Authorization: Bearer sk-test\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Content-Encoding: gzip\r\n"
+                           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+        const std::string resp = c.recv_response();
+        EXPECT_NE(resp.find("415"), std::string::npos) << resp;
+        // 415 is in neither status table by default, and an unlisted code falls
+        // through to 502 Bad Gateway. Pin the phrase, or a refusal blames the
+        // upstream for something the client did.
+        EXPECT_NE(resp.find("Unsupported Media Type"), std::string::npos) << resp;
+        EXPECT_TRUE(_backend.last_request().empty())
+            << "a body the gateway cannot read reached the provider:\n" << _backend.last_request();
+        c.close();
+    }
 }
 
 // identity is not a compression, so it must still be served. A gateway that refuses
@@ -1635,53 +1648,6 @@ TEST_P(ProxyAuth, IdentityEncodingIsStillServed)
     const std::string resp = c.recv_response();
     EXPECT_NE(resp.find("200"), std::string::npos) << resp;
     EXPECT_FALSE(_backend.last_request().empty()) << "identity was refused as if compressed";
-}
-
-// ── a compressed request body is refused, never guessed at ──────────────────
-//
-// Nothing here inflates a body, and every reader downstream scans bytes assuming
-// JSON: wants_stream, model_of and the translator. Accepting one meant forwarding a
-// request whose stream flag and model name had been read out of a gzip stream, and
-// the visible symptom was a stream served as a non-stream. It is refused instead.
-TEST_P(ProxyAuth, CompressedRequestBodyIsRefusedAndNeverReachesUpstream)
-{
-    _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, UpstreamDialect::Anthropic, GetParam());
-    Client c;
-    ASSERT_TRUE(c.connect(_proxy_port));
-    // Real gzip magic, so this is the request a compressing client actually sends
-    // and not a header with JSON behind it.
-    const std::string body = std::string("\x1f\x8b\x08\x00\x00\x00\x00\x00", 8) + "payload";
-    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
-                       "Authorization: Bearer sk-test\r\n"
-                       "Content-Encoding: gzip\r\n"
-                       "Content-Type: application/json\r\nContent-Length: " +
-                       std::to_string(body.size()) + "\r\n\r\n" + body));
-    const std::string resp = c.recv_response();
-    EXPECT_NE(resp.find("415"), std::string::npos) << resp;
-    EXPECT_NE(resp.find("Unsupported Media Type"), std::string::npos)
-        << "415 is absent from the status tables, so it answered as something else:\n" << resp;
-    EXPECT_TRUE(_backend.last_request().empty())
-        << "a body the gateway cannot read reached the upstream:\n" << _backend.last_request();
-}
-
-// identity is the explicit no-op coding. Refusing it would reject a correct request.
-TEST_P(ProxyAuth, IdentityEncodingIsAccepted)
-{
-    _backend.set_response(http_ok(anthropic_resp_body("ok")));
-    start(0, true, UpstreamDialect::Anthropic, GetParam());
-    Client c;
-    ASSERT_TRUE(c.connect(_proxy_port));
-    const std::string body =
-        "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
-    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
-                       "Authorization: Bearer sk-test\r\n"
-                       "Content-Encoding: identity\r\n"
-                       "Content-Type: application/json\r\nContent-Length: " +
-                       std::to_string(body.size()) + "\r\n\r\n" + body));
-    const std::string resp = c.recv_response();
-    EXPECT_NE(resp.find("200"), std::string::npos) << resp;
-    EXPECT_FALSE(_backend.last_request().empty()) << "identity was refused";
 }
 
 // A second Authorization header cannot smuggle past the check by hiding behind a
@@ -5431,6 +5397,54 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
     EXPECT_EQ(r.cached_tokens, 3000) << "cached is the read subset of in";
     EXPECT_EQ(r.tokens_out, 19);
     EXPECT_EQ(r.tokens_in - r.cached_tokens, 510) << "in - cached is the full-rate part";
+    // The write is billed above the input rate, 1.25x at Anthropic's five-minute TTL
+    // and 2x at one hour, so folding it into the prompt total prices a first turn low.
+    // Without this it read -1 and the 500 was indistinguishable from fresh input.
+    EXPECT_EQ(r.cache_write_tokens, 500) << "the cache-creation write is reported on its own";
+    EXPECT_EQ(r.tokens_in - r.cached_tokens - r.cache_write_tokens, 10)
+        << "what is left is the genuinely fresh input";
+}
+
+// A byte-forwarded stream is the Claude Code path: nothing translates the events, so
+// the counts come from scan_usage over the tail. It must agree with the translated
+// path above, or the same request priced differently depending on which venue served
+// it, which is precisely the comparison the tape exists to make.
+TEST_P(ProxyForwardStream, AByteForwardedStreamReportsTheCacheWriteToo)
+{
+    const std::string events =
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\","
+        "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":3000,"
+        "\"cache_creation_input_tokens\":500,\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_delta\n"
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":19}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(events, 4096));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Anthropic in, Anthropic out: the pair matches, so the bytes are forwarded and
+    // nothing parses the events.
+    const std::string body =
+        "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":64,\"stream\":true,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.tokens_in, 10 + 3000 + 500);
+    EXPECT_EQ(r.cached_tokens, 3000);
+    EXPECT_EQ(r.cache_write_tokens, 500) << "byte-forward must match the translated path";
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyForwardStream,

@@ -823,7 +823,7 @@ namespace llmbridge
         // of completion text. On no match the headers are simply omitted. The
         // existing rule everywhere in this file is to omit instead of report a
         // number we did not measure.
-        struct BodyUsage { long long in = -1, out = -1, cached = -1; };
+        struct BodyUsage { long long in = -1, out = -1, cached = -1, cache_write = -1; };
 
         /// Bytes of a response worth searching for a usage block.
         ///
@@ -865,6 +865,8 @@ namespace llmbridge
             u.in = num_after("\"prompt_tokens\"");
             u.out = num_after("\"completion_tokens\"");
             u.cached = num_after("\"cached_tokens\"");
+            // No cache-write count is read on this branch. OpenAI bills the write on the
+            // GPT-5.6 family, but the field it reports it under is not verified here.
             if (u.in >= 0 || u.out >= 0) return u; // OpenAI shape, done
 
             // Anthropic names the same three things differently, and a byte-forwarded
@@ -880,12 +882,14 @@ namespace llmbridge
             // part only, with cache reads and the cache-creation write reported
             // separately. Add them back: `in` is the whole prompt, `cached` is the
             // discounted read subset of it, so `in - cached` is the full-rate part on
-            // both. The creation write is premium-priced and folded into `in` but not
-            // separated; the tape has no field for it, and first-turn cost undercounts.
+            // both. The creation write is part of `in` too and is reported separately in
+            // `cache_write`, because it is billed above the input rate and a caller that
+            // cannot see it prices a first turn low.
             const long long read = num_after("\"cache_read_input_tokens\"");
             const long long write = num_after("\"cache_creation_input_tokens\"");
             u.cached = read > 0 ? read : 0;
-            u.in = fresh + u.cached + (write > 0 ? write : 0);
+            u.cache_write = write > 0 ? write : 0;
+            u.in = fresh + u.cached + u.cache_write;
             return u;
         }
 
@@ -1123,6 +1127,8 @@ namespace llmbridge
             // carries the real total.
                 if (client->usage_in < 0 && u.in >= 0) client->usage_in = u.in;
                 if (client->usage_cached < 0 && u.cached >= 0) client->usage_cached = u.cached;
+                if (client->usage_cache_write < 0 && u.cache_write >= 0)
+                    client->usage_cache_write = u.cache_write;
                 if (u.out >= 0) client->usage_out = u.out;
             }
             // Trimmed last, so the buffer stays bounded across reads while every read
@@ -1146,10 +1152,11 @@ namespace llmbridge
         {
             if (c->sse_xlate)
                 return {c->sse_xlate->input_tokens(), c->sse_xlate->output_tokens(),
-                        static_cast<long long>(c->sse_xlate->cached_tokens())};
+                        static_cast<long long>(c->sse_xlate->cached_tokens()),
+                        static_cast<long long>(c->sse_xlate->cache_write_tokens())};
             // Accumulated by stream_note_usage as the stream ran. Reading the tail
             // here instead would miss anything stated before the last 2 KiB.
-            return {c->usage_in, c->usage_out, c->usage_cached};
+            return {c->usage_in, c->usage_out, c->usage_cached, c->usage_cache_write};
         }
 
         // Did this stream end, or did it just stop? The two are not the same, and one
@@ -2374,6 +2381,7 @@ namespace llmbridge
             r.tokens_in = c->sse_xlate->input_tokens();
             r.tokens_out = c->sse_xlate->output_tokens();
             r.cached_tokens = static_cast<int32_t>(c->sse_xlate->cached_tokens());
+            r.cache_write_tokens = static_cast<int32_t>(c->sse_xlate->cache_write_tokens());
         }
         else if (streamed)
         {
@@ -2384,12 +2392,14 @@ namespace llmbridge
             r.tokens_in = static_cast<int32_t>(u.in);
             r.tokens_out = static_cast<int32_t>(u.out);
             r.cached_tokens = static_cast<int32_t>(u.cached);
+            r.cache_write_tokens = static_cast<int32_t>(u.cache_write);
         }
         else if (!streamed)
         {
             r.tokens_in = static_cast<int32_t>(c->tok_in);
             r.tokens_out = static_cast<int32_t>(c->tok_out);
             r.cached_tokens = static_cast<int32_t>(c->tok_cached);
+            r.cache_write_tokens = static_cast<int32_t>(c->tok_cache_write);
         }
         for (size_t i = 0; i < kSinkCaptureMax; ++i)
             r.captured[i] = std::string_view(c->sink_cap[i], c->sink_cap_len[i]);
@@ -2404,7 +2414,7 @@ namespace llmbridge
         // keep-alive client's second stream inherited the first one's token counts,
         // because nothing cleared them between requests.
         c->stream_tail.clear();
-        c->usage_in = c->usage_out = c->usage_cached = -1;
+        c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
         c->ts_first_token = 0;
         // Defensive, not a fixed bug: the only reader of `wants_usage` runs on a
         // translated Anthropic request, and that translation writes the field.

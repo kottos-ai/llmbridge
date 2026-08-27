@@ -50,6 +50,8 @@ namespace llmbridge
         int32_t tokens_in = -1;   ///< streaming only, from the provider's usage; -1 unknown
         int32_t tokens_out = -1;
         int32_t cached_tokens = -1; ///< input tokens the provider served from cache; -1 unknown
+        /// Input tokens written to the provider's prompt cache this request.
+        int32_t cache_write_tokens = -1;
         bool streamed = false;
         /// The client sent a Content-Encoding other than identity. Every body-reading
         /// caller here assumes JSON, so this request was parsed as something it is not.
