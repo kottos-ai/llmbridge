@@ -8,6 +8,21 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.42.0]. 2026-08-27
+
+### Added
+
+- **A heartbeat line, every five minutes at Info: `clients`, `in_flight`,
+  `pooled_upstreams`, `requests`.**
+
+  It hangs off `sweep_idle`, which both backends already call on the same 200 ms tick,
+  so there is no new timer and nothing to keep in step between the two loops. One
+  timestamp comparison per sweep against one `write(2)` every 300 s. The first line
+  lands a tick after boot instead of an interval in, so the mechanism proves itself
+  without a five minute wait.
+
+  `--heartbeat` is not a flag yet; `set_heartbeat_ns(0)` silences it.
+
 ## [0.41.0]. 2026-08-27
 
 ### Added

@@ -543,6 +543,9 @@ namespace llmbridge
         // of the requests and crosses this line far more often. Every crossing costs
         // the next request a full reconnect. Hence a knob, not a constant.
         static constexpr int64_t kDefaultPoolIdleNs = 30LL * 1000 * 1000 * 1000; // 30 s
+
+        /// How often the gateway says how many connections it is holding.
+        static constexpr int64_t kDefaultHeartbeatNs = 300LL * 1000 * 1000 * 1000; // 5 min
         // How long a client may stay connected without completing one request.
         // Covers a TLS handshake that never finishes, a half-sent request, and a
         // client speaking the wrong protocol (TLS at a plaintext listener frames
@@ -596,6 +599,8 @@ namespace llmbridge
         void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
         /// Test seam, same contract: call before run(). 0 disables pool reaping.
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
+        /// Test seam and an operational dial. 0 silences the heartbeat.
+        void set_heartbeat_ns(int64_t ns) noexcept { _heartbeat_ns = ns; }
         /// Optional per-request metadata sink (sink.hpp). Non-owning; call before
         /// run(). `capture` names up to kSinkCaptureMax request headers whose values
         /// are copied (bounded) and handed back in RequestRecord::captured.
@@ -938,6 +943,11 @@ namespace llmbridge
 #endif
         unsigned _uring_buf_count = 0;     // 0 = kUrBufCount default (test hook only)
         int64_t _last_sweep_ns = 0;
+        int64_t _heartbeat_ns = kDefaultHeartbeatNs;
+        /// 0 until the first sweep emits, which it does immediately: the first line is
+        /// a tick after boot, so an operator learns the heartbeat works without
+        /// waiting an interval for it.
+        int64_t _last_heartbeat_ns = 0;
         bool _uring_active = false;
 
         int _epfd = -1;
