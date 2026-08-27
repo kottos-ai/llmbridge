@@ -251,6 +251,7 @@ namespace llmbridge
         long long tok_in = -1;
         long long tok_out = -1;
         long long tok_cached = -1; // non-streaming: prompt_tokens_details.cached_tokens
+        long long tok_cache_write = -1; // usage.cache_creation_input_tokens, when stated
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool request_pending = false; // client-only: full request buffered, awaiting forward
@@ -380,6 +381,7 @@ namespace llmbridge
         /// Fields, and not a tail scan at the end, because Anthropic states input
         /// and cache tokens in its first event and the tail has scrolled past them.
         long long usage_in = -1, usage_out = -1, usage_cached = -1;
+        long long usage_cache_write = -1; // cache_creation_input_tokens, first-wins
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         // io_uring streaming only: translated output accumulates in `wpending`
         // while a client send SQE is in flight, so `wbuf` (the send's buffer) is

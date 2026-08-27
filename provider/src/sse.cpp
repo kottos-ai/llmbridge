@@ -186,9 +186,9 @@ namespace llmbridge::provider
                     const long long fresh = detail::to_ll(u->num_or("input_tokens", "0"));
                     _out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
                     _cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
-                    const long long write =
+                    _cache_write_tok =
                         detail::to_ll(u->num_or("cache_creation_input_tokens", "0"));
-                    _in_tok = fresh + _cached_tok + write;
+                    _in_tok = fresh + _cached_tok + _cache_write_tok;
                 }
             }
             ensure_created();

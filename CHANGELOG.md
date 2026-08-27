@@ -8,6 +8,13 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.39.0]. 2026-08-27
+
+### Added
+
+- **`cache_write_tokens` on the sink record: the input tokens written to the
+  provider's prompt cache.**
+
 ## [0.38.0]. 2026-08-26
 
 ### Added
