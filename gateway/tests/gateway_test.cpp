@@ -5128,6 +5128,48 @@ TEST_P(ProxyRoute, AFramingErrorRecordDoesNotInheritThePreviousRequests)
 // A request that omits a captured header is the common case, and find_header returns
 // a null view for it. Copying 0 bytes from a null pointer is undefined behaviour even
 // though it "works": UBSan flags it, and no test sent such a request until this one.
+// A sink writes to disk, so "no credential reaches the sink" must be a property of the
+// code and not a convention the integrator remembers. Asking for one is refused, and
+// the request still serves normally: the refusal is about what is recorded, never about
+// whether the credential still reaches the upstream that needs it.
+TEST_P(ProxyRoute, ACredentialHeaderCanNeverBeCaptured)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    // Two credentials and one legitimate header, asked for together.
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
+          {"authorization", "x-kottos-run", "x-api-key"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                       "Authorization: Bearer sk-secret-value\r\n"
+                       "x-api-key: sk-another-secret\r\n"
+                       "x-kottos-run: my-run\r\n"
+                       "Content-Type: application/json\r\nContent-Length: 27\r\n\r\n"
+                       "{\"model\":\"m\",\"messages\":[]}"));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    // The legitimate header took the first slot, because the credentials were never
+    // registered at all rather than registered and blanked.
+    EXPECT_EQ(recs[0].cap[0], "my-run");
+    for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
+    {
+        EXPECT_EQ(recs[0].cap[i].find("sk-secret-value"), std::string::npos)
+            << "a bearer token reached the sink at slot " << i;
+        EXPECT_EQ(recs[0].cap[i].find("sk-another-secret"), std::string::npos)
+            << "an api key reached the sink at slot " << i;
+    }
+}
+
+
 TEST_P(ProxyRoute, ACaptureConfiguredButAbsentIsEmptyAndNotUndefined)
 {
     NamedBackend b;
