@@ -1104,6 +1104,37 @@ namespace llmbridge
         /// Bounded and only kept when the client asked for usage: with no
         /// `stream_options.include_usage` the provider sends no usage chunk, so the
         /// copy would buy nothing.
+        /// The first chunk carrying a visible token, on the byte-forward path.
+        ///
+        /// Empty content is not a token. OpenAI opens a stream with
+        /// {"role":"assistant","content":""} and matching that collapsed TTFT to TTFB
+        /// on every OpenAI-dialect stream.
+        static bool sse_carries_first_token(std::string_view s) noexcept
+        {
+            constexpr std::string_view kContent = "\"content\":\"";
+            for (size_t pos = s.find(kContent); pos != std::string_view::npos;
+                 pos = s.find(kContent, pos + 1))
+            {
+                const size_t v = pos + kContent.size();
+                if (v >= s.size()) return false; // value byte not in this read yet
+                if (s[v] != '"') return true;    // non-empty content
+            }
+            return s.find("\"text_delta\"") != std::string_view::npos ||
+                   s.find("\"type\":\"tool_use\"") != std::string_view::npos ||
+                   s.find("\"tool_calls\"") != std::string_view::npos;
+        }
+
+        /// The first reasoning marker on the wire, shared by both stamp sites so the
+        /// two never diverge. `thinking_delta` (Anthropic) and `reasoning_content`
+        /// (OpenAI-dialect) are the streamed forms; `redacted_thinking` is the block
+        /// Anthropic emits when it safety-filters the chain of thought.
+        static bool sse_carries_thinking(std::string_view s) noexcept
+        {
+            return s.find("\"thinking_delta\"") != std::string_view::npos ||
+                   s.find("\"reasoning_content\"") != std::string_view::npos ||
+                   s.find("\"redacted_thinking\"") != std::string_view::npos;
+        }
+
         void stream_note_usage(Connection* client, std::string_view bytes) noexcept
         {
             client->stream_tail.append(bytes);
@@ -1235,28 +1266,11 @@ namespace llmbridge
                 if (!sse_in.empty())
                 {
                     stream_note_usage(client, sse_in);
-                    // TTFT on the first payload carrying content, so a role-only
-                    // opening chunk does not claim the token arrived early. The
-                    // quote before `content` keeps `reasoning_content` out of it.
-                    // The first content-bearing chunk in either dialect. OpenAI says
-                    // `"content":"`; Anthropic says `text_delta`, and its
-                    // `content_block_start` carries an empty `"text":""` that is not
-                    // a token, which is why the delta is what counts.
-                    //
-                    // A tool call counts too.
-                    // Both dialects: Anthropic streams `thinking_delta`, an
-                    // OpenAI-dialect upstream streams `reasoning_content`, which the
-                    // token match below already excludes by requiring the quote
-                    // before `content`.
-                    if (client->ts_first_thinking == 0 &&
-                        (sse_in.find("\"thinking_delta\"") != std::string::npos ||
-                         sse_in.find("\"reasoning_content\"") != std::string::npos))
+                    // Reasoning is stamped before the token, because it comes first on
+                    // the wire and one read can carry both. See the two helpers.
+                    if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
                         client->ts_first_thinking = now_ns();
-                    if (client->ts_first_token == 0 &&
-                        (sse_in.find("\"content\":\"") != std::string::npos ||
-                         sse_in.find("\"text_delta\"") != std::string::npos ||
-                         sse_in.find("\"type\":\"tool_use\"") != std::string::npos ||
-                         sse_in.find("\"tool_calls\"") != std::string::npos))
+                    if (client->ts_first_token == 0 && sse_carries_first_token(sse_in))
                         client->ts_first_token = now_ns();
                     out.append(sse_in);
                 }
@@ -1282,9 +1296,7 @@ namespace llmbridge
             // the bytes.
             // Before the token stamp, because reasoning comes first on the wire and a
             // single read can carry both.
-            if (client->ts_first_thinking == 0 &&
-                (sse_in.find("\"thinking_delta\"") != std::string::npos ||
-                 sse_in.find("\"reasoning_content\"") != std::string::npos))
+            if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
                 client->ts_first_thinking = now_ns();
             if (client->ts_first_token == 0 && client->sse_xlate->content_started())
                 client->ts_first_token = now_ns();

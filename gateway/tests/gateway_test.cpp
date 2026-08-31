@@ -2821,6 +2821,27 @@ namespace
                sse_chunk_encode(anthropic_sse_thinking_events(), chunk);
     }
 
+    // Anthropic emits a redacted_thinking block, not thinking_delta, when it
+    // safety-filters the chain of thought: the encrypted reasoning rides in the block
+    // start's `data` field with no visible-token marker anywhere.
+    std::string anthropic_sse_redacted_events()
+    {
+        return
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+            "{\"id\":\"msg_r\",\"model\":\"claude\",\"usage\":{\"input_tokens\":9}}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EmEncrypted\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello.\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+            "{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    }
+
     std::string sse_tool_response(size_t chunk)
     {
         return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
@@ -5225,6 +5246,95 @@ TEST_P(ProxyStream, ReasoningIsStampedInTheOpenAiDialectToo)
     // The reason the token match requires the quote before `content`:
     // `reasoning_content` must not be taken for the first token the caller sees.
     EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+}
+
+
+// The OpenAI role-priming chunk is {"role":"assistant","content":""}, and matching its
+// empty "content":"" collapsed TTFT to TTFB on every OpenAI-dialect byte-forward
+// stream. A completion whose only content is empty produced no visible token, so its
+// ts_first_token must stay 0, which is what the buggy match got wrong.
+TEST_P(ProxyStream, AnEmptyContentChunkDoesNotStampTheFirstToken)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 1));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.ts_first_token, 0u)
+        << "empty content is not a token; stamping it collapsed TTFT to TTFB";
+}
+
+
+// The priming chunk must not swallow the real one: after {"content":""} a genuine
+// {"content":"Hello."} still stamps. With the test above proving empty never stamps, a
+// non-zero stamp here can only be the real content.
+TEST_P(ProxyStream, RealContentAfterAnEmptyChunkStillStampsTheFirstToken)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 1));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_token, 0u) << "real content must stamp the first token";
+    EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+}
+
+
+// redacted_thinking matches none of the visible-token markers. Without its own match
+// the whole redacted reasoning phase is charged to prefill, the bug 0.43.0 fixed,
+// resurfacing on the subset of streams whose reasoning is filtered.
+TEST_P(ProxyStream, RedactedThinkingIsStampedAsReasoning)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(anthropic_sse_redacted_events(), 1));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed st = parse_streamed(c.recv_all());
+    ASSERT_TRUE(st.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_thinking, 0u) << "redacted_thinking must stamp the reasoning";
+    EXPECT_LE(r.ts_first_thinking, r.ts_first_token);
 }
 
 

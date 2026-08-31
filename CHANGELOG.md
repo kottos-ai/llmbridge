@@ -8,6 +8,28 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.43.1]. 2026-08-31
+
+### Fixed
+
+- **TTFT stamped at the empty role-priming chunk on OpenAI-dialect byte-forward
+  streams.** OpenAI opens a stream with `{"role":"assistant","content":""}`, and the
+  first-token match keyed on the substring `"content":"`, which the empty value
+  contains. So `ts_first_token` was stamped at the response head on every
+  OpenAI-dialect stream, collapsing TTFT to TTFB and, since OpenAI reasoning models do
+  not stream a reasoning marker, making the whole prefill/generation split wrong for
+  the dialect.
+
+- **`ts_first_thinking` never matched `redacted_thinking`.** Anthropic emits a
+  `redacted_thinking` block instead of `thinking_delta` when it safety-filters the
+  chain of thought.
+
+### Known limitation
+
+- A reasoning or content marker split exactly across two reads is missed by the
+  per-read substring search and stamps late or not at all.
+
+
 ## [0.43.0]. 2026-08-29
 
 ### Added
