@@ -1469,7 +1469,14 @@ namespace llmbridge
         _listen_conn->fd = _listen_fd;
         ep_add_read(_listen_conn);
         LB_INFO("listening port=", _listen_port, " upstreams=",
-                static_cast<int64_t>(_upstreams.size()));
+                static_cast<int64_t>(_upstreams.size()),
+                _tls.client_tls ? " inbound=tls" : " inbound=plaintext");
+        if (!_tls.client_tls)
+            LB_WARN("inbound TLS is off and the listener accepts every interface, so a "
+                    "client's Authorization crosses the network in clear. Safe as a "
+                    "loopback sidecar behind something that terminates TLS; unsafe as a "
+                    "remote endpoint. Build -DLLMBRIDGE_TLS=ON and run --listen-tls "
+                    "--tls-cert --tls-key to terminate it here.");
         for (size_t i = 0; i < _upstreams.size(); ++i)
             LB_INFO("  upstream[", static_cast<int64_t>(i), "] ", _upstreams[i].ip, ":",
                     _upstreams[i].port, _upstreams[i].tls ? " tls" : " plaintext",
@@ -2370,6 +2377,15 @@ namespace llmbridge
         ep_forward(c); // resolves the translation for the chosen venue; see ep_forward
     }
 
+    // The header names that carry a credential, which is the set this gateway extracts
+    // and re-emits: authorization and x-api-key (Bearer / Anthropic), x-goog-api-key
+    // (Gemini), and api-key (Azure).
+    static bool is_credential_header(std::string_view lowered) noexcept
+    {
+        return lowered == "authorization" || lowered == "x-api-key" ||
+               lowered == "x-goog-api-key" || lowered == "api-key";
+    }
+
     void Gateway::set_request_sink(RequestSink* sink, std::vector<std::string> capture)
     {
         _sink = sink;
@@ -2379,6 +2395,12 @@ namespace llmbridge
             if (_sink_capture_names.size() == kSinkCaptureMax) break;
             for (char& ch : h)
                 ch = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+            if (is_credential_header(h))
+            {
+                LB_ERROR("sink capture refused for header ", h.c_str(),
+                         ": it carries a credential, which must never reach a sink");
+                continue;
+            }
             _sink_capture_names.push_back(std::move(h));
         }
     }

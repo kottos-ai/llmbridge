@@ -8,6 +8,19 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.44.1]. 2026-08-31
+
+### Changed
+
+- **A plaintext listener says so, loudly, at startup.** The upstream leg has always
+  warned when it is plaintext; the inbound leg, which carries the client's own
+  credential, said nothing.
+
+- **A credential header can never be captured into a sink.** `set_request_sink` took
+  whatever header names the integrator asked for, so asking for `authorization` would
+  have copied the bearer token into every record, and a sink writes to disk.
+
+
 ## [0.44.0]. 2026-08-31
 
 ### Added
