@@ -334,6 +334,8 @@ namespace llmbridge
         int64_t ts_up_recvd = 0;
         // Streaming only, and deliberately outside the t0-t6 scheme.
         int64_t ts_first_token = 0;
+        // The first thinking delta, when the model emits one.
+        int64_t ts_first_thinking = 0;
         // Last time this request saw any upstream progress (request forwarded, or
         // bytes received). The idle-timeout sweep measures against this.
         int64_t ts_up_activity = 0;

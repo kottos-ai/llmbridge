@@ -1244,6 +1244,14 @@ namespace llmbridge
                     // a token, which is why the delta is what counts.
                     //
                     // A tool call counts too.
+                    // Both dialects: Anthropic streams `thinking_delta`, an
+                    // OpenAI-dialect upstream streams `reasoning_content`, which the
+                    // token match below already excludes by requiring the quote
+                    // before `content`.
+                    if (client->ts_first_thinking == 0 &&
+                        (sse_in.find("\"thinking_delta\"") != std::string::npos ||
+                         sse_in.find("\"reasoning_content\"") != std::string::npos))
+                        client->ts_first_thinking = now_ns();
                     if (client->ts_first_token == 0 &&
                         (sse_in.find("\"content\":\"") != std::string::npos ||
                          sse_in.find("\"text_delta\"") != std::string::npos ||
@@ -1272,6 +1280,12 @@ namespace llmbridge
             // TTFT: the first content token, stamped here because this is the one place
             // both backends translate, and it runs right after the read that carried
             // the bytes.
+            // Before the token stamp, because reasoning comes first on the wire and a
+            // single read can carry both.
+            if (client->ts_first_thinking == 0 &&
+                (sse_in.find("\"thinking_delta\"") != std::string::npos ||
+                 sse_in.find("\"reasoning_content\"") != std::string::npos))
+                client->ts_first_thinking = now_ns();
             if (client->ts_first_token == 0 && client->sse_xlate->content_started())
                 client->ts_first_token = now_ns();
 
@@ -2388,6 +2402,7 @@ namespace llmbridge
         r.ts_up_sent = c->ts_up_sent;
         r.ts_up_recvd = c->ts_up_recvd;
         r.ts_first_token = c->ts_first_token;
+        r.ts_first_thinking = c->ts_first_thinking;
         r.ts_done = now_ns();
         r.tag = c->policy_tag;
         r.status = status;
@@ -2451,6 +2466,7 @@ namespace llmbridge
         c->tok_in = c->tok_out = c->tok_cached = c->tok_cache_write = -1;
         c->tok_cw_5m = c->tok_cw_1h = -1;
         c->ts_first_token = 0;
+        c->ts_first_thinking = 0;
         // Defensive, not a fixed bug: the only reader of `wants_usage` runs on a
         // translated Anthropic request, and that translation writes the field.
         c->wants_usage = false;

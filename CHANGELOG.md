@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.43.0]. 2026-08-29
+
+### Added
+
+- **`ts_first_thinking`, stamped on the first reasoning delta.** A thinking model
+  streams its reasoning before anything the caller is shown, and `ts_first_token` is
+  stamped on a text, content or tool delta, which a `thinking_delta` is not.
+
+  **Both dialects.** Anthropic streams `thinking_delta` and an OpenAI-dialect upstream
+  streams `reasoning_content`.
+
 ## [0.42.0]. 2026-08-27
 
 ### Added

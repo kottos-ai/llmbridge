@@ -2790,6 +2790,37 @@ namespace
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
 
+    // A thinking model streams its reasoning first, and the caller is shown none of
+    // it. The delay is deliberate: the point of the stamp is that the reasoning starts
+    // long before the first token anyone sees, so a mock where both land in the same
+    // read would pass whether or not the stamp works.
+    std::string anthropic_sse_thinking_events()
+    {
+        return
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+            "{\"id\":\"msg_k\",\"model\":\"claude\",\"usage\":{\"input_tokens\":9}}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me check.\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello.\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+            "{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":14}}\n\n"
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    }
+
+    std::string sse_thinking_response(size_t chunk)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(anthropic_sse_thinking_events(), chunk);
+    }
+
     std::string sse_tool_response(size_t chunk)
     {
         return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
@@ -5150,6 +5181,88 @@ TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
     // later than the flush. This is the real TTFT the tape's ttft_us reads.
     EXPECT_GT(r.ts_first_token, 0) << "a stream that produced content must stamp the first token";
     EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+    EXPECT_GE(r.ts_done, r.ts_first_token);
+    // No reasoning in this stream, so nothing to stamp. Zero and not the head: an
+    // absent measurement must not read as an instant one.
+    EXPECT_EQ(r.ts_first_thinking, 0);
+}
+
+// The same thing in the other dialect. An OpenAI-dialect upstream streams reasoning as
+// `reasoning_content`, which the first-token match deliberately excludes by requiring
+// the quote before `content`, so without a match of its own it would be as invisible
+// here as `thinking_delta` was.
+TEST_P(ProxyStream, ReasoningIsStampedInTheOpenAiDialectToo)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":"
+            "{\"reasoning_content\":\"Let me check.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 1));
+    // OpenAI in, OpenAI out: the bytes are forwarded, which is the path a real
+    // reasoning upstream in this dialect takes.
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const std::string raw = c.recv_all();
+    ASSERT_NE(raw.find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_thinking, 0) << "reasoning_content must stamp the reasoning";
+    EXPECT_GT(r.ts_first_token, 0);
+    EXPECT_LE(r.ts_first_thinking, r.ts_first_token);
+    // The reason the token match requires the quote before `content`:
+    // `reasoning_content` must not be taken for the first token the caller sees.
+    EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+}
+
+
+// A thinking model streams its reasoning before anything the caller sees, and none of
+// it matches what stamps ts_first_token. Without a stamp of its own the whole
+// reasoning phase is charged to the provider's prefill, which on a live tenant was
+// 27% of streamed wall clock sitting in a figure labelled prefill.
+TEST_P(ProxyStream, ReasoningIsStampedApartFromTheFirstTokenShown)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    // One byte at a time, so the reasoning and the first shown token cannot arrive in
+    // the same read. Both stamps would be identical then, and the test would pass
+    // without the code under test doing anything.
+    _backend.set_response(sse_thinking_response(1));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_all());
+    ASSERT_TRUE(s.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_TRUE(r.streamed);
+    EXPECT_GT(r.ts_first_thinking, 0) << "a stream that reasoned must stamp it";
+    EXPECT_GE(r.ts_first_thinking, r.ts_up_recvd) << "reasoning cannot precede the head";
+    // The whole point: reasoning starts first, and the gap between them is the wait
+    // that used to be indistinguishable from the provider's prefill. Not-after and
+    // not strictly-before, because one read can carry both deltas and then the two
+    // stamps are as close as two clock reads; what must never happen is reasoning
+    // dated after the token it precedes, which is what a wrongly ordered pair of
+    // stamps produced on epoll.
+    EXPECT_LE(r.ts_first_thinking, r.ts_first_token)
+        << "the reasoning must not be stamped after the first token the caller sees";
     EXPECT_GE(r.ts_done, r.ts_first_token);
 }
 
