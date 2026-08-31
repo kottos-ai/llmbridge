@@ -1255,6 +1255,20 @@ namespace llmbridge
                 in.clear();
             }
 
+            // The longest silence between chunks, measured here because this is the one
+            // point every chunk crosses in either dialect and on both backends. Only
+            // after the first visible token.
+            if (!sse_in.empty())
+            {
+                const int64_t now = now_ns();
+                if (client->ts_first_token != 0 && client->ts_last_chunk != 0)
+                {
+                    const int64_t gap = now - client->ts_last_chunk;
+                    if (gap > client->max_chunk_gap_ns) client->max_chunk_gap_ns = gap;
+                }
+                client->ts_last_chunk = now;
+            }
+
             // No translator = BYTE-FORWARD. An OpenAI-compatible venue already speaks
             // the client's dialect, so the bytes pass through untouched and the
             // provider's own [DONE] terminates the stream. Until 2026-08-21 this mode
@@ -1632,6 +1646,15 @@ namespace llmbridge
     // counts live in bytes we cannot read. request_without drops Accept-Encoding so
     // this should not happen, so if it does the provider compressed unasked and the
     // operator needs to know why the tape went quiet, and not read a dash and guess.
+    // What the provider said about its own limits, kept from the response head.
+    // Shared by both backends and by the streaming and non-streaming paths, so the
+    // four cannot disagree about what a refusal meant.
+    void Gateway::note_quota(Connection* client, const net::http::ResponseHead& h) noexcept
+    {
+        client->quota_exhausted = static_cast<uint8_t>(h.quota_exhausted);
+        client->retry_after_s = h.retry_after_s;
+    }
+
     void Gateway::stream_warn_if_encoded(const Connection* client,
                                          const net::http::ResponseHead& h) noexcept
     {
@@ -2415,6 +2438,9 @@ namespace llmbridge
         r.ts_up_recvd = c->ts_up_recvd;
         r.ts_first_token = c->ts_first_token;
         r.ts_first_thinking = c->ts_first_thinking;
+        r.max_chunk_gap_ns = c->max_chunk_gap_ns;
+        r.quota_exhausted = c->quota_exhausted;
+        r.retry_after_s = c->retry_after_s;
         r.ts_done = now_ns();
         r.tag = c->policy_tag;
         r.status = status;
@@ -2479,6 +2505,10 @@ namespace llmbridge
         c->tok_cw_5m = c->tok_cw_1h = -1;
         c->ts_first_token = 0;
         c->ts_first_thinking = 0;
+        c->ts_last_chunk = 0;
+        c->max_chunk_gap_ns = 0;
+        c->quota_exhausted = 0;
+        c->retry_after_s = 0;
         // Defensive, not a fixed bug: the only reader of `wants_usage` runs on a
         // translated Anthropic request, and that translation writes the field.
         c->wants_usage = false;
@@ -2815,6 +2845,7 @@ namespace llmbridge
                 // returns before reaching, so stamp it here or it stays 0 and the
                 // TTFB timing header reports garbage.
                 client->ts_up_recvd = now_ns();
+                note_quota(client, h);
                 ep_begin_stream(u, h);
                 return;
             }
@@ -2835,6 +2866,7 @@ namespace llmbridge
         const size_t total_len = r.total_len;
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
+        note_quota(client, h);
 
         if (client->translate_body)
         {
@@ -3895,6 +3927,7 @@ namespace llmbridge
                 if (h.event_stream && h.status == 200)
                 {
                     c->peer->ts_up_recvd = now_ns(); // t4: head complete, see the epoll mirror
+                    note_quota(c->peer, h);
                     ur_begin_stream(c, h);
                     return;
                 }
@@ -3906,6 +3939,7 @@ namespace llmbridge
             if (r.failed()) { ur_error_respond(c->peer, 502, "upstream response framing"); return; }
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
+            note_quota(c->peer, r.head);
             ur_on_response(c, r.head, r.body, r.total_len);
         }
     }

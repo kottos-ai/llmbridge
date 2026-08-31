@@ -2733,6 +2733,17 @@ namespace
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
 
+    // Chunk-encoded but NOT terminated, so the stream stays open and a later write can
+    // land as a separate read. sse_chunk_encode appends the zero chunk, which ends the
+    // response: using it for the first half completes the request before the pause and
+    // measures nothing.
+    std::string sse_chunk_open(std::string_view p)
+    {
+        char hex[32];
+        std::snprintf(hex, sizeof hex, "%zx", p.size());
+        return std::string(hex) + "\r\n" + std::string(p) + "\r\n";
+    }
+
     std::string sse_chunk_encode(std::string_view p, size_t chunk)
     {
         std::string s;
@@ -5246,6 +5257,146 @@ TEST_P(ProxyStream, ReasoningIsStampedInTheOpenAiDialectToo)
     // The reason the token match requires the quote before `content`:
     // `reasoning_content` must not be taken for the first token the caller sees.
     EXPECT_GE(r.ts_first_token, r.ts_up_recvd);
+}
+
+
+// A 429 used to record only that a request was refused. Which quota refused it, and
+// for how long the provider wanted us to wait, were in headers nobody read, so requests
+// per minute and input tokens per minute were indistinguishable after the fact and an
+// operator could not tell which limit to raise.
+TEST_P(ProxyStream, ARefusalRecordsWhichQuotaWasExhausted)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    // The shape Anthropic sends: the exhausted family reports zero remaining, the
+    // others report headroom. Only the zero one is the limit that actually refused.
+    _backend.set_response(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+        "retry-after: 42\r\n"
+        "anthropic-ratelimit-requests-remaining: 91\r\n"
+        "anthropic-ratelimit-input-tokens-remaining: 0\r\n"
+        "anthropic-ratelimit-output-tokens-remaining: 8000\r\n"
+        "Content-Length: 15\r\nConnection: keep-alive\r\n\r\n"
+        "{\"error\":\"no\"}\n");
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("{\"model\":\"m\",\"messages\":[]}")));
+    c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.status, 429);
+    EXPECT_EQ(r.retry_after_s, 42);
+    EXPECT_EQ(r.quota_exhausted,
+              static_cast<uint8_t>(llmbridge::net::http::ResponseHead::Quota::InputTokens))
+        << "the exhausted family is the one reporting zero remaining, not the first seen";
+}
+
+
+// A healthy response says nothing about quotas, and must not be recorded as though it
+// did: a zero here would name a limit that never refused anything.
+TEST_P(ProxyStream, AHealthyResponseRecordsNoQuota)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(provider_resp_body(UpstreamDialect::Anthropic, "ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("{\"model\":\"m\",\"messages\":[]}")));
+    c.recv_all();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.quota_exhausted,
+              static_cast<uint8_t>(llmbridge::net::http::ResponseHead::Quota::None));
+    EXPECT_EQ(recs[0].r.retry_after_s, 0);
+}
+
+
+// A stream can hold a healthy time to first token and a healthy total and still go
+// silent for seconds in the middle. That stall is what a voice or agent caller feels,
+// and until this field it was the one span nothing recorded: every other number looks
+// fine across it. The mock sends the head and the first token, pauses, then sends the
+// rest, so the gap is real wall clock and not a mocked value.
+TEST_P(ProxyStream, AMidStreamStallIsMeasured)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    const std::string head =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_open(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+            "{\"id\":\"msg_s\",\"model\":\"claude\",\"usage\":{\"input_tokens\":9}}}\n\n"
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n");
+    // The tail, 150 ms later: the stall sits between the first token and this.
+    _backend.set_response(head);
+    _backend.set_late_bytes(
+        sse_chunk_open(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"lo.\"}}\n\n"
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+            "{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n"
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") + "0\r\n\r\n",
+        150);
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed st = parse_streamed(c.recv_all());
+    ASSERT_TRUE(st.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.max_chunk_gap_ns, 100000000LL)   // over 100 ms of the 150 ms pause
+        << "a mid-stream stall must be measured";
+    EXPECT_LT(r.max_chunk_gap_ns, 5000000000LL)  // and it is a gap, not the whole stream
+        << "the stall must not swallow the whole request";
+    // The stall is invisible in every other field, which is the reason it exists.
+    EXPECT_GT(r.ts_first_token, 0);
+}
+
+
+// The silence before the first token is prefill and reasoning, both stamped
+// separately. Counting it as a stall would report every thinking model as one long
+// stall, so the measurement starts at the first visible token.
+TEST_P(ProxyStream, ReasoningTimeIsNotCountedAsAStall)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    // One byte at a time: the reasoning phase spans many reads before any token.
+    _backend.set_response(sse_thinking_response(1));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed st = parse_streamed(c.recv_all());
+    ASSERT_TRUE(st.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_thinking, 0) << "this stream did reason";
+    // Whatever the reasoning cost, it is not a stall: the gap is measured only after
+    // the first visible token, and this mock streams its tail without pausing.
+    EXPECT_LT(r.max_chunk_gap_ns, 1000000000LL)
+        << "reasoning before the first token must not be reported as a stall";
 }
 
 

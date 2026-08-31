@@ -44,6 +44,13 @@ namespace llmbridge
         int64_t ts_first_token = 0; ///< streaming only: ttft, the first token shown
         /// Streaming only, and 0 unless the model emitted reasoning. The first thinking delta.
         int64_t ts_first_thinking = 0;
+        /// Streaming only: the longest gap between two chunks after the first visible
+        /// token, in nanoseconds.
+        int64_t max_chunk_gap_ns = 0;
+        /// Which quota the provider said was exhausted, and how long it asked us to
+        /// wait, from the response headers.
+        uint8_t quota_exhausted = 0;   ///< net::http::ResponseHead::Quota
+        uint16_t retry_after_s = 0;
         int64_t ts_done = 0;       ///< reply fully flushed, or the stream finished
         uint64_t tag = 0;         ///< Decision::tag, verbatim
         int status = 0;           ///< as sent to the client
