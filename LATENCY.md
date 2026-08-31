@@ -132,12 +132,40 @@ how `connect-us` came to mean two things.
 
 `ts_first_token` is the second, and it is streaming-only. It is stamped when the
 translator emits the first content token (`content_started()`), which for a
-stream lands somewhere *after* t4: t4 is the response head, this is the first
-token, and their gap is the provider's prefill. It is not a mainline step,
+stream lands somewhere *after* t4: t4 is the response head and this is the first
+token the caller is shown. Their gap was described here as the provider's prefill,
+and on a reasoning model that is wrong: `ts_first_token` fires on a text, content
+or tool delta, and a `thinking_delta` is none of those, so the whole reasoning
+phase sits inside that gap. Measured on a live tenant it was 27% of streamed wall
+clock, correlating 0.80 with tokens *out*, which prompt processing cannot do
+because prefill is a function of the input. `ts_first_thinking` (below) splits the
+two. It is not a mainline step,
 because a non-streaming request has no first token at all. It is stamped once, in the shared
 `stream_step`, so both backends inherit it without a twin divergence. Its only
 consumer is the request sink: it cannot ride a response header, because headers
 precede the body and the first token has not arrived when they are written.
+
+`ts_first_thinking` is the third, streaming-only, and 0 unless the model reasoned.
+It is stamped on the first reasoning delta, which is `thinking_delta` in the
+Anthropic dialect and `reasoning_content` in the OpenAI one, and on
+`redacted_thinking` when the provider filters the chain of thought. It exists to
+split a span that was being read as one thing:
+
+    prefill   = ts_first_thinking − t4     (when the model reasoned)
+    reasoning = ts_first_token − ts_first_thinking
+
+With no reasoning it is 0 and the whole of `ts_first_token − t4` is prefill. It is
+stamped before the first-token check and in the same shared `stream_step`, because
+one read can carry both deltas and the order of the two blocks is then the only
+thing that orders the stamps.
+
+`max_chunk_gap_ns` is the fourth, streaming-only: the longest silence between two
+chunk deliveries **after** the first visible token. A stream can hold a healthy
+first token and a healthy total and still stall for seconds in the middle, which
+is what a caller waiting on it feels and what no other number here shows. It
+starts at the first token deliberately, since the silence before that is prefill
+and reasoning and both are stamped above. A read is not a token, so it measures
+the gap between deliveries and not between tokens.
 
 Two consequences of that table worth reading off it:
 
@@ -222,8 +250,9 @@ sites.
 `ts_first_token` (the `RequestRecord` field of the same name) is taken in
 `stream_step` the moment the translator emits its first content token, so a
 consumer with a sink installed gets both numbers: t4 for the head and
-`ts_first_token` for the token, and their difference is the provider's prefill on
-that request. This is the same event `streamgen` times client-side, now available
+`ts_first_token` for the token, and their difference is the wait before anything is
+shown: prefill, plus any reasoning the model did. `ts_first_thinking` separates
+them. This is the same event `streamgen` times client-side, now available
 per request to an in-process integrator. It is deliberately absent from the
 response headers, because a stream's headers are written before the first token
 exists.
@@ -323,7 +352,7 @@ accept(TLS)    ...          <- only when --listen-tls; see below
 | `connect(TLS)` | (t2−t1) | handshake only: **no handshake at all** on a pooled connection, and this line existing separately is the point. See the note on resolution below |
 | `response-path` | t4 → t6 | translate-back **plus** the client write, through full flush |
 | `added-total` | request-path + response-path | everything the gateway did to this request; **both handshakes excluded** |
-| `first-token` | t0 → first content token | the client's real wait before anything appears, on a **streamed** request only. Mostly the provider's prefill, and almost none of it ours; see the note below on why it is reported and not folded in |
+| `first-token` | t0 → first content token | the client's real wait before anything appears, on a **streamed** request only. Almost none of it ours: it is the provider's queue, its prefill, and any reasoning it did before showing a token; see the note below on why it is reported and not folded in |
 | `accept(TLS)` | client accept → inbound handshake done | the handshake we terminate for the client. **Printed only when it has samples**, i.e. only under `--listen-tls`; a plaintext listener never terminates one. Per connection, not per request, and unlike `connect(TLS)` it is genuinely ours; see §1 |
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,
@@ -422,8 +451,8 @@ resolution explains why the reused samples read as a bucket instead of as zero.
 
 `first-token` is a **provider** measurement we happen to be positioned to take,
 not a gateway one, and it is printed on its own line at the top level for that
-reason: folding it into `added-total` would put the provider's prefill inside a
-number whose whole purpose is to be small. It is the only line here that is
+reason: folding it into `added-total` would put the provider's own queue, prefill
+and reasoning inside a number whose whole purpose is to be small. It is the only line here that is
 mostly not our work, and saying so is the same discipline as excluding the
 handshakes.
 
