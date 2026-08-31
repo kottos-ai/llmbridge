@@ -336,6 +336,13 @@ namespace llmbridge
         int64_t ts_first_token = 0;
         // The first thinking delta, when the model emits one.
         int64_t ts_first_thinking = 0;
+        // The longest silence between two chunks once tokens have started, and the
+        // last chunk's arrival that measures it.
+        int64_t ts_last_chunk = 0;
+        int64_t max_chunk_gap_ns = 0;
+        // What the provider said about its own limits on this response.
+        uint8_t quota_exhausted = 0;
+        uint16_t retry_after_s = 0;
         // Last time this request saw any upstream progress (request forwarded, or
         // bytes received). The idle-timeout sweep measures against this.
         int64_t ts_up_activity = 0;
@@ -773,6 +780,8 @@ namespace llmbridge
         // across both backends used to write them out by hand.
         /// Warn once when a stream arrives compressed. Shared by both loops: it is a
         /// statement about the response, not about an I/O model.
+        /// Keep what the provider said about its own limits, from the response head.
+        static void note_quota(Connection* client, const net::http::ResponseHead& h) noexcept;
         static void stream_warn_if_encoded(const Connection* client,
                                            const net::http::ResponseHead& h) noexcept;
         /// A finished stream's contribution to the latency profile. Shared: a

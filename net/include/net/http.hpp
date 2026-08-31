@@ -124,6 +124,15 @@ namespace llmbridge::net::http
             return true;
         }
 
+        // Strict: only a well-formed 0 counts. A malformed or absent value must not be
+        // read as exhaustion, because naming the wrong quota sends an operator to raise
+        // a limit that was never the one refusing.
+        inline bool is_zero_count(std::string_view v) noexcept
+        {
+            size_t n = 0;
+            return parse_strict_length(v, n) && n == 0;
+        }
+
         // Reject a header block containing a bare CR or bare LF.
         //
         // We split lines on CRLF. A parser that splits on a bare CR (or bare LF)
@@ -336,6 +345,19 @@ namespace llmbridge::net::http
         bool has_content_length = false;
         bool encoded = false;          // Content-Encoding present and not identity
         size_t content_length = 0;
+        /// Which quota the provider says is exhausted, and how long it wants us to
+        /// wait.
+        ///
+        /// Both dialects: Anthropic names the family in the header
+        /// (`anthropic-ratelimit-input-tokens-remaining`), OpenAI names it in the
+        /// suffix (`x-ratelimit-remaining-tokens`). A family is recorded only when its
+        /// remaining count is zero, which is the one that actually refused.
+        enum class Quota : uint8_t { None = 0, Requests = 1, InputTokens = 2,
+                                     OutputTokens = 3, Tokens = 4 };
+        Quota quota_exhausted = Quota::None;
+        /// `Retry-After`, in seconds, 0 when absent. Saturated at 18 hours; a provider
+        /// asking for longer is telling us something no field here needs to carry.
+        uint16_t retry_after_s = 0;
     };
 
 
@@ -413,6 +435,37 @@ namespace llmbridge::net::http
                 if (out.has_content_length && n != out.content_length) return FrameStatus::Error;
                 out.content_length = n;
                 out.has_content_length = true;
+            }
+            else if (detail::line_is(line, "retry-after:"))
+            {
+                // Seconds only. The HTTP-date form is legal and providers do not use
+                // it here; an unparsed value stays 0, which reads as absent.
+                size_t n = 0;
+                if (detail::parse_strict_length(value, n))
+                    out.retry_after_s = n > 65535 ? 65535 : static_cast<uint16_t>(n);
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-requests-remaining:") ||
+                     detail::line_is(line, "x-ratelimit-remaining-requests:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::Requests;
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-input-tokens-remaining:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::InputTokens;
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-output-tokens-remaining:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::OutputTokens;
+            }
+            else if (detail::line_is(line, "x-ratelimit-remaining-tokens:"))
+            {
+                // The OpenAI dialect does not split input from output here, so it is
+                // recorded as the family it names and never guessed into one of them.
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::Tokens;
             }
             else if (detail::line_is(line, "transfer-encoding:"))
             {

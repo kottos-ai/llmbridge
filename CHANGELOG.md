@@ -8,6 +8,13 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.44.0]. 2026-08-31
+
+### Added
+
+- **`max_chunk_gap_ns`: the longest silence in a stream after the first visible
+  token.**
+
 ## [0.43.1]. 2026-08-31
 
 ### Fixed
@@ -773,6 +780,8 @@ provider produces it, and carries token counts it did not before.
   cannot read. The gate names the two modes that may stream; it does not exclude the
   two that may not, so a dialect added later is opted in by someone who thought about
   it.
+
+- **`quota_exhausted` and `retry_after_s`: which limit refused a request.**
 
 ### Added
 
