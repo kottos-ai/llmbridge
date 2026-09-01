@@ -390,6 +390,8 @@ namespace llmbridge
         /// What the venue called this failure, from its own error body on a non-2xx.
         char upstream_error[32] = {};
         uint8_t upstream_error_len = 0;
+        /// Client-only: the upstream this request took was already connected.
+        bool upstream_pooled = false;
 
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a
