@@ -1130,9 +1130,24 @@ namespace llmbridge
         /// Anthropic emits when it safety-filters the chain of thought.
         static bool sse_carries_thinking(std::string_view s) noexcept
         {
-            return s.find("\"thinking_delta\"") != std::string_view::npos ||
-                   s.find("\"reasoning_content\"") != std::string_view::npos ||
-                   s.find("\"redacted_thinking\"") != std::string_view::npos;
+            // `thinking_delta` and `redacted_thinking` are type names: their presence
+            // is the signal. `reasoning_content` is a field, and an OpenAI-compatible
+            // server that supports reasoning sends it on every delta whether or not
+            // the model reasoned, as `"reasoning_content":null`.
+            if (s.find("\"thinking_delta\"") != std::string_view::npos ||
+                s.find("\"redacted_thinking\"") != std::string_view::npos)
+                return true;
+            constexpr std::string_view kReason = "\"reasoning_content\":";
+            for (size_t pos = s.find(kReason); pos != std::string_view::npos;
+                 pos = s.find(kReason, pos + 1))
+            {
+                size_t v = pos + kReason.size();
+                while (v < s.size() && (s[v] == ' ' || s[v] == '\t')) ++v;
+                if (v >= s.size()) return false; // value byte not in this read yet
+                if (s[v] != '"') continue;       // null, and nothing else is a string
+                if (v + 1 < s.size() && s[v + 1] != '"') return true; // non-empty
+            }
+            return false;
         }
 
         void stream_note_usage(Connection* client, std::string_view bytes) noexcept
