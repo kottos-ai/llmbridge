@@ -841,6 +841,22 @@ namespace llmbridge
         /// tail, never a full-body scan.
         constexpr size_t kUsageWindow = 2048;
 
+        /// The string value of `key` at or after `from`, empty when the key is absent,
+        /// its value is null or a number, or the string runs past the end of `head`.
+        std::string_view json_string_at(std::string_view head, std::string_view key,
+                                        size_t from = 0) noexcept
+        {
+            const size_t k = head.find(key, from);
+            if (k == std::string_view::npos) return {};
+            size_t i = k + key.size();
+            while (i < head.size() && (head[i] == ':' || head[i] == ' ')) ++i;
+            if (i >= head.size() || head[i] != '"') return {};
+            const size_t b = ++i;
+            while (i < head.size() && head[i] != '"' && head[i] != '\\') ++i;
+            return i < head.size() && head[i] == '"' ? head.substr(b, i - b)
+                                                     : std::string_view{};
+        }
+
         /// Bytes of an error body worth searching. A provider states the type near
         /// the front, and the field that can be long is `message`.
         constexpr size_t kErrorWindow = 512;
@@ -852,21 +868,8 @@ namespace llmbridge
                 body.size() > kErrorWindow ? body.substr(0, kErrorWindow) : body;
             const size_t e = head.find("\"error\"");
             if (e == std::string_view::npos) return {};
-            const auto str_at = [&head, e](std::string_view key) -> std::string_view {
-                const size_t k = head.find(key, e);
-                if (k == std::string_view::npos) return {};
-                size_t i = k + key.size();
-                while (i < head.size() && (head[i] == ':' || head[i] == ' ')) ++i;
-                if (i >= head.size() || head[i] != '"') return {}; // null, or a number
-                const size_t b = ++i;
-                // No unescaping: a provider does not escape these, and a value that
-                // needs it is not one of the names we are looking for.
-                while (i < head.size() && head[i] != '"' && head[i] != '\\') ++i;
-                return i < head.size() && head[i] == '"' ? head.substr(b, i - b)
-                                                         : std::string_view{};
-            };
-            const std::string_view code = str_at("\"code\"");
-            return code.empty() ? str_at("\"type\"") : code;
+            const std::string_view code = json_string_at(head, "\"code\"", e);
+            return code.empty() ? json_string_at(head, "\"type\"", e) : code;
         }
 
         /// `window` 0 = search all of `body`, for a caller that already bounded it.
@@ -1192,6 +1195,34 @@ namespace llmbridge
             return false;
         }
 
+        /// Bytes of a reply worth searching for the served tier, and it is a different
+        /// end of the reply in each case. Measured against the live OpenAI API on
+        /// 2026-09-01: a stream chunk carries `service_tier` before `choices`, at byte
+        /// 125 of 305, and every chunk repeats it; a non-streamed body carries it after
+        /// `choices` and `usage`, at byte 1015 of 1070. Searching the wrong end finds
+        /// nothing on any reply longer than the window, which is why `tail` exists and
+        /// why these two numbers are recorded instead of one generous bound.
+        constexpr size_t kTierHead = 1024;
+        constexpr size_t kTierTail = 2048;
+
+        /// Record the tier the venue says it served, once. OpenAI repeats
+        /// `service_tier` on every chunk, so the first one seen is the answer and every
+        /// later chunk costs one predicate. `tail` searches the end of `bytes`, which
+        /// is where a non-streamed body puts it, beside the usage block.
+        void note_served_tier(Connection* c, std::string_view bytes, bool tail) noexcept
+        {
+            if (c->served_tier_len) return;
+            const size_t w = tail ? kTierTail : kTierHead;
+            const std::string_view head =
+                bytes.size() <= w ? bytes
+                                  : (tail ? bytes.substr(bytes.size() - w) : bytes.substr(0, w));
+            const std::string_view t = json_string_at(head, "\"service_tier\"");
+            const size_t n = t.size() < sizeof c->served_tier ? t.size()
+                                                              : sizeof c->served_tier;
+            c->served_tier_len = static_cast<uint8_t>(n);
+            if (n) std::memcpy(c->served_tier, t.data(), n);
+        }
+
         void stream_note_usage(Connection* client, std::string_view bytes) noexcept
         {
             client->stream_tail.append(bytes);
@@ -1337,6 +1368,7 @@ namespace llmbridge
                 if (!sse_in.empty())
                 {
                     stream_note_usage(client, sse_in);
+                    note_served_tier(client, sse_in, /*tail=*/false);
                     // Reasoning is stamped before the token, because it comes first on
                     // the wire and one read can carry both. See the two helpers.
                     if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
@@ -2552,6 +2584,7 @@ namespace llmbridge
         r.model = std::string_view(c->sink_model, c->sink_model_len);
         r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
         r.upstream_error = std::string_view(c->upstream_error, c->upstream_error_len);
+        r.served_tier = std::string_view(c->served_tier, c->served_tier_len);
         r.from_pool = c->upstream_pooled;
         if (streamed && c->sse_xlate)
         {
@@ -2610,6 +2643,7 @@ namespace llmbridge
         c->tier_override = {};
         c->asked_tier_len = 0;
         c->upstream_error_len = 0;
+        c->served_tier_len = 0;
         c->upstream_pooled = false;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;
@@ -3065,6 +3099,7 @@ namespace llmbridge
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
+            note_served_tier(client, body_buf, /*tail=*/true);
             const BodyUsage bu = scan_usage(body_buf);
             client->tok_in = bu.in;
             client->tok_out = bu.out;
@@ -4345,6 +4380,7 @@ namespace llmbridge
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
+            note_served_tier(client, body_buf, /*tail=*/true);
             const BodyUsage bu = scan_usage(body_buf);
             client->tok_in = bu.in;
             client->tok_out = bu.out;

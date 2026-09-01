@@ -8,6 +8,21 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.49.0]. 2026-09-01
+
+### Added
+
+- **`RequestRecord::served_tier`: the tier the venue says it served.** `asked_tier` and
+  whatever a policy writes are both requests.
+
+  **The two reply shapes put it at opposite ends, so one window cannot serve both.**
+
+### Changed
+
+- **`json_string_at` factored out of `scan_error_type`.** One reader for a JSON string
+  field, used by the error type, the error code and the served tier. No behaviour
+  change, and the error-type tests cover it.
+
 ## [0.48.0]. 2026-09-01
 
 ### Added
