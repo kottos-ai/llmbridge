@@ -841,6 +841,34 @@ namespace llmbridge
         /// tail, never a full-body scan.
         constexpr size_t kUsageWindow = 2048;
 
+        /// Bytes of an error body worth searching. A provider states the type near
+        /// the front, and the field that can be long is `message`.
+        constexpr size_t kErrorWindow = 512;
+
+        /// What the venue called this failure, taken from its own error body.
+        std::string_view scan_error_type(std::string_view body) noexcept
+        {
+            const std::string_view head =
+                body.size() > kErrorWindow ? body.substr(0, kErrorWindow) : body;
+            const size_t e = head.find("\"error\"");
+            if (e == std::string_view::npos) return {};
+            const auto str_at = [&head, e](std::string_view key) -> std::string_view {
+                const size_t k = head.find(key, e);
+                if (k == std::string_view::npos) return {};
+                size_t i = k + key.size();
+                while (i < head.size() && (head[i] == ':' || head[i] == ' ')) ++i;
+                if (i >= head.size() || head[i] != '"') return {}; // null, or a number
+                const size_t b = ++i;
+                // No unescaping: a provider does not escape these, and a value that
+                // needs it is not one of the names we are looking for.
+                while (i < head.size() && head[i] != '"' && head[i] != '\\') ++i;
+                return i < head.size() && head[i] == '"' ? head.substr(b, i - b)
+                                                         : std::string_view{};
+            };
+            const std::string_view code = str_at("\"code\"");
+            return code.empty() ? str_at("\"type\"") : code;
+        }
+
         /// `window` 0 = search all of `body`, for a caller that already bounded it.
         /// Passing a second, smaller window there is how the retained bytes and the
         /// searched bytes drift apart and the counts come back -1.
@@ -1691,6 +1719,20 @@ namespace llmbridge
         client->retry_after_s = h.retry_after_s;
     }
 
+    void Gateway::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
+                                      std::string_view body) noexcept
+    {
+        client->upstream_error_len = 0;
+        // 0 is a head we never framed, and a 3xx is not the venue naming a failure.
+        if (h.status < 400) return;
+        const std::string_view t = scan_error_type(body);
+        const size_t n = t.size() < sizeof client->upstream_error
+                             ? t.size()
+                             : sizeof client->upstream_error;
+        client->upstream_error_len = static_cast<uint8_t>(n);
+        if (n) std::memcpy(client->upstream_error, t.data(), n);
+    }
+
     void Gateway::stream_warn_if_encoded(const Connection* client,
                                          const net::http::ResponseHead& h) noexcept
     {
@@ -2509,6 +2551,7 @@ namespace llmbridge
         r.backend = _active_backend;
         r.model = std::string_view(c->sink_model, c->sink_model_len);
         r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
+        r.upstream_error = std::string_view(c->upstream_error, c->upstream_error_len);
         if (streamed && c->sse_xlate)
         {
             r.tokens_in = c->sse_xlate->input_tokens();
@@ -2565,6 +2608,7 @@ namespace llmbridge
         // caller must not report the last one's tier.
         c->tier_override = {};
         c->asked_tier_len = 0;
+        c->upstream_error_len = 0;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;
         c->max_chunk_gap_ns = 0;
@@ -2938,6 +2982,7 @@ namespace llmbridge
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
         note_quota(client, h);
+        note_upstream_error(client, h, body_buf);
 
         if (client->translate_body)
         {
@@ -4015,6 +4060,7 @@ namespace llmbridge
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
             note_quota(c->peer, r.head);
+            note_upstream_error(c->peer, r.head, r.body);
             ur_on_response(c, r.head, r.body, r.total_len);
         }
     }

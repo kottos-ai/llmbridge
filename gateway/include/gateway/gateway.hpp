@@ -387,6 +387,9 @@ namespace llmbridge
         /// reused before the sink runs.
         char asked_tier[16] = {};
         uint8_t asked_tier_len = 0;
+        /// What the venue called this failure, from its own error body on a non-2xx.
+        char upstream_error[32] = {};
+        uint8_t upstream_error_len = 0;
 
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a
@@ -789,6 +792,11 @@ namespace llmbridge
         /// statement about the response, not about an I/O model.
         /// Keep what the provider said about its own limits, from the response head.
         static void note_quota(Connection* client, const net::http::ResponseHead& h) noexcept;
+        /// Copy the venue's own name for a failure out of its error body, for the
+        /// sink. Does nothing on a 2xx.
+        static void note_upstream_error(Connection* client,
+                                        const net::http::ResponseHead& h,
+                                        std::string_view body) noexcept;
         static void stream_warn_if_encoded(const Connection* client,
                                            const net::http::ResponseHead& h) noexcept;
         /// A finished stream's contribution to the latency profile. Shared: a

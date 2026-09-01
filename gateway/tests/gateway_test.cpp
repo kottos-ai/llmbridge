@@ -4051,6 +4051,15 @@ namespace
             _b.start();
         }
         void stop() { _b.stop(); }
+        /// Answer with a chosen status line and body, for the failure paths.
+        void start_raw(std::string status_line, const std::string& body)
+        {
+            _b.set_response(status_line +
+                            "\r\nContent-Type: application/json\r\nConnection: keep-alive"
+                            "\r\nContent-Length: " + std::to_string(body.size()) +
+                            "\r\n\r\n" + body);
+            _b.start();
+        }
         uint16_t port() const { return _b.port(); }
         /// Answer once, then close: a provider dropping an idle pooled keep-alive.
         /// Only the first connection dies after one response; later ones stay
@@ -4898,6 +4907,7 @@ namespace
                 c.cap[i].assign(r.captured[i]); // the views die with the call
             c.model.assign(r.model);            // and so does this one
             c.asked_tier.assign(r.asked_tier);  // and this
+            c.upstream_error.assign(r.upstream_error); // and this
             _records.push_back(std::move(c));
         }
         struct Copy
@@ -4906,6 +4916,7 @@ namespace
             std::string cap[llmbridge::kSinkCaptureMax];
             std::string model;
             std::string asked_tier;
+            std::string upstream_error;
         };
         std::vector<Copy> records()
         {
@@ -7884,4 +7895,178 @@ TEST_P(ProxyPolicy, AnOrdinaryRefusalDoesNotNameThePeer)
     EXPECT_NE(sink.text.find("reply 429"), std::string::npos) << sink.text;
     EXPECT_EQ(sink.text.find("peer="), std::string::npos)
         << "only an authentication refusal carries the address:\n" << sink.text;
+}
+
+
+// ── the venue's own name for a failure reaches the sink ───────────────────────
+//
+// Three 400s on the live tenant took a correlation across neighbouring records to
+// explain, because the record said only "400". The provider had said exactly why in
+// a body we read and threw away. This captures the name and nothing else: the
+// `message` beside it is free text the provider composes and can quote the request
+// back, and this record is written to a durable tape.
+namespace
+{
+    /// What Anthropic answers when a prompt crosses the context ceiling. The message
+    /// is real, and is here to be asserted absent.
+    constexpr const char* kAnthropicTooLong =
+        R"({"type":"error","error":{"type":"invalid_request_error",)"
+        R"("message":"prompt is too long: 1013243 tokens > 1000000 maximum"}})";
+    /// The same failure in the OpenAI dialect. `type` is the generic one both
+    /// dialects share; `code` is the specific one only this dialect states.
+    constexpr const char* kOpenAiTooLong =
+        R"({"error":{"message":"This model's maximum context length is 128000 tokens",)"
+        R"("type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}})";
+} // namespace
+
+TEST_P(ProxyRoute, TheSinkRecordsAnAnthropicErrorType)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 400 Bad Request", kAnthropicTooLong);
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.status, 400);
+    EXPECT_EQ(recs[0].upstream_error, "invalid_request_error");
+    EXPECT_EQ(recs[0].upstream_error.find("prompt is too long"), std::string::npos)
+        << "the message is the provider's free text and must not be captured";
+}
+
+// The finer of the two names wins, or the field says `invalid_request_error` for a
+// context overflow and a bad parameter alike, which is the distinction worth having.
+TEST_P(ProxyRoute, TheSinkPrefersAnOpenAiErrorCodeOverItsType)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 400 Bad Request", kOpenAiTooLong);
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].upstream_error, "context_length_exceeded");
+}
+
+// OpenAI states `"code":null` on the errors that have no code, and a scanner that
+// took the key's presence as an answer would record an empty name for every one.
+TEST_P(ProxyRoute, ANullErrorCodeFallsBackToTheType)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 429 Too Many Requests",
+                R"({"error":{"message":"slow down","type":"rate_limit_error",)"
+                R"("param":null,"code":null}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].upstream_error, "rate_limit_error");
+}
+
+// A translated venue answers its failures in its own dialect and the gateway rewrites
+// them for the caller. The name recorded is the one the venue used, taken before that
+// rewrite, so the tape says what the venue said.
+TEST_P(ProxyRoute, TheSinkRecordsAnErrorTypeOnTheTranslatedPath)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 529 Overloaded",
+                R"({"type":"error","error":{"type":"overloaded_error",)"
+                R"("message":"Overloaded"}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink,
+          {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    // A real body: this venue is translated, so the gateway parses the request, and
+    // the plain-text default would be refused at 400 before any venue is contacted.
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.translated);
+    EXPECT_EQ(recs[0].r.status, 529);
+    EXPECT_EQ(recs[0].upstream_error, "overloaded_error");
+}
+
+// Empty on success, so a reader can take a non-empty value as "the venue refused"
+// without also checking the status.
+TEST_P(ProxyRoute, ASuccessfulRequestRecordsNoErrorType)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.status, 200);
+    EXPECT_EQ(recs[0].upstream_error, "");
+}
+
+// A failure body we do not recognise leaves the field empty instead of guessing at
+// one, which is the same rule the usage scanner follows: report nothing measured
+// instead of a plausible wrong name.
+TEST_P(ProxyRoute, AnUnrecognisedErrorBodyRecordsNothing)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 502 Bad Gateway", "<html>upstream is down</html>");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].upstream_error, "");
 }
