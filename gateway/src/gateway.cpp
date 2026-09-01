@@ -1109,6 +1109,20 @@ namespace llmbridge
         /// Empty content is not a token. OpenAI opens a stream with
         /// {"role":"assistant","content":""} and matching that collapsed TTFT to TTFB
         /// on every OpenAI-dialect stream.
+        /// The client's address, for a refusal we are about to log. Empty when the
+        /// socket cannot answer, which is normal on one already torn down.
+        static std::string peer_of(int fd) noexcept
+        {
+            sockaddr_in a{};
+            socklen_t len = sizeof a;
+            if (fd < 0 || ::getpeername(fd, reinterpret_cast<sockaddr*>(&a), &len) != 0)
+                return {};
+            if (a.sin_family != AF_INET) return {};
+            char buf[INET_ADDRSTRLEN];
+            if (!::inet_ntop(AF_INET, &a.sin_addr, buf, sizeof buf)) return {};
+            return std::string(buf) + ":" + std::to_string(ntohs(a.sin_port));
+        }
+
         static bool sse_carries_first_token(std::string_view s) noexcept
         {
             constexpr std::string_view kContent = "\"content\":\"";
@@ -2264,7 +2278,11 @@ namespace llmbridge
         // A client-caused refusal is DEBUG; anything we or the provider caused is WARN.
         // Getting that backwards means drowning in 4xx noise at scale or missing an
         // outage, so the level is derived from the code, never chosen per site.
-        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        // An authentication refusal names where it came from.
+        const std::string peer = (code == 401 || code == 403) ? peer_of(client->fd)
+                                                              : std::string{};
+        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client,
+                peer.empty() ? "" : " peer=", peer);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
         client->wbuf = build_error(code, detail);
@@ -3778,7 +3796,11 @@ namespace llmbridge
                                    const char* detail) noexcept
     {
         if (!client || client->doomed) return;
-        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client);
+        // An authentication refusal names where it came from.
+        const std::string peer = (code == 401 || code == 403) ? peer_of(client->fd)
+                                                              : std::string{};
+        LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client,
+                peer.empty() ? "" : " peer=", peer);
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
         client->wbuf = build_error(code, detail);
         client->woff = 0;
