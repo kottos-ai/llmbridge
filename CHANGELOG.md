@@ -8,6 +8,20 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.47.0]. 2026-09-01
+
+### Added
+
+- **`RequestRecord::upstream_error`: the venue's own name for a failure.**
+
+  **The finest name the venue offered.** Anthropic states a `type`
+  (`invalid_request_error`, `overloaded_error`); OpenAI states a `type` and often a
+  `code`.
+
+  **Never the `message`.** It is free text the provider composes, it can quote the
+  request back, and this view reaches a sink that keeps it. The type and code are
+  fixed vocabularies the provider chose from.
+
 ## [0.46.0]. 2026-09-01
 
 ### Added
