@@ -7675,3 +7675,69 @@ TEST_P(ProxyHeartbeat, AZeroIntervalSilencesTheHeartbeat)
 
     EXPECT_EQ(sink.text.find("heartbeat"), std::string::npos) << sink.text;
 }
+
+// An OpenAI-compatible server that supports reasoning sends the field on every delta
+// whether or not the model reasoned. DeepInfra sends `"reasoning_content":null` four
+// times in a two-token Llama reply, and matching the field name alone stamped the
+// reasoning as starting on the first chunk: the live tape shows a Llama request whose
+// reasoning and first token landed at the same microsecond, on a model that does not
+// reason at all. The value has to be read, exactly as it is for `"content":""`.
+TEST_P(ProxyStream, ANullReasoningFieldIsNotReasoning)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"reasoning_content\":null}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":"
+            "{\"reasoning_content\":null,\"content\":\"Hello.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.ts_first_thinking, 0)
+        << "a null reasoning field is the server saying the model did not reason";
+    EXPECT_GT(recs[0].r.ts_first_token, 0);
+}
+
+// The control: the same field carrying actual reasoning still stamps. Without this the
+// fix above could be "never match reasoning_content" and nothing would notice.
+TEST_P(ProxyStream, AFilledReasoningFieldStillStamps)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"reasoning_content\":null}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":"
+            "{\"reasoning_content\":\"Let me check.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello.\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_GT(recs[0].r.ts_first_thinking, 0);
+    EXPECT_LE(recs[0].r.ts_first_thinking, recs[0].r.ts_first_token);
+}

@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.44.2]. 2026-09-01
+
+### Fixed
+
+- **A null reasoning field is no longer read as reasoning.** `thinking_delta` and
+  `redacted_thinking` are type names, so their presence is the signal;
+  `reasoning_content` is a field and not a type, and an OpenAI-compatible server that supports
+  reasoning sends it on every delta whether the model reasoned or not. DeepInfra sends
+  `"reasoning_content":null` four times in a two-token Llama reply, so the scan matched
+  the first chunk of every such stream and stamped the reasoning as beginning there.
+
 ## [0.44.1]. 2026-08-31
 
 ### Changed
