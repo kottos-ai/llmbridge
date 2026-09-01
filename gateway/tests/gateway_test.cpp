@@ -4897,6 +4897,7 @@ namespace
             for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
                 c.cap[i].assign(r.captured[i]); // the views die with the call
             c.model.assign(r.model);            // and so does this one
+            c.asked_tier.assign(r.asked_tier);  // and this
             _records.push_back(std::move(c));
         }
         struct Copy
@@ -4904,6 +4905,7 @@ namespace
             llmbridge::RequestRecord r;
             std::string cap[llmbridge::kSinkCaptureMax];
             std::string model;
+            std::string asked_tier;
         };
         std::vector<Copy> records()
         {
@@ -7783,7 +7785,7 @@ TEST_P(ProxyStream, TheRouteSetsTheServiceTierOnTheWire)
     EXPECT_NE(up.find(R"("model":"gpt-5.6-sol")"), std::string::npos)
         << "and every other byte the client sent must survive";
     ASSERT_EQ(sink.records().size(), 1u);
-    EXPECT_TRUE(sink.records()[0].r.asked_tier.empty())
+    EXPECT_TRUE(sink.records()[0].asked_tier.empty())
         << "the client named no tier, so there is no disagreement to report";
 }
 
@@ -7810,7 +7812,7 @@ TEST_P(ProxyStream, ACallersOwnTierIsOverriddenAndReported)
     EXPECT_EQ(up.find(R"("service_tier":"flex")"), std::string::npos)
         << "exactly one tier may reach the venue";
     ASSERT_EQ(sink.records().size(), 1u);
-    EXPECT_EQ(sink.records()[0].r.asked_tier, "flex")
+    EXPECT_EQ(sink.records()[0].asked_tier, "flex")
         << "the override has to be visible, or it is a silent one";
 }
 
@@ -7831,5 +7833,5 @@ TEST_P(ProxyStream, NoTierAskedMeansTheBodyIsUntouched)
     const std::string up = _backend.last_request();
     EXPECT_EQ(up.find("service_tier"), std::string::npos) << up;
     ASSERT_EQ(sink.records().size(), 1u);
-    EXPECT_TRUE(sink.records()[0].r.asked_tier.empty());
+    EXPECT_TRUE(sink.records()[0].asked_tier.empty());
 }

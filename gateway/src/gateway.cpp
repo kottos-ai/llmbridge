@@ -2695,7 +2695,10 @@ namespace llmbridge
                 // tier too long to be one is still worth reporting.
                 c->asked_tier_len = static_cast<uint8_t>(
                     had.size() < sizeof c->asked_tier ? had.size() : sizeof c->asked_tier);
-                std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
+                // Guarded, because the common case is a caller that named no tier and
+                // an empty string_view's data() is null.
+                if (c->asked_tier_len)
+                    std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
             }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,
@@ -4106,7 +4109,10 @@ namespace llmbridge
                 // tier too long to be one is still worth reporting.
                 c->asked_tier_len = static_cast<uint8_t>(
                     had.size() < sizeof c->asked_tier ? had.size() : sizeof c->asked_tier);
-                std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
+                // Guarded, because the common case is a caller that named no tier and
+                // an empty string_view's data() is null.
+                if (c->asked_tier_len)
+                    std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
             }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,

@@ -8,6 +8,19 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.45.1]. 2026-09-01
+
+### Fixed
+
+- **`memcpy` from a null pointer when the caller named no service tier.** The common
+  case: an empty `string_view`'s `data()` is null, and `memcpy` is declared `nonnull`,
+  so a zero length does not excuse it.
+
+- **A test read a sink view after the connection holding it was freed.** `asked_tier`
+  is valid only during `on_request`, like every other view on the record, and the
+  recording sink in the tests copies `model` and the captures out for exactly that
+  reason.
+
 ## [0.45.0]. 2026-09-01
 
 ### Added
