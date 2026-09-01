@@ -69,6 +69,8 @@ namespace llmbridge
         bool streamed = false;
         /// The client sent a Content-Encoding other than identity. Every body-reading
         /// caller here assumes JSON, so this request was parsed as something it is not.
+        /// The upstream connection was reused.
+        bool from_pool = false;
         bool client_encoded = false;
         bool error_reply = false; ///< the gateway generated the reply; stamps unset
         bool truncated = false;   ///< stream ended without a clean finish

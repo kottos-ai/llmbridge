@@ -2552,6 +2552,7 @@ namespace llmbridge
         r.model = std::string_view(c->sink_model, c->sink_model_len);
         r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
         r.upstream_error = std::string_view(c->upstream_error, c->upstream_error_len);
+        r.from_pool = c->upstream_pooled;
         if (streamed && c->sse_xlate)
         {
             r.tokens_in = c->sse_xlate->input_tokens();
@@ -2609,6 +2610,7 @@ namespace llmbridge
         c->tier_override = {};
         c->asked_tier_len = 0;
         c->upstream_error_len = 0;
+        c->upstream_pooled = false;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;
         c->max_chunk_gap_ns = 0;
@@ -2801,6 +2803,7 @@ namespace llmbridge
         c->ts_req_built = now_ns();   // end of our request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
+        c->upstream_pooled = u->connected;
 
         // Optimistic send: if the pooled upstream is already connected (the common
         // case), write immediately and only arm EPOLLOUT if the socket buffer is
@@ -4221,6 +4224,7 @@ namespace llmbridge
         c->ts_req_built = now_ns();   // end of our request-side work
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
+        c->upstream_pooled = u->connected;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)

@@ -8070,3 +8070,34 @@ TEST_P(ProxyRoute, AnUnrecognisedErrorBodyRecordsNothing)
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_EQ(recs[0].upstream_error, "");
 }
+
+// ── whether the handshake was paid, stated per request ───────────────────────
+//
+// The first request to a venue dials it; every one after rides the same socket. The
+// sink could infer this from ts_wire_ready == ts_req_built, and that is a coincidence
+// of two stamps rather than the condition the gateway branched on.
+TEST_P(ProxyRoute, TheSinkSaysWhetherTheUpstreamWasReused)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    // Two requests down one client connection, so the second finds the upstream in
+    // the pool. Sequential on purpose: concurrent ones may each dial.
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_FALSE(recs[0].r.from_pool) << "the first request dialled the venue";
+    EXPECT_TRUE(recs[1].r.from_pool) << "the second rode the same socket";
+}
