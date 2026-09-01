@@ -51,6 +51,22 @@ namespace llmbridge::provider
     /// escaping of a string that lands in a request body is how an injection starts.
     std::string rewrite_model(std::string_view openai_body, std::string_view model);
 
+    /// Set a top-level string key, inserting it when the body does not already carry
+    /// one. Returns the new body, or empty to refuse.
+    ///
+    /// `rewrite_model` can only replace, because a request without a `model` is not one
+    /// this gateway serves. `service_tier` is different: most callers never send it,
+    /// and the route deciding the tier has to be able to put it there. Same splice,
+    /// same top-level-only rule, one more case.
+    std::string upsert_string(std::string_view openai_body, std::string_view key,
+                              std::string_view value, std::string_view* had = nullptr);
+
+    /// Both of the route's overrides in one pass. Either may be empty, and both empty
+    /// returns the body unchanged.
+    std::string apply_overrides(std::string_view openai_body, std::string_view model,
+                                std::string_view service_tier,
+                                std::string_view* had_tier = nullptr);
+
     /// The model the client asked for, as a view into `body`. Empty when the body is
     /// not an object, names no top-level `model`, or spells it with anything other
     /// than a plain string.

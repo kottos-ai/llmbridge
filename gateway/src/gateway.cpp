@@ -2388,6 +2388,7 @@ namespace llmbridge
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
             // Valid only through the forward below, which runs in this call stack.
             c->model_override = d.model;
+            c->tier_override = d.service_tier;
         }
         ep_forward(c); // resolves the translation for the chosen venue; see ep_forward
     }
@@ -2489,6 +2490,7 @@ namespace llmbridge
         r.translated = c->translate_body;
         r.backend = _active_backend;
         r.model = std::string_view(c->sink_model, c->sink_model_len);
+        r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
         if (streamed && c->sse_xlate)
         {
             r.tokens_in = c->sse_xlate->input_tokens();
@@ -2541,6 +2543,10 @@ namespace llmbridge
         c->tok_in = c->tok_out = c->tok_cached = c->tok_cache_write = -1;
         c->tok_cw_5m = c->tok_cw_1h = -1;
         c->ts_first_token = 0;
+        // Per request, like the stamps around it: a pooled connection serving the next
+        // caller must not report the last one's tier.
+        c->tier_override = {};
+        c->asked_tier_len = 0;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;
         c->max_chunk_gap_ns = 0;
@@ -2676,13 +2682,20 @@ namespace llmbridge
             // byte the client sent survives; the derived Content-Length then describes
             // the spliced body without anyone having to remember to update it.
             std::string rewritten;
-            if (!c->model_override.empty())
+            if (!c->model_override.empty() || !c->tier_override.empty())
             {
-                rewritten = provider::rewrite_model(
+                std::string_view had;
+                rewritten = provider::apply_overrides(
                     std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
-                    c->model_override);
+                    c->model_override, c->tier_override, &had);
                 if (rewritten.empty())
-                { ep_error_respond(c, 400, "cannot rewrite model"); return; }
+                { ep_error_respond(c, 400, "cannot apply route overrides"); return; }
+                // Copied, not held: `had` points into the request buffer, which is
+                // reused before the sink runs. Truncated and not refused, because a
+                // tier too long to be one is still worth reporting.
+                c->asked_tier_len = static_cast<uint8_t>(
+                    had.size() < sizeof c->asked_tier ? had.size() : sizeof c->asked_tier);
+                std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
             }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,
@@ -4029,6 +4042,7 @@ namespace llmbridge
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
             // Valid only through the forward below, which runs in this call stack.
             c->model_override = d.model;
+            c->tier_override = d.service_tier;
         }
         ur_forward(c); // resolves the translation for the chosen venue; see ur_forward
     }
@@ -4079,13 +4093,20 @@ namespace llmbridge
             // byte the client sent survives; the derived Content-Length then describes
             // the spliced body without anyone having to remember to update it.
             std::string rewritten;
-            if (!c->model_override.empty())
+            if (!c->model_override.empty() || !c->tier_override.empty())
             {
-                rewritten = provider::rewrite_model(
+                std::string_view had;
+                rewritten = provider::apply_overrides(
                     std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
-                    c->model_override);
+                    c->model_override, c->tier_override, &had);
                 if (rewritten.empty())
-                { ur_error_respond(c, 400, "cannot rewrite model"); return; }
+                { ur_error_respond(c, 400, "cannot apply route overrides"); return; }
+                // Copied, not held: `had` points into the request buffer, which is
+                // reused before the sink runs. Truncated and not refused, because a
+                // tier too long to be one is still worth reporting.
+                c->asked_tier_len = static_cast<uint8_t>(
+                    had.size() < sizeof c->asked_tier ? had.size() : sizeof c->asked_tier);
+                std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
             }
             upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
                                              c->msg.header_len, _strip_headers, up.host_hdr,
