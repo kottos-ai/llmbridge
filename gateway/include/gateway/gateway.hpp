@@ -380,6 +380,13 @@ namespace llmbridge
         /// The Anthropic->OpenAI SSE translator, null when the stream needs none.
         /// What the policy asked this request's `model` to become, empty for none.
         std::string_view model_override{};
+        /// What the policy asked this request's `service_tier` to become, and what the
+        /// client's own body carried.
+        std::string_view tier_override{};
+        /// What the client's own body said, copied out because the request buffer is
+        /// reused before the sink runs.
+        char asked_tier[16] = {};
+        uint8_t asked_tier_len = 0;
 
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a

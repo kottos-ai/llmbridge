@@ -610,6 +610,145 @@ namespace llmbridge::provider
         return out;
     }
 
+    std::string upsert_string(std::string_view openai_body, std::string_view key,
+                              std::string_view value, std::string_view* had)
+    {
+        if (had) *had = {};
+        if (key.empty() || value.empty()) return {};
+        // Both halves land inside quotes in a request body, so both are held to the
+        // charset rewrite_model uses. A tier or a key needing an escape is a caller
+        // speaking a different schema, not something to guess at.
+        for (const std::string_view s : {key, value})
+            for (const char ch : s)
+            {
+                const auto u = static_cast<unsigned char>(ch);
+                if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return {};
+            }
+        bool ok = false;
+        const json::Value v = json::parse(openai_body, ok);
+        if (!ok || !v.is_object()) return {};
+
+        const char* base = openai_body.data();
+        const auto in_body = [&](std::string_view sv) {
+            return sv.data() >= base && sv.data() + sv.size() <= base + openai_body.size();
+        };
+
+        if (const json::Value* cur = v.find(key))
+        {
+            // Present and not a string: refuse. See the header.
+            if (!cur->is_string() || !in_body(cur->sv)) return {};
+            if (had) *had = cur->sv;
+            const size_t at = static_cast<size_t>(cur->sv.data() - base);
+            std::string out;
+            out.reserve(openai_body.size() + value.size());
+            out.append(openai_body.substr(0, at));
+            out.append(value);
+            out.append(openai_body.substr(at + cur->sv.size()));
+            return out;
+        }
+
+        // Absent: splice it in right after the object's opening brace, which the
+        // parser's own span gives us. Inserting at the front means no scan for
+        // the matching close.
+        if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return {};
+        const size_t open = static_cast<size_t>(v.sv.data() - base) + 1;
+        // An empty object takes no comma; anything else does. Whitespace between the
+        // brace and the first member is legal and stays where it is.
+        size_t probe = open;
+        while (probe < openai_body.size() &&
+               (openai_body[probe] == ' ' || openai_body[probe] == '\t' ||
+                openai_body[probe] == '\n' || openai_body[probe] == '\r'))
+            ++probe;
+        const bool empty_object = probe < openai_body.size() && openai_body[probe] == '}';
+
+        std::string out;
+        out.reserve(openai_body.size() + key.size() + value.size() + 6);
+        out.append(openai_body.substr(0, open));
+        out.push_back('"');
+        out.append(key);
+        out.append("\":\"");
+        out.append(value);
+        out.push_back('"');
+        if (!empty_object) out.push_back(',');
+        out.append(openai_body.substr(open));
+        return out;
+    }
+
+    std::string apply_overrides(std::string_view openai_body, std::string_view model,
+                                std::string_view service_tier, std::string_view* had_tier)
+    {
+        if (had_tier) *had_tier = {};
+        if (model.empty() && service_tier.empty()) return std::string(openai_body);
+        for (const std::string_view v : {model, service_tier})
+            for (const char ch : v)
+            {
+                const auto u = static_cast<unsigned char>(ch);
+                if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return {};
+            }
+        bool ok = false;
+        const json::Value v = json::parse(openai_body, ok);
+        if (!ok || !v.is_object()) return {};
+
+        const char* base = openai_body.data();
+        const auto in_body = [&](std::string_view sv) {
+            return sv.data() >= base && sv.data() + sv.size() <= base + openai_body.size();
+        };
+
+        // Each edit as (offset, length-to-drop, text). Collected first, applied in
+        // ascending offset, so one pass over the body emits the result.
+        struct Edit { size_t at; size_t drop; std::string text; };
+        Edit edits[2];
+        size_t n = 0;
+
+        if (!model.empty())
+        {
+            const json::Value* m = v.find("model");
+            if (!m || !m->is_string() || !in_body(m->sv)) return {};
+            edits[n++] = {static_cast<size_t>(m->sv.data() - base), m->sv.size(),
+                          std::string(model)};
+        }
+        if (!service_tier.empty())
+        {
+            if (const json::Value* t = v.find("service_tier"))
+            {
+                if (!t->is_string() || !in_body(t->sv)) return {};
+                if (had_tier) *had_tier = t->sv;
+                edits[n++] = {static_cast<size_t>(t->sv.data() - base), t->sv.size(),
+                              std::string(service_tier)};
+            }
+            else
+            {
+                if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return {};
+                const size_t open = static_cast<size_t>(v.sv.data() - base) + 1;
+                size_t probe = open;
+                while (probe < openai_body.size() &&
+                       (openai_body[probe] == ' ' || openai_body[probe] == '\t' ||
+                        openai_body[probe] == '\n' || openai_body[probe] == '\r'))
+                    ++probe;
+                const bool empty_object =
+                    probe < openai_body.size() && openai_body[probe] == '}';
+                std::string ins = "\"service_tier\":\"";
+                ins += service_tier;
+                ins += '"';
+                if (!empty_object) ins += ',';
+                edits[n++] = {open, 0, std::move(ins)};
+            }
+        }
+        if (n == 2 && edits[0].at > edits[1].at) std::swap(edits[0], edits[1]);
+
+        std::string out;
+        out.reserve(openai_body.size() + model.size() + service_tier.size() + 24);
+        size_t cursor = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            out.append(openai_body.substr(cursor, edits[i].at - cursor));
+            out.append(edits[i].text);
+            cursor = edits[i].at + edits[i].drop;
+        }
+        out.append(openai_body.substr(cursor));
+        return out;
+    }
+
     std::string openai_to_anthropic_request(std::string_view openai_body,
                                             bool* wants_stream_usage)
     {

@@ -8,6 +8,34 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.45.0]. 2026-09-01
+
+### Added
+
+- **A policy can set the request's `service_tier`.** `Decision::service_tier`, applied
+  on the byte-forward path only, because a tier is an OpenAI-dialect field and every
+  venue that reads one already speaks the caller's dialect.
+
+- **`provider::upsert_string`**, which is what makes that possible. `rewrite_model` can
+  only replace, since a request with no model is not one this gateway serves; almost no
+  caller sends a tier, so the route has to be able to insert one.
+
+- **`provider::apply_overrides`** does both splices in one parse, and the gateway calls
+  only it. Measured, because the cost is not where it looks: on a 4 MB body (about a
+  million tokens) parsing costs 4,313 us and copying the whole string 164 us, so the
+  splice position is nearly free and the parse is everything. Two calls cost 9.6 ms
+  against 4.7 ms for one, and a caller sending `model: "auto"` pays it on every
+  request. Timed at 1 KB through 16 MB; the cost is linear in body size, as it must be.
+
+- **`RequestRecord::asked_tier`** carries what the caller's own body said. The route
+  wins, which is right because the route is what was priced.
+
+### Changed
+
+- Minor: `Decision` and `RequestRecord` each gain a field, so a policy or sink built
+  against 0.44 keeps compiling and keeps behaving identically. Nothing sets a tier
+  unless a policy asks.
+
 ## [0.44.2]. 2026-09-01
 
 ### Fixed

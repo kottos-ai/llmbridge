@@ -7741,3 +7741,95 @@ TEST_P(ProxyStream, AFilledReasoningFieldStillStamps)
     EXPECT_GT(recs[0].r.ts_first_thinking, 0);
     EXPECT_LE(recs[0].r.ts_first_thinking, recs[0].r.ts_first_token);
 }
+
+// ── The route sets the service tier ────────────────────────────────────────────
+// One model is sold at three prices under one name, chosen by a body field and not by
+// the model string. A route that means to buy the cheap tier has to say so in the
+// body, so the gateway splices it in the way it splices the model. Byte-forward only:
+// a tier is an OpenAI-dialect field and a translated venue would not read it.
+namespace
+{
+    class TierPolicy final : public llmbridge::Policy
+    {
+      public:
+        std::string_view tier{"flex"};
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            llmbridge::Decision d;
+            d.allow = true;
+            d.service_tier = tier;
+            return d;
+        }
+    };
+} // namespace
+
+TEST_P(ProxyStream, TheRouteSetsTheServiceTierOnTheWire)
+{
+    TierPolicy pol;
+    RecordingSink sink;
+    _policy = &pol;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"gpt-5.6-sol","max_completion_tokens":8})")));
+    c.recv_all();
+    c.close();
+    shutdown();
+
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find(R"("service_tier":"flex")"), std::string::npos)
+        << "the venue must be told which tier was bought:\n" << up;
+    EXPECT_NE(up.find(R"("model":"gpt-5.6-sol")"), std::string::npos)
+        << "and every other byte the client sent must survive";
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_TRUE(sink.records()[0].r.asked_tier.empty())
+        << "the client named no tier, so there is no disagreement to report";
+}
+
+// The caller loses, and is not overridden in silence: what it asked for reaches the
+// record so the page it reads can say the route bought something else.
+TEST_P(ProxyStream, ACallersOwnTierIsOverriddenAndReported)
+{
+    TierPolicy pol;
+    pol.tier = "priority";
+    RecordingSink sink;
+    _policy = &pol;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","service_tier":"flex","max_completion_tokens":8})")));
+    c.recv_all();
+    c.close();
+    shutdown();
+
+    const std::string up = _backend.last_request();
+    EXPECT_NE(up.find(R"("service_tier":"priority")"), std::string::npos) << up;
+    EXPECT_EQ(up.find(R"("service_tier":"flex")"), std::string::npos)
+        << "exactly one tier may reach the venue";
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_EQ(sink.records()[0].r.asked_tier, "flex")
+        << "the override has to be visible, or it is a silent one";
+}
+
+// The control. Without a policy asking for one, nothing touches the body: a stock
+// build must put the client's bytes on the wire unchanged.
+TEST_P(ProxyStream, NoTierAskedMeansTheBodyIsUntouched)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","max_completion_tokens":8})")));
+    c.recv_all();
+    c.close();
+    shutdown();
+
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.find("service_tier"), std::string::npos) << up;
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_TRUE(sink.records()[0].r.asked_tier.empty());
+}

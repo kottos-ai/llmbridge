@@ -1246,3 +1246,128 @@ TEST(CacheControl, ANonTextPartIsStillRefusedInTheBlockForm)
             {"type":"text","text":"x","cache_control":{"type":"ephemeral"}},
             {"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]})").empty());
 }
+
+// ── upsert_string: the route setting a field the caller usually omits ──────────
+// rewrite_model can only replace, because a request with no model is not one this
+// gateway serves. A service tier is the opposite: almost nobody sends one, and the
+// route has to be able to put it there. Same splice, one more case, and it sits on a
+// body a credential travels with, so the refusals matter as much as the successes.
+namespace
+{
+    std::string upsert(std::string_view body, std::string_view k, std::string_view v,
+                       std::string_view* had = nullptr)
+    {
+        return llmbridge::provider::upsert_string(body, k, v, had);
+    }
+} // namespace
+
+TEST(UpsertString, InsertsWhenTheKeyIsAbsent)
+{
+    std::string_view had = "x";
+    const std::string out = upsert(R"({"model":"m","max_tokens":8})",
+                                   "service_tier", "flex", &had);
+    EXPECT_EQ(out, R"({"service_tier":"flex","model":"m","max_tokens":8})");
+    EXPECT_TRUE(had.empty()) << "absent must be reported as absent, not as a value";
+}
+
+TEST(UpsertString, ReplacesWhenTheKeyIsPresentAndReportsWhatItWas)
+{
+    std::string_view had;
+    const std::string out = upsert(R"({"model":"m","service_tier":"priority"})",
+                                   "service_tier", "flex", &had);
+    EXPECT_EQ(out, R"({"model":"m","service_tier":"flex"})");
+    EXPECT_EQ(had, "priority") << "the caller's own value is what a disagreement is";
+}
+
+// The reason this is a splice and not a re-serialisation: a field the parser does not
+// model must survive untouched.
+TEST(UpsertString, LeavesEveryOtherFieldExactlyAsItWas)
+{
+    const std::string in =
+        R"({"model":"m","future_field":{"a":[1,2,{"b":null}]},"stream":true})";
+    const std::string out = upsert(in, "service_tier", "flex");
+    EXPECT_NE(out.find(R"("future_field":{"a":[1,2,{"b":null}]})"), std::string::npos);
+    EXPECT_NE(out.find(R"("stream":true)"), std::string::npos);
+}
+
+// The whole point of the top-level rule: a prompt that talks about the key is text.
+TEST(UpsertString, DoesNotTouchTheKeyInsideAMessage)
+{
+    const std::string in =
+        R"({"model":"m","messages":[{"role":"user","content":"what is \"service_tier\":\"priority\"?"}]})";
+    std::string_view had = "x";
+    const std::string out = upsert(in, "service_tier", "flex", &had);
+    EXPECT_TRUE(had.empty()) << "the string in the prompt is not the caller's tier";
+    EXPECT_NE(out.find(R"(\"service_tier\":\"priority\")"), std::string::npos)
+        << "the prompt must reach the venue unchanged";
+    EXPECT_EQ(out.find(R"({"service_tier":"flex",)"), 0u);
+}
+
+TEST(UpsertString, AnEmptyObjectTakesNoComma)
+{
+    EXPECT_EQ(upsert("{}", "service_tier", "flex"), R"({"service_tier":"flex"})");
+}
+
+TEST(UpsertString, WhitespaceBeforeTheFirstMemberIsPreserved)
+{
+    const std::string out = upsert("{  \"model\":\"m\" }", "service_tier", "flex");
+    EXPECT_EQ(out, "{\"service_tier\":\"flex\",  \"model\":\"m\" }");
+    bool ok = false;
+    llmbridge::provider::json::parse(out, ok);
+    EXPECT_TRUE(ok) << "and the result still parses";
+}
+
+// Present but not a string. Replacing the span with a quoted value would produce a
+// body neither side meant, so this refuses instead of guessing.
+TEST(UpsertString, RefusesWhenTheKeyIsPresentAndNotAString)
+{
+    EXPECT_TRUE(upsert(R"({"model":"m","service_tier":3})", "service_tier", "flex").empty());
+    EXPECT_TRUE(upsert(R"({"model":"m","service_tier":null})", "service_tier", "flex").empty());
+    EXPECT_TRUE(upsert(R"({"model":"m","service_tier":{"a":1}})", "service_tier", "flex").empty());
+}
+
+// A value needing an escape is a caller speaking a schema we do not model. Guessing at
+// the escaping of a string that lands in a request body is how an injection starts.
+TEST(UpsertString, RefusesAValueOrKeyNeedingEscapes)
+{
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "service_tier", "fl\"ex").empty());
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "service_tier", "fl\\ex").empty());
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "service_tier", std::string("a\x01b")).empty());
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "ser\"vice", "flex").empty());
+}
+
+TEST(UpsertString, RefusesWhatIsNotAnObject)
+{
+    EXPECT_TRUE(upsert("[1,2,3]", "service_tier", "flex").empty());
+    EXPECT_TRUE(upsert("\"a string\"", "service_tier", "flex").empty());
+    EXPECT_TRUE(upsert("not json", "service_tier", "flex").empty());
+    EXPECT_TRUE(upsert("", "service_tier", "flex").empty());
+}
+
+TEST(UpsertString, RefusesAnEmptyKeyOrValue)
+{
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "", "flex").empty());
+    EXPECT_TRUE(upsert(R"({"model":"m"})", "service_tier", "").empty());
+}
+
+// Every accepted result has to be a body a venue can parse, whatever shape went in.
+TEST(UpsertString, EveryAcceptedResultStillParses)
+{
+    const char* bodies[] = {
+        R"({})", R"({"model":"m"})", R"({"a":1,"b":[1,2],"c":{"d":"e"}})",
+        R"({ "model" : "m" })", R"({"service_tier":"priority","model":"m"})",
+        R"({"model":"m","service_tier":"flex"})",
+    };
+    for (const char* b : bodies)
+    {
+        const std::string out = upsert(b, "service_tier", "flex");
+        ASSERT_FALSE(out.empty()) << b;
+        bool ok = false;
+        const auto v = llmbridge::provider::json::parse(out, ok);
+        EXPECT_TRUE(ok) << b << " -> " << out;
+        ASSERT_TRUE(v.is_object());
+        const auto* got = v.find("service_tier");
+        ASSERT_NE(got, nullptr) << out;
+        EXPECT_EQ(got->sv, "flex") << out;
+    }
+}

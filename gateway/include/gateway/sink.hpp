@@ -76,6 +76,8 @@ namespace llmbridge
         uint8_t backend = 0;      ///< 1 = epoll, 2 = io_uring
         /// The model the client asked for, empty when the body named none.
         std::string_view model;
+        /// The `service_tier` the client's own body carried, empty when it named none.
+        std::string_view asked_tier;
         /// Valid only during on_request: they point into the connection. Copy out.
         std::string_view captured[kSinkCaptureMax];
     };

@@ -57,6 +57,11 @@ namespace llmbridge
         /// copied into the outgoing bytes there and never retained.
         std::string_view model{};
 
+        /// Set the request's `service_tier` to this before sending it. Empty leaves the
+        /// body alone, which is what every build without a policy does.
+        /// Same lifetime rule as `model`: valid until framing returns.
+        std::string_view service_tier{};
+
         /// Logged, never sent to the client. Must outlive the call, and must not carry
         /// credential material.
         const char* reason = "policy denied";
