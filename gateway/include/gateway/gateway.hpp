@@ -392,6 +392,8 @@ namespace llmbridge
         uint8_t upstream_error_len = 0;
         /// Client-only: the upstream this request took was already connected.
         bool upstream_pooled = false;
+        char served_tier[16] = {};
+        uint8_t served_tier_len = 0;
 
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a

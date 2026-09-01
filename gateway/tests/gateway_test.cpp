@@ -4908,6 +4908,7 @@ namespace
             c.model.assign(r.model);            // and so does this one
             c.asked_tier.assign(r.asked_tier);  // and this
             c.upstream_error.assign(r.upstream_error); // and this
+            c.served_tier.assign(r.served_tier);       // and this
             _records.push_back(std::move(c));
         }
         struct Copy
@@ -4917,6 +4918,7 @@ namespace
             std::string model;
             std::string asked_tier;
             std::string upstream_error;
+            std::string served_tier;
         };
         std::vector<Copy> records()
         {
@@ -8075,7 +8077,7 @@ TEST_P(ProxyRoute, AnUnrecognisedErrorBodyRecordsNothing)
 //
 // The first request to a venue dials it; every one after rides the same socket. The
 // sink could infer this from ts_wire_ready == ts_req_built, and that is a coincidence
-// of two stamps rather than the condition the gateway branched on.
+// of two stamps, not the condition the gateway branched on.
 TEST_P(ProxyRoute, TheSinkSaysWhetherTheUpstreamWasReused)
 {
     NamedBackend b;
@@ -8100,4 +8102,122 @@ TEST_P(ProxyRoute, TheSinkSaysWhetherTheUpstreamWasReused)
     ASSERT_EQ(recs.size(), 2u);
     EXPECT_FALSE(recs[0].r.from_pool) << "the first request dialled the venue";
     EXPECT_TRUE(recs[1].r.from_pool) << "the second rode the same socket";
+}
+
+// ── what the venue says it served, against what was asked for ─────────────────
+//
+// asked_tier and the policy's override are both requests. A venue is free to serve
+// something else, and without this the tape records the intention and calls it the
+// outcome. OpenAI echoes service_tier on a non-streamed body and on every chunk.
+TEST_P(ProxyRoute, TheSinkRecordsTheTierTheVenueSaysItServed)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"x","object":"chat.completion","service_tier":"flex",)"
+                R"("choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_tier, "flex");
+}
+
+// A venue with no such concept says nothing, and nothing is what gets recorded. An
+// invented default would make every Anthropic request claim a tier it never had.
+TEST_P(ProxyRoute, AVenueThatNamesNoTierRecordsNone)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_tier, "");
+}
+
+// The streamed case, which is the one that matters: Prosper AI's traffic is a
+// byte-forwarded OpenAI stream, and the tier rides on the first chunk.
+TEST_P(ProxyRoute, TheServedTierIsReadOffAStream)
+{
+    const std::string events =
+        "data: {\"id\":\"x\",\"service_tier\":\"priority\","
+        "\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        "data: {\"id\":\"x\",\"service_tier\":\"priority\",\"choices\":[]}\n\n"
+        "data: [DONE]\n\n";
+    TestBackend b;
+    b.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                   "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n"
+                   "Connection: keep-alive\r\n\r\n" +
+                   sse_chunk_encode(events, 64));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.streamed);
+    EXPECT_EQ(recs[0].served_tier, "priority");
+}
+
+// The served tier sits at opposite ends of the two reply shapes, so one window cannot
+// serve both. Measured against the live API 2026-09-01: a stream chunk carries it at
+// byte 125 of 305, before choices; a non-streamed body carries it at byte 1015 of 1070,
+// after choices and usage. A head-only scan found nothing on any body past the window,
+// which is every real completion of any length.
+TEST_P(ProxyRoute, TheServedTierIsFoundPastTheHeadOfALongBody)
+{
+    // Well past the 1 KiB head window, with the tier where OpenAI actually puts it.
+    const std::string filler(8000, 'x');
+    const std::string body =
+        R"({"id":"x","object":"chat.completion","choices":[{"index":0,"message":)"
+        R"({"role":"assistant","content":")" + filler + R"("}}],)"
+        R"("usage":{"prompt_tokens":7,"completion_tokens":2},"service_tier":"flex",)"
+        R"("system_fingerprint":"fp"})";
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK", body);
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_tier, "flex")
+        << "the tier follows the body, so the scan must search the tail";
 }
