@@ -7835,3 +7835,53 @@ TEST_P(ProxyStream, NoTierAskedMeansTheBodyIsUntouched)
     ASSERT_EQ(sink.records().size(), 1u);
     EXPECT_TRUE(sink.records()[0].asked_tier.empty());
 }
+
+// ── a refused stranger is attributable ─────────────────────────────────────────
+// This endpoint is public, so 401s arrive from people who are not customers. The
+// connection id names them only within one process lifetime; without an address a
+// repeated refusal cannot be told from background noise, which is the question an
+// operator actually has. Measured on the live box before this existed: 371 of them in
+// six hours, and nothing to say whether they shared a source.
+TEST_P(ProxyPolicy, AnAuthRefusalNamesThePeer)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 401,
+                                            .reason = "no token"}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+
+    EXPECT_NE(sink.text.find("reply 401"), std::string::npos) << sink.text;
+    EXPECT_NE(sink.text.find("peer=127.0.0.1:"), std::string::npos)
+        << "an authentication refusal must say where it came from:\n" << sink.text;
+}
+
+// And only there. Every other 4xx is a customer of ours getting a request wrong,
+// where the connection id is enough and the address is noise on every line.
+TEST_P(ProxyPolicy, AnOrdinaryRefusalDoesNotNameThePeer)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 429,
+                                            .reason = "slow down"}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+
+    EXPECT_NE(sink.text.find("reply 429"), std::string::npos) << sink.text;
+    EXPECT_EQ(sink.text.find("peer="), std::string::npos)
+        << "only an authentication refusal carries the address:\n" << sink.text;
+}

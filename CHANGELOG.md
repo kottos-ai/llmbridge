@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.46.0]. 2026-09-01
+
+### Added
+
+- **An authentication refusal names the address it came from.** This endpoint is
+  public, so 401s arrive from people who are not customers, and a connection id names
+  them only within one process lifetime.
+
+  **Only 401 and 403.** Every other 4xx is a customer getting a request wrong, where
+  the connection id is enough and an address on every line is noise.
+
 ## [0.45.1]. 2026-09-01
 
 ### Fixed
