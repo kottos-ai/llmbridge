@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.50.1]. 2026-09-02
+
+### Fixed
+
+- **A translated request never recorded the served tier.** Both capture calls sat in the
+  passthrough branch. Three of the four corners of (streamed, translated) had tests and
+  the fourth had none, which is the corner the fix moved into; all four are covered now,
+  on both backends.
+
 ## [0.50.0]. 2026-09-02
 
 ### Fixed
