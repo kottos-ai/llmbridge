@@ -17,6 +17,7 @@ compile_commands.json
 
 # LiteLLM head-to-head venv (large; recreate via the note in bench/run_headtohead.sh)
 bench/.litellm-venv/
+bench/.litellm-venv-current/
 
 # Python venv (pandas/numpy for the price observatory's feature builder). `python -m
 # venv` writes its own .venv/.gitignore containing `*`, so this is belt-and-braces;

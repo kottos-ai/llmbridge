@@ -41,12 +41,16 @@ if [ "${#RPS_LIST[@]}" -eq 1 ]; then read -r -a RPS_LIST <<< "${RPS_LIST[0]}"; f
 MOCK_PORT=9001
 LLMBRIDGE_PORT=8088
 LL_PORT=8089
-VENV=bench/.litellm-venv
+# Overridable so rerun_litellm.sh can point at a venv holding a different LiteLLM
+# release without disturbing the pinned 1.95.0 one the published figures came from.
+VENV="${LITELLM_VENV:-bench/.litellm-venv}"
 RESDIR=bench/results
 mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SUMMARY="$RESDIR/headtohead-$STAMP.txt"
-CSV="$RESDIR/phase-a-comparison.csv"
+# Overridable: rerun_litellm.sh points each arm at its own file so a re-measurement
+# cannot overwrite the published run that feeds make_chart.py.
+CSV="${H2H_CSV:-$RESDIR/phase-a-comparison.csv}"
 
 BIN="${BIN:-}"
 if [ -z "$BIN" ]; then
@@ -135,6 +139,12 @@ for RPS in "${RPS_LIST[@]}"; do
   k99=$(awk -v u="$k_self_p99" 'BEGIN{printf "%.3f", u/1000.0}')
   k999=$(awk -v u="$k_self_p999" 'BEGIN{printf "%.3f", u/1000.0}')
   kmax=$(awk -v u="$k_self_max" 'BEGIN{printf "%.3f", u/1000.0}')
+
+  # Delivering nothing is not negative latency. l50 defaults to 0 when the sample is
+  # empty, so the subtraction above turns a dead proxy into a large negative delta.
+  if [ "$la" -eq 0 ] 2>/dev/null; then
+    la50=dead; la99=dead; la999=dead; lamax=dead
+  fi
 
   printf "%-6s | %-22s | %-30s | %s\n" "$RPS" \
     "$k50 / $k99" \

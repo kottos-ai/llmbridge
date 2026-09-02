@@ -473,6 +473,75 @@ bench/.litellm-venv/bin/pip install "litellm[proxy]==1.95.0" \
 
 Verify before a run: the proxy must answer `GET /health/liveliness` with 200.
 
+### The pin is a liability as well as a guarantee (2026-09-02)
+
+1.95.0 is what the published figures were measured against, and it stays pinned so
+they stay reproducible. It is also **five releases behind**: PyPI is on 1.99.0, and
+LiteLLM has announced an optional sidecar that moves the hot path out of Python,
+claiming 1,000 QPS without failures and up to 5,000 on 4 CPU and 8 GB. Our published
+figure is a ~246 RPS ceiling on one worker. Both cannot be true of the same software.
+
+Read their post carefully before repeating either number. It states a Q1 **goal** of
+"sub-millisecond proxy overhead" and reports **no overhead measurement and no version**,
+so the only concrete claim in it is throughput.
+
+`bench/rerun_litellm.sh` measures the current release in a separate venv and leaves the
+pinned one alone.
+
+### What 1.99.0 actually contains (inspected 2026-09-02)
+
+The install now succeeds unpinned. FastAPI 0.141.1 and litellm 1.99.0 start the proxy
+fine, so the `get_flat_dependant` caveat above describes a window that has closed. The
+1.95.0 pin stays for reproducibility, not because a newer one cannot run.
+
+The re-architecture ships, under a different name than the post uses. There is no file
+in the package mentioning a sidecar; there is a compiled `litellm/rust_bridge/_native.abi3.so`
+and 35 modules referencing it. Searching for the blog's vocabulary returns nothing and
+is how a first pass concluded the feature was absent.
+
+Three properties of that path decide what has to be re-measured, all read from
+`rust_bridge/chat_completions.py` in the installed package:
+
+| property | value | consequence for our claims |
+|---|---|---|
+| gate | `LITELLM_RUST` in `{1,true,yes,on}`, or `litellm_params["rust"] is True`; default empty | off unless asked for, so the default arm is still the Python path a user gets |
+| providers | `frozenset({"anthropic", "bedrock"})` | covers our head-to-head exactly, which uses the anthropic provider |
+| streaming | `if stream: return False` | **the streaming numbers need no re-measurement**: this path serves no streamed request |
+
+So the streaming results, including 99.93-100% delivery against LiteLLM's 4% at 512
+concurrent, are unaffected by the Rust work regardless of how the non-streamed arm comes
+out. The non-streamed comparison needs both arms, default and `LITELLM_RUST=1`, or it
+measures a configuration the vendor would fairly object to.
+
+### First fit measurement of 1.99.0 (2026-09-02, provisional)
+
+A second run on a quiet host (load 0.72, no IDEs) put **llmbridge's own p99 at 0.085 ms
+against the published 0.080 ms**, a 6% control drift, so the comparison is readable.
+Single run, not the median of three, and the host still carried a desktop session, so
+these are provisional pending a cold-boot median.
+
+At 100 RPS, the only unsaturated point:
+
+| | llmbridge p99 | LiteLLM added p50 | LiteLLM added p99 | ratio on p99 |
+|---|---|---|---|---|
+| 1.95.0, published, cold, median of 3 | 0.080 ms | 4.490 ms | **87.060 ms** | ~1,090x |
+| 1.99.0 default (Python path) | 0.085 ms | 4.690 ms | **30.450 ms** | **~360x** |
+| 1.99.0 with `LITELLM_RUST=1` | 0.080 ms | 4.410 ms | **23.690 ms** | **~300x** |
+
+**The median did not move; the tail did.** Added p50 is 4.49, 4.69 and 4.41 ms across all
+three, statistically one number. The p99 fell from 87 ms to 24-30 ms, so the work landed
+on tail latency.
+
+**Consequence for the public claim: "~1,000x versus LiteLLM" is no longer defensible.**
+Measured like for like at 100 RPS it is now roughly 360x against the default configuration
+and 300x against the fastest one the release offers.
+
+**The throughput claim in their post is not reproduced.** Single-worker saturation measured
+217 to 235 req/s, against ~246 published for 1.95.0, so the ceiling is unchanged inside
+run-to-run noise. Their post claims 1,000 QPS without failures and up to 5,000 on 4 CPU and
+8 GB, which is a multi-worker configuration; our harness runs one worker, as the published
+baseline did.
+
 ## Inbound TLS arm (added 2026-08-12)
 
 `streamgen` gained `--tls --ca FILE`, the only client in this tree that can drive
