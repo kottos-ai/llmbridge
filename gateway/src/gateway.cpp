@@ -1196,22 +1196,21 @@ namespace llmbridge
         }
 
         /// Bytes of a reply worth searching for the served tier, and it is a different
-        /// end of the reply in each case. Measured against the live OpenAI API on
-        /// 2026-09-01: a stream chunk carries `service_tier` before `choices`, at byte
-        /// 125 of 305, and every chunk repeats it; a non-streamed body carries it after
-        /// `choices` and `usage`, at byte 1015 of 1070. Searching the wrong end finds
-        /// nothing on any reply longer than the window, which is why `tail` exists and
-        /// why these two numbers are recorded instead of one generous bound.
-        constexpr size_t kTierHead = 1024;
+        /// end of the reply in each dialect.
+        constexpr size_t kTierHead = 2048;
         constexpr size_t kTierTail = 2048;
 
-        /// Record the tier the venue says it served, once. OpenAI repeats
-        /// `service_tier` on every chunk, so the first one seen is the answer and every
-        /// later chunk costs one predicate. `tail` searches the end of `bytes`, which
-        /// is where a non-streamed body puts it, beside the usage block.
+        /// Reads to search before concluding the venue has no such field. Both dialects
+        /// put it in the first chunk, so this only has to survive a read that splits
+        /// one, and four is generous for that.
+        constexpr uint8_t kTierTries = 4;
+
+        /// `tail` searches the end of `bytes`, which is where a non-streamed body puts
+        /// it, beside the usage block.
         void note_served_tier(Connection* c, std::string_view bytes, bool tail) noexcept
         {
-            if (c->served_tier_len) return;
+            if (c->served_tier_len || c->served_tier_tries >= kTierTries) return;
+            ++c->served_tier_tries;
             const size_t w = tail ? kTierTail : kTierHead;
             const std::string_view head =
                 bytes.size() <= w ? bytes
@@ -2644,6 +2643,7 @@ namespace llmbridge
         c->asked_tier_len = 0;
         c->upstream_error_len = 0;
         c->served_tier_len = 0;
+        c->served_tier_tries = 0;
         c->upstream_pooled = false;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;

@@ -8,6 +8,14 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.50.0]. 2026-09-02
+
+### Fixed
+
+- **The served-tier search was bounded on the wrong axis.**
+
+- **The head window missed a venue that names the tier once.**
+
 ## [0.49.0]. 2026-09-01
 
 ### Added

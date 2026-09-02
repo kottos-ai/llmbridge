@@ -394,6 +394,10 @@ namespace llmbridge
         bool upstream_pooled = false;
         char served_tier[16] = {};
         uint8_t served_tier_len = 0;
+        /// Reads searched for it so far. Both dialects put it in the first chunk, so
+        /// this gives up quickly on a venue that has no such field instead of
+        /// searching every chunk of the stream.
+        uint8_t served_tier_tries = 0;
 
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
         /// Tail of a BYTE-FORWARDED stream, for the final usage chunk. Empty on a
