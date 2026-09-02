@@ -8258,3 +8258,74 @@ TEST_P(ProxyRoute, TheServedTierIsFoundWhenTheVenueSendsItOnlyOnce)
     EXPECT_EQ(recs[0].served_tier, "standard")
         << "a venue that names the tier once must still be read";
 }
+
+// A translated venue still names the tier, and the record has to carry it. The capture
+// used to sit inside the byte-forward branch, so an OpenAI-dialect client reaching an
+// Anthropic venue recorded nothing. Caught on live traffic, not by a test.
+TEST_P(ProxyRoute, TheServedTierIsReadOnATranslatedStream)
+{
+    const std::string events =
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\","
+        "\"usage\":{\"input_tokens\":9,\"output_tokens\":1,\"service_tier\":\"standard\"}}}\n\n"
+        "event: content_block_delta\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    TestBackend b;
+    b.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                   "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n"
+                   "Connection: keep-alive\r\n\r\n" + sse_chunk_encode(events, 4096));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    // Anthropic upstream, OpenAI-speaking client, so the response is translated.
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink,
+          {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.translated);
+    EXPECT_EQ(recs[0].served_tier, "standard")
+        << "translation rewrites the reply for the caller, not what the venue served";
+}
+
+// The fourth corner of the matrix: not streamed and translated. The other three had
+// tests before this one did, which is how the translated placement bug survived: the
+// hoisted non-streamed call had no case exercising it at all.
+TEST_P(ProxyRoute, TheServedTierIsReadOnATranslatedBody)
+{
+    NamedBackend b;
+    // An Anthropic reply, where the tier rides inside usage and near the end.
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"m","type":"message","role":"assistant","model":"c",)"
+                R"("content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",)"
+                R"("usage":{"input_tokens":9,"output_tokens":2,"service_tier":"standard"}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink,
+          {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.translated);
+    EXPECT_EQ(recs[0].served_tier, "standard");
+}

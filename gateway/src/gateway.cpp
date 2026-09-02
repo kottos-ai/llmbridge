@@ -1354,6 +1354,9 @@ namespace llmbridge
                     if (gap > client->max_chunk_gap_ns) client->max_chunk_gap_ns = gap;
                 }
                 client->ts_last_chunk = now;
+                // Beside the gap stamp, and for the same reason: this is the one point
+                // every chunk crosses in either dialect.
+                note_served_tier(client, sse_in, /*tail=*/false);
             }
 
             // No translator = BYTE-FORWARD. An OpenAI-compatible venue already speaks
@@ -1367,7 +1370,6 @@ namespace llmbridge
                 if (!sse_in.empty())
                 {
                     stream_note_usage(client, sse_in);
-                    note_served_tier(client, sse_in, /*tail=*/false);
                     // Reasoning is stamped before the token, because it comes first on
                     // the wire and one read can carry both. See the two helpers.
                     if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
@@ -3020,6 +3022,7 @@ namespace llmbridge
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
         note_quota(client, h);
         note_upstream_error(client, h, body_buf);
+        note_served_tier(client, body_buf, /*tail=*/true);
 
         if (client->translate_body)
         {
@@ -3099,7 +3102,6 @@ namespace llmbridge
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
-            note_served_tier(client, body_buf, /*tail=*/true);
             const BodyUsage bu = scan_usage(body_buf);
             client->tok_in = bu.in;
             client->tok_out = bu.out;
@@ -4099,6 +4101,7 @@ namespace llmbridge
             c->peer->ts_up_recvd = now_ns();
             note_quota(c->peer, r.head);
             note_upstream_error(c->peer, r.head, r.body);
+            note_served_tier(c->peer, r.body, /*tail=*/true);
             ur_on_response(c, r.head, r.body, r.total_len);
         }
     }
@@ -4380,7 +4383,6 @@ namespace llmbridge
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
-            note_served_tier(client, body_buf, /*tail=*/true);
             const BodyUsage bu = scan_usage(body_buf);
             client->tok_in = bu.in;
             client->tok_out = bu.out;
