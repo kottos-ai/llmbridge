@@ -8221,3 +8221,40 @@ TEST_P(ProxyRoute, TheServedTierIsFoundPastTheHeadOfALongBody)
     EXPECT_EQ(recs[0].served_tier, "flex")
         << "the tier follows the body, so the scan must search the tail";
 }
+
+// Anthropic sends the tier once, inside message_start's usage, where OpenAI repeats it
+// on every chunk. So a miss on the first read is permanent there, and the head window
+// has to clear the real offset: measured 414 to 426 bytes across opus-5, sonnet-5 and
+// haiku-4-5 on 2026-09-02.
+TEST_P(ProxyRoute, TheServedTierIsFoundWhenTheVenueSendsItOnlyOnce)
+{
+    // Padding puts the field past the old 1 KiB window and leaves it in exactly one
+    // chunk, which is the Anthropic shape.
+    const std::string pad(1400, 'p');
+    const std::string events =
+        "data: {\"type\":\"message_start\",\"pad\":\"" + pad +
+        "\",\"usage\":{\"input_tokens\":9,\"service_tier\":\"standard\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n"
+        "data: [DONE]\n\n";
+    TestBackend b;
+    b.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                   "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n"
+                   "Connection: keep-alive\r\n\r\n" + sse_chunk_encode(events, 4096));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_tier, "standard")
+        << "a venue that names the tier once must still be read";
+}
