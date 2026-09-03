@@ -8,6 +8,12 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.52.2]. 2026-09-03
+
+### Performance
+
+- **A streamed request spent 65 us in substring searches.** Replaced find by memmem.
+
 ## [0.52.1]. 2026-09-03
 
 ### Fixed
