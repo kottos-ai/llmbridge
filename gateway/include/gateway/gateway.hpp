@@ -293,6 +293,23 @@ namespace llmbridge
         // dead pooled connection. GATEWAY-INTERNALS.md section 2b.
         size_t woff = 0;
 
+        // One `Connection` serves both legs and `is_client` says which. Read that
+        // before reading any timestamp here, because two of them change meaning:
+        //
+        //   inbound  (is_client == true)   client to gateway
+        //   upstream (is_client == false)  gateway to venue
+        //
+        //   ts_accepted    inbound: accept() returned. upstream: socket created.
+        //   ts_first_byte  inbound: first request byte. upstream: first response byte.
+        //
+        // Inbound only: client_upload_ns, ever_framed, client_conn_reused,
+        // client_conn_setup_ns, stream_tail, sse_scratch, msg.
+        // Upstream only: from_pool, retried.
+        //
+        // The `client_` prefix marks a field that is meaningless on an upstream
+        // connection. `from_pool` is the upstream pool and has no inbound counterpart
+        // beyond client_conn_reused, which is a different pool entirely.
+
         // Client conns: when we accepted it, and whether it has ever produced a
         // complete request. Together they bound the setup phase: a peer that
         // connects and then stalls, deliberately or through a protocol mismatch,
@@ -305,6 +322,8 @@ namespace llmbridge
         // sat on the descriptor. Not part of the t0-t6 scheme; it is per connection.
         int64_t ts_client_activity = 0;
         bool ever_framed = false;
+        bool client_conn_reused = false;
+        int64_t client_conn_setup_ns = 0;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
         net::http::Message msg{};
@@ -404,6 +423,8 @@ namespace llmbridge
         /// translated stream, which gets its counts from the translator, and empty
         /// when the client did not ask for usage. Bounded; see stream_note_usage.
         std::string stream_tail{};
+        /// Scratch for one streaming step's decoded bytes, reused across chunks.
+        std::string sse_scratch{};
         /// Usage accumulated as a byte-forwarded stream runs. -1 = not reported,
         /// which is not the same as zero and must never be rendered as a number.
         /// Fields, and not a tail scan at the end, because Anthropic states input

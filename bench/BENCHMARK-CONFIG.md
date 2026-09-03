@@ -542,6 +542,180 @@ run-to-run noise. Their post claims 1,000 QPS without failures and up to 5,000 o
 8 GB, which is a multi-worker configuration; our harness runs one worker, as the published
 baseline did.
 
+The Rust path was verified to actually serve the request, instead of being assumed from
+the environment variable: with `LITELLM_RUST=1` the response carries `x-litellm-rust: true`,
+and without it the header is absent. Check that header before attributing a number to it.
+
+### Independent corroboration, and a first Bifrost number (2026-09-02)
+
+A third-party benchmark published 2026-06-26 by the author of GoModel measures four
+gateways on an AWS c7i.large against an instant mock, 8,000 requests at concurrency 10,
+two trials in randomised order, throughput from a separate saturation sweep. Harness:
+github.com/ENTERPILOT/ai-gateway-reproducible-benchmark.
+
+| gateway | runtime | p50 added | p99 added | sustained | peak RAM |
+|---|---|---|---|---|---|
+| GoModel | Go | 1.8 ms | 6.9 ms | 4,900 req/s | 37 MB |
+| Bifrost | Go | 2.5 ms | 18.3 ms | 3,100 req/s | 143 MB |
+| Portkey | Node | 9.7 ms | 30.5 ms | 950 req/s | 112 MB |
+| LiteLLM | Python | 30.6 ms | 39.3 ms | 324 req/s | 2.3 GB |
+
+**It corroborates today's correction.** They measure 39.3 ms added p99 on different
+hardware with a different harness; we measured 30.45 ms. Both sit near 30 ms, and our
+published 87 ms is the outlier, which is what a version improvement looks like from two
+directions at once.
+
+**It is also our first Bifrost measurement, and it contradicts their marketing.**
+Bifrost claims roughly 11 microseconds of overhead at 5,000 RPS; a third party measures
+p50 2.5 ms and p99 18.3 ms. Treat neither as settled and run the harness ourselves.
+
+### Reconciling ~84k with ~30k in the third-party harness (2026-09-02)
+
+The ENTERPILOT harness measures one llmbridge worker at roughly 30,000 req/s, against
+our published ~84k single-thread ceiling. Both are correct. They differ by four factors,
+three of them measured on one box in one session, and none of them is a defect.
+
+| | measured | note |
+|---|---|---|
+| our loadgen to our fastbackend, direct | 114,278 | the backend is not the limit |
+| our loadgen to llmbridge to our fastbackend | 69,308 | one backend, matches the ~65k this file already documents |
+| our loadgen to their Go mock, direct | 79,053 | their mock alone |
+| our loadgen to llmbridge to their Go mock | 41,074 | swapping only the backend costs 41% |
+| the same, containerised, default seccomp | 32,785 | containerisation costs 20% |
+| the same, seccomp and apparmor off | 38,528 | 18% of that is the syscall filter |
+| the same, plus `--cpuset-cpus` pinning | 41,375 | matches native; container overhead fully recovered |
+
+**Factor 1, backend count.** The published 84k needs `BACKENDS=4`; at one backend this
+file already says the mock becomes the ceiling at ~65k, and today's run measured 69,308.
+The third-party harness runs a single mock process. A third of the gap was never a
+mystery, it is in the table above under `BACKENDS`.
+
+**Factor 2, the backend itself.** Same gateway, same generator, only the mock swapped:
+69,308 to 41,074. Their Go mock returns **439 bytes against our fastbackend's 228**, and
+a byte-forwarding proxy's cost scales with bytes. Their mock is not saturating (79,053
+direct), so this is the gateway doing more work per request. Payload size is the leading
+explanation and not an isolated one: the two mocks differ in implementation as well as
+response size, and nothing here varied payload alone.
+
+**Factor 3, containerisation, and it is recoverable.** A container costs 20%, of which
+**18 points are seccomp**: the filter is evaluated on every syscall, and this workload is
+89% kernel time, so a per-syscall tax lands right on it. The remaining ~7% is the
+scheduler migrating the worker between cores. `--security-opt seccomp=unconfined` plus
+`--cpuset-cpus` restores native throughput exactly.
+
+### The filters were not a tax, they disabled io_uring (2026-09-02)
+
+Docker's default seccomp profile **blocks the io_uring syscalls**, so llmbridge inside a
+default container silently selects the epoll fallback. Read off its own startup line:
+
+```
+default seccomp:     backend requested=auto active=epoll
+seccomp unconfined:  backend requested=auto active=io_uring
+```
+
+Everything that harness has measured for llmbridge was therefore **epoll**, not the
+backend this project defaults to on Ubuntu 24.04. The memory jump on the unconfined run,
+15.1 to 32.3 MB, is the io_uring rings, and it was the tell: a syscall filter cannot cost
+memory. An earlier note here called the 18% a per-syscall tax. It is not; it is a
+different I/O backend, and the correction matters because the two have different
+explanations and different fixes.
+
+Measured effect, single worker, same box, `--force` passes with a desktop session
+running, so read the ratio and not the absolutes:
+
+| | epoll (default seccomp) | io_uring (unconfined) |
+|---|---|---|
+| peak sustained | 29,723 | 33,881 |
+| no-gateway baseline that day | 66,846 | 60,813 |
+| share of the path's ceiling | 44.5% | **55.7%** |
+| memory, peak | 15.1 MB | 32.3 MB |
+| knee | c=16 | c=32 |
+
+**This is a deployment fact, not only a benchmark fact.** Anyone running llmbridge in a
+container with default seccomp gets epoll. That belongs in the deployment documentation,
+and the gateway should arguably say so louder than an INFO line, since `--io auto`
+downgrading to epoll is invisible to an operator who did not think to look.
+
+**The harness is good, and this is not a criticism of it.** Five trials in randomised
+order, throughput swept separately from latency, per-dialect warmup, a no-gateway
+baseline recorded, reproducible from a public repository, and its author states his
+scope honestly. The seccomp cost is Docker's default, inherited by any containerised
+benchmark, not a design error.
+
+### The full nine-arm run, and what its streaming column measures (2026-09-03)
+
+One run, one floor, one worker, seccomp off for every arm so llmbridge runs io_uring,
+five trials at concurrency 10. Chat non-streaming:
+
+| gateway | cores | added p50 | above floor | peak rps | memory | startup | rps/CPU% |
+|---|---|---|---|---|---|---|---|
+| tcprelay, the floor | 2.17 | 0.25 | 0 | 44,233 | 6.5 MB | 0.30 s | 158.5 |
+| llmbridge | 0.99 | 0.25 | 0.000 | 38,236 | 32.0 MB | 0.29 s | 335.9 |
+| llmbridge-anthropic | 1.04 | 0.34 | 0.090 | 30,670 | 31.9 MB | 0.30 s | 246.3 |
+| gomodel | 6.01 | 0.65 | 0.400 | 16,380 | 68.6 MB | 0.54 s | 22.7 |
+| bifrost | 7.86 | 0.95 | 0.700 | 10,049 | 495.6 MB | 11.41 s | 10.9 |
+| portkey | 1.20 | 7.71 | 7.460 | 1,250 | 187.6 MB | 0.98 s | 10.1 |
+| litellm | 8.05 | 10.98 | 10.730 | 876 | 9,528 MB | 39.30 s | 0.9 |
+| tensorzero | 0.16 | 41.92 | 41.670 | 6,537 | 126.2 MB | 0.51 s | 16.6 |
+| omniroute | 1.07 | 171.70 | 171.450 | 58 | 931.4 MB | 5.95 s | 0.5 |
+
+Non-streaming lands **at the floor**, 0.000 ms above a byte pipe that parses nothing, on
+0.99 cores against its 2.17.
+
+**The cores column is not optional.** GoModel and Bifrost are not multi-threaded by
+accident of Docker: the Go runtime takes `GOMAXPROCS` = every core. Measured directly,
+outside the harness, GoModel consumed **6.11 cores non-streaming and 4.42 streaming**.
+Quoting throughput without cores flatters them and understates us by roughly an order of
+magnitude.
+
+### The streaming column measures connection churn, not streaming
+
+Streaming looks like our weakest row (0.74 ms above the floor against GoModel's 0.42).
+Before optimising anything against it, know what it is. Syscalls counted under strace
+over 1,000 requests, one worker, io_uring:
+
+| | `io_uring_enter` | `setsockopt` | `shutdown` | `close` |
+|---|---|---|---|---|
+| non-streaming | 1,634 | 11 | 9 | 20 |
+| streaming | 2,261 | 1,007 | 1,005 | 1,016 |
+
+**But the churn is not the cost here.** Accounting for the 137.8 us gap over 34 events:
+roughly 10 us of extra syscalls and handshake, ~1 us of scans measured in isolation, and
+**~125 us, about 3.7 us per event, still unattributed**.
+
+### Why this does not contradict the 40k-stream claim
+
+The two benchmarks measure opposite things and neither is wrong.
+
+**The mock does not pace its tokens.** It flushes 35 SSE events back to back with no
+sleep, so a stream completes in microseconds and the test is an event-throughput and
+connection-churn test at concurrency 10. Our own streaming benchmark holds thousands of
+concurrent streams at a realistic ~20 ms inter-token interval and measures time to first
+token and token delivery. At 512 concurrent streams that is ~25,600 tokens/s; this
+harness pushes ~159,000 events/s through a single core. Six times the event rate on a
+sixth of the cores, and a connection teardown on every one.
+
+Per core, streaming: llmbridge **5,531 req/s/core** (5,227 on 0.94 cores) against
+GoModel's **1,505** (6,650 on 4.42). It buys 27% more absolute throughput with 4.7x the
+cores.
+
+### What the per-chunk scans actually cost, measured in isolation
+
+Measured directly, 187-byte chunk, at 4.19 GHz:
+
+| | ns/call |
+|---|---|
+| `sse_carries_thinking`, three misses | 216.2 |
+| `sse_carries_first_token`, hits | 65.3 |
+| the two-`find` usage gate | 13.0 |
+| append + trim to exactly 2 KiB, the old way | 19.8 |
+| append + amortised trim, the new way | 5.8 |
+
+About **11 us per stream before the fixes and 1 us after**, against 180 us of CPU per
+stream. So the scans were ~6% of it and the fixes are worth ~1.5%. They remain correct
+(an unbounded scan that cannot succeed; a memmove quadratic in chunks) but they are not
+where streaming cost lives.
+
 ## Inbound TLS arm (added 2026-08-12)
 
 `streamgen` gained `--tls --ca FILE`, the only client in this tree that can drive

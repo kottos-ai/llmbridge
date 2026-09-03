@@ -1,0 +1,30 @@
+# llmbridge in the ENTERPILOT harness. Built locally: no image is published.
+services:
+  llmbridge:
+    profiles: ["llmbridge"]
+    # Built by run_enterpilot.sh with plain `docker build`, never by compose: a
+    # compose build interpolates every included service and fails on the other
+    # gateways' image variables, which run-on-instance.sh only sets later.
+    image: ${LLMBRIDGE_IMAGE:-llmbridge:bench}
+    depends_on: [mock]
+    ports:
+      - "${LLMBRIDGE_HOST_PORT:-8092}:8080"
+    # Space separated, one argv element per list item. The parser is exact match on
+    # the flag and silently ignores anything it does not recognise, so "--listen=8080"
+    # runs on the default port against the default upstream and the benchmark measures
+    # a gateway pointed somewhere else. Verified 2026-09-02.
+    command:
+      - "--listen"
+      - "8080"
+      - "--upstream"
+      - "http://mock:9999"
+      - "--upstream-dialect"
+      - "openai"
+      - "--log-level"
+      - "error"
+      # One worker by default in the binary, and the harness hands LiteLLM one per
+      # core while the Go gateways take every core through their runtime. Leaving
+      # this unset measures one of our cores against twelve of theirs.
+      - "--workers"
+      - "${LLMBRIDGE_WORKERS:-1}"
+    restart: "no"

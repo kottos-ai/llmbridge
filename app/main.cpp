@@ -252,6 +252,14 @@ static int run(int argc, char** argv)
                         "[--io auto|epoll|uring] [--workers N] [--timing-headers] [--config FILE]\n", argv[0]);
             return 0;
         }
+        else
+        {
+            std::string m = "unknown argument '" + std::string(a) + "'";
+            if (const size_t eq = a.find('='); eq != std::string_view::npos)
+                m += "; flags take a separate value, so write '" + std::string(a.substr(0, eq)) +
+                     " " + std::string(a.substr(eq + 1)) + "'";
+            return refuse(m + ". Run --help for the accepted flags.");
+        }
     }
     llmbridge::net::log::register_thread("main", 0);
     {

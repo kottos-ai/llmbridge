@@ -36,6 +36,12 @@ namespace llmbridge
         /// client_upload_ns it gives effective upload throughput, which is what
         /// separates a full pipe from a congestion window still opening.
         uint64_t request_bytes = 0;
+        bool client_conn_reused = false;
+        /// Inbound leg, first request on the connection only, else 0: accept to t0.
+        /// Contains the TLS handshake, the client's idle time, and the request upload
+        /// (`client_upload_ns`, subtract it). Excludes the TCP handshake because it
+        /// completes before `accept()`. For handshake alone prefer the `accept(TLS)`.
+        int64_t client_conn_setup_ns = 0;
         int64_t ts_req_recvd = 0;  ///< t0
         int64_t ts_req_built = 0;  ///< t1
         int64_t ts_wire_ready = 0; ///< t2; == t1 when the connection was pooled
@@ -67,10 +73,11 @@ namespace llmbridge
         int32_t cache_write_5m_tokens = -1;
         int32_t cache_write_1h_tokens = -1;
         bool streamed = false;
+        /// The venue connection was reused from the pool. Not the same as
+        /// `client_conn_reused`, which is the client's leg.
+        bool from_pool = false;
         /// The client sent a Content-Encoding other than identity. Every body-reading
         /// caller here assumes JSON, so this request was parsed as something it is not.
-        /// The upstream connection was reused.
-        bool from_pool = false;
         bool client_encoded = false;
         bool error_reply = false; ///< the gateway generated the reply; stamps unset
         bool truncated = false;   ///< stream ended without a clean finish

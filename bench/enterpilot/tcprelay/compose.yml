@@ -1,0 +1,18 @@
+# Not a gateway. A byte-for-byte TCP relay that parses no HTTP and decides nothing,
+# so its cost is the cost of being in the path at all: one extra container-to-container
+# traversal over the bridge, plus the relay's own copying.
+#
+# It exists because the harness computes added latency as (gateway - baseline), and the
+# baseline is loadgen -> mock, one traversal, while every gateway arm is
+# loadgen -> gateway -> mock, two. So every published overhead figure in this harness
+# silently contains one bridge hop that is not the gateway's doing. Subtracting this row
+# instead of the baseline removes it, uniformly, for every gateway.
+services:
+  tcprelay:
+    profiles: ["tcprelay"]
+    image: ${TCPRELAY_IMAGE:-alpine/socat:latest}
+    depends_on: [mock]
+    ports:
+      - "${TCPRELAY_HOST_PORT:-8094}:8080"
+    command: ["TCP-LISTEN:8080,fork,reuseaddr,nodelay", "TCP:mock:9999,nodelay"]
+    restart: "no"

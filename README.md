@@ -225,6 +225,30 @@ properties worth knowing:
 - **Paths, never secrets.** `cert` and `key` are filenames. Do not put provider API
   keys in it; those travel per request, from the client.
 
+### Running in a container: unblock io_uring
+
+The gateway picks io_uring on a kernel that has it and falls back to epoll otherwise.
+Docker's default seccomp profile blocks the io_uring syscalls, so a container run
+with the defaults gets the epoll path, on a machine that could have done better. It
+starts up saying so:
+
+```
+WARN  io_uring unavailable, using epoll. Inside a container this is usually the
+      default seccomp profile blocking io_uring_setup ...
+INFO  backend requested=auto active=epoll
+```
+
+Give it a profile that permits the io_uring syscalls, or lift the filter entirely:
+
+```sh
+docker run --security-opt seccomp=unconfined ... llmbridge --listen 8080 --upstream ...
+```
+
+Measured on one box, the epoll fallback served about a quarter less throughput than
+io_uring at the same concurrency. Lifting seccomp widens the container's syscall
+surface, so on a shared host prefer a custom profile that allows `io_uring_setup`,
+`io_uring_enter` and `io_uring_register` and nothing else.
+
 ### Inbound TLS: terminating the client's connection
 
 The same build also terminates TLS for clients, so the gateway can be a remote

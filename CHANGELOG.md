@@ -8,6 +8,37 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.51.0]. 2026-09-03
+
+### Fixed
+
+- **A request body carrying no `messages` array was translated into an empty
+  conversation and forwarded.**
+
+- **An unrecognised command-line argument was ignored instead of refused.** Every flag
+  matched exactly, so `--listen=8080` fell through the parse loop in silence and the
+  gateway served the default port against the default upstream.
+
+### Changed
+
+- **`--io auto` says so when it falls back to epoll.**
+
+### Added
+
+- **Per-request visibility of client connection reuse:** `client_conn_reused` and
+  `client_conn_setup_ns` on the sink record, set on both backends.
+
+### Changed
+
+- **The inbound and upstream legs are now named apart.**
+
+### Performance
+
+- **Two unbounded per-chunk scans on a byte-forwarded stream.** Neither affects a
+  translated stream.
+
+- **One allocation per SSE event removed.**
+
 ## [0.50.1]. 2026-09-02
 
 ### Fixed
