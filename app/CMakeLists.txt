@@ -40,6 +40,16 @@ if (LLMBRIDGE_BUILD_TESTS)
     llmbridge_cli_refuses(CliRefusesUnreadableConfig
             "cannot read"
             --config /nonexistent/llmbridge.json)
+    # An unrecognised flag used to fall through the parse loop in silence, so the
+    # gateway served the default port and the default upstream while the operator
+    # believed it had been configured. `--listen=8080` is the shape that found it.
+    llmbridge_cli_refuses(CliRefusesEqualsFormFlag
+            "flags take a separate value"
+            --listen=8080 --upstream 127.0.0.1:9)
+    llmbridge_cli_refuses(CliRefusesUnknownFlag
+            "unknown argument"
+            --listen 0 --upstream 127.0.0.1:9 --lisen 8080)
+
     llmbridge_cli_refuses(CliRefusesCertWithoutListenTls
             "certificate/key was given without enabling the"
             --listen 0 --upstream 127.0.0.1:9 --tls-cert /nonexistent --tls-key /nonexistent)

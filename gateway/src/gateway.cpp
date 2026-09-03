@@ -1268,7 +1268,7 @@ namespace llmbridge
             }
             // Trimmed last, so the buffer stays bounded across reads while every read
             // is searched whole.
-            if (client->stream_tail.size() > kUsageWindow)
+            if (client->stream_tail.size() > 2 * kUsageWindow)
                 client->stream_tail.erase(0, client->stream_tail.size() - kUsageWindow);
         }
 
@@ -1329,7 +1329,9 @@ namespace llmbridge
         // `in` is the upstream's raw buffer (consumed); `out` receives client SSE.
         StreamStep stream_step(Connection* client, std::string& in, std::string& out, bool at_eof)
         {
-            std::string sse_in;
+            // Reused, never re-allocated
+            std::string& sse_in = client->sse_scratch;
+            sse_in.clear();
             if (client->stream_chunked)
             {
                 const bool ok = client->chunkdec.feed(in, sse_in);
@@ -1372,7 +1374,8 @@ namespace llmbridge
                     stream_note_usage(client, sse_in);
                     // Reasoning is stamped before the token, because it comes first on
                     // the wire and one read can carry both. See the two helpers.
-                    if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
+                    if (client->ts_first_thinking == 0 && client->ts_first_token == 0 &&
+                        sse_carries_thinking(sse_in))
                         client->ts_first_thinking = now_ns();
                     if (client->ts_first_token == 0 && sse_carries_first_token(sse_in))
                         client->ts_first_token = now_ns();
@@ -1579,6 +1582,11 @@ namespace llmbridge
         if (_io == IoBackend::Uring || _io == IoBackend::Auto) _uring_active = uring_ok;
         if (_io == IoBackend::Uring && !uring_ok)
             LB_WARN("io_uring requested but unavailable; falling back to epoll");
+        else if (_io == IoBackend::Auto && !uring_ok)
+            LB_WARN("io_uring unavailable, using epoll. Inside a container this is "
+                    "usually the default seccomp profile blocking io_uring_setup: run "
+                    "with --security-opt seccomp=unconfined, or a profile that permits "
+                    "the io_uring syscalls, to get the faster backend");
 #endif
         const char* want = _io == IoBackend::Uring ? "uring" : _io == IoBackend::Epoll ? "epoll" : "auto";
         LB_INFO("backend requested=", want, " active=", _uring_active ? "io_uring" : "epoll");
@@ -2439,6 +2447,8 @@ namespace llmbridge
         c->msg = m;
         c->ts_req_recvd = t0;
         c->client_upload_ns = span_since(c->ts_first_byte, t0);
+        c->client_conn_reused = c->ever_framed;
+        c->client_conn_setup_ns = c->client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
         // A pipelining client's next request is already here, so its arrival begins
         // now; otherwise the next read stamps it.
         c->ts_first_byte = c->rbuf.size() > m.total_len ? t0 : 0;
@@ -2560,6 +2570,8 @@ namespace llmbridge
         r.seq = c->req_seq;
         r.wall_t0_ns = c->wall_t0;
         r.client_upload_ns = c->client_upload_ns;
+        r.client_conn_reused = c->client_conn_reused;
+        r.client_conn_setup_ns = c->client_conn_setup_ns;
         r.request_bytes = c->msg.total_len;
         r.client_encoded = c->msg.encoded;
         r.ts_req_recvd = c->ts_req_recvd;
@@ -2631,6 +2643,8 @@ namespace llmbridge
         // keep-alive client's second stream inherited the first one's token counts,
         // because nothing cleared them between requests.
         c->stream_tail.clear();
+        c->sse_scratch.clear();
+        c->sse_scratch.shrink_to_fit();
         c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
         c->usage_cw_5m = c->usage_cw_1h = -1;
         // The non-streaming counters. They are assigned only where a body is scanned,
@@ -4118,6 +4132,8 @@ namespace llmbridge
         c->msg = m;
         c->ts_req_recvd = now_ns();
         c->client_upload_ns = span_since(c->ts_first_byte, c->ts_req_recvd);
+        c->client_conn_reused = c->ever_framed;
+        c->client_conn_setup_ns = c->client_conn_reused ? 0 : span_since(c->ts_accepted, c->ts_req_recvd);
         c->ts_first_byte = c->rbuf.size() > m.total_len ? c->ts_req_recvd : 0; // see epoll mirror
         // See the epoll mirror: assigned here, before forward touches rbuf.
         c->req_seq = g_seq.fetch_add(1, std::memory_order_relaxed);

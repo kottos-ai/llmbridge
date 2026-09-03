@@ -2733,7 +2733,7 @@ namespace
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
 
-    // Chunk-encoded but NOT terminated, so the stream stays open and a later write can
+    // Chunk-encoded but never terminated, so the stream stays open and a later write can
     // land as a separate read. sse_chunk_encode appends the zero chunk, which ends the
     // response: using it for the first half completes the request before the pause and
     // measures nothing.
@@ -4932,6 +4932,38 @@ namespace
     };
 } // namespace
 
+// client_conn_reused is what settles whether a streaming client is paying to reconnect. Two
+// requests on one socket: the first reports false and a setup span, the second reports
+// true and zero. Without this the flag could invert and nothing would notice.
+TEST_P(ProxyRoute, TheSinkReportsWhetherTheClientConnectionWasReused)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                            "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    for (int i = 0; i < 2; ++i) // same socket, sequentially
+    {
+        ASSERT_TRUE(c.send(req)) << "request " << i;
+        EXPECT_NE(c.recv_response().find("alpha"), std::string::npos) << "request " << i;
+    }
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u) << "both requests must reach the sink";
+    EXPECT_FALSE(recs[0].r.client_conn_reused) << "the first request opened the connection";
+    EXPECT_GT(recs[0].r.client_conn_setup_ns, 0) << "accept to t0 must be measured on the first";
+    EXPECT_TRUE(recs[1].r.client_conn_reused) << "the second arrived on the same connection";
+    EXPECT_EQ(recs[1].r.client_conn_setup_ns, 0) << "setup is reported once, not per request";
+}
+
 TEST_P(ProxyRoute, TheSinkSeesACompletedRequestWithItsCapturedHeaders)
 {
     NamedBackend b;
@@ -5173,7 +5205,7 @@ TEST_P(ProxyRoute, ACredentialHeaderCanNeverBeCaptured)
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
     // The legitimate header took the first slot, because the credentials were never
-    // registered at all rather than registered and blanked.
+    // registered at all, not registered and blanked.
     EXPECT_EQ(recs[0].cap[0], "my-run");
     for (size_t i = 0; i < llmbridge::kSinkCaptureMax; ++i)
     {
@@ -5636,6 +5668,82 @@ class ProxyForwardStream : public ProxyIT,
                            public ::testing::WithParamInterface<llmbridge::IoBackend>
 {
 };
+
+// Usage survives a stream long enough that the tail is trimmed many times. Nothing
+// exercised the trim path before this, so its bound could be changed without a test
+// noticing.
+//
+// Read it as a guard, not as proof of the trim: shrinking the window to 64 bytes leaves
+// this test passing. Usage is captured by scanning each read as it arrives, and the
+// scan is triggered by "usage" or "_tokens", both of which sit inside the same compact
+// object, so the first read that carries the numbers also carries the trigger and the
+// tail is not consulted. The tail only earns its keep when a value is split mid-marker
+// across two reads. The amortised trim is safe by construction anyway: it strictly
+// widens the retained window, so it cannot lose a value the old bound would have kept.
+TEST_P(ProxyForwardStream, UsageIsFoundAfterTheTailHasBeenTrimmed)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    std::string body;
+    for (int i = 0; i < 120; ++i) // ~7 KiB, several times the 2 KiB window
+        body += "data: {\"choices\":[{\"delta\":{\"content\":\"filler-" +
+                std::to_string(i) + "\"}}]}\n\n";
+    body += "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,"
+            "\"completion_tokens\":5,\"total_tokens\":16}}\n\n"
+            "data: [DONE]\n\n";
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(body, 64)); // small reads, so many trims happen
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    const Streamed st = parse_streamed(c.recv_all());
+    ASSERT_TRUE(st.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, 11) << "input tokens lost past the tail window";
+    EXPECT_EQ(recs[0].r.tokens_out, 5) << "output tokens lost past the tail window";
+}
+
+// The reasoning stamp on a byte-forwarded stream. Its scan is gated on the token stamp
+// as well as its own, so that a model which never reasons stops paying for it after the
+// first token. This pins the case that gate must not break: reasoning arrives first, so
+// it is still stamped, and still before the first visible token.
+TEST_P(ProxyForwardStream, ReasoningBeforeContentIsStillStamped)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    const std::string body =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(body, 48));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    const Streamed st = parse_streamed(c.recv_all());
+    ASSERT_TRUE(st.done);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_thinking, 0) << "this stream reasoned before it answered";
+    EXPECT_GT(r.ts_first_token, 0);
+    EXPECT_LE(r.ts_first_thinking, r.ts_first_token)
+        << "reasoning is stamped before the first visible token, never after";
+}
 
 TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
 {

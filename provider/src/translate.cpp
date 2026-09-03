@@ -278,7 +278,10 @@ namespace llmbridge::provider
         std::string messages = "["; // anthropic user/assistant turns
         messages.reserve(openai_body.size() + 256);
         bool first = true;
-        if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
+        // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
+        const json::Value* msgs = v.find("messages");
+        if (!msgs || !msgs->is_array()) return {};
+        if (msgs)
         {
             bool in_tool_results = false; // merging consecutive OpenAI tool messages
             for (const auto& m : msgs->arr)
@@ -879,7 +882,10 @@ namespace llmbridge::provider
         bool has_system = false;
         std::string contents = "[";  // gemini "contents" turns
         bool first = true;
-        if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
+        // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
+        const json::Value* msgs = v.find("messages");
+        if (!msgs || !msgs->is_array()) return {};
+        if (msgs)
         {
             for (const auto& m : msgs->arr)
             {
@@ -987,7 +993,10 @@ namespace llmbridge::provider
         // differences are top_p -> "p" and the response shape.
         std::string messages = "[";
         bool first = true;
-        if (const json::Value* msgs = v.find("messages"); msgs && msgs->is_array())
+        // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
+        const json::Value* msgs = v.find("messages");
+        if (!msgs || !msgs->is_array()) return {};
+        if (msgs)
         {
             for (const auto& m : msgs->arr)
             {

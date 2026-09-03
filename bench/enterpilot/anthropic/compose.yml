@@ -1,0 +1,29 @@
+# llmbridge with an Anthropic-dialect venue. The pair decides the work, so this entry
+# covers the two workloads the OpenAI-venue entry refuses, and exercises the translator
+# instead of the byte-forward path:
+#   /v1/messages          Anthropic caller, Anthropic venue  -> byte-forward
+#   /v1/chat/completions  OpenAI caller,    Anthropic venue  -> translated both legs
+#   /v1/responses         unknown target reads as OpenAI, and a Responses body is not a
+#                         chat body, so this one is expected to fail
+services:
+  llmbridge-anthropic:
+    profiles: ["llmbridge-anthropic"]
+    image: ${LLMBRIDGE_ANTHROPIC_IMAGE:-llmbridge:bench}
+    depends_on: [mock]
+    ports:
+      - "${LLMBRIDGE_ANTHROPIC_HOST_PORT:-8093}:8080"
+    command:
+      - "--listen"
+      - "8080"
+      - "--upstream"
+      - "http://mock:9999"
+      - "--upstream-dialect"
+      - "anthropic"
+      - "--log-level"
+      - "error"
+      # One worker by default in the binary, and the harness hands LiteLLM one per
+      # core while the Go gateways take every core through their runtime. Leaving
+      # this unset measures one of our cores against twelve of theirs.
+      - "--workers"
+      - "${LLMBRIDGE_WORKERS:-1}"
+    restart: "no"

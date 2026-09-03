@@ -504,6 +504,11 @@ decomposing where the time goes inside it.
 
 ## 5. Warm vs cold connections
 
+There are two connection legs and they behave differently. **Upstream**
+(gateway to venue) is pooled and reused, and is what the rest of this section
+describes. **Inbound** (client to gateway) is reused for a normal reply and
+never reused for a streamed one, which section 5b covers.
+
 The gateway keeps a pool of keep-alive connections to the upstream. Idle
 pooled connections are reaped after **30 s** (`kIdleUpstreamNs`): providers
 drop idle keep-alives on their own schedule, and a pooled corpse costs a
@@ -534,6 +539,14 @@ another round trip plus certificate-chain validation). Measured
   which is precisely why connect time is reported separately and excluded
   from the added-latency claim (§1).
 
+
+### 5b. The inbound leg: a streamed reply does not keep the connection
+
+Section 1 says an operator must add `accept(TLS)` themselves using the
+connection-reuse ratio they actually run. For streamed responses that ratio is
+not theirs to choose: the gateway sends **`Connection: close`** on every SSE
+reply. So a non-streaming client amortises one handshake over its whole session,
+and a streaming client pays one per request.
 
 ## 6. Where the floor is
 

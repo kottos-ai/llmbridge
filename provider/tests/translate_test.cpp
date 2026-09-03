@@ -110,6 +110,32 @@ TEST(ReqXlate, MalformedReturnsEmpty)
     EXPECT_TRUE(openai_to_anthropic_request(R"(["array","not","object"])").empty());
 }
 
+TEST(ReqXlate, RefusesBodyWithNoMessagesArray)
+{
+    // A Responses-API body reaches this translator because /v1/responses is not a
+    // recognised target and falls back to the OpenAI dialect. It carries `input`, not
+    // `messages`, and every venue translator used to emit an empty conversation and
+    // forward it: the upstream saw messages:[], the caller was billed, and the prompt
+    // was gone. Measured against the live mock on 2026-09-02, which received
+    // {"model":"claude-3","max_tokens":1024,"messages":[]} and answered 200.
+    //
+    // An explicitly empty array stays valid: it is a well-formed chat request, and
+    // several tests below rely on it. What is refused is a body that is not a chat
+    // request at all.
+    const std::string responses_body = R"({"model":"claude-3","input":"SECRET_PROMPT"})";
+    EXPECT_TRUE(openai_to_anthropic_request(responses_body).empty());
+    EXPECT_TRUE(openai_to_gemini_request(responses_body).empty());
+    EXPECT_TRUE(openai_to_cohere_request(responses_body).empty());
+    std::string model_out;
+    EXPECT_TRUE(llmbridge::provider::openai_to_bedrock_request(responses_body, model_out).empty());
+
+    // `messages` present but the wrong shape is the same refusal.
+    const std::string wrong_shape = R"({"model":"m","messages":{"role":"user"}})";
+    EXPECT_TRUE(openai_to_anthropic_request(wrong_shape).empty());
+    EXPECT_TRUE(openai_to_gemini_request(wrong_shape).empty());
+    EXPECT_TRUE(openai_to_cohere_request(wrong_shape).empty());
+}
+
 TEST(ReqXlate, PreservesModelString)
 {
     Value out = P(openai_to_anthropic_request(R"({"model":"claude-x","messages":[]})"));

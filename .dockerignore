@@ -1,0 +1,11 @@
+.git
+build*
+cmake-build-*
+bench/.enterpilot
+bench/.litellm-venv*
+bench/results
+fuzz/corpus
+# The context root is the repository root, because bench/enterpilot/Dockerfile builds
+# the whole tree. The classic builder reads this file and only this one: a
+# Dockerfile.dockerignore beside the Dockerfile is a BuildKit feature and buildx is
+# not always installed.
