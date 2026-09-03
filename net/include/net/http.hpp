@@ -34,6 +34,9 @@ namespace llmbridge::net::http
         size_t total_len = 0;  // header_len + body_len: full message size
         bool keep_alive = true;
         bool encoded = false;  // Content-Encoding present and not identity
+        /// The caller spoke HTTP/1.1. False for 1.0, which matters because chunked
+        /// transfer-encoding does not exist before 1.1.
+        bool http_1_1 = true;
     };
 
     // The framing tri-state, shared by every parse entry point in this header.
@@ -263,6 +266,17 @@ namespace llmbridge::net::http
         // headers we care about. Default keep-alive for HTTP/1.1.
         out.body_len = 0;
         out.keep_alive = true;
+        // "method SP target SP HTTP/1.x": the version is the token after the last
+        // space of the request line.
+        {
+            const size_t rl_end = buf.find("\r\n");
+            const std::string_view rl = buf.substr(0, rl_end == std::string_view::npos ? 0 : rl_end);
+            const size_t sp = rl.rfind(' ');
+            const std::string_view ver = sp == std::string_view::npos ? std::string_view{}
+                                                                     : rl.substr(sp + 1);
+            out.http_1_1 = ver == "HTTP/1.1";
+            if (ver == "HTTP/1.0") out.keep_alive = false;
+        }
         bool have_cl = false; // to detect a conflicting duplicate Content-Length
         std::string_view headers = buf.substr(0, hdr_end);
 
@@ -311,8 +325,11 @@ namespace llmbridge::net::http
             else if (detail::line_is(line, "connection:"))
             {
                 std::string_view v = detail::ltrim(value);
-                // Only "close" flips the default; "keep-alive" is the default.
+                // 1.1 defaults to keep-alive and 1.0 to close, so an explicit header has
+                // to be able to flip either way. Reading only "close" left a 1.0
+                // client that asked for keep-alive being closed on anyway.
                 if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
+                else if (v.size() >= 10 && detail::line_is(v, "keep-alive")) out.keep_alive = true;
             }
             pos = eol;
         }

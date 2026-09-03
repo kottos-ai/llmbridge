@@ -8,6 +8,21 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.52.0]. 2026-09-03
+
+### Changed
+
+- **A streamed reply no longer closes the client's connection.** The client-facing stream 
+  is now framed with `Transfer-Encoding: chunked`, so the terminating zero-length chunk
+  ends the body and the connection survives.
+
+  **Only for a caller that can use it.** `Message::http_1_1` is new: chunked encoding
+  does not exist before HTTP/1.1, so a 1.0 caller still gets the close-delimited stream.
+
+### Fixed
+
+- **An HTTP/1.0 client asking for keep-alive was closed on anyway.**
+
 ## [0.51.0]. 2026-09-03
 
 ### Fixed
