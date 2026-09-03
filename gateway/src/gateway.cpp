@@ -844,10 +844,32 @@ namespace llmbridge
 
         /// The string value of `key` at or after `from`, empty when the key is absent,
         /// its value is null or a number, or the string runs past the end of `head`.
+        /// Substring search for the JSON scanners below, backed by memmem.
+        [[nodiscard]] size_t find_fast(std::string_view hay, std::string_view needle,
+                                       size_t from = 0) noexcept
+        {
+            if (from > hay.size()) return std::string_view::npos;
+            if (needle.empty()) return from;
+            const void* p = ::memmem(hay.data() + from, hay.size() - from, needle.data(), needle.size());
+            return p ? static_cast<size_t>(static_cast<const char*>(p) - hay.data())
+                     : std::string_view::npos;
+        }
+
+        /// Last occurrence, as repeated forward finds. Hits are rare in this use (a
+        /// usage key appears once or twice), so the loop runs once or twice.
+        [[nodiscard]] size_t rfind_fast(std::string_view hay, std::string_view needle) noexcept
+        {
+            size_t last = std::string_view::npos;
+            for (size_t at = find_fast(hay, needle); at != std::string_view::npos;
+                 at = find_fast(hay, needle, at + 1))
+                last = at;
+            return last;
+        }
+
         std::string_view json_string_at(std::string_view head, std::string_view key,
                                         size_t from = 0) noexcept
         {
-            const size_t k = head.find(key, from);
+            const size_t k = find_fast(head, key, from);
             if (k == std::string_view::npos) return {};
             size_t i = k + key.size();
             while (i < head.size() && (head[i] == ':' || head[i] == ' ')) ++i;
@@ -867,7 +889,7 @@ namespace llmbridge
         {
             const std::string_view head =
                 body.size() > kErrorWindow ? body.substr(0, kErrorWindow) : body;
-            const size_t e = head.find("\"error\"");
+            const size_t e = find_fast(head, "\"error\"");
             if (e == std::string_view::npos) return {};
             const std::string_view code = json_string_at(head, "\"code\"", e);
             return code.empty() ? json_string_at(head, "\"type\"", e) : code;
@@ -886,7 +908,7 @@ namespace llmbridge
             // message_start and the real total in message_delta. Taking the first
             // match reports every answer as one token long.
             const auto num_at = [&tail](std::string_view key, bool last) -> long long {
-                const size_t k = last ? tail.rfind(key) : tail.find(key);
+                const size_t k = last ? rfind_fast(tail, key) : find_fast(tail, key);
                 if (k == std::string_view::npos) return -1;
                 size_t i = k + key.size();
                 while (i < tail.size() && (tail[i] == ':' || tail[i] == ' ')) ++i;
@@ -1193,16 +1215,16 @@ namespace llmbridge
         static bool sse_carries_first_token(std::string_view s) noexcept
         {
             constexpr std::string_view kContent = "\"content\":\"";
-            for (size_t pos = s.find(kContent); pos != std::string_view::npos;
-                 pos = s.find(kContent, pos + 1))
+            for (size_t pos = find_fast(s, kContent); pos != std::string_view::npos;
+                 pos = find_fast(s, kContent, pos + 1))
             {
                 const size_t v = pos + kContent.size();
                 if (v >= s.size()) return false; // value byte not in this read yet
                 if (s[v] != '"') return true;    // non-empty content
             }
-            return s.find("\"text_delta\"") != std::string_view::npos ||
-                   s.find("\"type\":\"tool_use\"") != std::string_view::npos ||
-                   s.find("\"tool_calls\"") != std::string_view::npos;
+            return find_fast(s, "\"text_delta\"") != std::string_view::npos ||
+                   find_fast(s, "\"type\":\"tool_use\"") != std::string_view::npos ||
+                   find_fast(s, "\"tool_calls\"") != std::string_view::npos;
         }
 
         /// The first reasoning marker on the wire, shared by both stamp sites so the
@@ -1215,12 +1237,12 @@ namespace llmbridge
             // is the signal. `reasoning_content` is a field, and an OpenAI-compatible
             // server that supports reasoning sends it on every delta whether or not
             // the model reasoned, as `"reasoning_content":null`.
-            if (s.find("\"thinking_delta\"") != std::string_view::npos ||
-                s.find("\"redacted_thinking\"") != std::string_view::npos)
+            if (find_fast(s, "\"thinking_delta\"") != std::string_view::npos ||
+                find_fast(s, "\"redacted_thinking\"") != std::string_view::npos)
                 return true;
             constexpr std::string_view kReason = "\"reasoning_content\":";
-            for (size_t pos = s.find(kReason); pos != std::string_view::npos;
-                 pos = s.find(kReason, pos + 1))
+            for (size_t pos = find_fast(s, kReason); pos != std::string_view::npos;
+                 pos = find_fast(s, kReason, pos + 1))
             {
                 size_t v = pos + kReason.size();
                 while (v < s.size() && (s[v] == ' ' || s[v] == '\t')) ++v;
@@ -1284,8 +1306,8 @@ namespace llmbridge
             // read, and a mock or a fast provider delivers an entire stream in one
             // read: message_start had already been cut away when the scan ran, so
             // input and cache came back as "not reported" while output was found.
-            if (bytes.find("usage") != std::string_view::npos ||
-                bytes.find("_tokens") != std::string_view::npos)
+            if (find_fast(bytes, "usage") != std::string_view::npos ||
+                find_fast(bytes, "_tokens") != std::string_view::npos)
             {
                 const BodyUsage u = scan_usage(client->stream_tail, 0);
             // Input and cache are first-wins: stated once, in message_start, and a
