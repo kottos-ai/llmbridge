@@ -1056,13 +1056,48 @@ namespace llmbridge
             "Connection: close\r\n"
             "\r\n";
 
+        /// The same reply framed so the connection survives it.
+        constexpr std::string_view kSseHeadChunked =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n";
+
+        /// Whether this client can be handed a chunked stream and keep its connection.
+        [[nodiscard]] bool stream_reusable_out(const Connection* c) noexcept
+        {
+            return c->msg.http_1_1 && c->msg.keep_alive;
+        }
+
+        /// Wrap whatever was appended to `out` at or after `pos` in one chunk frame.
+        /// A no-op on a close-delimited stream, so both framings share one write path.
+        void chunk_wrap(const Connection* c, std::string& out, size_t pos)
+        {
+            if (!c->stream_chunked_out || out.size() <= pos) return;
+            char hdr[24];
+            const int n = std::snprintf(hdr, sizeof hdr, "%zx\r\n", out.size() - pos);
+            if (n <= 0) return;
+            out.insert(pos, hdr, static_cast<size_t>(n));
+            out.append("\r\n", 2);
+        }
+
+        /// The terminating zero-length chunk. Emitted only on a clean end: a truncated
+        /// stream must not be given the marker that says it finished.
+        void chunk_terminate(const Connection* c, std::string& out)
+        {
+            if (c->stream_chunked_out) out.append("0\r\n\r\n", 5);
+        }
+
         // Same head with a timing block spliced in before the terminating CRLF.
         // A stream cannot report total gateway time in a header (headers precede
         // the body), so it reports what is known at this point: t0, the request-path
         // cost, and time to the provider's first byte.
-        std::string sse_head_with_timing(std::string_view extra)
+        ///
+        /// Takes the base head, never assuming one.
+        std::string sse_head_with_timing(std::string_view extra, std::string_view base)
         {
-            std::string out(kSseHead.substr(0, kSseHead.size() - 2)); // drop final CRLF
+            std::string out(base.substr(0, base.size() - 2)); // drop final CRLF
             out.append(extra);
             out.append("\r\n");
             return out;
@@ -1380,10 +1415,13 @@ namespace llmbridge
                         client->ts_first_thinking = now_ns();
                     if (client->ts_first_token == 0 && sse_carries_first_token(sse_in))
                         client->ts_first_token = now_ns();
+                    const size_t at = out.size();
                     out.append(sse_in);
+                    chunk_wrap(client, out, at);
                 }
                 if (stream_complete(client, at_eof) && !client->stream_ended)
                 {
+                    chunk_terminate(client, out); // clean end only; see the helper
                     client->stream_ended = true;
                     return StreamStep::Ended;
                 }
@@ -1397,7 +1435,9 @@ namespace llmbridge
             // Honour the translator's own failure (its DoS caps are sticky): a
             // hostile/broken upstream must tear the stream down, not silently
             // produce nothing while we keep reading it forever.
+            const size_t xlate_at = out.size();
             if (!sse_in.empty() && !client->sse_xlate->feed(sse_in, out)) return StreamStep::Failed;
+            chunk_wrap(client, out, xlate_at);
 
             // TTFT: the first content token, stamped here because this is the one place
             // both backends translate, and it runs right after the read that carried
@@ -1411,7 +1451,12 @@ namespace llmbridge
 
             if (stream_complete(client, at_eof) && !client->stream_ended)
             {
+                // The translator's trailer ([DONE] and any final event) is body, so it
+                // is framed like every other write before the terminator closes it.
+                const size_t fin_at = out.size();
                 if (!client->sse_xlate->finish(out)) return StreamStep::Failed;
+                chunk_wrap(client, out, fin_at);
+                chunk_terminate(client, out);
                 client->stream_ended = true;
                 return StreamStep::Ended;
             }
@@ -3216,6 +3261,8 @@ namespace llmbridge
         // Only a request that needs translating gets a translator.
         if (client->translate_body && client->effective_dialect == UpstreamDialect::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
+        // Chosen once, before either head is built, and remembered.
+        client->stream_chunked_out = stream_reusable_out(client);
         if (_timing_headers)
         {
             // t4 = provider's first response byte, stamped by the caller.
@@ -3229,10 +3276,11 @@ namespace llmbridge
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
                                   client->req_seq, client->client_upload_ns / 1000);
-            client->wbuf.assign(sse_head_with_timing(timing));
+            client->wbuf.assign(sse_head_with_timing(
+                timing, client->stream_chunked_out ? kSseHeadChunked : kSseHead));
         }
         else
-            client->wbuf.assign(kSseHead);
+            client->wbuf.assign(client->stream_chunked_out ? kSseHeadChunked : kSseHead);
         client->woff = 0;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
@@ -3294,8 +3342,37 @@ namespace llmbridge
         if (client->peer && !client->peer->doomed) ep_resume_read(client->peer);
     }
 
-    // Stream complete: drop the upstream (a just-streamed conn isn't pooled),
-    // count the request, and close the client (which delimits the SSE body).
+    /// Can reuse only if we framed the reply so the body has an end marker, the
+    /// stream reached that marker, and the caller wanted the connection kept.
+    [[nodiscard]] bool stream_client_reusable(const Connection* c) noexcept
+    {
+        return c->stream_chunked_out && !c->close_after_resp && c->msg.keep_alive;
+    }
+
+    /// Clear the per-stream state so the next request on this connection starts clean.
+    void stream_reset_for_next(Connection* c) noexcept
+    {
+        c->streaming = false;
+        c->stream_ended = false;
+        c->stream_chunked = false;
+        c->stream_chunked_out = false;
+        c->stream_keep_alive = false;
+        c->wants_usage = false;
+        c->sse_xlate.reset();
+        c->chunkdec = net::http::ChunkDecoder{};
+        c->stream_tail.clear();
+        c->sse_scratch.clear();
+        // The counts the stream produced.
+        c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
+        c->usage_cw_5m = c->usage_cw_1h = -1;
+        c->ts_first_token = 0;
+        c->ts_first_thinking = 0;
+        c->ts_last_chunk = 0;
+        c->max_chunk_gap_ns = 0;
+        c->served_tier_len = 0;
+        c->served_tier_tries = 0;
+    }
+
     void Gateway::ep_finalize_stream(Connection* client) noexcept
     {
         if (Connection* u = client->peer)
@@ -3327,7 +3404,14 @@ namespace llmbridge
             stream_record_latency(client);
         }
         if (_sink) sink_emit(client, 200, /*streamed=*/true);
-        ep_close_client(client);
+
+        // Keep the connection when the framing gave the body an end marker.
+        if (!stream_client_reusable(client)) { ep_close_client(client); return; }
+        stream_reset_for_next(client);
+        client->wbuf.clear();
+        client->woff = 0;
+        client->msg = net::http::Message{};
+        ep_on_client_readable(client); // a pipelined next request is already in rbuf
     }
 
     // Abort requests whose upstream has gone silent. Runs on the loop's existing
@@ -4584,6 +4668,8 @@ namespace llmbridge
         // Only a request that needs translating gets a translator.
         if (client->translate_body && client->effective_dialect == UpstreamDialect::Anthropic)
             client->sse_xlate = std::make_unique<provider::AnthropicToOpenAiSse>(-1, client->wants_usage);
+        // Chosen once, before either head is built, and remembered.
+        client->stream_chunked_out = stream_reusable_out(client);
         if (_timing_headers)
         {
             // t4 = provider's first response byte, stamped by the caller.
@@ -4597,10 +4683,11 @@ namespace llmbridge
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
                                   client->req_seq, client->client_upload_ns / 1000);
-            client->wpending.assign(sse_head_with_timing(timing));
+            client->wpending.assign(sse_head_with_timing(
+                timing, client->stream_chunked_out ? kSseHeadChunked : kSseHead));
         }
         else
-            client->wpending.assign(kSseHead);
+            client->wpending.assign(client->stream_chunked_out ? kSseHeadChunked : kSseHead);
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         ur_stream_pump(u);
     }
@@ -4682,7 +4769,14 @@ namespace llmbridge
             stream_record_latency(client);
         }
         if (_sink) sink_emit(client, 200, /*streamed=*/true);
-        ur_close(client);
+
+        // Keep the connection when the framing gave the body an end marker.
+        if (!stream_client_reusable(client)) { ur_close(client); return; }
+        stream_reset_for_next(client);
+        client->wpending.clear();
+        client->msg = net::http::Message{};
+        // The client's multishot recv stays armed.
+        ur_try_forward_buffered(client);
     }
 
     int Gateway::run_uring()

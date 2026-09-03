@@ -419,6 +419,38 @@ TEST(HttpQuirk, BodyLengthAtCapIsNotError)
         "POST / HTTP/1.1\r\nContent-Length: " + std::to_string(llmbridge::net::http::kMaxBodyLen) + "\r\n\r\n";
     EXPECT_NE(parse_request(raw, m), FrameStatus::Error);
 }
+// The version decides whether a chunked reply is legal, so it is parsed and not
+// assumed. A 1.0 caller also defaults to close, which is the opposite of the 1.1
+// default, and getting that backwards would leave a 1.0 client waiting on a socket
+// the standard says should already be shut.
+TEST(HttpVersion, ParsedFromTheRequestLineAndDrivesTheKeepAliveDefault)
+{
+    Message m11;
+    ASSERT_EQ(parse_request("POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\n"
+                            "Content-Length: 1\r\n\r\nx",
+                            m11),
+              FrameStatus::Complete);
+    EXPECT_TRUE(m11.http_1_1);
+    EXPECT_TRUE(m11.keep_alive) << "1.1 defaults to keep-alive";
+
+    Message m10;
+    ASSERT_EQ(parse_request("POST /v1/chat/completions HTTP/1.0\r\nHost: h\r\n"
+                            "Content-Length: 1\r\n\r\nx",
+                            m10),
+              FrameStatus::Complete);
+    EXPECT_FALSE(m10.http_1_1) << "1.0 cannot be sent a chunked body";
+    EXPECT_FALSE(m10.keep_alive) << "1.0 defaults to close";
+
+    // An explicit header still wins over the version's default.
+    Message m10k;
+    ASSERT_EQ(parse_request("POST /v1/chat/completions HTTP/1.0\r\nHost: h\r\n"
+                            "Connection: keep-alive\r\nContent-Length: 1\r\n\r\nx",
+                            m10k),
+              FrameStatus::Complete);
+    EXPECT_FALSE(m10k.http_1_1);
+    EXPECT_TRUE(m10k.keep_alive) << "an explicit keep-alive overrides the 1.0 default";
+}
+
 TEST(HttpQuirk, ConnectionClosedPrefixMatchesClose)
 {
     Message m;

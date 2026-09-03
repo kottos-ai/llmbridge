@@ -29,6 +29,7 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <charconv>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -503,6 +504,36 @@ namespace
                     std::string out = _buf.substr(0, m.total_len);
                     _buf.erase(0, m.total_len);
                     return out;
+                }
+                pollfd p{_fd, POLLIN, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) return "";
+                ssize_t n = ::read(_fd, tmp, sizeof(tmp));
+                if (n <= 0) return "";
+                _buf.append(tmp, static_cast<size_t>(n));
+            }
+        }
+        /// One chunk-framed response, read to its terminating zero-length chunk and
+        /// consumed out of the buffer so the next one can be read from the same socket.
+        /// `recv_response` cannot do this (it frames on Content-Length, which a stream
+        /// has none of) and `recv_all` cannot either, because a keep-alive stream never
+        /// closes. Returns "" on timeout.
+        std::string recv_chunked(int timeout_ms = 3000)
+        {
+            char tmp[8192];
+            constexpr std::string_view kEnd = "0\r\n\r\n";
+            for (;;)
+            {
+                const size_t hdr = _buf.find("\r\n\r\n");
+                if (hdr != std::string::npos)
+                {
+                    const size_t end = _buf.find(kEnd, hdr + 4);
+                    if (end != std::string::npos)
+                    {
+                        const size_t total = end + kEnd.size();
+                        std::string out = _buf.substr(0, total);
+                        _buf.erase(0, total);
+                        return out;
+                    }
                 }
                 pollfd p{_fd, POLLIN, 0};
                 if (::poll(&p, 1, timeout_ms) <= 0) return "";
@@ -5745,10 +5776,76 @@ TEST_P(ProxyForwardStream, ReasoningBeforeContentIsStillStamped)
         << "reasoning is stamped before the first visible token, never after";
 }
 
+// Strip chunked transfer framing. A streamed reply to an HTTP/1.1 keep-alive client is
+// chunk-framed so the connection survives it, so a test that wants the payload has to
+// undo the transport first. Returns false on framing this does not accept, which is a
+// failure worth reporting, not a silent half body.
+namespace
+{
+    bool dechunk(std::string_view in, std::string& out)
+    {
+        while (true)
+        {
+            const size_t eol = in.find("\r\n");
+            if (eol == std::string_view::npos) return false;
+            size_t n = 0;
+            const auto [p, ec] = std::from_chars(in.data(), in.data() + eol, n, 16);
+            if (ec != std::errc{} || p != in.data() + eol) return false;
+            in.remove_prefix(eol + 2);
+            if (n == 0) return in == "\r\n" || in.empty(); // terminator, then done
+            if (in.size() < n + 2) return false;
+            out.append(in.substr(0, n));
+            if (in.substr(n, 2) != "\r\n") return false;
+            in.remove_prefix(n + 2);
+        }
+    }
+} // namespace
+
+// The point of the chunked framing: a streaming client keeps its connection. Before
+// this, every streamed reply carried `Connection: close`, so a client paid a TCP
+// handshake per request, and a TLS one on a TLS listener (49 ms at the median on a live
+// tenant). Two streams over one socket, and the second must be as clean as the first.
+TEST_P(ProxyForwardStream, TwoStreamsShareOneConnection)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(openai_sse_response(64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+
+    for (int i = 0; i < 2; ++i)
+    {
+        ASSERT_TRUE(c.send(openai_stream_request_with_usage())) << "request " << i;
+        const std::string raw = c.recv_chunked();
+        const size_t hdr = raw.find("\r\n\r\n");
+        ASSERT_NE(hdr, std::string::npos) << "request " << i << ": " << raw;
+        EXPECT_NE(raw.find("Transfer-Encoding: chunked"), std::string::npos) << raw;
+        std::string body;
+        ASSERT_TRUE(dechunk(raw.substr(hdr + 4), body)) << "request " << i;
+        EXPECT_EQ(body, openai_sse_events())
+            << "stream " << i << " did not carry the provider's bytes";
+    }
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u) << "both streams must reach the sink";
+    EXPECT_FALSE(recs[0].r.client_conn_reused) << "the first stream opened the connection";
+    EXPECT_TRUE(recs[1].r.client_conn_reused)
+        << "the second stream must arrive on the same connection: this is the whole point";
+    // State from the first stream must not leak into the second.
+    EXPECT_EQ(recs[0].r.tokens_in, recs[1].r.tokens_in);
+    EXPECT_EQ(recs[0].r.tokens_out, recs[1].r.tokens_out);
+    EXPECT_GT(recs[1].r.ts_first_token, 0) << "the second stream stamps its own first token";
+}
+
 TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
 {
-    // Byte-for-byte: a venue that already speaks the client's dialect must not have
-    // its stream rewritten, including its own terminal [DONE].
+    // Byte-for-byte: a venue that already speaks the client's dialect must not have its
+    // stream rewritten, including its own terminal [DONE]. The transport around those
+    // bytes did change: the reply is chunk-framed so the client keeps its connection,
+    // which is why this de-frames before comparing. What is pinned is the payload.
     _backend.set_response(openai_sse_response(4096));
     start(0, true, UpstreamDialect::OpenAI, GetParam());
     Client c;
@@ -5759,7 +5856,14 @@ TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
     const size_t hdr = raw.find("\r\n\r\n");
     ASSERT_NE(hdr, std::string::npos) << raw;
     EXPECT_NE(raw.find("Content-Type: text/event-stream"), std::string::npos) << raw;
-    EXPECT_EQ(raw.substr(hdr + 4), openai_sse_events())
+    EXPECT_NE(raw.find("Transfer-Encoding: chunked"), std::string::npos)
+        << "an HTTP/1.1 keep-alive client must get a stream it can survive";
+    EXPECT_EQ(raw.find("Connection: close"), std::string::npos)
+        << "close-delimiting forces one connection per streamed request";
+
+    std::string body;
+    ASSERT_TRUE(dechunk(raw.substr(hdr + 4), body)) << raw.substr(hdr + 4);
+    EXPECT_EQ(body, openai_sse_events())
         << "the forwarded body is not the provider's bytes";
 }
 

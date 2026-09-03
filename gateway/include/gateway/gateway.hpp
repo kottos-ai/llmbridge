@@ -425,6 +425,10 @@ namespace llmbridge
         std::string stream_tail{};
         /// Scratch for one streaming step's decoded bytes, reused across chunks.
         std::string sse_scratch{};
+        /// Whether this stream is framed to the client with chunked transfer-encoding
+        /// instead of being close-delimited. False for an HTTP/1.0 caller, which has no
+        /// chunked encoding, and for one that asked to close.
+        bool stream_chunked_out = false;
         /// Usage accumulated as a byte-forwarded stream runs. -1 = not reported,
         /// which is not the same as zero and must never be rendered as a number.
         /// Fields, and not a tail scan at the end, because Anthropic states input
