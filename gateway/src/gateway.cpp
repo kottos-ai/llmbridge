@@ -3270,6 +3270,7 @@ namespace llmbridge
     /// Answer `Expect: 100-continue` without entering the response path.
     void Gateway::send_interim_continue(Connection* c, bool uring) noexcept
     {
+#ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
             if (!c->tls->handshake_done()) return;
@@ -3284,6 +3285,9 @@ namespace llmbridge
             if (!done) c->client_interim_inflight = true; // the writable event drains it
             return;
         }
+#else
+        (void)uring;
+#endif
         const ssize_t n = ::send(c->fd, kContinue.data(), kContinue.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n > 0 && static_cast<size_t>(n) < kContinue.size())
         {
