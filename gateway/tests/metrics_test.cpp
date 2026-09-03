@@ -240,6 +240,20 @@ TEST(Stats, HandshakeHistogramsCoverARealHandshake)
     EXPECT_GE(s.connect.max_tracked_ns(), 100ull * 1000 * 1000);
     EXPECT_GE(s.accept_tls.max_tracked_ns(), 100ull * 1000 * 1000);
 
+    // The inbound surface needs far more headroom than the outbound one, and giving
+    // it the same range was the bug. `connect` is our handshake to a provider we
+    // chose; `accept_tls` is a handshake begun by anyone who can reach the listener,
+    // and its tail runs to kClientSetupNs, the 30 s deadline that reaps a peer which
+    // never frames a request. A live gateway reported p50 50.99 ms beside a p99 of
+    // 28,664 ms flagged [overflow!]: that p99 was the running max, not a percentile.
+    // Anything inside the deadline must land in a bucket.
+    s.accept_tls.record(29ull * 1000 * 1000 * 1000);
+    EXPECT_EQ(s.accept_tls.overflow_count(), 0u)
+        << "a slow inbound handshake still inside the setup deadline must not overflow";
+    EXPECT_GE(s.accept_tls.max_tracked_ns(),
+              static_cast<uint64_t>(llmbridge::Gateway::kClientSetupNs))
+        << "the range must cover every handshake the setup deadline permits";
+
     // The overhead histograms keep the fine range: they measure microseconds and a
     // coarse bucket would erase the number the project is actually judged on.
     EXPECT_LE(s.overhead.bucket_ns(), 100u);

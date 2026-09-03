@@ -527,8 +527,7 @@ namespace llmbridge
         // reasoning that excludes the upstream handshake does not apply. See
         // LATENCY.md section 1. Empty unless --listen-tls.
         //
-        // Same range as `connect`, and for the same reasons; see the note there.
-        Histogram accept_tls{1'000, 262'144};
+        Histogram accept_tls{1'000'000, 32'768};
         Histogram resp_path; // upstream-recv -> client-sent
         /// Time to first token, streamed requests only: t0 to the first content
         /// chunk. See LATENCY.md section 4.

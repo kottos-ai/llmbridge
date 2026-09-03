@@ -556,6 +556,28 @@ namespace
             if (r.size() < 12 || r.compare(0, 5, "HTTP/") != 0) return 0;
             return (r[9] - '0') * 100 + (r[10] - '0') * 10 + (r[11] - '0');
         }
+        /// A streamed reply read to its end: the terminating zero-length chunk when the
+        /// stream framed itself, or the peer closing when it did not. Strictly better
+        /// than `recv_all` for a stream, because since llmbridge stopped closing a
+        /// clean one, waiting for the close alone means waiting out the whole timeout
+        /// every time. It still returns on close, so a truncated stream is unaffected.
+        std::string recv_stream(int timeout_ms = 3000)
+        {
+            std::string out = std::move(_buf);
+            _buf.clear();
+            char tmp[8192];
+            for (;;)
+            {
+                // An SSE payload separates events with "\n\n", never "\r\n\r\n", so
+                // this sequence appears only as the terminating chunk.
+                if (out.find("0\r\n\r\n") != std::string::npos) return out;
+                pollfd p{_fd, POLLIN, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) return out;
+                ssize_t n = ::read(_fd, tmp, sizeof(tmp));
+                if (n <= 0) return out;
+                out.append(tmp, static_cast<size_t>(n));
+            }
+        }
         // Read everything until the peer closes the connection (for close-delimited
         // responses like a streamed SSE body). Returns all bytes received.
         std::string recv_all(int timeout_ms = 3000)
@@ -2945,7 +2967,7 @@ TEST_P(ProxyStream, TranslatesAnthropicSseToOpenAiChunks)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
 
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_TRUE(s.sse_headers);            // client got text/event-stream
     EXPECT_TRUE(s.role);                   // first chunk carried the assistant role
     EXPECT_EQ(s.content, "Hello, world");  // deltas reassemble to the full message
@@ -2969,7 +2991,7 @@ TEST_P(ProxyStream, SurvivesTinyUpstreamChunks)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_EQ(s.content, "Hello, world");
     EXPECT_TRUE(s.done);
     c.close();
@@ -3003,7 +3025,7 @@ TEST_P(ProxyStream, NonChunkedCloseDelimitedUpstream)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_EQ(s.content, "Hello, world");
     EXPECT_TRUE(s.done); // EOF finalizes the stream
     c.close();
@@ -3023,7 +3045,7 @@ TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_EQ(s.content, "Hello, world"); // everything received is delivered
     EXPECT_TRUE(s.done);                  // finish() at EOF closes the stream cleanly
     c.close();
@@ -3045,7 +3067,7 @@ TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_FALSE(s.done) << "corrupt framing must not emit a fabricated [DONE]";
     c.close();
     shutdown();
@@ -3174,7 +3196,7 @@ TEST_P(ProxyStream, IncludeUsageEmitsFinalUsageChunk)
         "{\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"include_usage\":true},"
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
 
-    const std::string raw = c.recv_all();
+    const std::string raw = c.recv_stream();
     const Streamed s = parse_streamed(raw);
     EXPECT_EQ(s.content, "Hello, world");
     EXPECT_TRUE(s.done);
@@ -3194,7 +3216,7 @@ TEST_P(ProxyStream, NoUsageChunkWhenNotRequested)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
-    const std::string raw = c.recv_all();
+    const std::string raw = c.recv_stream();
     EXPECT_EQ(raw.find("prompt_tokens"), std::string::npos) << "usage must be opt-in";
     EXPECT_TRUE(parse_streamed(raw).done);
     c.close();
@@ -3324,7 +3346,7 @@ TEST_P(ProxyStreamPool, ReusesUpstreamAcrossSequentialStreams)
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port)) << "stream " << i;
         ASSERT_TRUE(c.send(openai_stream_request("hi"))) << "stream " << i;
-        const Streamed s = parse_streamed(c.recv_all());
+        const Streamed s = parse_streamed(c.recv_stream());
         EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
         EXPECT_TRUE(s.done) << "stream " << i;
         c.close();
@@ -3351,7 +3373,7 @@ TEST_P(ProxyStreamPool, ReusedUpstreamCarriesNoStreamStateIntoTheNextRequest)
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port));
         ASSERT_TRUE(c.send(openai_stream_request("hi")));
-        const Streamed s = parse_streamed(c.recv_all());
+        const Streamed s = parse_streamed(c.recv_stream());
         *out = s.content;
         EXPECT_TRUE(s.done);
         EXPECT_TRUE(s.role) << "each response must start its own assistant role delta";
@@ -3381,7 +3403,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolWhenUpstreamSaysConnectionClose)
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port));
         ASSERT_TRUE(c.send(openai_stream_request("hi")));
-        const Streamed s = parse_streamed(c.recv_all());
+        const Streamed s = parse_streamed(c.recv_stream());
         EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
         c.close();
     }
@@ -3408,7 +3430,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolACloseDelimitedStream)
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port));
         ASSERT_TRUE(c.send(openai_stream_request("hi")));
-        const Streamed s = parse_streamed(c.recv_all());
+        const Streamed s = parse_streamed(c.recv_stream());
         EXPECT_EQ(s.content, "Hello, world") << "stream " << i;
         c.close();
     }
@@ -3431,7 +3453,7 @@ TEST_P(ProxyStreamPool, DoesNotPoolAnAbortedStream)
         Client c;
         ASSERT_TRUE(c.connect(_proxy_port));
         ASSERT_TRUE(c.send(openai_stream_request("hi")));
-        (void)c.recv_all(); // truncated stream; content is not the assertion here
+        (void)c.recv_stream(); // truncated stream; content is not the assertion here
         c.close();
     }
     shutdown();
@@ -3584,7 +3606,7 @@ TEST_P(ProxyTiming, StreamingEmitsTtfbNotTotal)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
     EXPECT_NE(all.find("x-llmbridge-t0:"), std::string::npos) << all.substr(0, 400);
     EXPECT_NE(all.find("x-llmbridge-upstream-ttfb-us:"), std::string::npos) << all.substr(0, 400);
     EXPECT_EQ(all.find("x-llmbridge-upstream-us:"), std::string::npos) << all.substr(0, 400);
@@ -3665,7 +3687,7 @@ TEST_P(ProxyTiming, StreamingHasNoTokenHeaders)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
     const std::string head = all.substr(0, all.find("\r\n\r\n"));
     EXPECT_EQ(head.find("x-llmbridge-tokens-"), std::string::npos) << head;
     EXPECT_NE(head.find("x-llmbridge-seq:"), std::string::npos) << head;
@@ -3799,7 +3821,7 @@ TEST_P(ProxyTools, StreamingRequestWithToolsStillStreams)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
     EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 300);
     EXPECT_NE(all.find("[DONE]"), std::string::npos);
     // and the upstream still saw both the stream flag and the tools
@@ -3858,7 +3880,7 @@ TEST_P(ProxyToolStream, ToolCallsStreamAndReassemble)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
 
     EXPECT_NE(all.find("text/event-stream"), std::string::npos) << all.substr(0, 200);
     // Ordinals must be 0 and 1 even though Anthropic used blocks 1 and 2.
@@ -4680,7 +4702,7 @@ TEST_P(ProxyRoute, AStreamingRequestFailsOverBeforeItsFirstByte)
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     EXPECT_TRUE(st.sse_headers) << "no stream reached the client";
     EXPECT_EQ(st.content, "Hello, world") << "the stream did not complete after the failover";
     c.close();
@@ -5314,7 +5336,7 @@ TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     ASSERT_TRUE(s.done);
     c.close();
     shutdown();
@@ -5363,7 +5385,7 @@ TEST_P(ProxyStream, ReasoningIsStampedInTheOpenAiDialectToo)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string raw = c.recv_all();
+    const std::string raw = c.recv_stream();
     ASSERT_NE(raw.find("[DONE]"), std::string::npos);
     c.close();
     shutdown();
@@ -5402,7 +5424,7 @@ TEST_P(ProxyStream, ARefusalRecordsWhichQuotaWasExhausted)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("{\"model\":\"m\",\"messages\":[]}")));
-    c.recv_all();
+    c.recv_stream();
     c.close();
     shutdown();
 
@@ -5428,7 +5450,7 @@ TEST_P(ProxyStream, AHealthyResponseRecordsNoQuota)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request("{\"model\":\"m\",\"messages\":[]}")));
-    c.recv_all();
+    c.recv_stream();
     c.close();
     shutdown();
 
@@ -5474,7 +5496,7 @@ TEST_P(ProxyStream, AMidStreamStallIsMeasured)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     ASSERT_TRUE(st.done);
     c.close();
     shutdown();
@@ -5504,7 +5526,7 @@ TEST_P(ProxyStream, ReasoningTimeIsNotCountedAsAStall)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     ASSERT_TRUE(st.done);
     c.close();
     shutdown();
@@ -5539,7 +5561,7 @@ TEST_P(ProxyStream, AnEmptyContentChunkDoesNotStampTheFirstToken)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
     c.close();
     shutdown();
 
@@ -5569,7 +5591,7 @@ TEST_P(ProxyStream, RealContentAfterAnEmptyChunkStillStampsTheFirstToken)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
     c.close();
     shutdown();
 
@@ -5596,7 +5618,7 @@ TEST_P(ProxyStream, RedactedThinkingIsStampedAsReasoning)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     ASSERT_TRUE(st.done);
     c.close();
     shutdown();
@@ -5625,7 +5647,7 @@ TEST_P(ProxyStream, ReasoningIsStampedApartFromTheFirstTokenShown)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const Streamed s = parse_streamed(c.recv_all());
+    const Streamed s = parse_streamed(c.recv_stream());
     ASSERT_TRUE(s.done);
     c.close();
     shutdown();
@@ -5730,7 +5752,7 @@ TEST_P(ProxyForwardStream, UsageIsFoundAfterTheTailHasBeenTrimmed)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     ASSERT_TRUE(st.done);
     c.close();
     shutdown();
@@ -5762,7 +5784,7 @@ TEST_P(ProxyForwardStream, ReasoningBeforeContentIsStillStamped)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
-    const Streamed st = parse_streamed(c.recv_all());
+    const Streamed st = parse_streamed(c.recv_stream());
     ASSERT_TRUE(st.done);
     c.close();
     shutdown();
@@ -5851,7 +5873,7 @@ TEST_P(ProxyForwardStream, TheProvidersEventsArriveUnaltered)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
-    const std::string raw = c.recv_all();
+    const std::string raw = c.recv_stream();
 
     const size_t hdr = raw.find("\r\n\r\n");
     ASSERT_NE(hdr, std::string::npos) << raw;
@@ -5886,7 +5908,7 @@ TEST_P(ProxyForwardStream, ItStreamsRatherThanBufferingToTheEnd)
     EXPECT_EQ(first.find("[DONE]"), std::string::npos)
         << "the whole stream arrived in one read, so it was buffered: " << first;
     // And it does finish: a stream that starts early must still deliver everything.
-    const std::string rest = c.recv_all();
+    const std::string rest = c.recv_stream();
     EXPECT_NE((first + rest).find("[DONE]"), std::string::npos);
 }
 
@@ -5902,7 +5924,7 @@ TEST_P(ProxyForwardStream, TheSinkGetsTheProvidersTokenCountsIncludingCached)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -5937,7 +5959,7 @@ TEST_P(ProxyForwardStream, NothingIsInventedFromNothing)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -5960,7 +5982,7 @@ TEST_P(ProxyForwardStream, UsageIsRecordedWhetherOrNotTheClientAskedForIt)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi"))); // no stream_options
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -5998,7 +6020,7 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -6036,7 +6058,7 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsNormalizedToTheWholePrompt)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -6092,7 +6114,7 @@ TEST_P(ProxyForwardStream, AByteForwardedStreamReportsTheCacheWriteToo)
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
     ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -6181,7 +6203,7 @@ TEST_P(ProxyForwardStream, ACacheWriteWithNoBreakdownStaysUnsplit)
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
     ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -6480,7 +6502,7 @@ TEST_P(ProxyAzure, ItStreams)
     const std::string first = c.recv_some();
     EXPECT_NE(first.find("text/event-stream"), std::string::npos) << first;
     EXPECT_EQ(first.find("[DONE]"), std::string::npos) << first;
-    EXPECT_NE((first + c.recv_all()).find("[DONE]"), std::string::npos);
+    EXPECT_NE((first + c.recv_stream()).find("[DONE]"), std::string::npos);
 }
 
 TEST_P(ProxyAzure, AQueryOnAVenueThatCannotUseItIsRefusedAtStartup)
@@ -6842,7 +6864,7 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     Client b;
     ASSERT_TRUE(b.connect(_proxy_port));
     ASSERT_TRUE(b.send(openai_stream_request("hi")));
-    const std::string resp = b.recv_all();
+    const std::string resp = b.recv_stream();
     b.close();
     shutdown();
     EXPECT_FALSE(resp.empty()) << "the next client's request was never answered: the "
@@ -7183,7 +7205,7 @@ TEST_P(ProxyForwardStream, AnthropicUsageIsRecordedAcrossTheWholeStream)
     ASSERT_TRUE(c.send(make_request(
         "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -7256,7 +7278,7 @@ TEST_P(ProxyForwardStream, ARequestThatArrivesInPiecesRecordsHowLongItTook)
         "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"" +
         std::string(3000, 'x') + "\"}]}";
     ASSERT_TRUE(c.send_trickle(make_request(body), 64));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -7281,7 +7303,7 @@ TEST_P(ProxyForwardStream, ARequestThatArrivesAtOnceRecordsNoUploadSpan)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -7303,7 +7325,7 @@ TEST_P(ProxyForwardStream, AnthropicFirstTokenCountsAToolCall)
     ASSERT_TRUE(c.send(make_request(
         "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"read a.txt\"}]}")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -7328,7 +7350,7 @@ TEST_P(ProxyForwardStream, AnthropicFirstTokenIsTheFirstTextDelta)
     ASSERT_TRUE(c.send(make_request(
         "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,"
         "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
 
@@ -7362,7 +7384,7 @@ TEST_P(ProxyForwardStream, AcceptEncodingIsNotForwarded)
                        "Accept-Encoding: gzip, deflate, br\r\n"
                        "Content-Type: application/json\r\nContent-Length: " +
                        std::to_string(body.size()) + "\r\n\r\n" + body));
-    (void)c.recv_all();
+    (void)c.recv_stream();
     c.close();
     shutdown();
     const std::string up = _backend.last_request();
@@ -7385,7 +7407,7 @@ TEST_P(ProxyForwardStream, ACompressedStreamStillReachesTheClientAndInventsNoCou
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    const std::string got = c.recv_all();
+    const std::string got = c.recv_stream();
     c.close();
     shutdown();
     EXPECT_NE(got.find("opaque bytes"), std::string::npos) << "the body was not forwarded";
@@ -7927,7 +7949,7 @@ TEST_P(ProxyStream, ANullReasoningFieldIsNotReasoning)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
     c.close();
     shutdown();
 
@@ -7959,7 +7981,7 @@ TEST_P(ProxyStream, AFilledReasoningFieldStillStamps)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
-    ASSERT_NE(c.recv_all().find("[DONE]"), std::string::npos);
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
     c.close();
     shutdown();
 
@@ -8000,7 +8022,7 @@ TEST_P(ProxyStream, TheRouteSetsTheServiceTierOnTheWire)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"gpt-5.6-sol","max_completion_tokens":8})")));
-    c.recv_all();
+    c.recv_stream();
     c.close();
     shutdown();
 
@@ -8028,7 +8050,7 @@ TEST_P(ProxyStream, ACallersOwnTierIsOverriddenAndReported)
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(
         R"({"model":"m","service_tier":"flex","max_completion_tokens":8})")));
-    c.recv_all();
+    c.recv_stream();
     c.close();
     shutdown();
 
@@ -8051,7 +8073,7 @@ TEST_P(ProxyStream, NoTierAskedMeansTheBodyIsUntouched)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","max_completion_tokens":8})")));
-    c.recv_all();
+    c.recv_stream();
     c.close();
     shutdown();
 

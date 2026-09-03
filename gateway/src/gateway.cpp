@@ -3432,6 +3432,10 @@ namespace llmbridge
         os << "requests=" << _stats.requests << " errors=" << _stats.errors
            << " upstream_conns_opened=" << _stats.upstream_conns_opened
            << " upstream_reused=" << _stats.upstream_reused << "\n";
+        os << "client_setup_timeouts=" << _stats.client_setup_timeouts
+           << " client_idle_timeouts=" << _stats.client_idle_timeouts
+           << " tls_handshake_failures=" << _stats.client_tls_handshake_failures
+           << " upstream_timeouts=" << _stats.upstream_timeouts << "\n";
         std::fputs(os.str().c_str(), out);
     }
 
