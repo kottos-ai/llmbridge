@@ -668,6 +668,30 @@ namespace
                 _buf.append(tmp, static_cast<size_t>(n));
             }
         }
+        /// A streamed reply read to its end: the terminating zero-length chunk on a
+        /// clean stream, or the peer closing on a truncated one. `recv_all` waits for
+        /// the close alone, and since llmbridge stopped closing a clean stream that
+        /// means waiting out the full timeout every time. Sixteen concurrent streams
+        /// turned this suite's slowest test from milliseconds into 80 seconds, which
+        /// is what timed the TLS job out in CI.
+        std::string recv_stream(int timeout_ms = 5000)
+        {
+            std::string out = std::move(_buf);
+            _buf.clear();
+            char tmp[8192];
+            for (;;)
+            {
+                // The zero-length chunk. Safe to search for whole: an SSE payload
+                // separates events with "\n\n", never "\r\n\r\n", so this appears
+                // only as framing.
+                if (out.find("0\r\n\r\n") != std::string::npos) return out;
+                pollfd p{_fd, POLLIN, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) return out;
+                const ssize_t n = ::read(_fd, tmp, sizeof tmp);
+                if (n <= 0) return out; // truncated: the close is the end
+                out.append(tmp, static_cast<size_t>(n));
+            }
+        }
         std::string recv_all(int timeout_ms = 5000)
         {
             std::string out = std::move(_buf);
@@ -881,7 +905,7 @@ TEST_P(GatewayTls, TlsHandshakeIsAttributedToConnectStreaming)
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true,"messages":[]})")));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
     ASSERT_FALSE(all.empty());
     expect_handshake_in_connect(all);
 }
@@ -916,7 +940,7 @@ TEST_P(GatewayTls, SseStreamsThroughTlsWithTranslation)
     Client c;
     ASSERT_TRUE(c.connect(_port));
     ASSERT_TRUE(c.send(make_request(R"({"model":"m","stream":true,"messages":[]})")));
-    const std::string all = c.recv_all();
+    const std::string all = c.recv_stream();
     // The Anthropic event stream must come back as translated OpenAI chunks:
     // the token, a finish_reason, and the [DONE] sentinel.
     EXPECT_NE(all.find("hola"), std::string::npos) << all.substr(0, 400);
@@ -966,7 +990,7 @@ TEST_P(GatewayTls, ConcurrentTlsStreamsAllComplete)
     int done = 0;
     for (int i = 0; i < kStreams; ++i)
     {
-        const std::string all = clients[i]->recv_all();
+        const std::string all = clients[i]->recv_stream();
         EXPECT_NE(all.find("hola"), std::string::npos) << "stream " << i;
         if (all.find("[DONE]") != std::string::npos) ++done;
     }

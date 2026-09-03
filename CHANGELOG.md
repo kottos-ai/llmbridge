@@ -8,6 +8,16 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.52.1]. 2026-09-03
+
+### Fixed
+
+- **`accept(TLS)` could not report its own tail.**
+
+- **The test suite waited out a timeout on every clean stream.** Now that a clean stream
+  ends with a chunk terminator instead, every streaming test sat until its receive
+  timeout expired.
+
 ## [0.52.0]. 2026-09-03
 
 ### Changed
