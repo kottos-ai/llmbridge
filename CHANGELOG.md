@@ -8,6 +8,25 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.53.0]. 2026-09-03
+
+### Added
+
+- **`Expect: 100-continue` is answered.** The gateway already stripped the header on the
+  way upstream, which is right since a 1xx cannot be relayed, but sent nothing back.
+
+### Performance
+
+- **A large request body was copied four times and its headers parsed a thousand
+  times.** Extra two were `rbuf` reallocating as it grew toward the body in 4 KB 
+  recv steps. Beside it, every one of those ~1,000 recvs re-ran `parse_request` 
+  on headers whose answer could not change.
+
+  `parse_request` already computes the total length before it reports `NeedMore`, so
+  the framing loop now remembers it now. `rbuf` is reserved to it once, and the headers
+  are not re-parsed until the bytes are in. A test covers the case the memo could break,
+  which is a large request followed by a smaller one on the same socket.
+
 ## [0.52.2]. 2026-09-03
 
 ### Performance

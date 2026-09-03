@@ -324,6 +324,12 @@ namespace llmbridge
         bool ever_framed = false;
         bool client_conn_reused = false;
         int64_t client_conn_setup_ns = 0;
+        /// The total length of the request currently being buffered, learned
+        /// from its headers on the first partial read, or 0 when none is in progress.
+        size_t client_frame_want = 0;
+        /// An interim `100 Continue` was handed to the TLS layer and its
+        /// ciphertext has not fully left the socket.
+        bool client_interim_inflight = false;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
         net::http::Message msg{};
@@ -723,6 +729,7 @@ namespace llmbridge
         // Write the buffered response to the client; close out accounting.
         void ep_respond(Connection* client) noexcept;
         void ep_finish_client(Connection* c) noexcept;
+        void send_interim_continue(Connection* c, bool uring) noexcept;
 
         // ── Streaming pump (epoll) ──────────────────────────────────────────
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)

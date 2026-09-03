@@ -353,6 +353,30 @@ namespace llmbridge
             return (start > 0 && end >= start) ? end - start : 0;
         }
 
+        /// Whether a request head carries `Expect: 100-continue`. RFC 9110 section
+        /// 10.1.1: a server that receives it must send an immediate 100 or a final
+        /// status before reading the body.
+        [[nodiscard]] bool expects_continue(std::string_view head) noexcept
+        {
+            size_t pos = head.find("\r\n");
+            while (pos != std::string_view::npos && pos + 2 < head.size())
+            {
+                const size_t eol = head.find("\r\n", pos + 2);
+                const std::string_view line =
+                    head.substr(pos + 2, eol == std::string_view::npos ? std::string_view::npos
+                                                                        : eol - pos - 2);
+                if (net::http::detail::line_is(line, "expect:"))
+                {
+                    std::string_view v = net::http::detail::ltrim(line.substr(7));
+                    return v.size() >= 12 && net::http::detail::line_is(v, "100-continue");
+                }
+                pos = eol;
+            }
+            return false;
+        }
+
+        constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";
+
         std::string request_without(std::string_view msg, size_t header_len,
                                     const std::vector<std::string>& strip,
                                     std::string_view host_hdr, std::string_view base_path,
@@ -2506,10 +2530,26 @@ namespace llmbridge
         // the request-path overhead. On a partial read parse returns NeedMore and
         // we discard t0 and return, so inter-packet network wait is never charged
         // to the gateway.
+        // A request whose length is already known is not re-parsed per read: the headers
+        // were walked once, and the answer does not change until the bytes are in.
+        if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
         const int64_t t0 = now_ns();
         net::http::Message m;
         auto st = net::http::parse_request(c->rbuf, m);
-        if (st == net::http::FrameStatus::NeedMore) return;
+        if (st == net::http::FrameStatus::NeedMore)
+        {
+            if (m.total_len && !c->client_frame_want)
+            {
+                c->client_frame_want = m.total_len;
+                c->rbuf.reserve(m.total_len);
+                // No body byte yet: the client is waiting on us, not the network.
+                if (c->rbuf.size() <= m.header_len &&
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
+                    send_interim_continue(c, /*uring=*/false);
+            }
+            return;
+        }
+        c->client_frame_want = 0;
         if (st == net::http::FrameStatus::Error) { ep_error_respond(c, 400, "request framing"); return; }
 
         c->msg = m;
@@ -3227,8 +3267,42 @@ namespace llmbridge
         ep_finish_client(c);
     }
 
+    /// Answer `Expect: 100-continue` without entering the response path.
+    void Gateway::send_interim_continue(Connection* c, bool uring) noexcept
+    {
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->tls)
+        {
+            if (!c->tls->handshake_done()) return;
+            const auto* p = reinterpret_cast<const uint8_t*>(kContinue.data());
+            if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return;
+#ifdef LLMBRIDGE_HAVE_URING
+            if (uring) { ur_tls_flush(c); return; } // completion sees an empty wbuf: nothing finishes
+#endif
+            (void)uring;
+            bool done = false;
+            if (!ep_tls_flush(c, &done)) return;
+            if (!done) c->client_interim_inflight = true; // the writable event drains it
+            return;
+        }
+#else
+        (void)uring;
+#endif
+        const ssize_t n = ::send(c->fd, kContinue.data(), kContinue.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0 && static_cast<size_t>(n) < kContinue.size())
+        {
+            // A torn interim line is a protocol error the client cannot recover from.
+            c->doomed = true;
+        }
+    }
+
     void Gateway::ep_finish_client(Connection* c) noexcept
     {
+        if (c->client_interim_inflight)
+        {
+            c->client_interim_inflight = false; // the 100 Continue left; nothing finished
+            return;
+        }
         // Error replies (close_after_resp) are counted in _stats.errors, not the
         // latency histograms; their timing stamps are unset and would be garbage.
         if (!c->close_after_resp)
@@ -4258,9 +4332,23 @@ namespace llmbridge
         // Forward the next framed request only when the client is idle. No request
         // in flight (peer) and no response still draining to it (wbuf).
         if (c->peer != nullptr || !c->wbuf.empty() || c->rbuf.empty()) return;
+        // Same memo as the epoll twin; see the note there.
+        if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
         net::http::Message m;
         const auto st = net::http::parse_request(c->rbuf, m);
-        if (st == net::http::FrameStatus::NeedMore) return; // the armed recv will deliver more
+        if (st == net::http::FrameStatus::NeedMore)
+        {
+            if (m.total_len && !c->client_frame_want)
+            {
+                c->client_frame_want = m.total_len;
+                c->rbuf.reserve(m.total_len);
+                if (c->rbuf.size() <= m.header_len &&
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
+                    send_interim_continue(c, /*uring=*/true);
+            }
+            return; // the armed recv will deliver more
+        }
+        c->client_frame_want = 0;
         if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400, "request framing"); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
