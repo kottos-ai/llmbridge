@@ -512,6 +512,27 @@ namespace
                 _buf.append(tmp, static_cast<size_t>(n));
             }
         }
+        /// Bytes up to and including `marker`, left otherwise unparsed. For an interim
+        /// `100 Continue`, which frames on nothing the other helpers understand.
+        std::string recv_until(std::string_view marker, int timeout_ms = 2000)
+        {
+            char tmp[8192];
+            for (;;)
+            {
+                const size_t at = _buf.find(marker);
+                if (at != std::string::npos)
+                {
+                    std::string out = _buf.substr(0, at + marker.size());
+                    _buf.erase(0, at + marker.size());
+                    return out;
+                }
+                pollfd p{_fd, POLLIN, 0};
+                if (::poll(&p, 1, timeout_ms) <= 0) return "";
+                ssize_t n = ::read(_fd, tmp, sizeof(tmp));
+                if (n <= 0) return "";
+                _buf.append(tmp, static_cast<size_t>(n));
+            }
+        }
         /// One chunk-framed response, read to its terminating zero-length chunk and
         /// consumed out of the buffer so the next one can be read from the same socket.
         /// `recv_response` cannot do this (it frames on Content-Length, which a stream
@@ -2294,6 +2315,71 @@ TEST_P(ProxyBackend, TranslateRoundTripAndForward)
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// A large request, delivered in small writes, then a smaller one on the same socket.
+// The framing loop memoises the first request's total length so it neither reparses
+// the headers nor reallocates the buffer per read; if that memo outlived the request,
+// the smaller one that follows would never reach the remembered size and would wait
+// forever. Every other pipelining test here sends same-sized requests, which is why
+// removing the reset passed all of them.
+// A client that sends `Expect: 100-continue` holds its body until the server says
+// go. Nothing said go, so libcurl waited one second on every request with a body over
+// 1 KB. The gateway now answers the interim itself, once, before any body byte, and
+// the request then completes normally with a single final status.
+TEST_P(ProxyBackend, AnswersExpectContinueBeforeTheBodyIsSent)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body(8 * 1024, 'x');
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Expect: 100-continue\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n"));
+    const std::string interim = c.recv_until("\r\n\r\n", 2000);
+    ASSERT_EQ(interim, "HTTP/1.1 100 Continue\r\n\r\n")
+        << "the client is waiting for permission to send its body";
+    ASSERT_TRUE(c.send(body));
+    const std::string resp = c.recv_response(5000);
+    EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 80);
+    EXPECT_EQ(resp.find("100 Continue"), std::string::npos) << "the interim is sent once";
+}
+
+TEST_P(ProxyBackend, NoInterimWithoutExpectOrWhenTheBodyAlreadyArrived)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    // Whole request in one write, Expect present: the body is already here, so
+    // nothing is waiting and an interim would be noise.
+    const std::string body(8 * 1024, 'y');
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Expect: 100-continue\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n\r\n" + body));
+    std::string resp = c.recv_response(5000);
+    EXPECT_EQ(Client::status_of(resp), 200);
+    EXPECT_EQ(resp.find("100 Continue"), std::string::npos);
+    // No Expect at all, head first: nothing interim, the final status is the first thing.
+    ASSERT_TRUE(c.send(make_request(body).substr(0, 60)));
+    ASSERT_TRUE(c.send(make_request(body).substr(60)));
+    resp = c.recv_response(5000);
+    EXPECT_EQ(Client::status_of(resp), 200);
+    EXPECT_EQ(resp.find("100 Continue"), std::string::npos);
+}
+
+TEST_P(ProxyBackend, ALargeRequestThenASmallerOneOnTheSameConnection)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string big(300 * 1024, 'x');
+    const std::string first = make_request(big);
+    for (size_t off = 0; off < first.size(); off += 4096)
+        ASSERT_TRUE(c.send(first.substr(off, 4096)));
+    EXPECT_EQ(c.recv_status(5000), 200) << "the large request itself";
+    ASSERT_TRUE(c.send(make_request("small")));
+    EXPECT_EQ(c.recv_status(3000), 200)
+        << "the smaller request behind it must not wait for the first one's length";
 }
 
 TEST_P(ProxyBackend, TrickledClientAndUpstream)

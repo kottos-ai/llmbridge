@@ -578,6 +578,33 @@ namespace
         }
 
         /// Read until one complete HTTP response is framed, or the deadline passes.
+        /// Raw bytes up to and including `marker`, for an interim `100 Continue`,
+        /// which frames on nothing recv_response understands.
+        std::string recv_until(std::string_view marker, int timeout_ms = 3000)
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(timeout_ms);
+            char tmp[8192];
+            for (;;)
+            {
+                const size_t at = _buf.find(marker);
+                if (at != std::string::npos)
+                {
+                    std::string out = _buf.substr(0, at + marker.size());
+                    _buf.erase(0, at + marker.size());
+                    return out;
+                }
+                if (std::chrono::steady_clock::now() > deadline) return {};
+                const int n = SSL_read(_ssl, tmp, sizeof tmp);
+                if (n <= 0)
+                {
+                    const int e = SSL_get_error(_ssl, n);
+                    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+                    return {};
+                }
+                _buf.append(tmp, static_cast<size_t>(n));
+            }
+        }
         std::string recv_response(int timeout_ms = 5000)
         {
             const auto deadline = std::chrono::steady_clock::now() +
@@ -1334,6 +1361,27 @@ TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)
     ASSERT_TRUE(c.send(kReq));
     const std::string resp = c.recv_response();
     EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp.substr(0, 120);
+}
+
+// The interim has to cross the TLS session too, and it takes a different path there:
+// into OpenSSL, then the backend's own ciphertext drain, never wbuf. That path is
+// the one a production listener actually runs, so it gets its own test.
+TEST_P(GatewayTls, InboundAnswersExpectContinueThroughTls)
+{
+    start_inbound(UpstreamDialect::Anthropic);
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    const std::string body = R"({"model":"m","messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Expect: 100-continue\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n"));
+    ASSERT_EQ(c.recv_until("\r\n\r\n"), "HTTP/1.1 100 Continue\r\n\r\n")
+        << "over TLS the client is waiting on us just the same";
+    ASSERT_TRUE(c.send(body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp.substr(0, 120);
+    EXPECT_EQ(resp.find("100 Continue"), std::string::npos);
 }
 
 TEST_P(GatewayTls, InboundKeepAliveServesSeveralRequestsOnOneSession)
