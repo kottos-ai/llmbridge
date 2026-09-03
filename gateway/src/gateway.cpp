@@ -26,6 +26,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -3334,6 +3335,22 @@ namespace llmbridge
     // that hasn't been answered yet gets a real 504; a live stream (headers already
     // sent) is closed without a terminal [DONE], so the client sees a truncated
     // stream instead of a fabricated clean finish.
+    void Gateway::print_profile(std::FILE* out, const char* title) const noexcept
+    {
+        std::ostringstream os;
+        os << "\n=== llmbridge " << title << " ===\n";
+        if (_stats.overhead.total() > 0) _stats.overhead.print(os, "added-total   ");
+        if (_stats.req_path.total() > 0) _stats.req_path.print(os, "req-path      ");
+        if (_stats.resp_path.total() > 0) _stats.resp_path.print(os, "resp-path     ");
+        if (_stats.connect.total() > 0) _stats.connect.print(os, "connect(TLS)  ");
+        if (_stats.accept_tls.total() > 0) _stats.accept_tls.print(os, "accept(TLS)   ");
+        if (_stats.first_token.total() > 0) _stats.first_token.print(os, "first-token   ");
+        os << "requests=" << _stats.requests << " errors=" << _stats.errors
+           << " upstream_conns_opened=" << _stats.upstream_conns_opened
+           << " upstream_reused=" << _stats.upstream_reused << "\n";
+        std::fputs(os.str().c_str(), out);
+    }
+
     void Gateway::sweep_idle(bool uring) noexcept
     {
         const int64_t now = now_ns();
@@ -3354,6 +3371,12 @@ namespace llmbridge
                     " pooled_upstreams=", pooled_upstream_count(),
                     " requests=", _stats.requests);
         }
+
+        // A SIGUSR1 dump, serviced here so the worker prints its own stats and nobody
+        // reads a Histogram it does not own.
+        if (_dump.exchange(false, std::memory_order_relaxed))
+            print_profile(stderr, "live profile (worker snapshot, gateway still running)");
+
 
         // Reap idle pooled upstreams. Providers close idle keep-alives on their own
         // schedule, and discovering a corpse costs a request its retry, so drop them

@@ -633,6 +633,16 @@ namespace llmbridge
         // Async-signal-safe-ish: flips a flag the loop observes within one poll tick.
         void request_stop() noexcept { _stop.store(true, std::memory_order_relaxed); }
 
+        /// Ask this worker to print its own latency histograms on its next sweep.
+        /// This exists because the shutdown profile is otherwise the only way to read
+        /// `accept(TLS)`
+        void request_stats_dump() noexcept { _dump.store(true, std::memory_order_relaxed); }
+
+        /// Write this worker's histograms to `out`. Safe to call from the owning
+        /// worker (that is what the SIGUSR1 path does) or from any thread once the
+        /// worker has stopped and been joined.
+        void print_profile(std::FILE* out, const char* title) const noexcept;
+
         const Stats& stats() const noexcept { return _stats; }
 
         // The configured event-loop backend (the requested mode; Auto stays Auto).
@@ -1020,5 +1030,6 @@ namespace llmbridge
         // a std::atomic (not volatile) for a correct memory-model tripwire. Relaxed
         // is enough; it gates loop continuation, no other state depends on it.
         std::atomic<bool> _stop{false};
+        std::atomic<bool> _dump{false};
     };
 } // namespace llmbridge

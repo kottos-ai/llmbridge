@@ -332,7 +332,7 @@ Two further properties are deliberate:
 Headers are per-request **samples**. For distributions, see the histograms.
 
 
-## 4. The shutdown profile (histograms)
+## 4. The profile (histograms)
 
 On exit the gateway prints aggregate histograms (after a configurable warm-up
 period, `_warmup_ns`, is excluded):
@@ -345,6 +345,26 @@ added-total    count=...  p50=...  p99=...  p99.9=...  max=...
 first-token    ...          <- only when it has samples, i.e. only if traffic streamed
 accept(TLS)    ...          <- only when --listen-tls; see below
 ```
+
+(The same block is printed live on SIGUSR1; see below.)
+
+```
+```
+
+**`SIGUSR1` prints the same histograms without stopping anything**, one snapshot
+per worker, straight to stderr:
+
+```sh
+sudo kill -USR1 "$(pgrep -x llmbridge)"     # or the unit's MainPID
+```
+
+That exists because `accept(TLS)` is otherwise readable only at shutdown.
+The dump runs inside each worker's own sweep, never in the signal handler and
+never from another thread. The signal handler only sets an atomic, as 
+`request_stop` does.
+
+Two differences from the shutdown output: it is per worker, not aggregated, and
+it is cumulative since start, so two dumps subtracted give you an interval.
 
 | line | span | contents |
 |---|---|---|

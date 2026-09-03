@@ -25,6 +25,8 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 ### Added
 
+- **`SIGUSR1` prints the latency profile without stopping the gateway.**
+
 - **Per-request visibility of client connection reuse:** `client_conn_reused` and
   `client_conn_setup_ns` on the sink record, set on both backends.
 

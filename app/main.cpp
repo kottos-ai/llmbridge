@@ -83,6 +83,14 @@ namespace
         if (g_gateways)
             for (auto& g : *g_gateways) g->request_stop();
     }
+
+    // SIGUSR1 prints the profile without stopping anything. Until this existed the
+    // only way to read `accept(TLS)` on a running gateway was to kill it.
+    void on_dump_signal(int) noexcept
+    {
+        if (g_gateways)
+            for (auto& g : *g_gateways) g->request_stats_dump();
+    }
 } // namespace
 
 // The real body. `main` below turns any escaping exception into a single
@@ -410,6 +418,7 @@ static int run(int argc, char** argv)
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+    std::signal(SIGUSR1, on_dump_signal);
 
     std::thread timer;
     if (duration > 0)
