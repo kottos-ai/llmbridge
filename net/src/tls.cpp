@@ -248,8 +248,11 @@ namespace llmbridge::net::tls
           _wbio(std::exchange(o._wbio, nullptr)),
           _want(o._want),
           _hs_done(o._hs_done),
-          _err(std::move(o._err))
+          _err(std::move(o._err)),
+          _sink(std::exchange(o._sink, nullptr)),
+          _staging(std::move(o._staging))
     {
+        if (_wbio) BIO_set_data(_wbio, this); // the BIO points back at its owner
     }
 
     Session& Session::operator=(Session&& o) noexcept
@@ -263,8 +266,51 @@ namespace llmbridge::net::tls
             _want = o._want;
             _hs_done = o._hs_done;
             _err = std::move(o._err);
+            _sink = std::exchange(o._sink, nullptr);
+            _staging = std::move(o._staging);
+            if (_wbio) BIO_set_data(_wbio, this);
         }
         return *this;
+    }
+
+    // The write side is our own BIO: OpenSSL hands each finished record to
+    // bio_write, which appends it to the sink the owner chose. A memory BIO would
+    // hold the record until pull_ciphertext copied it out again.
+    int Session::bio_write(bio_st* b, const char* d, int n) noexcept
+    {
+        auto* s = static_cast<Session*>(BIO_get_data(b));
+        if (!s || n < 0) return -1;
+        std::string& out = s->_sink ? *s->_sink : s->_staging;
+        out.append(d, static_cast<size_t>(n));
+        return n;
+    }
+
+    long Session::bio_ctrl(bio_st* b, int cmd, long, void*) noexcept
+    {
+        switch (cmd)
+        {
+            case BIO_CTRL_FLUSH: return 1;
+            case BIO_CTRL_WPENDING:
+            case BIO_CTRL_PENDING:
+            {
+                auto* s = static_cast<Session*>(BIO_get_data(b));
+                return s ? static_cast<long>(s->_staging.size()) : 0;
+            }
+            default: return 0;
+        }
+    }
+
+    const BIO_METHOD* Session::sink_method() noexcept
+    {
+        static const BIO_METHOD* m = [] {
+            BIO_METHOD* mm = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK,
+                                          "llmbridge-sink");
+            if (!mm) return static_cast<BIO_METHOD*>(nullptr);
+            BIO_meth_set_write(mm, &Session::bio_write);
+            BIO_meth_set_ctrl(mm, &Session::bio_ctrl);
+            return mm;
+        }();
+        return m;
     }
 
     // Allocate the SSL object and its memory BIO pair. Shared by both directions
@@ -282,7 +328,7 @@ namespace llmbridge::net::tls
         }
 
         _rbio = BIO_new(BIO_s_mem());
-        _wbio = BIO_new(BIO_s_mem());
+        _wbio = sink_method() ? BIO_new(sink_method()) : nullptr;
         if (!_rbio || !_wbio)
         {
             _err = drain_errors();
@@ -298,7 +344,8 @@ namespace llmbridge::net::tls
         // closed" instead of "nothing yet". Without this the first read on an empty
         // BIO tears the connection down.
         BIO_set_mem_eof_return(_rbio, -1);
-        BIO_set_mem_eof_return(_wbio, -1);
+        BIO_set_data(_wbio, this);
+        BIO_set_init(_wbio, 1);
 
         SSL_set_bio(_ssl, _rbio, _wbio);  // takes ownership of both
         return true;
@@ -417,9 +464,11 @@ namespace llmbridge::net::tls
 
     size_t Session::pull_ciphertext(std::span<uint8_t> out) noexcept
     {
-        if (!_ssl || out.empty()) return 0;
-        const int n = BIO_read(_wbio, out.data(), clamp_len(out.size()));
-        return n > 0 ? static_cast<size_t>(n) : 0;
+        if (!_ssl || out.empty() || _staging.empty()) return 0;
+        const size_t n = std::min(out.size(), _staging.size());
+        std::memcpy(out.data(), _staging.data(), n);
+        _staging.erase(0, n);
+        return n;
     }
 
     size_t Session::read_plaintext(std::span<uint8_t> out) noexcept
@@ -472,12 +521,12 @@ namespace llmbridge::net::tls
 
     size_t Session::pending_output_bytes() const noexcept
     {
-        return _wbio ? static_cast<size_t>(BIO_ctrl_pending(_wbio)) : 0;
+        return _staging.size();
     }
 
     bool Session::has_pending_output() const noexcept
     {
-        return _wbio && BIO_ctrl_pending(_wbio) > 0;
+        return !_staging.empty();
     }
 
 }  // namespace llmbridge::net::tls

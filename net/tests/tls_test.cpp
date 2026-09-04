@@ -279,6 +279,54 @@ TEST_F(TlsPump, ApplicationDataRoundTrips)
     EXPECT_EQ(std::string(reinterpret_cast<char*>(buf.data()), rn), resp);
 }
 
+// With a sink set, records land in the caller's buffer as OpenSSL finishes them
+// and nothing stages inside the Session; with the sink cleared, staging resumes.
+// The bytes must be the same either way: the server decrypts both.
+TEST_F(TlsPump, ASinkReceivesRecordsDirectlyAndStagingStaysEmpty)
+{
+    Session c;
+    ASSERT_TRUE(c.init_client(ctx, kHost));
+    Server s(id);
+    (void)c.start_handshake();
+    ASSERT_TRUE(drive_handshake(c, s)) << c.last_error();
+    std::vector<uint8_t> buf(16384);
+    while (c.pull_ciphertext(buf) > 0) {}
+
+    const std::string req(40000, 'x'); // three records
+    std::string sink;
+    c.set_sink(&sink);
+    const auto* p = reinterpret_cast<const uint8_t*>(req.data());
+    for (size_t off = 0; off < req.size();) // one record per call, like the gateway
+    {
+        const size_t w = c.write_plaintext({p + off, req.size() - off});
+        ASSERT_GT(w, 0u);
+        off += w;
+    }
+    c.set_sink(nullptr);
+    EXPECT_GT(sink.size(), req.size());
+    EXPECT_FALSE(c.has_pending_output());
+    EXPECT_EQ(c.pull_ciphertext(buf), 0u);
+
+    s.feed(std::vector<uint8_t>(sink.begin(), sink.end()));
+    std::string got;
+    char chunk[16384];
+    for (int n; (n = SSL_read(s.ssl, chunk, sizeof chunk)) > 0;) got.append(chunk, n);
+    EXPECT_EQ(got, req);
+
+    // Sink cleared: the next record stages again and comes out through the pull.
+    const std::string more = "tail";
+    ASSERT_EQ(c.write_plaintext({reinterpret_cast<const uint8_t*>(more.data()), more.size()}),
+              more.size());
+    EXPECT_TRUE(c.has_pending_output());
+    EXPECT_EQ(sink.size(), sink.size()); // untouched
+    size_t n = c.pull_ciphertext(buf);
+    EXPECT_GT(n, more.size());
+    s.feed(std::vector<uint8_t>(buf.begin(), buf.begin() + static_cast<long>(n)));
+    const int got_n = SSL_read(s.ssl, chunk, sizeof chunk);
+    ASSERT_GT(got_n, 0);
+    EXPECT_EQ(std::string(chunk, static_cast<size_t>(got_n)), more);
+}
+
 // The point of the memory-BIO design is that it cannot care how the bytes were
 // framed by the transport. io_uring will hand us arbitrary fragments, so prove a
 // byte-at-a-time feed produces the same result as one bulk feed.

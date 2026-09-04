@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.54.0]. 2026-09-04
+
+### Changed
+
+- **OpenSSL writes ciphertext straight into the send buffer.** The write BIO is now
+  the session's own method: each finished record is appended to a sink the gateway
+  sets for the duration of a push, `Connection::tls_out`, instead of being held in a
+  memory BIO and copied out again through a 16 KB stack buffer
+  
+- **The ciphertext buffer for an upstream request is reserved once.**
+
 ## [0.53.0]. 2026-09-03
 
 ### Added
