@@ -94,7 +94,7 @@ came from the pool and no response byte has arrived.
  frame HTTP/1.1 (net/http.hpp)      <- refuses malformed input, never repairs it
    |
    v
- translate OpenAI -> provider dialect (provider/translate.cpp)
+ translate OpenAI -> provider dialect (provider/src/translate_*.cpp)
    |
    v
  acquire upstream: pooled keep-alive, or a fresh connect

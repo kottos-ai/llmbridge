@@ -4,7 +4,10 @@
 # translation is enabled.
 
 add_library(provider STATIC
-        src/translate.cpp
+        src/translate_anthropic.cpp
+        src/translate_body.cpp
+        src/translate_cohere.cpp
+        src/translate_gemini.cpp
         src/sse.cpp
 )
 add_library(llmbridge::provider ALIAS provider) # namespaced alias, matches find_package()

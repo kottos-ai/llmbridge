@@ -25,7 +25,7 @@ namespace llmbridge::provider
     namespace
     {
         // Control-byte neutralisation lives in openai_common.hpp so the SSE
-        // passthrough and the error-envelope passthrough (translate.cpp) can't
+        // passthrough and the error-envelope passthrough (translate_body.cpp) can't
         // drift: a raw newline emitted into our SSE output would let a hostile
         // upstream inject fake events ("\n\ndata: ..."), and a raw control byte
         // anywhere makes our JSON unparseable to a strict client.

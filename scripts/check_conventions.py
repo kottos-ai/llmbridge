@@ -40,7 +40,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-GATEWAY = ROOT / "gateway" / "src" / "gateway.cpp"
+# Gateway is defined across three files: the shared methods, then one per backend.
+# They are read as one text, since a crossing is a call from a method in one file to
+# a method in another, and the reachability walk needs every method in view.
+GATEWAY_FILES = [ROOT / "gateway" / "src" / f
+                 for f in ("gateway.cpp", "gateway_epoll.cpp", "gateway_uring.cpp")]
+
+
+def gateway_text():
+    """(text, locate): the three files' comment-stripped text joined, and a function
+    mapping a line in it back to `file:line`."""
+    parts, starts, at = [], [], 0
+    for f in GATEWAY_FILES:
+        body = strip_comments(f.read_text(encoding="utf-8"))
+        parts.append(body)
+        starts.append((at, f))
+        at += body.count("\n") + 1
+
+    def locate(line):
+        for begin, f in reversed(starts):
+            if line > begin:
+                return f"{f.relative_to(ROOT)}:{line - begin}"
+        return f"{GATEWAY_FILES[0].relative_to(ROOT)}:{line}"
+    return "\n".join(parts), locate
 
 # Methods that are legitimately unprefixed despite not being called from both
 # backends: entry points, accessors, and the ctor. Anything else that is
@@ -130,8 +152,7 @@ def main():
     failures = []
 
     # ---------------------------------------------------------------- 1 & 2
-    raw = GATEWAY.read_text()
-    text = strip_comments(raw)
+    text, locate = gateway_text()
     lines = text.splitlines()
     spans = method_spans(text)
     if len(spans) < 40:
@@ -155,7 +176,7 @@ def main():
             tb = backend_strict(called)
             if tb is not None and tb != cb:
                 failures.append(
-                    f"{GATEWAY.relative_to(ROOT)}:{line}: CROSSING: {caller}() calls "
+                    f"{locate(line)}: CROSSING: {caller}() calls "
                     f"{called}(); {cb} and {tb} teardown/IO are not interchangeable")
 
     # 2. unprefixed methods reachable from only one backend
@@ -173,7 +194,7 @@ def main():
             only = "epoll" if "ep" in sides else "io_uring"
             pfx = "ep_" if "ep" in sides else "ur_"
             failures.append(
-                f"{GATEWAY.relative_to(ROOT)}:{decl_line}: UNMARKED: {name}() is reachable "
+                f"{locate(decl_line)}: UNMARKED: {name}() is reachable "
                 f"only from {only}, but an unprefixed name means shared. Rename to "
                 f"{pfx}{name}, or add it to UNPREFIXED_ALLOWED with a reason")
 
@@ -296,13 +317,16 @@ def main():
     # Only contradictions are reported: a prefixed constant used from the other
     # backend, or a bare one used exclusively by one. A constant used only from free
     # functions or file scope has no evidence either way and is left alone.
-    gw = ROOT / "gateway" / "src" / "gateway.cpp"
-    gtext = strip_comments(gw.read_text(encoding="utf-8"))
+    gtext, _ = gateway_text()
     glines = gtext.splitlines()
     spans = method_spans(gtext)
     hdr = strip_comments((ROOT / "gateway" / "include" / "gateway" / "gateway.hpp")
                          .read_text(encoding="utf-8"))
     consts = set(const_re.findall(hdr)) | set(const_re.findall(gtext))
+    # The helpers beside gateway.cpp hold constants too, and a kEp*/kUr* placed
+    # there is still read from a Gateway method, which is where the evidence is.
+    for helper in sorted((ROOT / "gateway" / "src").glob("*.hpp")):
+        consts |= set(const_re.findall(strip_comments(helper.read_text(encoding="utf-8"))))
     consts = {c for c in consts if re.fullmatch(r"k[A-Z]\w*", c)}
     n_checked = 0
     for name in sorted(consts):

@@ -105,9 +105,9 @@ and in this document. Every stamp is a `Connection` member except the last two,
 which are locals; nothing outlives the request that needs them.
 
 Stamps are named by the **function** that assigns them, in
-`gateway/src/gateway.cpp`: epoll first, io_uring second. The gateway is
+`gateway/src/gateway_epoll.cpp` and `gateway/src/gateway_uring.cpp`. The gateway is
 implemented twice, so every stamp has a site in each loop, and a change to one
-that misses the other is the characteristic bug in this file.
+that misses the other is the characteristic bug in those files.
 `scripts/check_conventions.py` verifies in CI that each named function still
 assigns the stamp attributed to it.
 

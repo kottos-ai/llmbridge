@@ -8,6 +8,36 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.54.1]. 2026-09-04
+
+### Changed
+
+- **`provider/src/translate.cpp` is four files.** One per venue, `translate_anthropic.cpp`
+  (tools, the Messages walk Bedrock shares, the response), `translate_gemini.cpp` and
+  `translate_cohere.cpp`, plus `translate_body.cpp` for the edits that do not depend on
+  the venue: the top-level walk behind `model_of`, the model and service-tier rewrites,
+  and the upstream error envelope. The `content` helpers every request walk shares
+  moved to `content.hpp`, private to `src/`, still inline.
+
+- **`gateway/src/gateway.cpp` is `Gateway` and its event loops, and nothing else.** The
+  1,500 lines of free helpers in front of it moved out, all under
+  `gateway/src/` and none installed: `request.hpp/.cpp` (dialect resolution, the
+  byte-forward rebuild, the translated request with its credentials, the response
+  translated back), `response.hpp/.cpp` (error envelopes, relayed statuses, 
+  the SSE head, timing and usage headers), `scan.hpp` (the bounded usage and 
+  error scans) and `stream.hpp` (the streaming step both backends share).
+
+- **The two backends are two files.** Every `ep_` method and `run_epoll()` are in
+  `gateway_epoll.cpp`, every `ur_` method and `run_uring()` in `gateway_uring.cpp`
+  (empty without `LLMBRIDGE_HAVE_URING`), and `gateway.cpp` keeps construction, the
+  shared methods and `run()`. What both loops read moved to `loop.hpp`. The
+  convention checker reads the three files as one text, so a call across the
+  prefixes still fails the build, now naming the file it is in.
+
+- **`gateway/gateway.hpp` is `Gateway` and `Stats`; the rest is `connection.hpp`.**
+  The refusal strings, the dialect and backend enums, `TlsConfig`, `Upstream` and
+  `Connection` moved to the new header.
+
 ## [0.54.0]. 2026-09-04
 
 ### Changed
