@@ -206,6 +206,8 @@ namespace llmbridge
         ur_submit_send(u); // sets send_inflight; see the note there
     }
 
+#endif // LLMBRIDGE_HAVE_TLS
+
     // Send wbuf to a client connection, whatever the transport.
     //
     // The plaintext path submits a send straight out of wbuf. A TLS conn cannot:
@@ -1284,7 +1286,5 @@ namespace llmbridge
 
         return 0;
     }
-
-#endif // LLMBRIDGE_HAVE_TLS
 } // namespace llmbridge
 #endif // LLMBRIDGE_HAVE_URING
