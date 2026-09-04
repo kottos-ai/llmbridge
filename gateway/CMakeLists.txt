@@ -6,6 +6,8 @@
 add_library(gateway STATIC
         src/metrics.cpp
         src/gateway.cpp
+        src/gateway_epoll.cpp
+        src/gateway_uring.cpp
         src/request.cpp
         src/response.cpp
 )

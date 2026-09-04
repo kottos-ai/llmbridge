@@ -24,8 +24,12 @@ net/        sockets + HTTP/1.1 framing + raw io_uring wrapper   (no project deps
   └─ uring.{hpp,cpp} thin raw-syscall io_uring ring wrapper (Linux only)
 provider/   dialect translation (OpenAI ⇄ Anthropic / Gemini / Cohere)   (no I/O)
   ├─ json.hpp        hand-rolled, scoped JSON parser + escaping builder
-  └─ translate.{hpp,cpp}   string→string translation functions
+  └─ translate.hpp   string→string translation functions, one .cpp per venue
 gateway/    the event-loop proxy that ties net + provider together
+  ├─ gateway.cpp        Gateway: construction, the shared methods, run()
+  ├─ gateway_epoll.cpp  every ep_ method and run_epoll()
+  ├─ gateway_uring.cpp  every ur_ method and run_uring()
+  └─ request, response, scan, stream, loop   the helpers, by concern (src/ only)
 app/        the CLI daemon (llmbridge --listen ... --upstream ... --upstream-dialect ...)
 ```
 
@@ -46,6 +50,10 @@ Namespaces mirror the directory, with no exceptions:
 | `ep_` | epoll-only, reachable solely from `run_epoll()` |
 | `ur_` | io_uring-only, reachable solely from `run_uring()` |
 | *(none)* | genuinely shared by both loops (`sweep_idle`, the `tls_*` pump helpers) |
+
+The prefix is also the file: `ep_` methods are defined in `gateway_epoll.cpp`, `ur_`
+methods in `gateway_uring.cpp`, and unprefixed ones in `gateway.cpp`, so a fix that
+lands on one side shows in the diff as a file that its twin did not touch.
 
 Two rules make this worth the verbosity:
 
@@ -149,7 +157,7 @@ flight after you'd like to free it. The backend tracks an in-flight op count per
 connection and defers the free until the count reaches zero (a "doomed" list),
 handles multishot CQEs that carry `F_MORE` alongside a terminal result, and re-arms
 on transient conditions. This is the most safety-critical code in the repo and is
-commented inline in `gateway/src/gateway.cpp`.
+commented inline in `gateway/src/gateway_uring.cpp`.
 
 ## Request lifecycle (proxy)
 

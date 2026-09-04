@@ -131,6 +131,20 @@ namespace llmbridge::detail
             return out;
         }
 
+        // Build the auth/extra header lines to inject into the translated
+        // upstream request, from the client's request headers.
+        //
+        // Whitelist, not passthrough: the gateway rebuilds the upstream request,
+        // and only the credential headers the target dialect understands may
+        // cross the translation boundary. Echoing arbitrary client headers
+        // through a rebuilt request is a smuggling surface (and our own framing
+        // headers must stay authoritative). A byte-forward is untouched by all of
+        // this: it already carries every client header.
+        //
+        // Values re-emitted here cannot contain CR/LF: find_header() bounds each
+        // value by its own line's CRLF, so injection via a crafted credential is
+        // structurally impossible instead of filtered.
+        //
         // Returns false when the client supplied a syntactically invalid credential
         // (control characters). The caller must fail the request instead of
         // forward. Silently dropping would still send a credential-less request
