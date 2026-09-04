@@ -1,0 +1,19 @@
+{
+  "date": "2026-09-04T02:32:14Z",
+  "harness_commit": "unknown",
+  "images": {"tcprelay": "alpine/socat:latest", "llmbridge": "llmbridge:bench", "llmbridge-anthropic": "llmbridge:bench", "gomodel": "enterpilot/gomodel:latest", "litellm": "litellm/litellm:main-stable", "portkey": "portkeyai/gateway:latest", "bifrost": "maximhq/bifrost:latest", "tensorzero": "tensorzero/gateway:latest", "omniroute": "diegosouzapw/omniroute:latest"},
+  "n_requests": 20000,
+  "max_variant_seconds": 60,
+  "concurrency": 10,
+  "repeats": 5,
+  "litellm_num_workers": 12,
+  "warmup": 100,
+  "resource_seconds": 15,
+  "rest_seconds": 5,
+  "sweep_concurrency": "1,2,4,8,16,32,64,128,256",
+  "sweep_duration_s": 8,
+  "gateways": "tcprelay,llmbridge,llmbridge-anthropic,gomodel,litellm,portkey,bifrost,tensorzero,omniroute",
+  "instance_type": "unknown",
+  "cpus": 12,
+  "kernel": "7.0.0-30-generic"
+}

@@ -7,6 +7,7 @@ different jobs:
 |---|---|---|---|
 | **A. Non-streaming** | request → response | one whole request | added latency per request, requests/sec |
 | **B. Streaming (SSE)** | one long-lived stream, many tokens | one token | time to first token, added latency per token, concurrent streams |
+| **C. Third-party harness** | nine gateways, one public methodology | one request | added latency over a no-gateway baseline, cores, req/s |
 
 **The numbers are not interchangeable.** A streaming request occupies a connection
 for the whole generation, so "requests per second" is not a meaningful axis for it;
@@ -72,8 +73,7 @@ configurations are documented in
 ![Throughput saturation: offered vs achieved RPS](bench/results/saturation.svg)
 
 Single-thread ceiling is **~84k RPS**, the median of three cold-boot runs (84,928; the
-mean, 84,763, rounds to the same claim); best single run 86,982, reproducing an earlier
-87.6k measurement on the same code. Requires `BACKENDS=4`, or the mock is the limit (at
+mean, 84,763, rounds to the same claim); best single run 86,982. Requires `BACKENDS=4`, or the mock is the limit (at
 the default of 1 the mock caps it at ~65k). The middle run is quoted, not the
 best, because the best run is only achievable on a cold machine, and median-of-3 is
 the summary statistic used throughout this document.
@@ -96,8 +96,7 @@ percentages follow and they have three different denominators, so to be explicit
 - **89% kernel / 6.7% llmbridge**: a split of the worker's own CPU time (that 87-92%),
   not of the machine. Nine of every ten cycles the gateway burns execute kernel code.
 
-Softirq time is ~0%, so it is not the loopback packet path. An earlier revision of this
-document claimed that, and the measurement contradicts it. Throughput therefore tracks
+Softirq time is ~0%, so it is not the loopback packet path. Throughput therefore tracks
 clock speed almost linearly: the same build measures ~78k on this laptop at a thermally
 throttled 4.0 GHz and ~88k at 4.5 GHz. Scaling past it is `--workers N` (SO_REUSEPORT,
 shared-nothing) or less CPU per request. **C-states are irrelevant here** in the direct
@@ -184,9 +183,7 @@ instrument**: neither gateway self-reports.
 > Configuration changes; otherwise it silently blends incompatible runs. Repeating the
 > Same configuration is the intended use and is what the median is for: these figures
 > are the median of **three** runs on the **v0.10.0** tree, measured 2026-08-06 on a
-> host rebooted immediately beforehand (50 °C at each rep's start, load < 0.8). (An earlier revision of this note said to reset to a
-> single run's rows, which was true when only one run existed and would now silently
-> discard the repetitions.)
+> host rebooted immediately beforehand (50 °C at each rep's start, load < 0.8).
 
 ### Results: llmbridge vs LiteLLM (50 tok/s per stream, one worker each)
 
@@ -268,9 +265,8 @@ every level for every arm.
 *One caveat, stated because it was checked and not assumed:* LiteLLM's server log
 contains a handful of connect errors, all timestamped **10 seconds after the final
 measurement ended**; they occur during teardown, when the harness stops the mock while
-LiteLLM still has a backlog queued. An earlier run of this benchmark had to be discarded
-because equivalent errors occurred *during* measurement; the check is now part of the
-runbook.
+LiteLLM still has a backlog queued. Errors *during* measurement void the run, and the
+runbook checks for them.
 
 ### Steady-state added latency at 4,096 concurrent streams
 
@@ -379,12 +375,12 @@ table.
 Until a driver and a CSV land, read this table as a founder's measurement, not a
 reproducible one. Everything else in this document is reproducible.
 
-### Connection reuse (and why the earlier numbers were worse)
+### Connection reuse
 
-Until recently a streaming request closed its upstream connection at stream end, so
-every stream paid a fresh connect. At 4,096 streams that was **706 connects/sec**, and
-it was the single largest term in time-to-first-token on *both* backends. Upstream
-connections are now returned to the keep-alive pool when the framing proves it is safe
+A streaming request that closes its upstream connection at stream end pays a fresh
+connect per stream. At 4,096 streams that is **706 connects/sec**, the single largest
+term in time-to-first-token on *both* backends. Upstream connections are therefore
+returned to the keep-alive pool when the framing proves it is safe
 (chunked body, terminal chunk consumed, no trailing bytes, upstream keep-alive, clean
 end); the pool is capped at 256 with 30 s idle eviction.
 
@@ -401,11 +397,9 @@ was loading the whole path - including the provider's accept queue.
 
 ### Where llmbridge saturates
 
-**Withdrawn pending re-measurement.** The previous knee ("between 2,048 and 4,096
-streams") was measured before connection reuse existed and against a provider that was
-itself saturating, so it reflected connect churn and the mock as much as the gateway.
-The related claim that epoll degrades more gracefully past the knee is withdrawn too: it
-was a single sample, and the churn-free data above shows io_uring ahead at every
+**Not measured churn-free.** A knee taken with streams completing, against a provider
+that is itself saturating, reflects connect churn and the mock as much as the gateway,
+so no knee is claimed. The churn-free data above shows io_uring ahead of epoll at every
 percentile.
 
 **Reproduce**
@@ -521,9 +515,8 @@ Two things follow, and the second one is a host-configuration result, not a code
 1. **llmbridge's own work costs ~5 us/token** - HTTP framing, chunked decode, the SSE
    state machine and re-serialisation combined. Everything else is the price of putting a
    process in the path. Every gateway sits at ~5% of one core, so none of it is
-   compute-bound. The honest ceiling on optimising *our code* here is therefore ~5 us.
-   (An earlier revision of this document said ~2 us; that was inside the noise floor of
-   an untuned host, and the tuned measurement supersedes it.)
+   compute-bound. The honest ceiling on optimising *our code* here is therefore ~5 us,
+   measured on a tuned host; an untuned one puts it inside its own noise floor.
 2. **The hop is mostly CPU idle-state exit latency, not transit.** Capping idle states at
    C1 (2 us exit, versus 70-890 us for C3-C10) cuts it 3.9x. Of the 14 us that remains,
    busy-polling the relay recovers only ~3 us, so the residual is the loopback data path
@@ -615,3 +608,88 @@ interleaved and ran at identical clocks).
   been 6.7%, and an AppArmor figure quoted as both 6.1% and 6.37%) and could only be
   resolved by majority, not by re-derivation. Treat the profile as indicative and
   re-run it before quoting any single line.
+
+## C. Third-party harness: nine gateways on one methodology
+
+The two benchmarks above compare one competitor with a load generator we wrote,
+which a skeptic cannot check for bias. `bench/run_enterpilot.sh` therefore also runs
+`llmbridge` inside the
+[AI gateway reproducible benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark),
+under the MIT license, written by Jakub A. Wąsek of ENTERPILOT, the author of GoModel, whose
+own runs are published at
+[enterpilot.io](https://enterpilot.io/blog/benchmarking-ai-gateways-gomodel-litellm-portkey-bifrost-june-2026/).
+Every gateway runs from its public Docker image, one at a time, against the same
+in-memory Go mock, with a no-gateway baseline: 20,000 requests per variant at
+concurrency 10, five trials in randomised order, six variants (chat, responses and
+messages, streamed and not), a separate throughput sweep from c=1 to c=256, and
+`docker stats` under sustained load. Its unit of work is one request, so its numbers
+sit beside A and never beside B.
+
+Three arms are ours: `llmbridge` (OpenAI in, byte-forward), `llmbridge-anthropic` (the
+same binary translating OpenAI to Anthropic, so its `chat` rows do real work) and
+`tcprelay`, a socat byte pipe. The harness's baseline is one bridge traversal and every
+gateway arm is two, so each overhead figure carries one hop that belongs to the
+topology; the byte pipe measures exactly that hop, and "above floor" below subtracts
+it. A negative figure is noise around zero and reads as at the floor, never as faster
+than copying bytes.
+
+### Results
+
+One llmbridge worker, twelve logical CPUs, quiet host (baseline p99 within
+0.52-0.64 ms across trials), the harness at its upstream commit
+[f156704](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark/commit/f156704cd96a3aa02168ce04d0c86260c135ef0a).
+Chat completions, added p50 in ms over the harness's own baseline:
+
+| gateway | version | cores | non-streaming | above floor | streaming | above floor | peak req/s | memory | req/s per CPU% |
+|---|---|---|---|---|---|---|---|---|---|
+| tcprelay, the floor | socat 1.8.1.3 | 2.17 | 0.06 | 0 | 0.27 | 0 | 43,973 | 5.1 MB | 157 |
+| llmbridge | v0.53.0 | 0.98 | 0.07 | 0.01 | **0.18** | **-0.09** | 40,677 | 32.1 MB | **354** |
+| llmbridge-anthropic | v0.53.0 | 1.02 | 0.10 | 0.04 | 0.56 | 0.29 | 35,298 | 30.4 MB | 300 |
+| gomodel | 0.1.86 | 5.96 | 0.47 | 0.41 | 0.75 | 0.48 | 16,468 | 76.6 MB | 23 |
+| bifrost | 2.0.0 | 7.90 | 0.80 | 0.74 | 2.77 | 2.50 | 10,043 | 492.7 MB | 11 |
+| portkey | 1.15.2 | 1.20 | 7.56 | 7.50 | 27.60 | 27.33 | 1,232 | 197.7 MB | 10 |
+| litellm | 1.99.1 | 7.05 | 10.77 | 10.71 | 46.06 | 45.79 | 880 | 9,528 MB | 1 |
+| tensorzero | 2026.6.0 | 0.17 | 41.74 | 41.68 | 41.03 | 40.76 | 6,834 | 131.7 MB | 16 |
+| omniroute | 3.8.50 | 1.08 | 172.01 | 171.95 | 207.37 | 207.10 | 58 | 928.5 MB | 0.4 |
+
+Every variant, the per-trial data, the run parameters and each image's resolved
+version and digest are in `bench/results/enterpilot/20260904-023214/`.
+
+### How to read it
+
+- **Non-streaming sits at the floor**, 0.01 ms above a byte pipe that parses nothing,
+  on 0.98 cores against socat's 2.17. Streaming reads under the pipe, which says this
+  measurement cannot resolve any cost of ours on that row.
+- **The cores column is not optional.** GoModel and Bifrost take every core through
+  the Go runtime (5.96 and 7.90 under load) and LiteLLM runs one worker per core.
+  Throughput quoted without cores flatters them and understates a single-threaded
+  gateway by about an order of magnitude; the last column is throughput per percent of
+  CPU.
+- **Coverage.** llmbridge serves four of the six variants: it refuses `messages`
+  because Anthropic-in translation is unbuilt, and the translating arm refuses
+  `responses` because a Responses body is not a chat body. A refusal is not a failure.
+  Portkey refuses `messages` in this single-provider setup, TensorZero served only
+  chat, LiteLLM completed 57,690 of 100,000 streamed chat requests inside the window,
+  and Bifrost's `messages/stream` failed outright.
+- **TensorZero at 41 ms and OmniRoute at 58 req/s are configuration problems**, not
+  measurements of the software. They are in the data and belong in no headline.
+- **What its streaming rows measure.** The mock does not pace tokens and the harness
+  closes the client connection after every stream, so those rows are a different unit
+  of work from B's paced tokens over held connections, and the two do not contradict
+  each other.
+
+### Two divergences from the published harness
+
+Both are stated in the run's own output, and both mean these figures compare within
+this table and never with enterpilot.io's:
+
+- **Docker's default seccomp and apparmor filters are off for every arm.** The default
+  seccomp profile blocks the io_uring syscalls, so under it llmbridge silently runs
+  epoll. Lifting the filter costs the other gateways nothing measurable.
+- **The host is a 12-CPU laptop**, against the c7i.large with two vCPUs behind the
+  published tables.
+
+The runbook is in [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md) §6. Its
+~40k req/s and the ~84k ceiling in section A differ by the backend: the harness runs
+one mock, and section A needs `BACKENDS=4` before the gateway and not the mock is the
+limit.

@@ -458,12 +458,10 @@ Compile-time constants that change benchmark results:
 | llmbridge vs LiteLLM streaming | `60 20 20 6 "16 64 256 512"`, `PROVIDER=fast`, SYN backlog raised, `ListenOverflows` delta 0 |
 | per-token cost ~5 µs | `nullrelay` control at 64 streams, C1-capped host |
 
-## Competitor versions (pinned)
+## Competitor versions
 
-The published LiteLLM figures were produced with these exact versions. A plain
-`pip install litellm[proxy]` no longer reproduces them: a newer LiteLLM pulls a
-FastAPI that removed `get_flat_dependant`, and its proxy then fails to start with
-a misleading `No module named 'proxy_server'`.
+The published LiteLLM figures in sections 2 and 3 were produced with these exact
+versions, and the pin stays so they stay reproducible:
 
 ```sh
 python3 -m venv bench/.litellm-venv
@@ -473,255 +471,141 @@ bench/.litellm-venv/bin/pip install "litellm[proxy]==1.95.0" \
 
 Verify before a run: the proxy must answer `GET /health/liveliness` with 200.
 
-### The pin is a liability as well as a guarantee (2026-09-02)
-
-1.95.0 is what the published figures were measured against, and it stays pinned so
-they stay reproducible. It is also **five releases behind**: PyPI is on 1.99.0, and
-LiteLLM has announced an optional sidecar that moves the hot path out of Python,
-claiming 1,000 QPS without failures and up to 5,000 on 4 CPU and 8 GB. Our published
-figure is a ~246 RPS ceiling on one worker. Both cannot be true of the same software.
-
-Read their post carefully before repeating either number. It states a Q1 **goal** of
-"sub-millisecond proxy overhead" and reports **no overhead measurement and no version**,
-so the only concrete claim in it is throughput.
-
-`bench/rerun_litellm.sh` measures the current release in a separate venv and leaves the
-pinned one alone.
-
-### What 1.99.0 actually contains (inspected 2026-09-02)
-
-The install now succeeds unpinned. FastAPI 0.141.1 and litellm 1.99.0 start the proxy
-fine, so the `get_flat_dependant` caveat above describes a window that has closed. The
-1.95.0 pin stays for reproducibility, not because a newer one cannot run.
-
-The re-architecture ships, under a different name than the post uses. There is no file
-in the package mentioning a sidecar; there is a compiled `litellm/rust_bridge/_native.abi3.so`
-and 35 modules referencing it. Searching for the blog's vocabulary returns nothing and
-is how a first pass concluded the feature was absent.
-
-Three properties of that path decide what has to be re-measured, all read from
-`rust_bridge/chat_completions.py` in the installed package:
-
-| property | value | consequence for our claims |
-|---|---|---|
-| gate | `LITELLM_RUST` in `{1,true,yes,on}`, or `litellm_params["rust"] is True`; default empty | off unless asked for, so the default arm is still the Python path a user gets |
-| providers | `frozenset({"anthropic", "bedrock"})` | covers our head-to-head exactly, which uses the anthropic provider |
-| streaming | `if stream: return False` | **the streaming numbers need no re-measurement**: this path serves no streamed request |
-
-So the streaming results, including 99.93-100% delivery against LiteLLM's 4% at 512
-concurrent, are unaffected by the Rust work regardless of how the non-streamed arm comes
-out. The non-streamed comparison needs both arms, default and `LITELLM_RUST=1`, or it
-measures a configuration the vendor would fairly object to.
-
-### First fit measurement of 1.99.0 (2026-09-02, provisional)
-
-A second run on a quiet host (load 0.72, no IDEs) put **llmbridge's own p99 at 0.085 ms
-against the published 0.080 ms**, a 6% control drift, so the comparison is readable.
-Single run, not the median of three, and the host still carried a desktop session, so
-these are provisional pending a cold-boot median.
-
-At 100 RPS, the only unsaturated point:
+**A newer LiteLLM moves the tail, not the median.** `bench/rerun_litellm.sh` measures
+the current release in a separate venv and leaves the pinned one alone. On 1.99.0, at
+100 RPS, the only unsaturated point, quiet host, single run against the published
+cold-boot median of three:
 
 | | llmbridge p99 | LiteLLM added p50 | LiteLLM added p99 | ratio on p99 |
 |---|---|---|---|---|
-| 1.95.0, published, cold, median of 3 | 0.080 ms | 4.490 ms | **87.060 ms** | ~1,090x |
-| 1.99.0 default (Python path) | 0.085 ms | 4.690 ms | **30.450 ms** | **~360x** |
+| 1.95.0, pinned | 0.080 ms | 4.490 ms | **87.060 ms** | ~1,090x |
+| 1.99.0, default Python path | 0.085 ms | 4.690 ms | **30.450 ms** | **~360x** |
 | 1.99.0 with `LITELLM_RUST=1` | 0.080 ms | 4.410 ms | **23.690 ms** | **~300x** |
 
-**The median did not move; the tail did.** Added p50 is 4.49, 4.69 and 4.41 ms across all
-three, statistically one number. The p99 fell from 87 ms to 24-30 ms, so the work landed
-on tail latency.
+Three properties of the Rust path, read from `rust_bridge/chat_completions.py` in the
+installed package, decide what a re-measurement has to cover:
 
-**Consequence for the public claim: "~1,000x versus LiteLLM" is no longer defensible.**
-Measured like for like at 100 RPS it is now roughly 360x against the default configuration
-and 300x against the fastest one the release offers.
-
-**The throughput claim in their post is not reproduced.** Single-worker saturation measured
-217 to 235 req/s, against ~246 published for 1.95.0, so the ceiling is unchanged inside
-run-to-run noise. Their post claims 1,000 QPS without failures and up to 5,000 on 4 CPU and
-8 GB, which is a multi-worker configuration; our harness runs one worker, as the published
-baseline did.
-
-The Rust path was verified to actually serve the request, instead of being assumed from
-the environment variable: with `LITELLM_RUST=1` the response carries `x-litellm-rust: true`,
-and without it the header is absent. Check that header before attributing a number to it.
-
-### Independent corroboration, and a first Bifrost number (2026-09-02)
-
-A third-party benchmark published 2026-06-26 by the author of GoModel measures four
-gateways on an AWS c7i.large against an instant mock, 8,000 requests at concurrency 10,
-two trials in randomised order, throughput from a separate saturation sweep. Harness:
-github.com/ENTERPILOT/ai-gateway-reproducible-benchmark.
-
-| gateway | runtime | p50 added | p99 added | sustained | peak RAM |
-|---|---|---|---|---|---|
-| GoModel | Go | 1.8 ms | 6.9 ms | 4,900 req/s | 37 MB |
-| Bifrost | Go | 2.5 ms | 18.3 ms | 3,100 req/s | 143 MB |
-| Portkey | Node | 9.7 ms | 30.5 ms | 950 req/s | 112 MB |
-| LiteLLM | Python | 30.6 ms | 39.3 ms | 324 req/s | 2.3 GB |
-
-**It corroborates today's correction.** They measure 39.3 ms added p99 on different
-hardware with a different harness; we measured 30.45 ms. Both sit near 30 ms, and our
-published 87 ms is the outlier, which is what a version improvement looks like from two
-directions at once.
-
-**It is also our first Bifrost measurement, and it contradicts their marketing.**
-Bifrost claims roughly 11 microseconds of overhead at 5,000 RPS; a third party measures
-p50 2.5 ms and p99 18.3 ms. Treat neither as settled and run the harness ourselves.
-
-### Reconciling ~84k with ~30k in the third-party harness (2026-09-02)
-
-The ENTERPILOT harness measures one llmbridge worker at roughly 30,000 req/s, against
-our published ~84k single-thread ceiling. Both are correct. They differ by four factors,
-three of them measured on one box in one session, and none of them is a defect.
-
-| | measured | note |
+| property | value | consequence |
 |---|---|---|
-| our loadgen to our fastbackend, direct | 114,278 | the backend is not the limit |
-| our loadgen to llmbridge to our fastbackend | 69,308 | one backend, matches the ~65k this file already documents |
-| our loadgen to their Go mock, direct | 79,053 | their mock alone |
-| our loadgen to llmbridge to their Go mock | 41,074 | swapping only the backend costs 41% |
-| the same, containerised, default seccomp | 32,785 | containerisation costs 20% |
-| the same, seccomp and apparmor off | 38,528 | 18% of that is the syscall filter |
-| the same, plus `--cpuset-cpus` pinning | 41,375 | matches native; container overhead fully recovered |
+| gate | `LITELLM_RUST` in `{1,true,yes,on}`, or `litellm_params["rust"] is True`; default empty | off unless asked for, so the default arm is the Python path a user gets |
+| providers | `frozenset({"anthropic", "bedrock"})` | covers the head-to-head, which uses the anthropic provider |
+| streaming | `if stream: return False` | the streaming numbers in section 3 are unaffected: this path serves no streamed request |
 
-**Factor 1, backend count.** The published 84k needs `BACKENDS=4`; at one backend this
-file already says the mock becomes the ceiling at ~65k, and today's run measured 69,308.
-The third-party harness runs a single mock process. A third of the gap was never a
-mystery, it is in the table above under `BACKENDS`.
+A response served by it carries `x-litellm-rust: true`; check the header before
+attributing a number to it.
 
-**Factor 2, the backend itself.** Same gateway, same generator, only the mock swapped:
-69,308 to 41,074. Their Go mock returns **439 bytes against our fastbackend's 228**, and
-a byte-forwarding proxy's cost scales with bytes. Their mock is not saturating (79,053
-direct), so this is the gateway doing more work per request. Payload size is the leading
-explanation and not an isolated one: the two mocks differ in implementation as well as
-response size, and nothing here varied payload alone.
+## 6. The ENTERPILOT harness: nine gateways on a methodology we did not write
 
-**Factor 3, containerisation, and it is recoverable.** A container costs 20%, of which
-**18 points are seccomp**: the filter is evaluated on every syscall, and this workload is
-89% kernel time, so a per-syscall tax lands right on it. The remaining ~7% is the
-scheduler migrating the worker between cores. `--security-opt seccomp=unconfined` plus
-`--cpuset-cpus` restores native throughput exactly.
+`bench/run_enterpilot.sh` runs llmbridge inside the
+[AI gateway reproducible benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark),
+under the MIT license, written by Jakub A. Wąsek of ENTERPILOT, the author of GoModel, and
+published with its history at
+[enterpilot.io](https://enterpilot.io/blog/benchmarking-ai-gateways-gomodel-litellm-portkey-bifrost-june-2026/).
+It runs every gateway from its public Docker image, one at a time, against the same
+in-memory Go mock, with a no-gateway baseline: 20,000 requests per variant at
+concurrency 10, five trials in randomised order, six variants (chat, responses and
+messages, each streamed and not), a separate throughput sweep from c=1 to c=256, and
+`docker stats` under sustained load.
 
-### The filters were not a tax, they disabled io_uring (2026-09-02)
+It is here beside `run_headtohead.sh` because ours compares one competitor with a load
+generator we wrote, which a skeptic cannot check for bias. This one is public, treats
+every gateway the same, and its author states his scope honestly. Its published
+figures come from an AWS c7i.large with two vCPUs; ours below come from the reference
+laptop with twelve, so the two sets compare within themselves and never with each other.
 
-Docker's default seccomp profile **blocks the io_uring syscalls**, so llmbridge inside a
-default container silently selects the epoll fallback. Read off its own startup line:
+### What the script changes, and says so in its output
 
-```
-default seccomp:     backend requested=auto active=epoll
-seccomp unconfined:  backend requested=auto active=io_uring
-```
+- **Three arms added.** `llmbridge` (OpenAI in, byte-forward to the mock),
+  `llmbridge-anthropic` (the same binary with `--upstream-dialect anthropic`, so its
+  `chat` rows are a real OpenAI-to-Anthropic translation), and `tcprelay`, a socat byte
+  pipe. Their compose files are under `bench/enterpilot/`; the image builds from this
+  tree with `bench/enterpilot/Dockerfile`.
+- **seccomp and apparmor off for every arm** (`bench/enterpilot/unconfine.py`).
+  Docker's default seccomp profile blocks the io_uring syscalls, so under it llmbridge
+  silently runs epoll; its startup line reads `backend requested=auto active=epoll`.
+  Lifting the filter puts it on the backend it ships with on Ubuntu 24.04.
+- **One llmbridge worker**, because that is what the binary ships with. The harness
+  hands LiteLLM one worker per core and the Go runtimes take every core, so the cores
+  column is what makes the throughput column readable. `LLMBRIDGE_WORKERS=$(nproc)`
+  gives the matched comparison.
+- **The byte-pipe floor.** The harness's baseline is loadgen to mock, one bridge
+  traversal, but every gateway arm is two. Each `overhead` column therefore carries one
+  hop that belongs to the topology and inflates every row equally, and `tcprelay`
+  measures exactly that hop. `bench/enterpilot/corrected_overhead.py` subtracts it. A
+  negative result is noise around zero and reads as "at the floor", never as faster
+  than copying bytes.
+- **The host gate** from `rerun_litellm.sh`: performance governor, load under 0.5,
+  nothing above 5% of a core, or the script refuses. `--force` runs a smoke test whose
+  numbers must not be published. Check the baseline row first on every run: if it
+  moved, the host is the variable and no gateway column means anything.
 
-Everything that harness has measured for llmbridge was therefore **epoll**, not the
-backend this project defaults to on Ubuntu 24.04. The memory jump on the unconfined run,
-15.1 to 32.3 MB, is the io_uring rings, and it was the tell: a syscall filter cannot cost
-memory. An earlier note here called the 18% a per-syscall tax. It is not; it is a
-different I/O backend, and the correction matters because the two have different
-explanations and different fixes.
+### Results
 
-Measured effect, single worker, same box, `--force` passes with a desktop session
-running, so read the ratio and not the absolutes:
+Data in `bench/results/enterpilot/20260904-023214/`: `summary.md` and `summary.json`
+with every variant, `meta.json` with the run parameters, and one `*_image.json` per
+gateway with the resolved version and digest. Harness at its upstream commit
+[f156704](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark/commit/f156704cd96a3aa02168ce04d0c86260c135ef0a)
+(2026-08-30, the one that added TensorZero and OmniRoute), llmbridge v0.53.0, kernel 7.0.0, twelve logical CPUs, one worker, filters off, five trials at
+concurrency 10; the baseline p99 spread 0.52-0.64 ms across trials, which is what a
+quiet host looks like.
 
-| | epoll (default seccomp) | io_uring (unconfined) |
-|---|---|---|
-| peak sustained | 29,723 | 33,881 |
-| no-gateway baseline that day | 66,846 | 60,813 |
-| share of the path's ceiling | 44.5% | **55.7%** |
-| memory, peak | 15.1 MB | 32.3 MB |
-| knee | c=16 | c=32 |
+Chat, non-streamed and streamed. Added p50 is in milliseconds over the harness's own
+baseline; "above floor" is the same figure less tcprelay's. Peak rps is from the sweep,
+memory is peak RSS under load, and the last column is peak rps per percent of CPU:
 
-**This is a deployment fact, not only a benchmark fact.** Anyone running llmbridge in a
-container with default seccomp gets epoll. That belongs in the deployment documentation,
-and the gateway should arguably say so louder than an INFO line, since `--io auto`
-downgrading to epoll is invisible to an operator who did not think to look.
+| gateway | version | cores | chat/nonstream | above floor | chat/stream | above floor | peak rps | memory | rps per CPU% |
+|---|---|---|---|---|---|---|---|---|---|
+| tcprelay, the floor | socat 1.8.1.3 | 2.17 | 0.06 | 0 | 0.27 | 0 | 43,973 | 5.1 MB | 157 |
+| llmbridge | v0.53.0 | 0.98 | 0.07 | 0.01 | **0.18** | **-0.09** | 40,677 | 32.1 MB | **354** |
+| llmbridge-anthropic | v0.53.0 | 1.02 | 0.10 | 0.04 | 0.56 | 0.29 | 35,298 | 30.4 MB | 300 |
+| gomodel | 0.1.86 | 5.96 | 0.47 | 0.41 | 0.75 | 0.48 | 16,468 | 76.6 MB | 23 |
+| bifrost | 2.0.0 | 7.90 | 0.80 | 0.74 | 2.77 | 2.50 | 10,043 | 492.7 MB | 11 |
+| portkey | 1.15.2 | 1.20 | 7.56 | 7.50 | 27.60 | 27.33 | 1,232 | 197.7 MB | 10 |
+| litellm | 1.99.1 | 7.05 | 10.77 | 10.71 | 46.06 | 45.79 | 880 | 9,528 MB | 1 |
+| tensorzero | 2026.6.0 | 0.17 | 41.74 | 41.68 | 41.03 | 40.76 | 6,834 | 131.7 MB | 16 |
+| omniroute | 3.8.50 | 1.08 | 172.01 | 171.95 | 207.37 | 207.10 | 58 | 928.5 MB | 0.4 |
 
-**The harness is good, and this is not a criticism of it.** Five trials in randomised
-order, throughput swept separately from latency, per-dialect warmup, a no-gateway
-baseline recorded, reproducible from a public repository, and its author states his
-scope honestly. The seccomp cost is Docker's default, inherited by any containerised
-benchmark, not a design error.
+All six variants, above the floor, exactly as `corrected_overhead.py` prints them
+(ms, p50, a dash is a variant the gateway did not serve, a negative cell is noise
+around zero and reads as at the floor):
 
-### The full nine-arm run, and what its streaming column measures (2026-09-03)
+| gateway | chat | chat/stream | responses | responses/stream | messages | messages/stream |
+|---|---|---|---|---|---|---|
+| llmbridge | 0.01 | -0.09 | 0.01 | -0.41 | - | - |
+| llmbridge-anthropic | 0.04 | 0.29 | - | - | 0.00 | -0.36 |
+| gomodel | 0.41 | 0.48 | 0.44 | 0.27 | 0.35 | 0.70 |
+| bifrost | 0.74 | 2.50 | 0.77 | 3.14 | 0.67 | - |
+| portkey | 7.50 | 27.33 | 7.58 | 26.44 | - | - |
+| litellm | 10.71 | 45.79 | 16.38 | 24.09 | 12.38 | 28.63 |
+| tensorzero | 41.68 | 40.76 | - | - | - | - |
+| omniroute | 171.95 | 207.10 | 175.66 | 230.05 | 176.83 | 227.85 |
 
-One run, one floor, one worker, seccomp off for every arm so llmbridge runs io_uring,
-five trials at concurrency 10. Chat non-streaming:
+### Reading it
 
-| gateway | cores | added p50 | above floor | peak rps | memory | startup | rps/CPU% |
-|---|---|---|---|---|---|---|---|
-| tcprelay, the floor | 2.17 | 0.25 | 0 | 44,233 | 6.5 MB | 0.30 s | 158.5 |
-| llmbridge | 0.99 | 0.25 | 0.000 | 38,236 | 32.0 MB | 0.29 s | 335.9 |
-| llmbridge-anthropic | 1.04 | 0.34 | 0.090 | 30,670 | 31.9 MB | 0.30 s | 246.3 |
-| gomodel | 6.01 | 0.65 | 0.400 | 16,380 | 68.6 MB | 0.54 s | 22.7 |
-| bifrost | 7.86 | 0.95 | 0.700 | 10,049 | 495.6 MB | 11.41 s | 10.9 |
-| portkey | 1.20 | 7.71 | 7.460 | 1,250 | 187.6 MB | 0.98 s | 10.1 |
-| litellm | 8.05 | 10.98 | 10.730 | 876 | 9,528 MB | 39.30 s | 0.9 |
-| tensorzero | 0.16 | 41.92 | 41.670 | 6,537 | 126.2 MB | 0.51 s | 16.6 |
-| omniroute | 1.07 | 171.70 | 171.450 | 58 | 931.4 MB | 5.95 s | 0.5 |
+- **Non-streaming sits at the floor**: 0.01 ms above a byte pipe that parses nothing,
+  on 0.98 cores against socat's 2.17. Streaming reads under the pipe (0.18 against
+  0.27 ms added, 8,973 against 7,723 req/s at c=10), which says this measurement can
+  no longer resolve any cost of ours on that row.
+- **The translating arm** costs 0.04 ms non-streamed and 0.29 ms streamed above the
+  floor on `chat`, under GoModel's byte-forward at 0.41 and 0.48. Its `messages` rows
+  byte-forward and sit at the floor.
+- **Cores.** GoModel and Bifrost take `GOMAXPROCS` = every core: 5.96 and 7.90 cores
+  under load, LiteLLM 7.05 across its workers. Throughput quoted without cores flatters
+  them and understates a single-threaded gateway by about an order of magnitude.
+- **Coverage, every gap named.** llmbridge refuses `messages`, because Anthropic-in
+  translation is unbuilt; `llmbridge-anthropic` refuses `responses`, because a
+  Responses body is not a chat body; Portkey refuses `messages` in this
+  single-provider setup; TensorZero served only chat; LiteLLM completed 57,690 of
+  100,000 streamed chat requests inside the window; Bifrost's `messages/stream` failed
+  outright. `bench/enterpilot/probe_dialect.sh` shows what each gateway actually sent upstream.
+- **Omniroute at 58 req/s and TensorZero at 41 ms are configuration problems**, not
+  measurements of the software, and should not be published.
 
-Non-streaming lands **at the floor**, 0.000 ms above a byte pipe that parses nothing, on
-0.99 cores against its 2.17.
-
-**The cores column is not optional.** GoModel and Bifrost are not multi-threaded by
-accident of Docker: the Go runtime takes `GOMAXPROCS` = every core. Measured directly,
-outside the harness, GoModel consumed **6.11 cores non-streaming and 4.42 streaming**.
-Quoting throughput without cores flatters them and understates us by roughly an order of
-magnitude.
-
-### The streaming column measures connection churn, not streaming
-
-Streaming looks like our weakest row (0.74 ms above the floor against GoModel's 0.42).
-Before optimising anything against it, know what it is. Syscalls counted under strace
-over 1,000 requests, one worker, io_uring:
-
-| | `io_uring_enter` | `setsockopt` | `shutdown` | `close` |
-|---|---|---|---|---|
-| non-streaming | 1,634 | 11 | 9 | 20 |
-| streaming | 2,261 | 1,007 | 1,005 | 1,016 |
-
-**But the churn is not the cost here.** Accounting for the 137.8 us gap over 34 events:
-roughly 10 us of extra syscalls and handshake, ~1 us of scans measured in isolation, and
-**~125 us, about 3.7 us per event, still unattributed**.
-
-### Why this does not contradict the 40k-stream claim
-
-The two benchmarks measure opposite things and neither is wrong.
-
-**The mock does not pace its tokens.** It flushes 35 SSE events back to back with no
-sleep, so a stream completes in microseconds and the test is an event-throughput and
-connection-churn test at concurrency 10. Our own streaming benchmark holds thousands of
-concurrent streams at a realistic ~20 ms inter-token interval and measures time to first
-token and token delivery. At 512 concurrent streams that is ~25,600 tokens/s; this
-harness pushes ~159,000 events/s through a single core. Six times the event rate on a
-sixth of the cores, and a connection teardown on every one.
-
-Per core, streaming: llmbridge **5,531 req/s/core** (5,227 on 0.94 cores) against
-GoModel's **1,505** (6,650 on 4.42). It buys 27% more absolute throughput with 4.7x the
-cores.
-
-### What the per-chunk scans actually cost, measured in isolation
-
-Measured directly, 187-byte chunk, at 4.19 GHz:
-
-| | ns/call |
-|---|---|
-| `sse_carries_thinking`, three misses | 216.2 |
-| `sse_carries_first_token`, hits | 65.3 |
-| the two-`find` usage gate | 13.0 |
-| append + trim to exactly 2 KiB, the old way | 19.8 |
-| append + amortised trim, the new way | 5.8 |
-
-About **11 us per stream before the fixes and 1 us after**, against 180 us of CPU per
-stream. So the scans were ~6% of it and the fixes are worth ~1.5%. They remain correct
-(an unbounded scan that cannot succeed; a memmove quadratic in chunks) but they are not
-where streaming cost lives.
-
-## Inbound TLS arm (added 2026-08-12)
+## 7. Inbound TLS arm
 
 `streamgen` gained `--tls --ca FILE`, the only client in this tree that can drive
 a `--listen-tls` gateway. Certificate and hostname verification are on and there
-is no way to turn them off: a benchmark client that skips verification is one
-somebody copies into production.
+is no way to turn them off.
 
 **The comparison has to be gateway-against-gateway, not gateway-against-control.**
 The usual streaming benchmark differences the gateway arm against a no-gateway
