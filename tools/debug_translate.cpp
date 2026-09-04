@@ -9,14 +9,14 @@
 // translator in a debugger (CLion, gdb, lldb). Unlike the live gateway, there is
 // No event loop, no sockets, no async I/O; each translate call runs inline on a
 // hardcoded payload, so you can set a breakpoint on the call and "Step Into"
-// (CLion: F7) to walk provider/src/translate.cpp line by line.
+// (CLion: F7) to walk provider/src/translate_*.cpp line by line.
 //
 // Build & debug in CLion:
 //   1. Open the repo root as a CMake project.
 //   2. Pick the "Debug" CMake profile (Settings ▸ Build ▸ CMake) so it compiles
 //      -O0 -g, because optimized builds make stepping jumpy.
 //   3. Select the `debug_translate` run/debug configuration.
-//   4. Put a breakpoint on a `provider::...` call below (or inside translate.cpp)
+//   4. Put a breakpoint on a `provider::...` call below (or inside translate_anthropic.cpp)
 //      and Debug (Shift+F9). Step Into to enter the translator.
 //
 // Pick a direction with argv[1]: anthropic | gemini | cohere | all (default all).

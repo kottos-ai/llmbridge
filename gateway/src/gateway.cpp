@@ -132,7 +132,7 @@ namespace llmbridge
                 }
 
             // Tool arguments are a JSON string that must decode to one object, and
-            // nothing else: see the splice in translate.cpp.
+            // nothing else: see the splice in translate_body.cpp.
             if (msgs->is_array())
                 for (const provider::json::Value& m : msgs->arr)
                 {
