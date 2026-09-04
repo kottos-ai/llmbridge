@@ -303,6 +303,10 @@ def main():
     hdr = strip_comments((ROOT / "gateway" / "include" / "gateway" / "gateway.hpp")
                          .read_text(encoding="utf-8"))
     consts = set(const_re.findall(hdr)) | set(const_re.findall(gtext))
+    # The helpers beside gateway.cpp hold constants too, and a kEp*/kUr* placed
+    # there is still read from a Gateway method, which is where the evidence is.
+    for helper in sorted((ROOT / "gateway" / "src").glob("*.hpp")):
+        consts |= set(const_re.findall(strip_comments(helper.read_text(encoding="utf-8"))))
     consts = {c for c in consts if re.fullmatch(r"k[A-Z]\w*", c)}
     n_checked = 0
     for name in sorted(consts):

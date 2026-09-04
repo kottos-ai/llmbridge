@@ -6,6 +6,8 @@
 add_library(gateway STATIC
         src/metrics.cpp
         src/gateway.cpp
+        src/request.cpp
+        src/response.cpp
 )
 target_include_directories(gateway PUBLIC include)
 target_compile_features(gateway PUBLIC cxx_std_20)
