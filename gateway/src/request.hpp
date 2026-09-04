@@ -68,18 +68,24 @@ namespace llmbridge::detail
     const char* dialect_name(UpstreamDialect m) noexcept;
     std::string build_http(std::string_view start_line, std::string_view body,
                            std::string_view extra = {});
-    std::string build_http_request(std::string_view start_line, std::string_view body,
-                                   std::string_view host, std::string_view extra);
+    /// Into `into`, capacity kept, like request_without.
+    void build_http_request(std::string_view start_line, std::string_view body,
+                            std::string_view host, std::string_view extra, std::string& into);
     [[nodiscard]] bool expects_continue(std::string_view head) noexcept;
-    std::string request_without(std::string_view msg, size_t header_len,
-                                const std::vector<std::string>& strip,
-                                std::string_view host_hdr, std::string_view base_path,
-                                std::string_view body_override = {});
+    /// Into `into`, whose capacity is kept: it is a buffer the pooled connections and
+    /// the loop pass around, so a request only a little larger than the last one does
+    /// not fault in a fresh copy of itself. False refuses the request; `into` is empty.
+    bool request_without(std::string_view msg, size_t header_len,
+                         const std::vector<std::string>& strip,
+                         std::string_view host_hdr, std::string_view base_path,
+                         std::string_view body_override, std::string& into);
+    /// `out` receives the framed request and `body_scratch` the translated body;
+    /// both keep their capacity across calls, which is the point of passing them.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view client_hdrs,
                                   const std::vector<std::string>& strip,
-                                  std::string& out, const char*& why,
-                                  std::string_view model_override = {},
+                                  std::string& out, std::string& body_scratch,
+                                  const char*& why, std::string_view model_override = {},
                                   bool* wants_stream_usage = nullptr);
     std::string xlate_resp(UpstreamDialect mode, std::string_view body);
     std::string host_header_for(const Upstream& u);

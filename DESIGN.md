@@ -191,9 +191,13 @@ sides are symmetric small state machines.
 - **Allocation-light, not allocation-free.** Be precise: the JSON DOM allocates its
   node vectors, each request builds its translated output in a growable `std::string`,
   and the proxy allocates one `Connection` per accepted socket. These are small, warm,
-  per-request allocations (bounded, no bursts) but they are allocations. A
-  per-connection slab arena to remove the remaining ones is staged for the multi-loop
-  phase; today the honest claim is "no GC, `malloc`-bounded tails," not "zero-alloc."
+  per-request allocations (bounded, no bursts) but they are allocations. They are
+  not small once a request is: an agent context of 10 MB written into a fresh string
+  faulted in 2.6 ms of pages per request on the live tape, which is why the upstream
+  request is now built in buffers the gateway keeps (v0.54.2), and why the
+  per-connection slab arena to remove the remaining ones has a measured reason and not
+  only a principle. It is staged for the multi-loop phase; today the honest claim is
+  "no GC, `malloc`-bounded tails," not "zero-alloc."
 
 ## Parsing & framing: hardened and fuzzed
 

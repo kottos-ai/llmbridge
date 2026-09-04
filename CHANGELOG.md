@@ -8,6 +8,17 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.54.2]. 2026-09-04
+
+### Performance
+
+- **Every upstream request is built in a buffer the gateway keeps.** The byte-forward
+  rebuild, the translated body (`openai_to_anthropic_request` and the Bedrock form gain
+  an overload that writes into a caller's string), the route-override rewrite
+  (`apply_overrides`, same) and the HTTP framing each wrote into a fresh string of
+  exactly the right size, which then replaced the pooled upstream's `wbuf` and freed the
+  last one. This is fixed.
+
 ## [0.54.1]. 2026-09-04
 
 ### Changed
