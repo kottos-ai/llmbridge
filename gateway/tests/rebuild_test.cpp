@@ -12,6 +12,8 @@
 
 #include "request.hpp"
 
+#include "gateway/gateway.hpp"
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -134,4 +136,17 @@ TEST(Rebuild, HttpRequestFramingKeepsItsBuffer)
     llmbridge::detail::build_http_request("POST /v1/messages HTTP/1.1", "{\"a\":1}", "h",
                                            "x-api-key: k\r\n", buf);
     EXPECT_EQ(buf.data(), before);
+}
+
+// The knob's whole point is that the pages are mapped before a request arrives:
+// with it off, the reserved scratch is address space and nothing more.
+TEST(Rebuild, PrefaultMapsTheScratchPages)
+{
+    const size_t want = 4u << 20;
+    llmbridge::Gateway off(0, "127.0.0.1", 1);
+    // An empty string points into its own object, so one resident page is the floor.
+    EXPECT_LE(off.prefault_resident_bytes_for_test(), 4096u);
+    llmbridge::Gateway on(0, "127.0.0.1", 1);
+    on.set_prefault_bytes(want);
+    EXPECT_GE(on.prefault_resident_bytes_for_test(), want);
 }

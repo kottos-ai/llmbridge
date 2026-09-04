@@ -33,7 +33,8 @@ TEST(Config, FullFileAppliesEveryGroup)
                     "strip_headers": ["authorization", "X-Internal"] },
       "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
-                    "duration_s": 12, "warmup_s": 2, "log_level": "debug" }
+                    "duration_s": 12, "warmup_s": 2, "log_level": "debug",
+                    "prefault_mb": 16 }
     })";
     ConfigFile c;
     std::string err;
@@ -58,6 +59,7 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_TRUE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 12);
     EXPECT_DOUBLE_EQ(c.warmup_s, 2);
+    EXPECT_DOUBLE_EQ(c.prefault_mb, 16);
     ASSERT_EQ(c.strip_headers.size(), 2u);
     EXPECT_EQ(c.strip_headers[0], "authorization");
     EXPECT_EQ(c.strip_headers[1], "X-Internal"); // normalized by the Gateway, not here
@@ -175,6 +177,7 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_pair(R"({"listen":{"port":70000}})", "out of range"),
         std::make_pair(R"({"timeouts":{"pool_idle_s":99999999}})", "out of range"),
         std::make_pair(R"({"runtime":{"workers":0}})", "out of range"),
+        std::make_pair(R"({"runtime":{"prefault_mb":8192}})", "out of range"),
         // structure
         std::make_pair("[]", "top level must be an object"),
         std::make_pair("{", "not valid JSON"),
@@ -231,11 +234,13 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_FALSE(c.timing_headers);
     EXPECT_DOUBLE_EQ(c.duration_s, 0);
     EXPECT_DOUBLE_EQ(c.warmup_s, 0);
+    EXPECT_DOUBLE_EQ(c.prefault_mb, 0);
 
     // Every settable key must appear, or the example silently stops documenting one.
     EXPECT_TRUE(c.has_listen_port && c.has_listen_tls && c.has_upstream_s &&
                 c.has_client_idle_s && c.has_pool_idle_s && c.has_workers &&
-                c.has_timing_headers && c.has_duration_s && c.has_warmup_s)
+                c.has_timing_headers && c.has_duration_s && c.has_warmup_s &&
+                c.has_prefault_mb)
         << "the example is missing a key it is supposed to document";
 }
 

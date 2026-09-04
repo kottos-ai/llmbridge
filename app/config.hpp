@@ -74,6 +74,8 @@ namespace llmbridge::app
         double duration_s = 0;
         bool has_warmup_s = false;
         double warmup_s = 0;
+        bool has_prefault_mb = false;
+        double prefault_mb = 0;
     };
 
     /// Parse `text` into `out`. On failure sets `err` to one line naming the offending

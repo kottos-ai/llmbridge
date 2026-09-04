@@ -245,7 +245,8 @@ namespace llmbridge::app
         {
             if (!g->is_object()) return fail(err, "config: \"runtime\" must be an object");
             if (!only(*g, "runtime",
-                      {"io", "workers", "timing_headers", "duration_s", "warmup_s", "log_level"},
+                      {"io", "workers", "timing_headers", "duration_s", "warmup_s", "log_level",
+                       "prefault_mb"},
                       err))
                 return false;
             if (!want_str(*g, "runtime", "io", out.io, err)) return false;
@@ -266,6 +267,9 @@ namespace llmbridge::app
                 return false;
             if (!want_num(*g, "runtime", "warmup_s", out.has_warmup_s, out.warmup_s, 0, 31536000,
                           err))
+                return false;
+            if (!want_num(*g, "runtime", "prefault_mb", out.has_prefault_mb, out.prefault_mb, 0,
+                          4096, err))
                 return false;
         }
         return true;

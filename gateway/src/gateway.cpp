@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -978,8 +979,34 @@ namespace llmbridge
         }
     }
 
+    void Gateway::prefault(std::string& s) const
+    {
+        if (s.capacity() >= _prefault_bytes) return;
+        // resize writes every byte, which is what maps the pages; clear keeps them.
+        s.resize(_prefault_bytes);
+        s.clear();
+    }
+
+    size_t Gateway::prefault_resident_bytes_for_test()
+    {
+        prefault(_rebuild);
+        prefault(_xlate);
+        const long page = ::sysconf(_SC_PAGESIZE);
+        const auto base = reinterpret_cast<uintptr_t>(_rebuild.data());
+        const uintptr_t first = base & ~static_cast<uintptr_t>(page - 1);
+        const size_t span = _rebuild.capacity() + (base - first);
+        const size_t pages = (span + static_cast<size_t>(page) - 1) / static_cast<size_t>(page);
+        std::vector<unsigned char> vec(pages);
+        if (::mincore(reinterpret_cast<void*>(first), span, vec.data()) != 0) return 0;
+        size_t resident = 0;
+        for (const unsigned char v : vec) resident += (v & 1) ? static_cast<size_t>(page) : 0;
+        return resident;
+    }
+
     int Gateway::run()
     {
+        prefault(_rebuild);
+        prefault(_xlate);
 #ifdef LLMBRIDGE_HAVE_URING
         if (_uring_active) return run_uring();
 #endif

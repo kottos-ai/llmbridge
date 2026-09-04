@@ -55,6 +55,9 @@
     "_timing_headers": "Per-request x-llmbridge-* response headers splitting the request into disjoint spans. Metadata only, no prompt or completion text. Defined precisely in LATENCY.md.",
     "timing_headers": false,
 
+    "_prefault_mb": "Megabytes to reserve and write through in every request buffer before it carries a request: the gateway's two scratch strings at start, each upstream connection's send buffer when it opens. Without it the first request through each buffer faults in fresh pages as it is written, measured at 2.6 ms for a 10 MB agent context. Memory is this size times the number of pooled upstream connections, resident for the life of the process, so leave it at 0 for small requests and set it to the largest request body you expect (16 for Claude Code sessions) when they are large.",
+    "prefault_mb": 0,
+
     "_duration_s": "Self-stop after N seconds and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
     "duration_s": 0,
 
