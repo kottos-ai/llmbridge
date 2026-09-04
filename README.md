@@ -38,7 +38,7 @@
 
 ![llmbridge vs LiteLLM: added latency p99](bench/results/comparison.svg)
 
-At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **80 µs p99** (self-measured) vs LiteLLM's **87 ms** (~**1,000×**), and `llmbridge` holds 41–80 µs p99 across 100–5,000 RPS while LiteLLM (1 uvicorn worker) saturates around **~246 RPS**.
+At the unsaturated **100 RPS** apples-to-apples point, `llmbridge` adds **80 µs p99** (self-measured) vs LiteLLM 1.95.0's **87 ms** (~**1,000×**; LiteLLM 1.99 cuts its own p99 to 24-30 ms, so ~300x against a current release, see [`bench/BENCHMARK-CONFIG.md`](./bench/BENCHMARK-CONFIG.md)), and `llmbridge` holds 41–80 µs p99 across 100–5,000 RPS while LiteLLM (1 uvicorn worker) saturates around **~246 RPS**.
 
 ![Throughput saturation: offered vs achieved RPS](bench/results/saturation.svg)
 
@@ -58,8 +58,8 @@ ours.*
 Two consequences. Making our own code twice as fast would raise the ceiling by **at most
 ~7%**, whereas `--workers 2` nearly doubles it. And the figure is **thermally dependent**, i.e.
 the same build measures 87k cold and 82k once the package reaches 85 °C on this laptop.
-*(An earlier revision of this README attributed the ceiling to the loopback packet path;
-profiling disproved that.)* *(Bifrost and Helicone not yet measured.)*
+Bifrost, GoModel, Portkey and five others are measured on a third-party harness below. 
+Helicone is not measured.
 
 ### Streaming (SSE)
 
@@ -117,6 +117,39 @@ BACKENDS=4 ./bench/saturate.sh 5 2 90000 130000                 # throughput cei
 WAN latency are deliberately excluded so the figure isolates gateway overhead (the
 gateway itself *does* support TLS upstreams); single worker/thread each; dev-box
 co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
+
+### Third-party harness: nine gateways, one methodology
+
+The numbers above come from a harness we wrote. For one we did not, `llmbridge` also
+runs inside the [AI gateway reproducible benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark)
+by Jakub A. Wąsek of [ENTERPILOT](https://enterpilot.io/blog/benchmarking-ai-gateways-gomodel-litellm-portkey-bifrost-june-2026/),
+the author of GoModel: every gateway from its public Docker image, one at a time,
+against the same in-memory mock, 20,000 requests per variant at concurrency 10, five
+trials in randomised order, a separate throughput sweep. Chat completions, added p50
+over the harness's no-gateway baseline, one llmbridge worker, reference laptop:
+
+| gateway | version | cores | non-streaming | streaming | peak req/s | req/s per CPU% | memory |
+|---|---|---|---|---|---|---|---|
+| socat byte pipe | 1.8.1.3 | 2.17 | 0.06 ms | 0.27 ms | 43,973 | 157 | 5 MB |
+| **llmbridge** | v0.53.0 | 0.98 | **0.07 ms** | **0.18 ms** | 40,677 | **354** | 32 MB |
+| llmbridge, translating to Anthropic | v0.53.0 | 1.02 | 0.10 ms | 0.56 ms | 35,298 | 300 | 30 MB |
+| GoModel | 0.1.86 | 5.96 | 0.47 ms | 0.75 ms | 16,468 | 23 | 77 MB |
+| Bifrost | 2.0.0 | 7.90 | 0.80 ms | 2.77 ms | 10,043 | 11 | 493 MB |
+| Portkey | 1.15.2 | 1.20 | 7.56 ms | 27.60 ms | 1,232 | 10 | 198 MB |
+| LiteLLM | 1.99.1 | 7.05 | 10.77 ms | 46.06 ms | 880 | 1 | 9,528 MB |
+
+The byte pipe is a socat relay that parses nothing: it measures the cost of being in
+the path at all, and `llmbridge` sits on it, on one core against the Go gateways' six to
+eight. Requests per percent of CPU is the harness's own column, throughput under load
+divided by the CPU it took, and the only one that compares a single-threaded gateway
+with ones that take every core. TensorZero and OmniRoute ran too and are left out here as misconfigured (41 ms
+and 58 req/s). Two divergences from the published harness, stated because they matter:
+Docker's default seccomp filter is off for every gateway (it blocks io_uring, so under
+it `llmbridge` runs epoll), and the host is a 12-CPU laptop and not their c7i.large, so
+these figures compare within this table and never with enterpilot.io's. Every variant,
+the raw data, the versions and digests are in `bench/results/enterpilot/20260904-023214/`,
+the reading rules in [BENCHMARKS.md](./BENCHMARKS.md), and `bench/run_enterpilot.sh`
+reproduces it.
 
 ## Quick start
 
@@ -351,8 +384,7 @@ signing. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
 AWS Bedrock (SigV4, v0.23.0) and Azure OpenAI (v0.24.0, including the `api-version`
 query on the upstream target) already ship: `--upstream-dialect bedrock` and
-`--upstream-dialect azure`. This section said otherwise until 2026-08-24, which `--help`
-contradicted on line one.
+`--upstream-dialect azure`.
 
 ## Installation
 

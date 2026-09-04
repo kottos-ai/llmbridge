@@ -217,12 +217,11 @@ and on the response, content / finish-reason / usage.
 
 ### Dialect resolution (client dialect x venue dialect)
 
-An earlier model folded two questions into the venue's dialect field, then called it
-`TranslateMode`: what the venue speaks, and what to translate. `Anthropic` did not mean
-"this venue speaks Anthropic", it meant "translate an OpenAI client to Anthropic", and
-`None` meant "do not translate" where the venue was in fact OpenAI-compatible. The OpenAI-client assumption was
-invisible and wrong for any caller that already speaks Anthropic: such a request was
-mistranslated into an OpenAI response the caller could not parse.
+Folding two questions into the venue's dialect field, what the venue speaks and what
+to translate, does not work: a single `anthropic` value would mean "translate an OpenAI
+client to Anthropic", which assumes an OpenAI client. That assumption is invisible and
+wrong for any caller that already speaks Anthropic, whose request would be
+mistranslated into an OpenAI response it cannot parse.
 
 The model separates the two axes:
 
@@ -549,44 +548,45 @@ The benchmark is designed to be honest first and impressive second:
   one core is its hard ceiling and at saturation that thread is 87-92% busy, out of
   headroom. (The machine reports ~95% idle only because one busy core is ~8% of 12 logical
   CPUs; reaching the rest needs `--workers N`.) Splitting *that thread's own* CPU time:
-  **89% kernel, 6.7% llmbridge**, the largest kernel slice being the TCP stack at 32.7%. An earlier revision attributed it to the
-  loopback packet path; that was wrong. Two consequences: optimising our code can win at
-  most ~7%, and the number is **thermally dependent** (87k cold, 82k at 85 °C on this
-  laptop). A separate-host run is the next credibility upgrade.
+  **89% kernel, 6.7% llmbridge**, the largest kernel slice being the TCP stack at 32.7%.
+  Two consequences: optimising our code can win at most ~7%, and the number is
+  **thermally dependent** (87k cold, 82k at 85 °C on this laptop).
+- **A harness we did not write.** `bench/run_enterpilot.sh` runs the gateway inside the
+  public [ENTERPILOT benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark)
+  beside eight other gateways, with a socat byte pipe as the in-path floor; see
+  BENCHMARKS.md §C.
 
 Reproduce: see [`bench/BENCHMARK-CONFIG.md`](bench/BENCHMARK-CONFIG.md), the host
 configuration (`BACKENDS=4`, governor, sysctls) changes the result as much as the code.
 
 ## What this repo does not do (yet)
 
-Checked against the tree on 2026-08-13, not against memory. Everything below was
-verified by grep before it was written down.
+Checked against the tree, not against memory; `CHANGELOG.md` is the source of truth
+when this list disagrees with it.
 
 - **Streaming is OpenAI ⇄ Anthropic only.** Gemini and Cohere translate
-  non-streaming requests and responses. A streamed client response is close-delimited.
-- **No Anthropic-in mode.** The client must speak OpenAI. The only SSE translator is
-  `AnthropicToOpenAiSse`; the mirror has to synthesise Anthropic's richer envelope from
-  OpenAI's flatter chunks and is not written.
-- **No vision, no `cache_control`.** Tool calling is done, streaming and not.
-- **No Bedrock, Vertex or Azure.** The dialects are close or identical; what is missing
-  is auth (SigV4, OAuth) and, for Bedrock streaming, a binary event-stream decoder.
+  non-streaming requests and responses and have no SSE translator, so they do not
+  stream here.
+- **No Anthropic-in translation.** A client speaking Anthropic to an Anthropic venue
+  byte-forwards; a client speaking Anthropic to an OpenAI venue needs
+  `OpenAiToAnthropicSse` and its request twin, which are not written. The pair is
+  refused, never mistranslated.
+- **No Bedrock streaming.** Bedrock streams from a different endpoint in AWS
+  event-stream framing, and that binary decoder is not built; a streamed request to a
+  Bedrock venue is refused.
+- **No vision.** A non-text content part is refused by name. `cache_control` ships.
 - **No failover policy.** `Policy::on_failure` is the mechanism; the default never
   retries.
 - **No language bindings.** Python, Go and Rust are planned.
 - **No routing policy, no matching, pricing or observability**, by design; that is the
   separate commercial layer.
 
-Shipped since earlier revisions of this list said otherwise: **TLS on both legs**
-(`-DLLMBRIDGE_TLS=ON`, `--upstream https://...`, `--listen-tls`), **provider auth
-passthrough**, and **tool calling**. The benchmark still runs against a mock, for
-reproducibility, not because a real provider is unreachable.
-
 ## Roadmap
 
 Derived from `git tag` and CHANGELOG.md, which are the source of truth when this
 disagrees with them.
 
-- **Next:** AWS SigV4 signing, to reach Bedrock as an upstream.
-- **Then:** Anthropic-in mode; streaming for Gemini and Cohere.
-- **Later:** vision and `cache_control`; Python, Go and Rust bindings.
+- **Next:** Bedrock streaming, and an Anthropic-speaking client to a Bedrock venue.
+- **Then:** Anthropic-in translation; streaming for Gemini and Cohere; vision.
+- **Later:** Python, Go and Rust bindings.
 - **v1.0.0:** API stability, only after six months of public use.

@@ -178,10 +178,8 @@ Two consequences of that table worth reading off it:
   If you add a fifth send path, it must stamp t3 or the request silently reports
   a zero upstream write.
 
-`gateway.hpp` and `gateway.cpp` use this same t0–t6 labelling in their comments.
-They previously used an older compressed t0–t4 scheme that did not break out the
-write or the flush, which made `connect-us` readable two different ways depending
-on which file you trusted.
+`gateway.hpp` and `gateway.cpp` use this same t0–t6 labelling in their comments,
+so `connect-us` reads one way whichever file you trust.
 
 Two intervals are the gateway's compute; one is connection setup; one is the
 upstream write; one is the provider; and the response write/flush sits at the
@@ -377,8 +375,7 @@ it is cumulative since start, so two dumps subtracted give you an interval.
 
 `connect(TLS)` here and `x-llmbridge-connect-us` in §3 are **the same span**,
 t2→t1, and are computed by the same function. They cannot disagree on the
-value, but the header is exact while the histogram quantises, and that
-distinction was documented wrongly here until 2026-08-12.
+value, but the header is exact while the histogram quantises.
 
 ### The handshake histograms use a different range, and why
 
@@ -395,38 +392,30 @@ Local mocks hid it completely: a loopback handshake fits in 2.62 ms.
 Widening the *bucket* far enough to fix that introduces the opposite error.
 `percentile()` reports a bucket's **upper** edge, deliberately, so the gateway
 never under-reports its own overhead. The cost is that a value of zero reads as
-one bucket width. This document previously said `connect(TLS)` reads "exactly 0"
-on a pooled connection; it read **20 ns**, and nobody questioned it because 20 ns
-reads as zero. At 10 µs buckets it would have read 10 µs, inventing handshake
-time that was never paid. 1 µs keeps the artifact below the noise while covering
-any real handshake.
+one bucket width. On a pooled connection `connect(TLS)` reads **20 ns**, which
+reads as zero; at 10 µs buckets it would read 10 µs, inventing handshake time
+that was never paid. 1 µs keeps the artifact below the noise while covering any
+real handshake.
 
-`first-token` sits at the far end of the same trade and repeated the first
-failure before shipping. It was built with `connect`'s range, and three live
-streamed turns printed `p50 = p99 = max = 680.69 ms  [overflow!]`: every sample
-past 262 ms, the clamped-maximum artifact again. 100 µs buckets cover 26.2 s,
-which is a long agent turn, and quantise a 680 ms sample by 0.015%. The memory
-is unchanged, since the bucket count is what costs, not the width.
+`first-token` sits at the far end of the same trade. With `connect`'s range a
+live streamed turn of 680 ms would print `p50 = p99 = max = 680.69 ms
+[overflow!]`, every sample past 262 ms clamped to the maximum. 100 µs buckets
+cover 26.2 s, which is a long agent turn, and quantise a 680 ms sample by
+0.015%. The memory is the same, since the bucket count is what costs, not the
+width.
 
 **So: `max()` is exact, percentiles are quantised upward by up to one bucket, and
 a pooled connection shows ≤ 1 µs, not a true zero.** The per-request
 header `x-llmbridge-connect-us` is exact and does read 0. There is a test pinning
 each half of this.
 
-That was not always true. `connect-us` used to span t1→t3 (handshake **plus**
-the upstream write) while this histogram split at t2, so one name carried two
-meanings on the same request. The cost of fixing it was one extra header line
-per response (`x-llmbridge-upwrite-us`), which is cheap: t2 was already stamped
-on every request for the histogram's benefit, so the split needed **no
-additional clock reads**, only one more integer on the wire.
-
-Both surfaces now derive from `timing_split()` in `gateway/src/metrics.cpp`,
-the single place stamps become intervals. Change that function and both move
-together; there is no longer a way to change one alone.
-
-**If you have the old semantics**, recover the retired number by adding the two
-headers that replaced it: `connect-us + upwrite-us == the old connect-us`.
-There is a test asserting exactly that.
+The split costs one extra header line per response (`x-llmbridge-upwrite-us`)
+and no additional clock reads: t2 is stamped on every request for the
+histogram's benefit, so the write span is one more integer on the wire. Both
+surfaces derive from `timing_split()` in `gateway/src/metrics.cpp`, the single
+place stamps become intervals. Change that function and both move together;
+there is no way to change one alone. A test asserts that `connect-us` plus
+`upwrite-us` is the whole t1→t3 span.
 
 If a histogram prints `[overflow!]`, at least one sample exceeded the
 histogram's range and the reported max is clamped. Treat that max as "above
@@ -479,12 +468,12 @@ handshakes.
 Per-token cadence still has to be measured externally, which is what the
 streaming benchmark in BENCHMARKS.md does; this is time-to-first-token only.
 
-**An empty histogram prints `(no samples)`, never zeros.** It used to print
-`p50=0 ns  p99=0 ns`, which reads as a spectacular result instead of as
-absent data, and `bench/run_bench.sh` seds that exact line for `p99=`, so a
-zero-sample run would have published a fabricated **0 µs** added latency.
-`Histogram::print` now short-circuits on `_total == 0`, and the bench regex
-finds nothing at all, not a zero.
+**An empty histogram prints `(no samples)`, never zeros.** A printed
+`p50=0 ns  p99=0 ns` reads as a spectacular result instead of as absent data,
+and `bench/run_bench.sh` seds that exact line for `p99=`, so a zero-sample run
+would publish a fabricated **0 µs** added latency. `Histogram::print`
+short-circuits on `_total == 0`, and the bench regex finds nothing at all, not
+a zero.
 
 ### Why the histogram reads higher than `gateway-us`
 

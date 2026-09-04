@@ -1,0 +1,1 @@
+{"gateway":"tcprelay","image":"alpine/socat:latest","version":"1.8.1.3","size_bytes":6871013,"size_mb":6.6,"compressed_bytes":6851366,"compressed_mb":6.5,"digest":"alpine/socat@sha256:5f275aa1b6e9889c851f61097142ee050fc6ac4615b4ea64ac1f2b0e81ff8d7f"}

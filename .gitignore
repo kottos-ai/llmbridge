@@ -36,4 +36,4 @@ __pycache__/
 *.pyc
 .mutate_check_active.json
 bench/.enterpilot/
-bench/results/enterpilot/
+bench/results/enterpilot/*.log
