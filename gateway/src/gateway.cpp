@@ -2017,8 +2017,12 @@ namespace llmbridge
     {
         // io_uring caution: callers there must only pump while no send SQE is in
         // flight on this conn; appending can reallocate tls_out under the kernel.
-        // The SSL object's write BIO is the staging area in the meantime.
-        uint8_t buf[16384];
+        // Reserved once for what this pass moves. Growing by append cost a 4 MB
+        // request 1.6 ms of reallocation on a connection's first use, more than the
+        // encryption itself.
+        const size_t need = u->tls_out.size() + u->tls->pending_output_bytes() + 256;
+        if (u->tls_out.capacity() < need) u->tls_out.reserve(need);
+        uint8_t buf[65536];
         size_t n;
         while ((n = u->tls->pull_ciphertext({buf, sizeof buf})) > 0)
             u->tls_out.append(reinterpret_cast<const char*>(buf), n);
@@ -2031,8 +2035,18 @@ namespace llmbridge
 
     void Gateway::tls_push_wbuf(Connection* u) noexcept
     {
-        // Feed as much request plaintext as the Session accepts. Does not pump the
-        // resulting ciphertext; the two backends stage it differently.
+        // Feed as much request plaintext as the Session accepts. The ciphertext
+        // lands in tls_out directly, except while an io_uring send SQE points into
+        // tls_out.
+        const bool direct = !u->send_inflight;
+        if (direct)
+        {
+            tls_pump_out(u); // staged handshake flights go first: order is the wire's
+            const size_t todo = u->wbuf.size() > u->woff ? u->wbuf.size() - u->woff : 0;
+            const size_t need = u->tls_out.size() + todo + todo / 512 + 256;
+            if (u->tls_out.capacity() < need) u->tls_out.reserve(need);
+            u->tls->set_sink(&u->tls_out);
+        }
         while (u->woff < u->wbuf.size())
         {
             const auto* p = reinterpret_cast<const uint8_t*>(u->wbuf.data()) + u->woff;
@@ -2040,6 +2054,7 @@ namespace llmbridge
             if (n == 0) break; // handshake not done, or session back-pressured
             u->woff += n;
         }
+        u->tls->set_sink(nullptr);
     }
 
     bool Gateway::tls_wbuf_flushed(const Connection* u) const noexcept

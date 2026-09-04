@@ -57,6 +57,7 @@ extern "C"
     struct ssl_ctx_st;
     struct ssl_st;
     struct bio_st;
+    struct bio_method_st;
 }
 
 namespace llmbridge::net::tls
@@ -193,6 +194,7 @@ namespace llmbridge::net::tls
         /// Bytes of ciphertext staged in the write BIO. Measurement seam: the
         /// bool above answers "any?", and bounding a buffer needs "how much?".
         [[nodiscard]] size_t pending_output_bytes() const noexcept;
+        void set_sink(std::string* out) noexcept { _sink = out; }
         [[nodiscard]] const std::string& last_error() const noexcept { return _err; }
 
       private:
@@ -203,13 +205,18 @@ namespace llmbridge::net::tls
         /// Translate an OpenSSL return code into Want, recording errors. Central so
         /// every entry point classifies WANT_READ/WANT_WRITE identically.
         Want classify(int rc) noexcept;
+        static int bio_write(bio_st* b, const char* d, int n) noexcept;
+        static long bio_ctrl(bio_st* b, int cmd, long larg, void* parg) noexcept;
+        static const bio_method_st* sink_method() noexcept;
 
         ssl_st* _ssl{nullptr};
         bio_st* _rbio{nullptr};  ///< ciphertext in  (we write, OpenSSL reads)
-        bio_st* _wbio{nullptr};  ///< ciphertext out (OpenSSL writes, we read)
+        bio_st* _wbio{nullptr};  ///< ciphertext out: bio_write() into _sink or _staging
         Want _want{Want::None};
         bool _hs_done{false};
         std::string _err{};
+        std::string* _sink{nullptr};
+        std::string _staging{};
     };
 
 }  // namespace llmbridge::net::tls
