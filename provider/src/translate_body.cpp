@@ -213,20 +213,22 @@ namespace llmbridge::provider
         return out;
     }
 
-    std::string apply_overrides(std::string_view openai_body, std::string_view model,
-                                std::string_view service_tier, std::string_view* had_tier)
+    bool apply_overrides(std::string_view openai_body, std::string_view model,
+                         std::string_view service_tier, std::string_view* had_tier,
+                         std::string& out)
     {
         if (had_tier) *had_tier = {};
-        if (model.empty() && service_tier.empty()) return std::string(openai_body);
+        out.clear();
+        if (model.empty() && service_tier.empty()) { out.assign(openai_body); return true; }
         for (const std::string_view v : {model, service_tier})
             for (const char ch : v)
             {
                 const auto u = static_cast<unsigned char>(ch);
-                if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return {};
+                if (u < 0x20 || u == 0x7F || ch == '"' || ch == '\\') return false;
             }
         bool ok = false;
         const json::Value v = json::parse(openai_body, ok);
-        if (!ok || !v.is_object()) return {};
+        if (!ok || !v.is_object()) return false;
 
         const char* base = openai_body.data();
         const auto in_body = [&](std::string_view sv) {
@@ -242,7 +244,7 @@ namespace llmbridge::provider
         if (!model.empty())
         {
             const json::Value* m = v.find("model");
-            if (!m || !m->is_string() || !in_body(m->sv)) return {};
+            if (!m || !m->is_string() || !in_body(m->sv)) return false;
             edits[n++] = {static_cast<size_t>(m->sv.data() - base), m->sv.size(),
                           std::string(model)};
         }
@@ -250,14 +252,14 @@ namespace llmbridge::provider
         {
             if (const json::Value* t = v.find("service_tier"))
             {
-                if (!t->is_string() || !in_body(t->sv)) return {};
+                if (!t->is_string() || !in_body(t->sv)) return false;
                 if (had_tier) *had_tier = t->sv;
                 edits[n++] = {static_cast<size_t>(t->sv.data() - base), t->sv.size(),
                               std::string(service_tier)};
             }
             else
             {
-                if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return {};
+                if (!in_body(v.sv) || v.sv.empty() || v.sv.front() != '{') return false;
                 const size_t open = static_cast<size_t>(v.sv.data() - base) + 1;
                 size_t probe = open;
                 while (probe < openai_body.size() &&
@@ -275,8 +277,10 @@ namespace llmbridge::provider
         }
         if (n == 2 && edits[0].at > edits[1].at) std::swap(edits[0], edits[1]);
 
-        std::string out;
-        out.reserve(openai_body.size() + model.size() + service_tier.size() + 24);
+        {
+            const size_t need = openai_body.size() + model.size() + service_tier.size() + 24;
+            if (out.capacity() < need) out.reserve(need + need / 8);
+        }
         size_t cursor = 0;
         for (size_t i = 0; i < n; ++i)
         {
@@ -285,6 +289,14 @@ namespace llmbridge::provider
             cursor = edits[i].at + edits[i].drop;
         }
         out.append(openai_body.substr(cursor));
+        return true;
+    }
+
+    std::string apply_overrides(std::string_view openai_body, std::string_view model,
+                                std::string_view service_tier, std::string_view* had_tier)
+    {
+        std::string out;
+        apply_overrides(openai_body, model, service_tier, had_tier, out);
         return out;
     }
 

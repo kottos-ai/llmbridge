@@ -66,6 +66,10 @@ namespace llmbridge::provider
     std::string apply_overrides(std::string_view openai_body, std::string_view model,
                                 std::string_view service_tier,
                                 std::string_view* had_tier = nullptr);
+    /// The same, into `out`, whose capacity is kept across calls; false on refusal.
+    bool apply_overrides(std::string_view openai_body, std::string_view model,
+                         std::string_view service_tier, std::string_view* had_tier,
+                         std::string& out);
 
     /// The model the client asked for, as a view into `body`. Empty when the body is
     /// not an object, names no top-level `model`, or spells it with anything other
@@ -83,6 +87,11 @@ namespace llmbridge::provider
     /// `stream_options.include_usage`.
     std::string openai_to_anthropic_request(std::string_view openai_body,
                                             bool* wants_stream_usage = nullptr);
+    /// The same, into `out`, whose capacity is kept across calls: a gateway that
+    /// translates a growing agent context every turn must not allocate, and fault
+    /// in, a fresh copy of it each time. False refuses the body and leaves `out` empty.
+    bool openai_to_anthropic_request(std::string_view openai_body, std::string& out,
+                                     bool* wants_stream_usage = nullptr);
 
     /// The same Messages body as Bedrock wants it, and the model id it names.
     ///
@@ -93,6 +102,9 @@ namespace llmbridge::provider
     /// model, in which case there is no path to build and the request must be refused.
     std::string openai_to_bedrock_request(std::string_view openai_body,
                                           std::string& model_out);
+    /// The same, into `out`, capacity kept; false refuses and leaves `out` empty.
+    bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,
+                                   std::string& out);
     // Anthropic Messages response body  ->  OpenAI chat-completion response body.
     std::string anthropic_to_openai_response(std::string_view anthropic_body);
 

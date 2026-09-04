@@ -172,12 +172,13 @@ namespace llmbridge::provider
     /// Bedrock puts the model in the path, so its body must not carry one, and it
     /// wants `anthropic_version` in the JSON where Anthropic wants it in a header.
     /// Everything between those two is identical.
-    std::string messages_request(std::string_view openai_body, bool bedrock,
-                                 std::string* model_out, bool* wants_stream_usage = nullptr)
+    bool messages_request(std::string_view openai_body, bool bedrock, std::string* model_out,
+                          bool* wants_stream_usage, std::string& out)
     {
+        out.clear();
         bool ok = false;
         json::Value v = json::parse(openai_body, ok);
-        if (!ok || !v.is_object()) return {};
+        if (!ok || !v.is_object()) return false;
 
         // Read off the DOM we already have.
         if (wants_stream_usage)
@@ -190,12 +191,20 @@ namespace llmbridge::provider
         std::string system;             // collected system content (raw), joined by \n
         std::string_view system_cache;  // its `cache_control`, if a part carried one
         bool has_system = false;
-        std::string messages = "["; // anthropic user/assistant turns
-        messages.reserve(openai_body.size() + 256);
+        // The turns are built straight into `out`, and the small prefix (model,
+        // system, tools) is inserted in front at the end: one memmove inside a buffer
+        // that keeps its capacity, instead of a second body-sized allocation. The
+        // headroom is what lets the next, slightly larger, request reuse it.
+        {
+            const size_t need = openai_body.size() + 65536;
+            if (out.capacity() < need) out.reserve(need + need / 8);
+        }
+        std::string& messages = out; // anthropic user/assistant turns
+        messages = "[";
         bool first = true;
         // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
         const json::Value* msgs = v.find("messages");
-        if (!msgs || !msgs->is_array()) return {};
+        if (!msgs || !msgs->is_array()) { out.clear(); return false; }
         if (msgs)
         {
             bool in_tool_results = false; // merging consecutive OpenAI tool messages
@@ -206,14 +215,14 @@ namespace llmbridge::provider
                 if (role == "system")
                 {
                     if (has_system) system += "\\n"; // escaped newline in the output
-                    if (!append_text(system, content)) return {};
+                    if (!append_text(system, content)) { out.clear(); return false; }
                     // Anthropic's `system` takes a string or an array of blocks, and
                     // only the array form carries a breakpoint.
                     if (content && content->is_array())
                         for (const auto& part : content->arr)
                         {
                             std::string_view cc;
-                            if (!part_cache_control(part, cc)) return {};
+                            if (!part_cache_control(part, cc)) { out.clear(); return false; }
                             if (!cc.empty()) system_cache = cc;
                         }
                     has_system = true;
@@ -240,7 +249,7 @@ namespace llmbridge::provider
                     messages += R"({"type":"tool_result","tool_use_id":)";
                     json::append_raw_string(messages, m.str_or("tool_call_id"));
                     messages += R"(,"content":")";
-                    if (!append_text(messages, content)) return {};
+                    if (!append_text(messages, content)) { out.clear(); return false; }
                     messages += "\"}";
                     continue;
                 }
@@ -257,7 +266,7 @@ namespace llmbridge::provider
                     messages += R"({"role":"assistant","content":[)";
                     bool any = false;
                     std::string text;
-                    if (!append_text(text, content)) return {};
+                    if (!append_text(text, content)) { out.clear(); return false; }
                     if (!text.empty())
                     {
                         messages += R"({"type":"text","text":")";
@@ -295,7 +304,7 @@ namespace llmbridge::provider
                         {
                             bool arg_ok = false;
                             const json::Value parsed = json::parse(args, arg_ok);
-                            if (!arg_ok || !parsed.is_object()) return {};
+                            if (!arg_ok || !parsed.is_object()) { out.clear(); return false; }
                             // And nothing after it. The parser stops at the end of
                             // the first value, so `{}}]},{...}` parses as a valid
                             // empty object with the payload trailing behind it, and
@@ -307,7 +316,7 @@ namespace llmbridge::provider
                             while (end > 0 && (args[end - 1] == ' ' || args[end - 1] == '\t' ||
                                                args[end - 1] == '\n' || args[end - 1] == '\r'))
                                 --end;
-                            if (parsed.sv.size() != end) return {};
+                            if (parsed.sv.size() != end) { out.clear(); return false; }
                         }
                         messages += ",\"input\":";
                         messages += args.empty() ? "{}" : args;
@@ -322,7 +331,7 @@ namespace llmbridge::provider
                 messages += "{\"role\":";
                 json::append_raw_string(messages, role);
                 messages += ",\"content\":";
-                if (!append_content(messages, content)) return {};
+                if (!append_content(messages, content)) { out.clear(); return false; }
                 messages += "}";
             }
             if (in_tool_results) messages += "]}"; // close a trailing tool_result turn
@@ -331,45 +340,45 @@ namespace llmbridge::provider
 
         const std::string_view model = v.str_or("model", "claude-3-5-sonnet-latest");
         if (model_out) model_out->assign(model);
-        std::string out = "{";
-        out.reserve(messages.size() + system.size() + 512); // same reason as `messages`
+        std::string pre = "{";
+        pre.reserve(system.size() + 512);
         if (bedrock)
         {
             // Not a version we choose: Bedrock rejects a Messages body without it,
             // and this literal is the only value its Anthropic models accept.
-            out += "\"anthropic_version\":\"bedrock-2023-05-31\"";
+            pre += "\"anthropic_version\":\"bedrock-2023-05-31\"";
         }
         else
         {
-            out += "\"model\":";
-            json::append_raw_string(out, model);
+            pre += "\"model\":";
+            json::append_raw_string(pre, model);
         }
         // Anthropic requires max_tokens; default if the OpenAI request omitted it.
-        out += ",\"max_tokens\":";
-        out += v.num_or("max_tokens", "1024");
+        pre += ",\"max_tokens\":";
+        pre += v.num_or("max_tokens", "1024");
         if (has_system)
         {
             if (system_cache.empty())
             {
-                out += ",\"system\":\"";
-                out += system;
-                out += '"';
+                pre += ",\"system\":\"";
+                pre += system;
+                pre += '"';
             }
             else
             {
-                out += ",\"system\":[{\"type\":\"text\",\"text\":\"";
-                out += system;
-                out += "\",\"cache_control\":";
-                out.append(system_cache);
-                out += "}]";
+                pre += ",\"system\":[{\"type\":\"text\",\"text\":\"";
+                pre += system;
+                pre += "\",\"cache_control\":";
+                pre.append(system_cache);
+                pre += "}]";
             }
         }
-        if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
-        if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"top_p\":"; out += p; }
+        if (std::string_view t = v.num_or("temperature"); !t.empty()) { pre += ",\"temperature\":"; pre += t; }
+        if (std::string_view p = v.num_or("top_p"); !p.empty()) { pre += ",\"top_p\":"; pre += p; }
         // Pass streaming through: Anthropic uses the same `stream` flag, so an
         // OpenAI `stream:true` request becomes an Anthropic SSE response.
         if (const json::Value* s = v.find("stream"); s && s->type == json::Value::Type::Bool && s->boolean)
-            out += ",\"stream\":true";
+            pre += ",\"stream\":true";
         // Tools. tool_choice:"none" means "do not call tools", which Anthropic
         // expresses by there being none, so we omit the whole tools block.
         const json::Value* tc = v.find("tool_choice");
@@ -378,32 +387,48 @@ namespace llmbridge::provider
         {
             if (const std::string tools = anthropic_tools(v.find("tools")); !tools.empty())
             {
-                out += ",\"tools\":";
-                out += tools;
+                pre += ",\"tools\":";
+                pre += tools;
                 if (const std::string ch = anthropic_tool_choice(tc); !ch.empty())
                 {
-                    out += ",\"tool_choice\":";
-                    out += ch;
+                    pre += ",\"tool_choice\":";
+                    pre += ch;
                 }
             }
         }
-        out += ",\"messages\":";
-        out += messages;
-        out += "}";
-        return out;
+        pre += ",\"messages\":";
+        messages.insert(0, pre);
+        messages += "}";
+        return true;
     }
     } // namespace
+
+    bool openai_to_anthropic_request(std::string_view openai_body, std::string& out,
+                                     bool* wants_stream_usage)
+    {
+        return messages_request(openai_body, false, nullptr, wants_stream_usage, out);
+    }
 
     std::string openai_to_anthropic_request(std::string_view openai_body,
                                             bool* wants_stream_usage)
     {
-        return messages_request(openai_body, false, nullptr, wants_stream_usage);
+        std::string out;
+        messages_request(openai_body, false, nullptr, wants_stream_usage, out);
+        return out;
+    }
+
+    bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,
+                                   std::string& out)
+    {
+        return messages_request(openai_body, true, &model_out, nullptr, out);
     }
 
     std::string openai_to_bedrock_request(std::string_view openai_body,
                                           std::string& model_out)
     {
-        return messages_request(openai_body, true, &model_out);
+        std::string out;
+        messages_request(openai_body, true, &model_out, nullptr, out);
+        return out;
     }
 
     std::string anthropic_to_openai_response(std::string_view anthropic_body)

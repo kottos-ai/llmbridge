@@ -238,20 +238,21 @@ namespace llmbridge::detail
         // Translate an OpenAI request body to the upstream dialect, also yielding
         // the upstream start line. Empty return = malformed body. Shared by both
         // event-loop backends.
-        std::string xlate_req(UpstreamDialect mode, std::string_view body,
-                              std::string_view base_path, std::string_view query,
-                              std::string& start_line_store,
-                              std::string_view& start_line, std::string_view& target_out,
-                              bool* wants_stream_usage = nullptr)
+        bool xlate_req(UpstreamDialect mode, std::string_view body,
+                       std::string_view base_path, std::string_view query,
+                       std::string& start_line_store,
+                       std::string_view& start_line, std::string_view& target_out,
+                       bool* wants_stream_usage, std::string& out)
         {
             std::string target_store;
             std::string_view target;
-            std::string out;
+            out.clear();
             switch (mode)
             {
                 case UpstreamDialect::Anthropic:
                     target = "/v1/messages";
-                    out = provider::openai_to_anthropic_request(body, wants_stream_usage);
+                    if (!provider::openai_to_anthropic_request(body, out, wants_stream_usage))
+                        return false;
                     break;
                 case UpstreamDialect::Gemini:
                     target = "/v1beta/models/gemini:generateContent";
@@ -268,8 +269,8 @@ namespace llmbridge::detail
                     // slashes included: an inference-profile id may contain them, and
                     // a raw slash there would silently change which resource is named.
                     std::string model;
-                    out = provider::openai_to_bedrock_request(body, model);
-                    if (out.empty() || model.empty()) return {};
+                    if (!provider::openai_to_bedrock_request(body, model, out) || model.empty())
+                    { out.clear(); return false; }
                     target_store.assign("/model/")
                         .append(net::sigv4::uri_encode(model, true))
                         .append("/invoke");
@@ -281,12 +282,13 @@ namespace llmbridge::detail
                     // is forwarded as the client wrote it, so an option we do not
                     // model is not silently dropped on the way through.
                     out.assign(body);
-                    if (out.empty()) return {};
+                    if (out.empty()) return false;
                     target = "/chat/completions";
                     break;
                 case UpstreamDialect::OpenAI:
-                    return {};
+                    return false;
             }
+            if (out.empty()) return false; // Gemini and Cohere refuse by returning nothing
             // No base path is the common case and stays allocation-free: the view
             // points at a literal with static storage. Bedrock never takes that path,
             // because its target is built per request.
@@ -302,7 +304,7 @@ namespace llmbridge::detail
                     case UpstreamDialect::Cohere: start_line = "POST /v2/chat HTTP/1.1"; break;
                     case UpstreamDialect::Bedrock:
                     case UpstreamDialect::Azure:
-                    case UpstreamDialect::OpenAI: return {};
+                    case UpstreamDialect::OpenAI: out.clear(); return false;
                 }
                 target_out = start_line.substr(5, start_line.size() - 14);
             }
@@ -320,7 +322,7 @@ namespace llmbridge::detail
                 target_out = std::string_view(start_line_store).substr(
                     5, start_line_store.size() - 14);  // between "POST " and " HTTP/1.1"
             }
-            return out;
+            return true;
         }
 
         /// Sign a rebuilt Bedrock request, or refuse it.
@@ -502,11 +504,13 @@ namespace llmbridge::detail
     // Upstream request builder: build_http plus a Host header (HTTP/1.1
     // requires one; the benchmark mocks never cared, real providers reject
     // without it) and the per-dialect auth/extra header lines.
-    std::string build_http_request(std::string_view start_line, std::string_view body,
-                                   std::string_view host, std::string_view extra)
+    void build_http_request(std::string_view start_line, std::string_view body,
+                            std::string_view host, std::string_view extra, std::string& into)
     {
-        std::string out;
-        out.reserve(start_line.size() + body.size() + host.size() + extra.size() + 128);
+        std::string& out = into;
+        out.clear();
+        const size_t need = start_line.size() + body.size() + host.size() + extra.size() + 128;
+        if (out.capacity() < need) out.reserve(need + need / 8);
         out.append(start_line);
         out.append("\r\nHost: ");
         out.append(host);
@@ -516,7 +520,6 @@ namespace llmbridge::detail
         out.append(std::to_string(body.size()));
         out.append("\r\n\r\n");
         out.append(body);
-        return out;
     }
 
     /// Whether a request head carries `Expect: 100-continue`. RFC 9110 section
@@ -565,10 +568,10 @@ namespace llmbridge::detail
     ///
     /// Unambiguous because parse_request refuses Transfer-Encoding outright, so
     /// every request here is either Content-Length framed or has no body at all.
-    std::string request_without(std::string_view msg, size_t header_len,
-                                const std::vector<std::string>& strip,
-                                std::string_view host_hdr, std::string_view base_path,
-                                std::string_view body_override)
+    bool request_without(std::string_view msg, size_t header_len,
+                         const std::vector<std::string>& strip,
+                         std::string_view host_hdr, std::string_view base_path,
+                         std::string_view body_override, std::string& into)
     {
         // Copy in runs, not per line: a flush happens only where a stripped line
         // interrupts the kept ones, so one memcpy when nothing matches and two
@@ -635,7 +638,7 @@ namespace llmbridge::detail
         if (saw_cl || body_len)
         {
             const size_t after_start_line = out.find("\r\n");
-            if (after_start_line == std::string::npos) return {};
+            if (after_start_line == std::string::npos) { into.clear(); return false; }
             out.insert(after_start_line + 2,
                        "Content-Length: " + std::to_string(body_len) + "\r\n");
         }
@@ -648,13 +651,18 @@ namespace llmbridge::detail
                 out.insert(after_start_line + 2,
                            "Host: " + std::string(host_hdr) + "\r\n");
         }
-        if (!prefix_target(out, base_path)) return {};
+        if (!prefix_target(out, base_path)) { into.clear(); return false; }
         // The head is final: the body joins it once, and nothing shifts it after.
-        std::string full;
-        full.reserve(head.size() + body.size());
-        full.append(head);
-        full.append(body);
-        return full;
+        //
+        // Into the caller's buffer, capacity kept, with an eighth of headroom when it
+        // has to grow. A fresh string of exactly the right size reallocates on every
+        // request of an agent whose context grows each turn.
+        const size_t need = head.size() + body.size();
+        into.clear();
+        if (into.capacity() < need) into.reserve(need + need / 8);
+        into.append(head);
+        into.append(body);
+        return true;
     }
 
     /// Everything between a client request and the bytes for a translated venue.
@@ -665,8 +673,8 @@ namespace llmbridge::detail
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view client_hdrs,
                                   const std::vector<std::string>& strip,
-                                  std::string& out, const char*& why,
-                                  std::string_view model_override,
+                                  std::string& out, std::string& body_scratch,
+                                  const char*& why, std::string_view model_override,
                                   bool* wants_stream_usage)
     {
         // `mode` is the resolved per-request translation, not up.dialect: they are
@@ -684,10 +692,10 @@ namespace llmbridge::detail
         }
         std::string start_line_store;
         std::string_view start_line, target;
-        const std::string tbody =
-            xlate_req(mode, body, up.base_path, up.query, start_line_store,
-                      start_line, target, wants_stream_usage);
-        if (tbody.empty()) { why = "translate"; return false; }
+        if (!xlate_req(mode, body, up.base_path, up.query, start_line_store,
+                       start_line, target, wants_stream_usage, body_scratch))
+        { why = "translate"; return false; }
+        const std::string_view tbody = body_scratch;
 
         std::string auth_hdrs;
         const bool ok = mode == UpstreamDialect::Bedrock
@@ -695,7 +703,7 @@ namespace llmbridge::detail
                             : auth_headers_for(mode, client_hdrs, strip, auth_hdrs);
         if (!ok) { why = "credential"; return false; }
 
-        out = build_http_request(start_line, tbody, up.host_hdr, auth_hdrs);
+        build_http_request(start_line, tbody, up.host_hdr, auth_hdrs, out);
         return true;
     }
 

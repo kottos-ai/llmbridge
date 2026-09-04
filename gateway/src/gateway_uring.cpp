@@ -720,7 +720,6 @@ namespace llmbridge
             c->translate_body = plan.translate;
             c->effective_dialect = plan.venue;
         }
-        std::string upstream_bytes;
         if (c->translate_body)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
@@ -732,7 +731,7 @@ namespace llmbridge
             // into a grep; folding both loops onto one builder removes the chance of
             // the next such divergence entirely.)
             if (!build_translated_request(up, c->effective_dialect, body, client_hdrs, _strip_headers,
-                                          upstream_bytes, why, c->model_override,
+                                          _rebuild, _xlate, why, c->model_override,
                                           &c->wants_usage))
             {
                 if (why[0] == 't')
@@ -753,15 +752,15 @@ namespace llmbridge
             // Byte-forward rewrites the model by splicing the value, so every other
             // byte the client sent survives; the derived Content-Length then describes
             // the spliced body without anyone having to remember to update it.
-            std::string rewritten;
+            std::string_view rewritten;
             if (!c->model_override.empty() || !c->tier_override.empty())
             {
                 std::string_view had;
-                rewritten = provider::apply_overrides(
+                if (!provider::apply_overrides(
                     std::string_view(c->rbuf.data() + c->msg.header_len, c->msg.body_len),
-                    c->model_override, c->tier_override, &had);
-                if (rewritten.empty())
+                    c->model_override, c->tier_override, &had, _xlate))
                 { ur_error_respond(c, 400, "cannot apply route overrides"); return; }
+                rewritten = _xlate;
                 // Copied, not held: `had` points into the request buffer, which is
                 // reused before the sink runs. Truncated and not refused, because a
                 // tier too long to be one is still worth reporting.
@@ -772,18 +771,18 @@ namespace llmbridge
                 if (c->asked_tier_len)
                     std::memcpy(c->asked_tier, had.data(), c->asked_tier_len);
             }
-            upstream_bytes = request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
-                                             c->msg.header_len, _strip_headers, up.host_hdr,
-                                             up.base_path, rewritten);
             // Refused, not repaired: a venue with a base path needs an origin-form
             // target to prefix, and nothing has been sent upstream at this point.
-            if (upstream_bytes.empty())
+            if (!request_without(std::string_view(c->rbuf.data(), c->msg.total_len),
+                                 c->msg.header_len, _strip_headers, up.host_hdr,
+                                 up.base_path, rewritten, _rebuild))
             { ur_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
         Connection* u = ur_acquire_upstream(c->upstream_slot);
         if (!u)
         {
+            secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
             if (!ur_upstream_failed(c, 502, "no upstream (connect failed)"))
                 ur_error_respond(c, 502, "no upstream (connect failed)");
             return;
@@ -791,7 +790,9 @@ namespace llmbridge
 
         LB_DEBUG(ReqId{c->req_seq}, " upstream ", *u, " pooled=", u->from_pool,
                  " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
-        u->wbuf = std::move(upstream_bytes);
+        // The rebuilt request is already in `_rebuild`; the swap hands it over and
+        // takes the upstream's scrubbed, still-allocated buffer back as the next scratch.
+        u->wbuf.swap(_rebuild);
         u->woff = 0;
         // Keep the original bytes when a failover could use them: the rebuilt request
         // above was translated for this venue's dialect, so it cannot be resent to a

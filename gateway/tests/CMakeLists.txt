@@ -17,6 +17,10 @@ target_link_libraries(gateway_dialect_test PRIVATE gateway GTest::gtest_main)
 # The corpus is a recorded fixture (scripts/gen_qa_corpus.py); the test is
 # hermetic. LLMBRIDGE_TEST_DATA_DIR points at it so the test does not depend on
 # the working directory ctest happens to run from.
+add_executable(gateway_rebuild_test rebuild_test.cpp)
+target_link_libraries(gateway_rebuild_test PRIVATE gateway GTest::gtest_main)
+# The rebuild is a private helper under src/, reached here and nowhere else.
+target_include_directories(gateway_rebuild_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_executable(gateway_corpus_test gateway_corpus_test.cpp)
 target_link_libraries(gateway_corpus_test PRIVATE gateway GTest::gtest_main)
 target_compile_definitions(gateway_corpus_test
@@ -32,6 +36,7 @@ gtest_discover_tests(gateway_dialect_test)
 # with the rest of the suite under `ctest -j`, it both flakes and reports
 # meaningless latencies; the numbers it prints are only worth reading when it
 # has the machine to itself.
+gtest_discover_tests(gateway_rebuild_test)
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
 # End-to-end TLS tests: only when the TLS transport is compiled in. The mock

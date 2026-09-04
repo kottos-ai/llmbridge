@@ -479,6 +479,12 @@ namespace llmbridge
         std::vector<std::vector<Connection*>> _idle_upstreams; ///< one pool per upstream
         uint64_t _next_client_id = 1;
         std::vector<Connection*> _doomed; // closed mid-batch, freed after the batch
+        /// The byte-forward rebuild's destination, swapped with the upstream's `wbuf`
+        /// once the upstream is acquired, so the buffers rotate and keep their
+        /// capacity instead of being allocated per request. See request_without.
+        std::string _rebuild;
+        /// The translated or override-rewritten body on its way into `_rebuild`.
+        std::string _xlate;
 
         int64_t _t_start = 0;
         Stats _stats;
