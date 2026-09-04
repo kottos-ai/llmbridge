@@ -110,6 +110,7 @@ static int run(int argc, char** argv)
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     double client_idle = static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9;
     double pool_idle = static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9;
+    double prefault_mb = 0;
     std::string log_level = "info";
     int workers = 1;
     bool timing_headers = false;
@@ -183,6 +184,7 @@ static int run(int argc, char** argv)
         if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
         if (cfg.has_client_idle_s) client_idle = cfg.client_idle_s;
         if (cfg.has_pool_idle_s) pool_idle = cfg.pool_idle_s;
+        if (cfg.has_prefault_mb) prefault_mb = cfg.prefault_mb;
         if (!cfg.io.empty())
             io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
                  : cfg.io == "uring" ? llmbridge::IoBackend::Uring
@@ -212,6 +214,7 @@ static int run(int argc, char** argv)
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--client-idle")      { if (const char* v = nextarg()) client_idle = std::atof(v); }
         else if (a == "--pool-idle")        { if (const char* v = nextarg()) pool_idle = std::atof(v); }
+        else if (a == "--prefault-mb")      { if (const char* v = nextarg()) prefault_mb = std::atof(v); }
         else if (a == "--log-level")        { if (const char* v = nextarg()) log_level = v; }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
         else if (a == "--timing-headers") timing_headers = true;
@@ -255,6 +258,7 @@ static int run(int argc, char** argv)
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
+                        "[--prefault-mb MB] "
                         "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
                         "[--io auto|epoll|uring] [--workers N] [--timing-headers] [--config FILE]\n", argv[0]);
@@ -412,6 +416,7 @@ static int run(int argc, char** argv)
         // Before run(): the loop thread reads it, so setting it later is a data race.
         gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));
+        gw->set_prefault_bytes(static_cast<size_t>(prefault_mb * (1 << 20)));
         gateways.push_back(std::move(gw));
     }
     g_gateways = &gateways;

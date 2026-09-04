@@ -8,6 +8,18 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.55.0]. 2026-09-04
+
+### Added
+
+- **`--prefault-mb` (config: `runtime.prefault_mb`).** The retained buffers are still
+  cold the first time each is written, and every new upstream connection brings a
+  fresh one. With the knob set, the two scratch strings are reserved and written
+  through before the loop starts and each upstream's send buffer when its connection
+  opens, off the request path. A reserve alone maps nothing, so the pages are touched,
+  and a test proves it with `mincore`. Memory is the size times the pooled upstream
+  connections, so the default is 0.
+
 ## [0.54.2]. 2026-09-04
 
 ### Performance

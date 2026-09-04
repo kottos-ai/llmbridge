@@ -174,6 +174,13 @@ namespace llmbridge
         void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
         void set_heartbeat_ns(int64_t ns) noexcept { _heartbeat_ns = ns; }
+        /// Bytes to reserve and then write through in every request buffer before it
+        /// carries a request: the two scratch strings at run(), each upstream's
+        /// `wbuf` when its connection opens. A reserve alone maps nothing, the first
+        /// write still faults every page, so the pages are touched here, off the
+        /// request path. 0 (the default) prefaults nothing; the buffers still grow
+        /// and keep their capacity, so only the first pass through each is cold.
+        void set_prefault_bytes(size_t n) noexcept { _prefault_bytes = n; }
         /// Optional per-request metadata sink (sink.hpp). Non-owning; call before
         /// run(). `capture` names up to kSinkCaptureMax request headers whose values
         /// are copied (bounded) and handed back in RequestRecord::captured.
@@ -205,6 +212,10 @@ namespace llmbridge
         /// call before run(). Lets a test shrink the pool far enough to force -ENOBUFS,
         /// a branch never reached at the shipped size even at 8192 streams.
         void set_uring_buf_count_for_test(unsigned n) noexcept { _uring_buf_count = n; }
+        /// Test seam: prefault the scratch buffers now, without run(), and report how
+        /// many of `_rebuild`'s pages the kernel has resident (mincore), so a test
+        /// can prove the touch mapped them and a reserve alone would not have.
+        size_t prefault_resident_bytes_for_test();
 
     private:
         // Naming: ep_* is epoll-only, ur_* is io_uring-only, unprefixed is shared. A
@@ -443,6 +454,9 @@ namespace llmbridge
         int64_t _client_setup_ns = kClientSetupNs;
         int64_t _client_idle_ns = kDefaultClientIdleNs;
         int64_t _pool_idle_ns = kDefaultPoolIdleNs;
+        size_t _prefault_bytes = 0;
+        /// Reserve `_prefault_bytes` in `s` and touch every page. Shared by both backends.
+        void prefault(std::string& s) const;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
         TlsConfig _tls; // both legs; each flag inits its own context in the ctor
