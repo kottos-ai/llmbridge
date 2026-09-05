@@ -174,12 +174,13 @@ namespace llmbridge
         void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
         void set_heartbeat_ns(int64_t ns) noexcept { _heartbeat_ns = ns; }
-        /// Bytes to reserve and then write through in every request buffer before it
-        /// carries a request: the two scratch strings at run(), each upstream's
-        /// `wbuf` when its connection opens. A reserve alone maps nothing, the first
-        /// write still faults every page, so the pages are touched here, off the
-        /// request path. 0 (the default) prefaults nothing; the buffers still grow
-        /// and keep their capacity, so only the first pass through each is cold.
+        /// Bytes to reserve and then write through in the two scratch strings at
+        /// run(), before any request. A reserve alone maps nothing, the first write
+        /// still faults every page, so the pages are touched, once, at start. Not
+        /// per upstream connection: touching 16 MB there cost the request that opened
+        /// the connection 8 ms on the live tape, against 0.2 ms without, to spare a
+        /// later request at most 3 ms. 0 (the default) prefaults nothing; the buffers
+        /// still grow and keep their capacity, so only the first pass is cold.
         void set_prefault_bytes(size_t n) noexcept { _prefault_bytes = n; }
         /// Optional per-request metadata sink (sink.hpp). Non-owning; call before
         /// run(). `capture` names up to kSinkCaptureMax request headers whose values

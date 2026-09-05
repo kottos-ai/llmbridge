@@ -271,7 +271,6 @@ namespace llmbridge
         u->from_pool = false;
         u->upstream_slot = slot; // release() indexes the pool with this
         u->rbuf.reserve(kInitialBuf);
-        prefault(u->wbuf); // it will hold a request the moment the connect completes
 #ifdef LLMBRIDGE_HAVE_TLS
         if (up.tls && !tls_attach_upstream(u))
         {
