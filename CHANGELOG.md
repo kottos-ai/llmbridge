@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.55.1]. 2026-09-05
+
+### Fixed
+
+- **`--prefault-mb` no longer touches a fresh upstream connection's send buffer.**
+  v0.55.0 wrote through `prefault_mb` on every connection it opened, calling that
+  off the request path. It is not: the touch runs inside the request that opened the
+  connection.
+
 ## [0.55.0]. 2026-09-04
 
 ### Added
