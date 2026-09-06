@@ -271,6 +271,7 @@ namespace llmbridge
         u->from_pool = false;
         u->upstream_slot = slot; // release() indexes the pool with this
         u->rbuf.reserve(kInitialBuf);
+        adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (up.tls && !tls_attach_upstream(u))
         {
@@ -433,6 +434,7 @@ namespace llmbridge
         if (c->fd >= 0) { ::close(c->fd); c->fd = -1; }
         for (auto it = _doomed.begin(); it != _doomed.end(); ++it)
             if (*it == c) { _doomed.erase(it); break; }
+        retire_wbuf(c);
         delete c;
     }
 
@@ -720,6 +722,7 @@ namespace llmbridge
             c->translate_body = plan.translate;
             c->effective_dialect = plan.venue;
         }
+        note_build(c->msg.total_len);
         if (c->translate_body)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);

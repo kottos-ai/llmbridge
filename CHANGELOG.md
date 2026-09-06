@@ -8,6 +8,12 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.55.2]. 2026-09-06
+
+### Performance
+
+- **A new upstream connection no longer costs the next request a cold buffer.**
+
 ## [0.55.1]. 2026-09-05
 
 ### Fixed
