@@ -8,6 +8,12 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.55.4]. 2026-09-06
+
+### Fixed
+
+- **`cold_builds` and `warm_reuses` are in the profile every embedder prints.**
+
 ## [0.55.3]. 2026-09-06
 
 ### Fixed

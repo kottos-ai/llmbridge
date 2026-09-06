@@ -828,7 +828,8 @@ namespace llmbridge
         if (_stats.first_token.total() > 0) _stats.first_token.print(os, "first-token   ");
         os << "requests=" << _stats.requests << " errors=" << _stats.errors
            << " upstream_conns_opened=" << _stats.upstream_conns_opened
-           << " upstream_reused=" << _stats.upstream_reused << "\n";
+           << " upstream_reused=" << _stats.upstream_reused
+           << " cold_builds=" << _stats.cold_builds << " warm_reuses=" << _stats.warm_reuses << "\n";
         os << "client_setup_timeouts=" << _stats.client_setup_timeouts
            << " client_idle_timeouts=" << _stats.client_idle_timeouts
            << " tls_handshake_failures=" << _stats.client_tls_handshake_failures
