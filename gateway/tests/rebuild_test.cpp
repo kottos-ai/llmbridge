@@ -160,6 +160,10 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     llmbridge::Connection dying;
     dying.is_client = false;
     dying.wbuf.assign(1u << 20, 'k'); // a request, credential included, still in it
+#ifdef LLMBRIDGE_HAVE_TLS
+    dying.tls_out.assign(1u << 20, 'c'); // and its ciphertext
+    const char* cpages = dying.tls_out.data();
+#endif
     const char* pages = dying.wbuf.data();
     gw.retire_wbuf(&dying);
     EXPECT_EQ(gw.warm_bufs_for_test(), 1u);
@@ -169,6 +173,13 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     gw.adopt_warm(&born);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
     EXPECT_EQ(born.wbuf.data(), pages);
+#ifdef LLMBRIDGE_HAVE_TLS
+    EXPECT_TRUE(dying.tls_out.empty());
+    EXPECT_EQ(born.tls_out.data(), cpages);
+    EXPECT_TRUE(born.tls_out.empty());
+    EXPECT_EQ(std::count(born.tls_out.data(), born.tls_out.data() + (1u << 20), 'c'), 0)
+        << "the ciphertext of a credential must not survive either";
+#endif
     EXPECT_GE(born.wbuf.capacity(), 1u << 20);
     EXPECT_TRUE(born.wbuf.empty());
     EXPECT_EQ(std::count(born.wbuf.data(), born.wbuf.data() + (1u << 20), 'k'), 0)

@@ -8,6 +8,12 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.55.5]. 2026-09-06
+
+### Performance
+
+- **The ciphertext buffer keeps headroom and rides the warm list.**
+
 ## [0.55.4]. 2026-09-06
 
 ### Fixed

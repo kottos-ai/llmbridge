@@ -100,6 +100,8 @@ namespace llmbridge
         /// wrote were fresh and faulted in.
         uint64_t cold_builds = 0;
         uint64_t warm_reuses = 0; // new upstream connections given a retired buffer
+        /// Requests whose ciphertext buffer had to grow.
+        uint64_t tls_out_grows = 0;
     };
 
     class Gateway
@@ -514,7 +516,15 @@ namespace llmbridge
         /// once the upstream is acquired, so the buffers rotate and keep their
         /// capacity instead of being allocated per request. See request_without.
         std::string _rebuild;
-        std::vector<std::string> _warm; // see retire_wbuf
+        /// Connection buffers are expensive to recreate. Cached as WarmSet.
+        struct WarmSet
+        {
+            std::string wbuf;
+#ifdef LLMBRIDGE_HAVE_TLS
+            std::string tls_out;
+#endif
+        };
+        std::vector<WarmSet> _warm;
         /// The translated or override-rewritten body on its way into `_rebuild`.
         std::string _xlate;
 

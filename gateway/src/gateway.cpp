@@ -396,7 +396,7 @@ namespace llmbridge
         // request 1.6 ms of reallocation on a connection's first use, more than the
         // encryption itself.
         const size_t need = u->tls_out.size() + u->tls->pending_output_bytes() + 256;
-        if (u->tls_out.capacity() < need) u->tls_out.reserve(need);
+        if (u->tls_out.capacity() < need) u->tls_out.reserve(need + need / 8);
         uint8_t buf[65536];
         size_t n;
         while ((n = u->tls->pull_ciphertext({buf, sizeof buf})) > 0)
@@ -418,8 +418,14 @@ namespace llmbridge
         {
             tls_pump_out(u); // staged handshake flights go first: order is the wire's
             const size_t todo = u->wbuf.size() > u->woff ? u->wbuf.size() - u->woff : 0;
+            // Headroom, as for the plaintext scratch: an exact reserve on a context
+            // that grows every turn is a fresh allocation, and fresh pages, per request.
             const size_t need = u->tls_out.size() + todo + todo / 512 + 256;
-            if (u->tls_out.capacity() < need) u->tls_out.reserve(need);
+            if (u->tls_out.capacity() < need)
+            {
+                ++_stats.tls_out_grows;
+                u->tls_out.reserve(need + need / 8);
+            }
             u->tls->set_sink(&u->tls_out);
         }
         while (u->woff < u->wbuf.size())
@@ -829,7 +835,8 @@ namespace llmbridge
         os << "requests=" << _stats.requests << " errors=" << _stats.errors
            << " upstream_conns_opened=" << _stats.upstream_conns_opened
            << " upstream_reused=" << _stats.upstream_reused
-           << " cold_builds=" << _stats.cold_builds << " warm_reuses=" << _stats.warm_reuses << "\n";
+           << " cold_builds=" << _stats.cold_builds << " warm_reuses=" << _stats.warm_reuses
+           << " tls_out_grows=" << _stats.tls_out_grows << "\n";
         os << "client_setup_timeouts=" << _stats.client_setup_timeouts
            << " client_idle_timeouts=" << _stats.client_idle_timeouts
            << " tls_handshake_failures=" << _stats.client_tls_handshake_failures
@@ -1009,15 +1016,26 @@ namespace llmbridge
         if (u->is_client || _warm.size() >= kWarmBufs || u->wbuf.capacity() < kWarmMin) return;
         // A closing connection may still hold a request, credential included; the pool
         // scrub runs at release, and a connection closed mid-request never got there.
+        // The ciphertext is the same request encrypted, so it is scrubbed too.
+        WarmSet set;
         net::secure_clear(u->wbuf);
-        _warm.push_back(std::move(u->wbuf));
+        set.wbuf = std::move(u->wbuf);
+#ifdef LLMBRIDGE_HAVE_TLS
+        net::secure_clear(u->tls_out);
+        set.tls_out = std::move(u->tls_out);
+#endif
+        _warm.push_back(std::move(set));
     }
 
     void Gateway::adopt_warm(Connection* u) noexcept
     {
         if (_warm.empty()) return;
-        u->wbuf = std::move(_warm.back());
+        WarmSet set = std::move(_warm.back());
         _warm.pop_back();
+        u->wbuf = std::move(set.wbuf);
+#ifdef LLMBRIDGE_HAVE_TLS
+        u->tls_out = std::move(set.tls_out);
+#endif
         ++_stats.warm_reuses;
     }
 
@@ -1030,11 +1048,14 @@ namespace llmbridge
     {
         prefault(_rebuild);
         prefault(_xlate);
-        // One spare for the first connection, so its rotation costs nothing either.
+        // One spare set for the first connection, so its first request costs nothing.
         if (_prefault_bytes && _warm.empty())
         {
-            std::string spare;
-            prefault(spare);
+            WarmSet spare;
+            prefault(spare.wbuf);
+#ifdef LLMBRIDGE_HAVE_TLS
+            prefault(spare.tls_out);
+#endif
             _warm.push_back(std::move(spare));
         }
 #ifdef LLMBRIDGE_HAVE_URING

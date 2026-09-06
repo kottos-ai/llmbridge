@@ -463,6 +463,7 @@ static int run(int argc, char** argv)
         agg.upstream_unsent += s.upstream_unsent;
         agg.cold_builds += s.cold_builds;
         agg.warm_reuses += s.warm_reuses;
+        agg.tls_out_grows += s.tls_out_grows;
         if (s.tls_buffered_peak > agg.tls_buffered_peak)
             agg.tls_buffered_peak = s.tls_buffered_peak;
         agg.overhead.merge(s.overhead);
@@ -475,12 +476,12 @@ static int run(int argc, char** argv)
     std::fprintf(stderr, "\n=== llmbridge gateway: added-latency profile (%d worker%s) ===\n",
                  workers, workers == 1 ? "" : "s");
     std::fprintf(stderr, "timeouts=%llu  client_setup_timeouts=%llu  client_idle_timeouts=%llu  "
-                 "stream_pauses=%llu  uring_enobufs=%llu  cold_builds=%llu  warm_reuses=%llu\n",
+                 "stream_pauses=%llu  uring_enobufs=%llu  cold_builds=%llu  warm_reuses=%llu  tls_out_grows=%llu\n",
                  (unsigned long long)agg.upstream_timeouts,
                  (unsigned long long)agg.client_setup_timeouts,
                  (unsigned long long)agg.client_idle_timeouts, (unsigned long long)agg.stream_pauses,
                  (unsigned long long)agg.uring_enobufs, (unsigned long long)agg.cold_builds,
-                 (unsigned long long)agg.warm_reuses);
+                 (unsigned long long)agg.warm_reuses, (unsigned long long)agg.tls_out_grows);
     std::fprintf(stderr,
                  "requests=%llu  errors=%llu  upstream_conns_opened=%llu  reused=%llu  retries=%llu  "
                  "unsent=%llu\n",
