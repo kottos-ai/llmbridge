@@ -263,6 +263,7 @@ namespace llmbridge
         u->from_pool = false;
         u->upstream_slot = slot;
         u->rbuf.reserve(kInitialBuf);
+        adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (up.tls && !tls_attach_upstream(u))
         {
@@ -612,6 +613,7 @@ namespace llmbridge
         }
         // Build the bytes to send upstream (translate first, before acquiring an
         // upstream, so a bad body can't leak a pooled connection).
+        note_build(c->msg.total_len);
         if (c->translate_body)
         {
             std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
@@ -1231,7 +1233,7 @@ namespace llmbridge
                 }
             }
             sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
-            for (Connection* d : _doomed) delete d;
+            for (Connection* d : _doomed) { retire_wbuf(d); delete d; }
             _doomed.clear();
         }
         return 0;

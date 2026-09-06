@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -149,4 +150,56 @@ TEST(Rebuild, PrefaultMapsTheScratchPages)
     llmbridge::Gateway on(0, "127.0.0.1", 1);
     on.set_prefault_bytes(want);
     EXPECT_GE(on.prefault_resident_bytes_for_test(), want);
+}
+
+// A retired buffer keeps its pages for the next connection, and the counter says
+// when a build had to grow the scratch. Both are the rotation the tape exposed.
+TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
+{
+    llmbridge::Gateway gw(0, "127.0.0.1", 1);
+    llmbridge::Connection dying;
+    dying.is_client = false;
+    dying.wbuf.assign(1u << 20, 'k'); // a request, credential included, still in it
+    const char* pages = dying.wbuf.data();
+    gw.retire_wbuf(&dying);
+    EXPECT_EQ(gw.warm_bufs_for_test(), 1u);
+    EXPECT_TRUE(dying.wbuf.empty());
+    llmbridge::Connection born;
+    born.is_client = false;
+    gw.adopt_warm(&born);
+    EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
+    EXPECT_EQ(born.wbuf.data(), pages);
+    EXPECT_GE(born.wbuf.capacity(), 1u << 20);
+    EXPECT_TRUE(born.wbuf.empty());
+    EXPECT_EQ(std::count(born.wbuf.data(), born.wbuf.data() + (1u << 20), 'k'), 0)
+        << "the credential must not survive into the next connection";
+    EXPECT_EQ(gw.stats().warm_reuses, 1u);
+    // Too small to matter, a client's buffer, and a full list are all left alone.
+    llmbridge::Connection small;
+    small.is_client = false;
+    small.wbuf.assign(1024, 'x');
+    gw.retire_wbuf(&small);
+    llmbridge::Connection client;
+    client.wbuf.assign(1u << 20, 'x');
+    gw.retire_wbuf(&client);
+    EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
+    for (int i = 0; i < 6; ++i)
+    {
+        llmbridge::Connection d;
+        d.is_client = false;
+        d.wbuf.assign(1u << 17, 'x');
+        gw.retire_wbuf(&d);
+    }
+    EXPECT_EQ(gw.warm_bufs_for_test(), llmbridge::Gateway::kWarmBufs);
+}
+
+TEST(Rebuild, AColdBuildIsCounted)
+{
+    llmbridge::Gateway gw(0, "127.0.0.1", 1);
+    gw.note_build(1u << 20);
+    EXPECT_EQ(gw.stats().cold_builds, 1u);
+    gw.set_prefault_bytes(4u << 20);
+    gw.prefault_resident_bytes_for_test();
+    gw.note_build(1u << 20);
+    EXPECT_EQ(gw.stats().cold_builds, 1u) << "a prefaulted scratch holds it without growing";
 }

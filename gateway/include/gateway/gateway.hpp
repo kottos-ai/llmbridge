@@ -96,6 +96,10 @@ namespace llmbridge
         /// Re-dispatched to another venue after a failure; 0 unless a policy opts in.
         /// `upstream_retries` is the same venue on a fresh connection.
         uint64_t upstream_failovers = 0;
+        /// Requests whose scratch buffer had to grow to hold them, so the pages it
+        /// wrote were fresh and faulted in.
+        uint64_t cold_builds = 0;
+        uint64_t warm_reuses = 0; // new upstream connections given a retired buffer
     };
 
     class Gateway
@@ -110,6 +114,12 @@ namespace llmbridge
         /// reuse: 256 cost the non-streaming path 2.4x its throughput, git-bisected.
         /// Do not lower it without re-running ./bench/saturate.sh with BACKENDS=4.
         static constexpr size_t kMaxIdleUpstreams = 8192;
+        /// Retired send buffers kept for the next upstream connection; each may be as
+        /// large as the largest request seen, so this bounds resident memory.
+        static constexpr size_t kWarmBufs = 8;
+        /// Below this a buffer is not worth keeping: the faults it would spare are
+        /// microseconds.
+        static constexpr size_t kWarmMin = 64 * 1024;
         /// How long a pooled upstream may sit unused. A compromise for one upstream
         /// and one worker; every pool sees ~1/(workers x venues) of the traffic and
         /// every crossing of this line costs the next request a full reconnect,
@@ -217,6 +227,12 @@ namespace llmbridge
         /// many of `_rebuild`'s pages the kernel has resident (mincore), so a test
         /// can prove the touch mapped them and a reserve alone would not have.
         size_t prefault_resident_bytes_for_test();
+        /// Buffer rotation, shared by both backends and callable from tests.
+        void retire_wbuf(Connection* u) noexcept;
+        void adopt_warm(Connection* u) noexcept;
+        /// Counts a build the scratch could not hold without growing.
+        void note_build(size_t need) noexcept;
+        size_t warm_bufs_for_test() const noexcept { return _warm.size(); }
 
     private:
         // Naming: ep_* is epoll-only, ur_* is io_uring-only, unprefixed is shared. A
@@ -498,6 +514,7 @@ namespace llmbridge
         /// once the upstream is acquired, so the buffers rotate and keep their
         /// capacity instead of being allocated per request. See request_without.
         std::string _rebuild;
+        std::vector<std::string> _warm; // see retire_wbuf
         /// The translated or override-rewritten body on its way into `_rebuild`.
         std::string _xlate;
 

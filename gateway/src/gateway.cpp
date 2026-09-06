@@ -1003,10 +1003,39 @@ namespace llmbridge
         return resident;
     }
 
+    void Gateway::retire_wbuf(Connection* u) noexcept
+    {
+        if (u->is_client || _warm.size() >= kWarmBufs || u->wbuf.capacity() < kWarmMin) return;
+        // A closing connection may still hold a request, credential included; the pool
+        // scrub runs at release, and a connection closed mid-request never got there.
+        net::secure_clear(u->wbuf);
+        _warm.push_back(std::move(u->wbuf));
+    }
+
+    void Gateway::adopt_warm(Connection* u) noexcept
+    {
+        if (_warm.empty()) return;
+        u->wbuf = std::move(_warm.back());
+        _warm.pop_back();
+        ++_stats.warm_reuses;
+    }
+
+    void Gateway::note_build(size_t need) noexcept
+    {
+        if (_rebuild.capacity() < need) ++_stats.cold_builds;
+    }
+
     int Gateway::run()
     {
         prefault(_rebuild);
         prefault(_xlate);
+        // One spare for the first connection, so its rotation costs nothing either.
+        if (_prefault_bytes && _warm.empty())
+        {
+            std::string spare;
+            prefault(spare);
+            _warm.push_back(std::move(spare));
+        }
 #ifdef LLMBRIDGE_HAVE_URING
         if (_uring_active) return run_uring();
 #endif
