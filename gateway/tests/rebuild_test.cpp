@@ -183,14 +183,14 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     client.wbuf.assign(1u << 20, 'x');
     gw.retire_wbuf(&client);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
-    for (int i = 0; i < 6; ++i)
+    for (size_t i = 0; i < llmbridge::Gateway::kWarmBufs + 2; ++i)
     {
         llmbridge::Connection d;
         d.is_client = false;
         d.wbuf.assign(1u << 17, 'x');
         gw.retire_wbuf(&d);
     }
-    EXPECT_EQ(gw.warm_bufs_for_test(), llmbridge::Gateway::kWarmBufs);
+    EXPECT_EQ(gw.warm_bufs_for_test(), llmbridge::Gateway::kWarmBufs) << "the list is capped";
 }
 
 TEST(Rebuild, AColdBuildIsCounted)
