@@ -1,6 +1,6 @@
 # llmbridge
 
-> ⚡ A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, zero runtime dependencies, p99 < 1 ms at 1,000 RPS.
+> A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, zero runtime dependencies, p99 < 1 ms at 1,000 RPS.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
@@ -8,7 +8,7 @@
 
 ## What it does
 
-`llmbridge`™ is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, ...) and the response back, adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation calls directly in your own C++. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to High Frequency Trading (HFT) latency standards.
+`llmbridge` is a **sub-millisecond LLM gateway**. It sits between your app and a model provider: clients speak the **OpenAI** API to it, and it translates each request to the upstream provider's dialect (Anthropic, Gemini, Cohere, ...) and the response back, adding **microseconds, not milliseconds**. Run it as a standalone binary, or embed the translation calls directly in your own C++. It's the work gateways like LiteLLM, Bifrost, and Helicone do internally, rebuilt to High Frequency Trading (HFT) latency standards.
 
 **Three properties that matter:**
 
@@ -16,23 +16,58 @@
 - **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~84k RPS single-thread ceiling. No GC pauses. Built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
 - **Zero runtime dependencies.** Self-contained C++20; both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
 
-> **Open-core.** This repo is the fast gateway *core*: translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI™](https://kottos.ai) (see the bottom of this README).
+> **Open-core.** This repo is the fast gateway *core*: translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI](https://kottos.ai) (see the bottom of this README).
 
-**Current provider support for chat completions (streaming and non-streaming):**
+**Current provider support for chat completions:**
 
-- OpenAI ↔ Anthropic
-- OpenAI ↔ Google Gemini
-- OpenAI ↔ Cohere
+- **OpenAI ↔ Anthropic**, non-streaming and streaming (SSE, token-by-token), incl. `stream_options.include_usage`
+- **OpenAI ↔ Google Gemini** and **OpenAI ↔ Cohere**, non-streaming only
 - OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral, ...), passthrough, no body translation needed
-- Streaming (SSE, token-by-token). OpenAI ↔ Anthropic, incl. `stream_options.include_usage`
 - **Tool calling**, declarations, `tool_choice`, parallel calls and `tool_result` round-trip, **streaming and non-streaming** (OpenAI ↔ Anthropic)
+- **Prompt caching.** `cache_control` breakpoints are forwarded byte for byte on text parts, on tools and on the system block; a malformed breakpoint is refused
 - **TLS to the provider** (`--upstream https://...`, opt-in build) and **credential passthrough**, enough to front `api.anthropic.com` directly
 - **Per-request timing headers** (`--timing-headers`), what the gateway cost vs what the provider cost
+- An Anthropic-speaking client reaching an Anthropic upstream **byte-forwards**, which is how an Anthropic SDK or Claude Code runs through it unchanged
 - Not yet shipped, and **refused with a message that says so** instead of ignored:
-  vision, audio and file content parts. Also not yet shipped: `cache_control`,
-  streaming for Gemini/Cohere, Anthropic-in mode
+  vision, audio and file content parts; streaming for Gemini and Cohere; Bedrock
+  streaming; and the Anthropic-to-OpenAI *translator*, for a client speaking Anthropic
+  to an OpenAI-dialect upstream (distinct from the byte-forward above)
 
 ## Benchmarks
+
+### An independent harness: nine gateways, one methodology
+
+We run `llmbridge` inside the [AI gateway reproducible benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark)
+by Jakub A. Wąsek of [ENTERPILOT](https://enterpilot.io/blog/benchmarking-ai-gateways-gomodel-litellm-portkey-bifrost-june-2026/),
+the author of GoModel: every gateway from its public Docker image, one at a time,
+against the same in-memory mock, 20,000 requests per variant at concurrency 10, five
+trials in randomised order, a separate throughput sweep. Chat completions, added p50
+over the harness's no-gateway baseline, one llmbridge worker, reference laptop:
+
+| gateway | version | cores | non-streaming | streaming | peak req/s | req/s per CPU% | memory |
+|---|---|---|---|---|---|---|---|
+| socat byte pipe | 1.8.1.3 | 2.17 | 0.06 ms | 0.27 ms | 43,973 | 157 | 5 MB |
+| **llmbridge** | v0.53.0 | 0.98 | **0.07 ms** | **0.18 ms** | 40,677 | **354** | 32 MB |
+| llmbridge, translating to Anthropic | v0.53.0 | 1.02 | 0.10 ms | 0.56 ms | 35,298 | 300 | 30 MB |
+| GoModel | 0.1.86 | 5.96 | 0.47 ms | 0.75 ms | 16,468 | 23 | 77 MB |
+| Bifrost | 2.0.0 | 7.90 | 0.80 ms | 2.77 ms | 10,043 | 11 | 493 MB |
+| Portkey | 1.15.2 | 1.20 | 7.56 ms | 27.60 ms | 1,232 | 10 | 198 MB |
+| LiteLLM | 1.99.1 | 7.05 | 10.77 ms | 46.06 ms | 880 | 1 | 9,528 MB |
+
+The byte pipe is a socat relay that parses nothing: it measures the cost of being in
+the path at all, and `llmbridge` sits on it, on one core against the Go gateways' six to
+eight. Requests per percent of CPU is the harness's own column, throughput under load
+divided by the CPU it took, and it is the only one that compares a single-threaded gateway
+with ones that take every core. TensorZero and OmniRoute ran too and are left out here as misconfigured (41 ms
+and 58 req/s). Two divergences from the published harness, stated because they matter:
+Docker's default seccomp filter is off for every gateway (it blocks io_uring, so under
+it `llmbridge` runs epoll), and the host is a 12-CPU laptop and not their c7i.large, so
+these figures compare within this table and never with enterpilot.io's. Every variant,
+the raw data, the versions and digests are in `bench/results/enterpilot/20260904-023214/`,
+the reading rules in [BENCHMARKS.md](./BENCHMARKS.md), and `bench/run_enterpilot.sh`
+reproduces it.
+
+### Our own harness: equal-work against LiteLLM
 
 **Equal-work head-to-head:** both `llmbridge` and LiteLLM do the full OpenAI↔Anthropic translation against the same 200 ms mock backend, driven by the same open-loop, coordinated-omission-corrected load generator. Single Linux host (i7-9750H, 6cores/12threads), all processes co-located, so absolute tails are a dev-box upper bound. This measures **gateway overhead**, not end-to-end LLM latency.
 
@@ -118,40 +153,21 @@ WAN latency are deliberately excluded so the figure isolates gateway overhead (t
 gateway itself *does* support TLS upstreams); single worker/thread each; dev-box
 co-location; `llmbridge` is proxy-self-measured, LiteLLM client-measured (e2e − backend).
 
-### Third-party harness: nine gateways, one methodology
-
-The numbers above come from a harness we wrote. For one we did not, `llmbridge` also
-runs inside the [AI gateway reproducible benchmark](https://github.com/ENTERPILOT/ai-gateway-reproducible-benchmark)
-by Jakub A. Wąsek of [ENTERPILOT](https://enterpilot.io/blog/benchmarking-ai-gateways-gomodel-litellm-portkey-bifrost-june-2026/),
-the author of GoModel: every gateway from its public Docker image, one at a time,
-against the same in-memory mock, 20,000 requests per variant at concurrency 10, five
-trials in randomised order, a separate throughput sweep. Chat completions, added p50
-over the harness's no-gateway baseline, one llmbridge worker, reference laptop:
-
-| gateway | version | cores | non-streaming | streaming | peak req/s | req/s per CPU% | memory |
-|---|---|---|---|---|---|---|---|
-| socat byte pipe | 1.8.1.3 | 2.17 | 0.06 ms | 0.27 ms | 43,973 | 157 | 5 MB |
-| **llmbridge** | v0.53.0 | 0.98 | **0.07 ms** | **0.18 ms** | 40,677 | **354** | 32 MB |
-| llmbridge, translating to Anthropic | v0.53.0 | 1.02 | 0.10 ms | 0.56 ms | 35,298 | 300 | 30 MB |
-| GoModel | 0.1.86 | 5.96 | 0.47 ms | 0.75 ms | 16,468 | 23 | 77 MB |
-| Bifrost | 2.0.0 | 7.90 | 0.80 ms | 2.77 ms | 10,043 | 11 | 493 MB |
-| Portkey | 1.15.2 | 1.20 | 7.56 ms | 27.60 ms | 1,232 | 10 | 198 MB |
-| LiteLLM | 1.99.1 | 7.05 | 10.77 ms | 46.06 ms | 880 | 1 | 9,528 MB |
-
-The byte pipe is a socat relay that parses nothing: it measures the cost of being in
-the path at all, and `llmbridge` sits on it, on one core against the Go gateways' six to
-eight. Requests per percent of CPU is the harness's own column, throughput under load
-divided by the CPU it took, and the only one that compares a single-threaded gateway
-with ones that take every core. TensorZero and OmniRoute ran too and are left out here as misconfigured (41 ms
-and 58 req/s). Two divergences from the published harness, stated because they matter:
-Docker's default seccomp filter is off for every gateway (it blocks io_uring, so under
-it `llmbridge` runs epoll), and the host is a 12-CPU laptop and not their c7i.large, so
-these figures compare within this table and never with enterpilot.io's. Every variant,
-the raw data, the versions and digests are in `bench/results/enterpilot/20260904-023214/`,
-the reading rules in [BENCHMARKS.md](./BENCHMARKS.md), and `bench/run_enterpilot.sh`
-reproduces it.
 
 ## Quick start
+
+### Build it first
+
+```sh
+git clone https://github.com/kottos-ai/llmbridge && cd llmbridge
+cmake -B build -DCMAKE_BUILD_TYPE=Release          # add -DLLMBRIDGE_TLS=ON for https upstreams
+cmake --build build -j
+./build/bin/llmbridge --help
+```
+
+Needs CMake 3.20+ and GCC 13+ or Clang 16+ on Linux. The translator alone also builds on
+macOS; the gateway is Linux-only by design (epoll, io_uring). Full options and the
+library install are under [Installation](#installation).
 
 ### C++: translate a request/response body
 

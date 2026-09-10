@@ -136,7 +136,7 @@ stream lands somewhere *after* t4: t4 is the response head and this is the first
 token the caller is shown. Their gap was described here as the provider's prefill,
 and on a reasoning model that is wrong: `ts_first_token` fires on a text, content
 or tool delta, and a `thinking_delta` is none of those, so the whole reasoning
-phase sits inside that gap. Measured on a live tenant it was 27% of streamed wall
+phase sits inside that gap. Measured on a live hosted deployment it was 27% of streamed wall
 clock, correlating 0.80 with tokens *out*, which prompt processing cannot do
 because prefill is a function of the input. `ts_first_thinking` (below) splits the
 two. It is not a mainline step,
