@@ -125,8 +125,11 @@ namespace llmbridge::detail
         u.in = num_after("\"prompt_tokens\"");
         u.out = num_after("\"completion_tokens\"");
         u.cached = num_after("\"cached_tokens\"");
-        // No cache-write count is read on this branch. OpenAI bills the write on the
-        // GPT-5.6 family, but the field it reports it under is not verified here.
+        // Verified against a live gpt-5.6-luna response: the write is
+        // reported at usage.prompt_tokens_details.cache_write_tokens and is a subset of
+        // prompt_tokens, as cached_tokens already is.
+        const long long oai_write = num_after("\"cache_write_tokens\"");
+        if (oai_write > 0) u.cache_write = oai_write;
         if (u.in >= 0 || u.out >= 0) return u; // OpenAI shape, done
 
         // Anthropic names the same three things differently, and a byte-forwarded
@@ -147,6 +150,16 @@ namespace llmbridge::detail
         // cannot see it prices a first turn low.
         const long long read = num_after("\"cache_read_input_tokens\"");
         const long long write = num_after("\"cache_creation_input_tokens\"");
+        // An OpenAI Responses-API body reaches here too: it names its totals
+        // `input_tokens`/`output_tokens`, so the branch above does not claim it, but it
+        // carries neither Anthropic cache field and puts `cached_tokens` under
+        // `input_tokens_details`.
+        if (read < 0 && write < 0 && (u.cached >= 0 || u.cache_write > 0))
+        {
+            if (u.cached < 0) u.cached = 0;
+            u.in = fresh;
+            return u;
+        }
         u.cached = read > 0 ? read : 0;
         u.cache_write = write > 0 ? write : 0;
         const long long w5 = num_after("\"ephemeral_5m_input_tokens\"");

@@ -6117,6 +6117,83 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
     EXPECT_EQ(recs[0].r.cached_tokens, 7);
 }
 
+// OpenAI began charging for cache writes with the GPT-5.6 family, at 1.25x the uncached
+// input rate, and reports the count at usage.prompt_tokens_details.cache_write_tokens.
+// Verified against a live gpt-5.6-luna response on 2026-09-11: two identical calls over
+// the 1,024-token minimum returned write=2013/cached=0 then write=0/cached=2013 against
+// prompt_tokens=2016 both times. Unread, every OpenAI first turn prices at the plain
+// input rate, which understates exactly the request that establishes a prefix.
+TEST_P(ProxyForwardStream, OpenAiCacheWriteIsRecorded)
+{
+    const std::string events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+        "data: {\"choices\":[],"
+        "\"usage\":{\"prompt_tokens\":2016,\"completion_tokens\":4,\"total_tokens\":2020,"
+        "\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":2013,"
+        "\"audio_tokens\":0}}}\n\n"
+        "data: [DONE]\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(events, 4096));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    // The whole prompt, with the write a subset of it: no adding back on this side.
+    EXPECT_EQ(recs[0].r.tokens_in, 2016);
+    EXPECT_EQ(recs[0].r.cache_write_tokens, 2013);
+    EXPECT_EQ(recs[0].r.cached_tokens, 0);
+    // OpenAI documents one lifetime, so there is no split to state and these stay at
+    // -1, "not stated", and never 0, "stated as none". The reader needs that
+    // difference: it is what tells a pricer to charge the whole write at the venue's
+    // single write rate instead of inferring a five-minute entry.
+    EXPECT_EQ(recs[0].r.cache_write_5m_tokens, -1);
+    EXPECT_EQ(recs[0].r.cache_write_1h_tokens, -1);
+}
+
+// An OpenAI Responses-API body names its totals `input_tokens`/`output_tokens`, so the
+// OpenAI branch does not claim it and it falls through to the Anthropic one. That branch
+// used to overwrite the `cached_tokens` already found with zero, because no
+// `cache_read_input_tokens` is present, and a cache-heavy request then priced at the full
+// input rate. Its `input_tokens` is already the whole prompt, so nothing is added back.
+TEST_P(ProxyForwardStream, OpenAiResponsesShapeKeepsItsCachedTokens)
+{
+    const std::string events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+        "data: {\"choices\":[],"
+        "\"usage\":{\"input_tokens\":2016,\"output_tokens\":4,"
+        "\"input_tokens_details\":{\"cached_tokens\":2013}}}\n\n"
+        "data: [DONE]\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(events, 4096));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.tokens_in, 2016);
+    EXPECT_EQ(recs[0].r.cached_tokens, 2013); // was 0 before the fix
+    EXPECT_EQ(recs[0].r.tokens_out, 4);
+}
+
 // Anthropic reports the prompt as fresh `input_tokens` plus separate
 // `cache_read_input_tokens` and `cache_creation_input_tokens`. scan_usage normalizes to
 // the OpenAI convention so `tokens_in` means the same thing on both: the whole prompt,
