@@ -870,6 +870,7 @@ namespace llmbridge
                 // TTFB timing header reports garbage.
                 client->ts_up_recvd = now_ns();
                 note_quota(client, h);
+                note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
                 ep_begin_stream(u, h);
                 return;
             }
@@ -891,6 +892,7 @@ namespace llmbridge
 
         client->ts_up_recvd = t0; // end of upstream wait (stamped pre-framing)
         note_quota(client, h);
+        note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
         note_upstream_error(client, h, body_buf);
         note_served_tier(client, body_buf, /*tail=*/true);
 

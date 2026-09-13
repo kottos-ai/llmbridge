@@ -623,6 +623,7 @@ namespace llmbridge
                 {
                     c->peer->ts_up_recvd = now_ns(); // t4: head complete, see the epoll mirror
                     note_quota(c->peer, h);
+                    note_venue_req_id(c->peer, std::string_view(c->rbuf.data(), h.header_len));
                     ur_begin_stream(c, h);
                     return;
                 }
@@ -635,6 +636,7 @@ namespace llmbridge
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
             note_quota(c->peer, r.head);
+            note_venue_req_id(c->peer, std::string_view(c->rbuf.data(), r.head.header_len));
             note_upstream_error(c->peer, r.head, r.body);
             note_served_tier(c->peer, r.body, /*tail=*/true);
             ur_on_response(c, r.head, r.body, r.total_len);

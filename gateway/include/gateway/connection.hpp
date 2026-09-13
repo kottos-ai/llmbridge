@@ -301,6 +301,9 @@ namespace llmbridge
         uint8_t upstream_error_len = 0;
         /// Client-only: the upstream this request took was already connected.
         bool upstream_pooled = false;
+        /// The venue's own id for this request.
+        char venue_req_id[64] = {};
+        uint8_t venue_req_id_len = 0;
         char served_tier[16] = {};
         uint8_t served_tier_len = 0;
         /// Reads searched for the served tier so far, so a venue without the field
