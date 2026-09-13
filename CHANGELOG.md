@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.57.0]. 2026-09-12
+
+### Added
+- `RequestRecord::venue_req_id`: the venue's own id for a request, read from its
+  response head. Three spellings are tried in order, `x-amzn-RequestId`,
+  `request-id`, `x-request-id`, because a request may reach any venue and a
+  Claude-via-Bedrock response carries the AWS id and Anthropic's together. The AWS
+  one wins, since it is what CloudTrail indexes.
+
 ## [0.56.0]. 2026-09-11
 
 ### Added

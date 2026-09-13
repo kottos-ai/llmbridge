@@ -92,6 +92,8 @@ namespace llmbridge
         /// answered 4xx or 5xx: `invalid_request_error`, `context_length_exceeded`,
         /// `overloaded_error`.
         std::string_view upstream_error;
+        /// The venue's own id for this request.
+        std::string_view venue_req_id;
         /// Valid only during on_request: they point into the connection. Copy out.
         std::string_view captured[kSinkCaptureMax];
     };

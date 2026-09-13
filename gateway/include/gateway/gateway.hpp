@@ -343,6 +343,8 @@ namespace llmbridge
 
         /// Keep what the provider said about its own limits, from the response head.
         static void note_quota(Connection* client, const net::http::ResponseHead& h) noexcept;
+        /// Copy the venue's own request id out of its response head.
+        static void note_venue_req_id(Connection* client, std::string_view head) noexcept;
         /// Copy the venue's own name for a failure out of its error body, for the
         /// sink. Does nothing on a 2xx.
         static void note_upstream_error(Connection* client,

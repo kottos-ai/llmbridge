@@ -227,6 +227,28 @@ namespace llmbridge
         client->retry_after_s = h.retry_after_s;
     }
 
+    // Bedrock is first: a Claude-via-Bedrock response carries x-amzn and
+    // Anthropic's own id together, and the AWS one is what CloudTrail indexes.
+    void Gateway::note_venue_req_id(Connection* client, std::string_view head) noexcept
+    {
+        client->venue_req_id_len = 0;
+        static constexpr std::string_view kNames[] = {"x-amzn-requestid", "request-id",
+                                                      "x-request-id"};
+        for (const std::string_view name : kNames)
+        {
+            const std::string_view v = net::http::find_header(head, name);
+            if (v.empty()) continue;
+            const size_t n = v.size() < sizeof client->venue_req_id
+                                 ? v.size()
+                                 : sizeof client->venue_req_id;
+            // find_header returns a null view for an absent header, and memcpy's
+            // arguments are non-null even at length 0.
+            if (n) std::memcpy(client->venue_req_id, v.data(), n);
+            client->venue_req_id_len = static_cast<uint8_t>(n);
+            return;
+        }
+    }
+
     void Gateway::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
                                       std::string_view body) noexcept
     {
@@ -645,6 +667,7 @@ namespace llmbridge
         r.model = std::string_view(c->sink_model, c->sink_model_len);
         r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
         r.upstream_error = std::string_view(c->upstream_error, c->upstream_error_len);
+        r.venue_req_id = std::string_view(c->venue_req_id, c->venue_req_id_len);
         r.served_tier = std::string_view(c->served_tier, c->served_tier_len);
         r.from_pool = c->upstream_pooled;
         if (streamed && c->sse_xlate)
@@ -706,6 +729,7 @@ namespace llmbridge
         c->tier_override = {};
         c->asked_tier_len = 0;
         c->upstream_error_len = 0;
+        c->venue_req_id_len = 0;
         c->served_tier_len = 0;
         c->served_tier_tries = 0;
         c->upstream_pooled = false;

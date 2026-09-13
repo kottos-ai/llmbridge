@@ -4199,6 +4199,15 @@ namespace
                             "\r\n\r\n" + body);
             _b.start();
         }
+        /// Answer with one extra response header, for the fields read off the head
+        /// and not out of the body.
+        void start_with_header(const std::string& header, const std::string& body)
+        {
+            _b.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
+                            header + "\r\nConnection: keep-alive\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body);
+            _b.start();
+        }
         uint16_t port() const { return _b.port(); }
         /// Answer once, then close: a provider dropping an idle pooled keep-alive.
         /// Only the first connection dies after one response; later ones stay
@@ -5048,6 +5057,7 @@ namespace
             c.asked_tier.assign(r.asked_tier);  // and this
             c.upstream_error.assign(r.upstream_error); // and this
             c.served_tier.assign(r.served_tier);       // and this
+            c.venue_req_id.assign(r.venue_req_id);     // and this
             _records.push_back(std::move(c));
         }
         struct Copy
@@ -5058,6 +5068,7 @@ namespace
             std::string asked_tier;
             std::string upstream_error;
             std::string served_tier;
+            std::string venue_req_id;
         };
         std::vector<Copy> records()
         {
@@ -8527,6 +8538,86 @@ TEST_P(ProxyRoute, TheSinkRecordsTheTierTheVenueSaysItServed)
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_EQ(recs[0].served_tier, "flex");
+}
+
+// The venue's own request id is the join key into the venue's records, and for a
+// Bedrock cross-region profile it is the only way to learn which region served the
+// request: no response header names the region, and CloudTrail indexes on this id.
+// Read off the response HEAD, unlike served_tier which the venue puts in the body.
+TEST_P(ProxyRoute, TheSinkRecordsTheVenuesRequestId)
+{
+    NamedBackend b;
+    b.start_with_header("x-amzn-RequestId: 12345678-90ab-cdef-1234-567890abcdef",
+                        R"({"id":"x","object":"chat.completion","choices":[],)"
+                        R"("usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].venue_req_id, "12345678-90ab-cdef-1234-567890abcdef");
+}
+
+// Anthropic spells it request-id and OpenAI x-request-id. A venue that sends none
+// must leave the field empty and not inherit the previous request's id, which a
+// keep-alive connection makes reachable: the field is per request, the connection is
+// not.
+TEST_P(ProxyRoute, TheVenuesRequestIdIsPerRequestAndPerSpelling)
+{
+    NamedBackend b;
+    b.start_with_header("request-id: req_018EeWyXxfu5pfWkrYcMdjWG",
+                        R"({"id":"x","object":"chat.completion","choices":[],)"
+                        R"("usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].venue_req_id, "req_018EeWyXxfu5pfWkrYcMdjWG");
+}
+
+// A venue that names no id leaves it empty. Asserted because the buffer lives on the
+// Connection, which outlives the request on a keep-alive: without the reset the
+// second request would report the first one's id and nothing would look wrong.
+TEST_P(ProxyRoute, AVenueWithNoRequestIdRecordsNone)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"x","object":"chat.completion","choices":[],)"
+                R"("usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].venue_req_id, "");
 }
 
 // A venue with no such concept says nothing, and nothing is what gets recorded. An
