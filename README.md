@@ -1,6 +1,6 @@
 # llmbridge
 
-> A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, zero runtime dependencies, p99 < 1 ms at 1,000 RPS.
+> A sub-millisecond, drop-in OpenAI-compatible **LLM gateway** in C++. Microsecond translation overhead, dependency-free default build (TLS uses OpenSSL), p99 < 1 ms at 1,000 RPS.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
@@ -14,7 +14,7 @@
 
 - **Drop-in OpenAI-compatible.** Point an existing OpenAI client at `llmbridge` and route to a different provider with one flag. No app changes.
 - **Microsecond overhead.** p99 well under 1 ms at 1,000 RPS on a single core (see [Benchmarks](#benchmarks)); ~84k RPS single-thread ceiling. No GC pauses. Built for the workloads where the request path *is* the budget: agent loops, voice, trading agents.
-- **Zero runtime dependencies.** Self-contained C++20; both the gateway binary and the embeddable library. No Boost, no Abseil, no transitive dependency tree.
+- **Dependency-free default build.** The C++20 translator library and default gateway have no third-party runtime dependencies. The optional TLS build uses OpenSSL >= 3.0.
 
 > **Open-core.** This repo is the fast gateway *core*: translate and proxy to a single upstream. Multi-provider routing, the live provider price/latency book, observability, SSO, and the managed cloud are the commercial layer from [Kottos AI](https://kottos.ai) (see the bottom of this README).
 
@@ -394,7 +394,7 @@ against an OpenAI-compatible upstream, is planned, and is the harder direction b
 Anthropic's streaming protocol is richer, so the events must be synthesised instead of
 discarded.
 
-**Planned:** vision / image inputs, `cache_control`, streaming for the Gemini / Cohere
+**Planned:** vision / image inputs, streaming for the Gemini / Cohere
 dialects, and Anthropic-in mode. Google Vertex additionally needs OAuth2 request
 signing. Embeddings and audio (Whisper / TTS) are out of scope for now.
 
@@ -414,7 +414,7 @@ cmake --build build -j
 sudo cmake --install build
 ```
 
-Requires C++20 (GCC 13+, Clang 16+). CI builds and tests every push on **Ubuntu 24.04 LTS** (kernel 6.8+) against GCC 13, GCC 14, Clang 16, Clang 17 and Clang 18. The **translator library is portable** and is additionally built and tested on macOS; the **gateway is Linux-only by design**; it is built on epoll and io_uring, and there is no portable substitute worth the complexity. Older Linux distributions work if you supply a GCC 13+ / Clang 16+ toolchain; the distribution itself is not the constraint, the compiler is. **Zero third-party runtime dependencies**. `llmbridge` is a self-contained C++20 artifact you can drop into your build without inheriting a transitive dependency tree. Build-time tools (testing, benchmarking) have their own dependencies but are not linked into the distributed library.
+Requires C++20 (GCC 13+, Clang 16+). CI builds and tests every push on **Ubuntu 24.04 LTS** (kernel 6.8+) against GCC 13, GCC 14, Clang 16, Clang 17 and Clang 18. The **translator library is portable** and is additionally built and tested on macOS; the **gateway is Linux-only by design**; it is built on epoll and io_uring, and there is no portable substitute worth the complexity. Older Linux distributions work if you supply a GCC 13+ / Clang 16+ toolchain; the distribution itself is not the constraint, the compiler is. **The translator library and default gateway have no third-party runtime dependencies.** Enabling TLS with `-DLLMBRIDGE_TLS=ON` adds OpenSSL >= 3.0. Build-time tools (testing, benchmarking) have their own dependencies but are not linked into the distributed library.
 
 > The default build is **portable**; it does *not* use `-march=native`. To reproduce
 > the published benchmark numbers, tune for your CPU with `-DLLMBRIDGE_NATIVE_ARCH=ON`.
