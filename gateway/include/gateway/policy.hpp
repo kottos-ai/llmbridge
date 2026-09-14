@@ -31,6 +31,8 @@ namespace llmbridge
         /// or spelled it as anything but a plain string.
         std::string_view model;
         uint64_t prefix_hash = 0;
+        /// The gateway's request sequencer.
+        uint64_t seq = 0;
     };
 
     struct Decision
