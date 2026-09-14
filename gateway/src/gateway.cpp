@@ -763,7 +763,7 @@ namespace llmbridge
         // line where "metadata only, no prompt text".
         const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len,
                                  std::string_view(c->sink_model, c->sink_model_len),
-                                 c->prefix_hash};
+                                 c->prefix_hash, c->req_seq};
 
         Decision d = _policy->decide(facts);
         if (d.allow)

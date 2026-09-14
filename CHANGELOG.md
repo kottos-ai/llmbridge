@@ -8,6 +8,11 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.59.0]. 2026-09-14
+
+### Added
+- `RequestFacts::seq`: the gateway's request sequencer.
+
 ## [0.58.0]. 2026-09-14
 
 ### Added

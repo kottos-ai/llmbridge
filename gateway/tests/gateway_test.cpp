@@ -4049,6 +4049,7 @@ namespace
         {
             std::lock_guard<std::mutex> lk(_mu);
             hashes.push_back(f.prefix_hash);
+            seqs.push_back(f.seq);
             return {.allow = true, .upstream_index = 0};
         }
         std::vector<uint64_t> seen()
@@ -4056,10 +4057,15 @@ namespace
             std::lock_guard<std::mutex> lk(_mu);
             return hashes;
         }
+        std::vector<uint64_t> seen_seqs()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return seqs;
+        }
 
     private:
         std::mutex _mu;
-        std::vector<uint64_t> hashes;
+        std::vector<uint64_t> hashes, seqs;
     };
 
     class ProxyPolicy : public ProxyIT,
@@ -8645,6 +8651,10 @@ TEST_P(ProxyRoute, TheSinkCarriesThePrefixHashThePolicySaw)
     ASSERT_EQ(h.size(), 1u);
     EXPECT_NE(h[0], 0u);
     EXPECT_EQ(recs[0].r.prefix_hash, h[0]);
+    // And the sequencer: the identity a policy's per-decision note travels under.
+    const auto q = pol.seen_seqs();
+    ASSERT_EQ(q.size(), 1u);
+    EXPECT_EQ(recs[0].r.seq, q[0]) << "policy and sink must agree on which request this was";
 }
 
 // The venue's own request id is the join key into the venue's records, and for a
