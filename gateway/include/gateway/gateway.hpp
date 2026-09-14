@@ -51,6 +51,10 @@
 
 namespace llmbridge
 {
+    /// How much of the body RequestFacts::prefix_hash covers.
+    /// The field promises identity of "the leading bytes" and not this number.
+    inline constexpr size_t kPrefixHashBytes = 4096;
+
     struct Stats
     {
         /// The t0-t6 stamps grouped three ways (LATENCY.md section 4). `connect` is
@@ -485,6 +489,8 @@ namespace llmbridge
         /// `const` so there is no setter: swapping it while the loop runs would be a
         /// data race on the request path. See policy.hpp.
         Policy* const _policy = nullptr;
+        /// Policy::wants_prefix_hash(), read once in the constructor.
+        bool _wants_prefix_hash = false;
         RequestSink* _sink = nullptr;
         std::vector<std::string> _sink_capture_names; ///< lowercased, no colon
         uint8_t _active_backend = 0;                  ///< 1 epoll, 2 io_uring; set by run

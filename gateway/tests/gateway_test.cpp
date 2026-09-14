@@ -4027,15 +4027,39 @@ namespace
             seen_spoofable.assign(spoofable.data(), spoofable.size());
             seen_body_bytes = f.body_bytes;
             seen_model.assign(f.model.data(), f.model.size());
+            seen_hash = f.prefix_hash;
             return _d;
         }
 
         std::atomic<int> calls{0};
         std::string seen_head, seen_auth, seen_spoofable, seen_model;
         size_t seen_body_bytes = 0;
+        uint64_t seen_hash = 0;
 
     private:
         llmbridge::Decision _d;
+    };
+
+    /// Opts in to the prefix hash and keeps every value it was handed, in order.
+    class HashingPolicy final : public llmbridge::Policy
+    {
+    public:
+        bool wants_prefix_hash() const noexcept override { return true; }
+        llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            hashes.push_back(f.prefix_hash);
+            return {.allow = true, .upstream_index = 0};
+        }
+        std::vector<uint64_t> seen()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return hashes;
+        }
+
+    private:
+        std::mutex _mu;
+        std::vector<uint64_t> hashes;
     };
 
     class ProxyPolicy : public ProxyIT,
@@ -4057,6 +4081,61 @@ TEST_P(ProxyPolicy, NoPolicyInstalledForwardsEverything)
     EXPECT_EQ(_gw->stats().requests, 1u);
     EXPECT_EQ(_gw->stats().policy_denied, 0u);
     EXPECT_EQ(_backend.requests_seen(), 1);
+}
+
+// The field is off by default: a policy that never overrides wants_prefix_hash sees
+// 0 and the gateway never touches the body for it. This is the promise a stock build
+// and every existing policy rely on.
+TEST_P(ProxyPolicy, PrefixHashIsZeroUnlessThePolicyAsks)
+{
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(std::string(6000, 'x'))));
+    c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(pol.seen_hash, 0u);
+}
+
+// What the field promises, and only that: identical leading bytes, identical value,
+// within one process. Each request below differs from the first in exactly one way.
+TEST_P(ProxyPolicy, PrefixHashIdentifiesTheLeadingBytesAndNothingElse)
+{
+    HashingPolicy pol;
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+
+    std::string body(6000, 'a');
+    std::string inside = body;  inside[100] = 'b';   // one byte inside the hashed span
+    std::string after = body;   after[5000] = 'b';   // one byte past it
+    const std::string with_header =
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nX-Extra: yes\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (const std::string& req : {make_request(body), make_request(body), make_request(inside),
+                                   make_request(after), with_header, make_request("hello"),
+                                   make_request("hellp")})
+    {
+        ASSERT_TRUE(c.send(req));
+        c.recv_response();
+    }
+    c.close();
+    shutdown();
+
+    const auto h = pol.seen();
+    ASSERT_EQ(h.size(), 7u);
+    EXPECT_NE(h[0], 0u) << "a policy that asked must get a value";
+    EXPECT_EQ(h[0], h[1]) << "same body, same hash";
+    EXPECT_NE(h[0], h[2]) << "one changed byte inside the span changes it";
+    EXPECT_EQ(h[0], h[3]) << "a changed byte past the span does not";
+    EXPECT_EQ(h[0], h[4]) << "headers are not part of it";
+    EXPECT_NE(h[5], 0u) << "a body shorter than the span hashes what there is";
+    EXPECT_NE(h[5], h[6]) << "and still tells two short bodies apart";
 }
 
 TEST_P(ProxyPolicy, AllowForwardsUnchanged)
@@ -8538,6 +8617,34 @@ TEST_P(ProxyRoute, TheSinkRecordsTheTierTheVenueSaysItServed)
     const auto recs = sink.records();
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_EQ(recs[0].served_tier, "flex");
+}
+
+// The sink is handed the same identity the policy decided on, so a response's cache
+// counts can be filed under the prefix that produced them. Zero when nobody asked.
+TEST_P(ProxyRoute, TheSinkCarriesThePrefixHashThePolicySaw)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"x","object":"chat.completion","choices":[],)"
+                R"("usage":{"prompt_tokens":7,"completion_tokens":2}})");
+    RecordingSink sink;
+    HashingPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(std::string(3000, 'q'))));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const auto h = pol.seen();
+    ASSERT_EQ(h.size(), 1u);
+    EXPECT_NE(h[0], 0u);
+    EXPECT_EQ(recs[0].r.prefix_hash, h[0]);
 }
 
 // The venue's own request id is the join key into the venue's records, and for a

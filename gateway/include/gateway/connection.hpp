@@ -164,6 +164,7 @@ namespace llmbridge
         /// form, and a model name is not a prompt.
         char sink_model[64] = {};
         uint8_t sink_model_len = 0;
+        uint64_t prefix_hash = 0;
 
         /// Index into the upstream table, -1 when none applies. On an upstream
         /// connection the venue this socket talks to, so release finds the right

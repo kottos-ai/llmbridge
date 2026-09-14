@@ -30,6 +30,7 @@ namespace llmbridge
         /// The top-level `model` the client asked for, empty when the body named none
         /// or spelled it as anything but a plain string.
         std::string_view model;
+        uint64_t prefix_hash = 0;
     };
 
     struct Decision
@@ -109,6 +110,8 @@ namespace llmbridge
         /// because health is measured and it measures nothing. Ordering, ejection
         /// thresholds and cooldown belong to whoever implements this.
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
+
+        virtual bool wants_prefix_hash() const noexcept { return false; }
 
       protected:
         Policy() = default;
