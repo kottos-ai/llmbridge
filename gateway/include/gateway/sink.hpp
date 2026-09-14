@@ -94,6 +94,7 @@ namespace llmbridge
         std::string_view upstream_error;
         /// The venue's own id for this request.
         std::string_view venue_req_id;
+        uint64_t prefix_hash = 0;
         /// Valid only during on_request: they point into the connection. Copy out.
         std::string_view captured[kSinkCaptureMax];
     };

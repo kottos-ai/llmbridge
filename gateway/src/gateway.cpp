@@ -90,7 +90,8 @@ namespace llmbridge
                      Policy* policy, std::vector<std::string> strip_headers)
         : _listen_port(listen_port), _upstreams(std::move(upstreams)), _warmup_ns(warmup_ns),
           _io(io), _upstream_idle_ns(upstream_idle_ns), _tls(std::move(tls)),
-          _timing_headers(timing_headers), _policy(policy)
+          _timing_headers(timing_headers), _policy(policy),
+          _wants_prefix_hash(policy != nullptr && policy->wants_prefix_hash())
     {
         // Every path below indexes the table without a bounds special case, so an empty
         // one is a programming error caught here and not a crash on the first request.
@@ -625,12 +626,24 @@ namespace llmbridge
     void Gateway::capture_model(Connection* c) noexcept
     {
         c->sink_model_len = 0;
+        c->prefix_hash = 0;
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
         const std::string_view model = provider::model_of(body);
         if (!model.empty() && model.size() <= sizeof(c->sink_model))
         {
             std::memcpy(c->sink_model, model.data(), model.size());
             c->sink_model_len = static_cast<uint8_t>(model.size());
+        }
+        if (_wants_prefix_hash && !body.empty())
+        {
+            const size_t n = body.size() < kPrefixHashBytes ? body.size() : kPrefixHashBytes;
+            uint64_t h = 14695981039346656037ull;
+            for (size_t i = 0; i < n; ++i)
+            {
+                h ^= static_cast<unsigned char>(body[i]);
+                h *= 1099511628211ull;
+            }
+            c->prefix_hash = h;
         }
     }
 
@@ -668,6 +681,7 @@ namespace llmbridge
         r.asked_tier = std::string_view(c->asked_tier, c->asked_tier_len);
         r.upstream_error = std::string_view(c->upstream_error, c->upstream_error_len);
         r.venue_req_id = std::string_view(c->venue_req_id, c->venue_req_id_len);
+        r.prefix_hash = c->prefix_hash;
         r.served_tier = std::string_view(c->served_tier, c->served_tier_len);
         r.from_pool = c->upstream_pooled;
         if (streamed && c->sse_xlate)
@@ -748,7 +762,8 @@ namespace llmbridge
         // Head, plus the model identifier and nothing else from the body. This is the
         // line where "metadata only, no prompt text".
         const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len,
-                                 std::string_view(c->sink_model, c->sink_model_len)};
+                                 std::string_view(c->sink_model, c->sink_model_len),
+                                 c->prefix_hash};
 
         Decision d = _policy->decide(facts);
         if (d.allow)

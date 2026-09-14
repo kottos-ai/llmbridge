@@ -297,6 +297,8 @@ class Policy {
   public:
     virtual ~Policy() = default;
     virtual Decision decide(const RequestFacts&) noexcept = 0;
+    virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
+    virtual bool wants_prefix_hash() const noexcept { return false; }
 };
 ```
 
@@ -309,11 +311,16 @@ null in a stock build, so no call is made and the request forwards: absent, not
 permissive. `Decision::allow` is false, so a zeroed decision returned from a forgotten
 branch in someone's policy refuses instead of forwarding.
 
-`RequestFacts` carries the request line, the headers and the framed body size, and no
-route to the body: "metadata only, no prompt text" is a property of the type instead of
-a promise. It does carry the client credential, since `Authorization` is in the head, so
-nothing derived from it may be logged and the views die with the call. It exposes no
-lookup helper; `net::http::find_header(facts.head, name)` is the safe one.
+`RequestFacts` carries the request line, the headers, the framed body size and the
+top-level `model` name, and no route to the body: "metadata only, no prompt text" is a
+property of the type instead of a promise. It does carry the client credential, since
+`Authorization` is in the head, so nothing derived from it may be logged and the views
+die with the call. It exposes no lookup helper; `net::http::find_header(facts.head, name)`
+is the safe one.
+
+One more field crosses the seam, and only on request: `prefix_hash`, a 64-bit identity
+of the body's leading bytes, computed when the policy returns true from
+`wants_prefix_hash()` and 0 otherwise.
 
 ### Selecting a venue
 
@@ -349,7 +356,8 @@ failed venue may not be renamed, and nothing is re-sent once a byte reached the 
 honestly, because no LLM API can resume mid-stream and a reconnect would replay tokens
 the client already has.
 
-Still not in the seam: `RequestFacts` exposes no model name.
+Still not in the seam: the body itself, and anything derived from it beyond the model
+name and the opt-in prefix hash.
 
 ### Dropping headers before they leave (`upstream.strip_headers`)
 

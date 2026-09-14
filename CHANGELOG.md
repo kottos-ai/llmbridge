@@ -8,6 +8,11 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.58.0]. 2026-09-14
+
+### Added
+- `RequestFacts::prefix_hash`, **off by default**
+
 ## [0.57.0]. 2026-09-12
 
 ### Added
