@@ -8,6 +8,15 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.59.1]. 2026-09-16
+
+### Fixed
+- A request to a Bedrock venue whose bearer is not an AWS access key pair is now
+  refused with `refuse::kBedrockCredential`, which says what the venue signs with. It
+  used to share the "control characters are refused" string with the byte check, which
+  was false for the case a caller actually hits: a Bedrock API key in the bearer slot.
+  Same status, same fail-closed path, and the value is still never echoed.
+
 ## [0.59.0]. 2026-09-14
 
 ### Added

@@ -633,6 +633,9 @@ namespace llmbridge
                 // The caller's own header, so the caller is told. The value is
                 // never echoed: it is a credential, and this string lands in a JSON
                 // body with no escaping.
+                else if (why[0] == 'b')
+                    ep_error_respond(c, 400, "malformed credential",
+                                     refuse::kBedrockCredential);
                 else
                     ep_error_respond(c, 400, "malformed credential",
                                      refuse::kCredential);

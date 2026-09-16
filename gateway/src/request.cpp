@@ -337,13 +337,15 @@ namespace llmbridge::detail
         /// time these bytes exist.
         bool sign_bedrock(const Upstream& up, std::string_view client_hdrs,
                           const std::vector<std::string>& strip, std::string_view target,
-                          std::string_view body, std::string& out)
+                          std::string_view body, std::string& out, const char*& why)
         {
+            why = "credential";
     #ifdef LLMBRIDGE_HAVE_TLS
             if (up.aws_region.empty()) return false;
             const AuthHeaders h = scan_auth_headers(client_hdrs, strip);
             if (!header_value_safe(h.authorization)) return false;
             std::string_view bearer = h.authorization;
+            why = "bedrock credential";
             if (bearer.size() <= 7 ||
                 (bearer.compare(0, 7, "Bearer ") != 0 && bearer.compare(0, 7, "bearer ") != 0))
                 return false;
@@ -351,6 +353,7 @@ namespace llmbridge::detail
 
             net::sigv4::Credentials cred{};
             if (!net::sigv4::parse_credentials(bearer, cred)) return false;
+            why = "credential";
 
             char stamp[17];
             const std::time_t now = std::time(nullptr);
@@ -378,6 +381,7 @@ namespace llmbridge::detail
             return true;
     #else
             (void)up; (void)client_hdrs; (void)strip; (void)target; (void)body; (void)out;
+            (void)why;
             return false;   // no OpenSSL, no signature, and never an unsigned request
     #endif
         }
@@ -698,10 +702,13 @@ namespace llmbridge::detail
         const std::string_view tbody = body_scratch;
 
         std::string auth_hdrs;
-        const bool ok = mode == UpstreamDialect::Bedrock
-                            ? sign_bedrock(up, client_hdrs, strip, target, tbody, auth_hdrs)
-                            : auth_headers_for(mode, client_hdrs, strip, auth_hdrs);
-        if (!ok) { why = "credential"; return false; }
+        if (mode == UpstreamDialect::Bedrock)
+        {
+            if (!sign_bedrock(up, client_hdrs, strip, target, tbody, auth_hdrs, why))
+                return false;
+        }
+        else if (!auth_headers_for(mode, client_hdrs, strip, auth_hdrs))
+        { why = "credential"; return false; }
 
         build_http_request(start_line, tbody, up.host_hdr, auth_hdrs, out);
         return true;

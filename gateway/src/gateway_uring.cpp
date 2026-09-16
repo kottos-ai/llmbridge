@@ -741,6 +741,9 @@ namespace llmbridge
             {
                 if (why[0] == 't')
                     ur_error_respond(c, 400, "translate", translate_failure(body));
+                else if (why[0] == 'b')
+                    ur_error_respond(c, 400, "malformed credential",
+                                     refuse::kBedrockCredential);
                 else
                     ur_error_respond(c, 400, "malformed credential",
                                      refuse::kCredential);

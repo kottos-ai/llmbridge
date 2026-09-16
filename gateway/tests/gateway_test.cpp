@@ -6612,6 +6612,38 @@ TEST_P(ProxyBedrock, SessionTokenIsSignedAndSentInItsOwnHeader)
         << up;
 }
 
+TEST_P(ProxyBedrock, ABearerThatIsNotAKeyPairIsToldSoWithoutEchoingIt)
+{
+    // A Bedrock API key is a bearer with no colon. The caller who sends one is told
+    // what this venue signs with, and the key itself never lands in the error body.
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("ABSKbedrock-api-key-value")));
+    const std::string resp = c.recv_response();
+    c.close();
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kBedrockCredential), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("ABSKbedrock"), std::string::npos) << resp;
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
+TEST_P(ProxyBedrock, AnUnsafeByteInTheBearerIsStillTheGenericRefusal)
+{
+    // The two refusals must not swap: unsafe bytes are checked before the shape, so
+    // a key pair with an unsafe byte inside is refused for the bytes.
+    start_bedrock();
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(request("AKIDEXAMPLE:sec\xC3ret")));
+    const std::string resp = c.recv_response();
+    c.close();
+    EXPECT_EQ(Client::status_of(resp), 400) << resp;
+    EXPECT_NE(resp.find(llmbridge::refuse::kCredential), std::string::npos) << resp;
+    EXPECT_EQ(resp.find(llmbridge::refuse::kBedrockCredential), std::string::npos) << resp;
+    EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
+}
+
 #else  // no TLS compiled in
 
 TEST_P(ProxyBedrock, WithoutTlsEveryRequestIsRefusedAndNothingIsSent)
@@ -6623,7 +6655,9 @@ TEST_P(ProxyBedrock, WithoutTlsEveryRequestIsRefusedAndNothingIsSent)
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(request("AKIDEXAMPLE:secret")));
-    EXPECT_NE(c.recv_response().find("400"), std::string::npos);
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("400"), std::string::npos);
+    EXPECT_EQ(resp.find(llmbridge::refuse::kBedrockCredential), std::string::npos) << resp;
     EXPECT_TRUE(_backend.last_request().empty()) << _backend.last_request();
 }
 

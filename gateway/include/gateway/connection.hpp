@@ -44,6 +44,10 @@ namespace llmbridge
         inline constexpr const char* kCredential =
             "a credential header holds bytes that cannot be forwarded "
             "(control characters are refused)";
+        inline constexpr const char* kBedrockCredential =
+            "a Bedrock venue is signed with the caller's AWS access key pair, sent as "
+            "Bearer ACCESS_KEY_ID:SECRET or ACCESS_KEY_ID:SECRET:SESSION_TOKEN; the bearer "
+            "sent is not one (a Bedrock API key is not accepted here)";
         inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
         inline constexpr const char* kNotObject =
             "request translate: body is not a JSON object";
