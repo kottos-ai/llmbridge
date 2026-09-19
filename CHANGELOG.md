@@ -8,6 +8,27 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.59.2]. 2026-09-19
+
+We follow u/verstands suggestions to add CI tests that caputre silent degradation
+we introduced in header walks. We are thankful for the useful suggestions:
+https://www.reddit.com/r/LLMDevs/comments/1wi4uvq/comment/paq1asf/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
+
+### Tests
+
+- **Two header/body scans had shipped with no test reaching them directly** 
+  The one-pass credential scan that replaced six `find_header()` walks
+  moved out of its anonymous namespace and declared in `request.hpp` so it
+  is testable in isolation, same pattern as `request_without`.
+  New: header order and duplicates must not change the resolved credential (a full
+  permutation test), first-duplicate-wins holds across case, a stripped header
+  stays invisible, a control byte in a value is refused, and one golden fixture
+  pins the exact serialized bytes for a request with a mixed-case duplicated
+  `x-api-key`, a duplicated `anthropic-version` and a bearer alongside.
+- **Timing for the credential scan, split by looseness.** In the PR-blocking suite,
+  one sanity bound: under 2,000 ns per call averaged over 200,000, an order of
+  magnitude over the ~135 ns measured.
+
 ## [0.59.1]. 2026-09-16
 
 ### Fixed

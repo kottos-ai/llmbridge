@@ -45,6 +45,11 @@ ALLOW = {
     # Placeholder credentials in the auth tests are the point of those tests.
     "gateway/tests/gateway_test.cpp",
     "gateway/tests/gateway_corpus_test.cpp",
+    # A realistic-shaped placeholder header block for the auth-header-scan perf
+    # harness and its in-suite sanity bound, not a credential test; the shape (a
+    # Bearer value) is what makes the measurement representative of a real request.
+    "gateway/tests/request_perf_test.cpp",
+    "gateway/tests/request_test.cpp",
     # SECURITY.md documents what a leaked key looks like.
     "SECURITY.md",
 }
