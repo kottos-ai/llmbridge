@@ -131,110 +131,6 @@ namespace llmbridge::detail
             return out;
         }
 
-        // Build the auth/extra header lines to inject into the translated
-        // upstream request, from the client's request headers.
-        //
-        // Whitelist, not passthrough: the gateway rebuilds the upstream request,
-        // and only the credential headers the target dialect understands may
-        // cross the translation boundary. Echoing arbitrary client headers
-        // through a rebuilt request is a smuggling surface (and our own framing
-        // headers must stay authoritative). A byte-forward is untouched by all of
-        // this: it already carries every client header.
-        //
-        // Values re-emitted here cannot contain CR/LF: find_header() bounds each
-        // value by its own line's CRLF, so injection via a crafted credential is
-        // structurally impossible instead of filtered.
-        //
-        // Returns false when the client supplied a syntactically invalid credential
-        // (control characters). The caller must fail the request instead of
-        // forward. Silently dropping would still send a credential-less request
-        // upstream, which is a confusing 401; a 400 names the client's own bug.
-        bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
-                              const std::vector<std::string>& strip, std::string& out)
-        {
-            out.clear();
-            const AuthHeaders h = scan_auth_headers(client_headers, strip);
-
-            // Validate every credential-bearing header the client sent, whether or
-            // not this dialect uses it. Otherwise a malformed value routes around
-            // the check by picking the other header.
-            for (const std::string_view v :
-                 {h.authorization, h.x_api_key, h.x_goog_api_key, h.anthropic_version})
-                if (!v.empty() && !header_value_safe(v)) return false;
-
-            // "Bearer K" -> K (bearer scheme only; anything else is not a provider
-            // API key and is dropped instead of guessed at).
-            const auto bearer = [&]() -> std::string_view {
-                const std::string_view v = h.authorization;
-                if (v.size() > 7 &&
-                    (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
-                    return net::http::detail::ltrim(v.substr(7));
-                return {};
-            };
-
-            switch (mode)
-            {
-                case UpstreamDialect::Anthropic:
-                {
-                    std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
-                    if (!key.empty())
-                    {
-                        out.append("x-api-key: ");
-                        out.append(key);
-                        out.append("\r\n");
-                    }
-                    out.append("anthropic-version: ");
-                    out.append(h.anthropic_version.empty() ? kAnthropicVersionDefault
-                                                           : h.anthropic_version);
-                    out.append("\r\n");
-                    break;
-                }
-                case UpstreamDialect::Gemini:
-                {
-                    std::string_view key = h.x_goog_api_key.empty() ? bearer() : h.x_goog_api_key;
-                    if (!key.empty())
-                    {
-                        out.append("x-goog-api-key: ");
-                        out.append(key);
-                        out.append("\r\n");
-                    }
-                    break;
-                }
-                case UpstreamDialect::Cohere:
-                {
-                    // Cohere speaks Bearer natively -> forward the whole value.
-                    if (!h.authorization.empty())
-                    {
-                        out.append("Authorization: ");
-                        out.append(h.authorization);
-                        out.append("\r\n");
-                    }
-                    break;
-                }
-                case UpstreamDialect::Azure:
-                {
-                    // `api-key`, Azure's own header. A client sending Authorization is
-                    // using the OpenAI SDK against an Azure endpoint, which is the
-                    // normal case and the reason the bearer is accepted here at all.
-                    const std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
-                    if (key.empty()) return false;
-                    out.append("api-key: ");
-                    out.append(key);
-                    out.append("\r\n");
-                    break;
-                }
-                case UpstreamDialect::Bedrock:
-                    // Never reached: build_translated_request routes Bedrock to
-                    // sign_bedrock, because a signature covers the target and the body
-                    // and neither exists yet at this point. Refuse, because falling
-                    // through to `return true` would emit no credential at all.
-                    return false;
-                case UpstreamDialect::OpenAI:
-                    break; // byte-forward path; never called, but total anyway
-            }
-            return true;
-        }
-
         // Translate an OpenAI request body to the upstream dialect, also yielding
         // the upstream start line. Empty return = malformed body. Shared by both
         // event-loop backends.
@@ -387,6 +283,110 @@ namespace llmbridge::detail
         }
 
     } // namespace
+
+    // Build the auth/extra header lines to inject into the translated
+    // upstream request, from the client's request headers.
+    //
+    // Whitelist, not passthrough: the gateway rebuilds the upstream request,
+    // and only the credential headers the target dialect understands may
+    // cross the translation boundary. Echoing arbitrary client headers
+    // through a rebuilt request is a smuggling surface (and our own framing
+    // headers must stay authoritative). A byte-forward is untouched by all of
+    // this: it already carries every client header.
+    //
+    // Values re-emitted here cannot contain CR/LF: find_header() bounds each
+    // value by its own line's CRLF, so injection via a crafted credential is
+    // structurally impossible instead of filtered.
+    //
+    // Returns false when the client supplied a syntactically invalid credential
+    // (control characters). The caller must fail the request instead of
+    // forward. Silently dropping would still send a credential-less request
+    // upstream, which is a confusing 401; a 400 names the client's own bug.
+    bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
+                          const std::vector<std::string>& strip, std::string& out)
+    {
+        out.clear();
+        const AuthHeaders h = scan_auth_headers(client_headers, strip);
+
+        // Validate every credential-bearing header the client sent, whether or
+        // not this dialect uses it. Otherwise a malformed value routes around
+        // the check by picking the other header.
+        for (const std::string_view v :
+             {h.authorization, h.x_api_key, h.x_goog_api_key, h.anthropic_version})
+            if (!v.empty() && !header_value_safe(v)) return false;
+
+        // "Bearer K" -> K (bearer scheme only; anything else is not a provider
+        // API key and is dropped instead of guessed at).
+        const auto bearer = [&]() -> std::string_view {
+            const std::string_view v = h.authorization;
+            if (v.size() > 7 &&
+                (v.compare(0, 7, "Bearer ") == 0 || v.compare(0, 7, "bearer ") == 0))
+                return net::http::detail::ltrim(v.substr(7));
+            return {};
+        };
+
+        switch (mode)
+        {
+            case UpstreamDialect::Anthropic:
+            {
+                std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
+                if (!key.empty())
+                {
+                    out.append("x-api-key: ");
+                    out.append(key);
+                    out.append("\r\n");
+                }
+                out.append("anthropic-version: ");
+                out.append(h.anthropic_version.empty() ? kAnthropicVersionDefault
+                                                       : h.anthropic_version);
+                out.append("\r\n");
+                break;
+            }
+            case UpstreamDialect::Gemini:
+            {
+                std::string_view key = h.x_goog_api_key.empty() ? bearer() : h.x_goog_api_key;
+                if (!key.empty())
+                {
+                    out.append("x-goog-api-key: ");
+                    out.append(key);
+                    out.append("\r\n");
+                }
+                break;
+            }
+            case UpstreamDialect::Cohere:
+            {
+                // Cohere speaks Bearer natively -> forward the whole value.
+                if (!h.authorization.empty())
+                {
+                    out.append("Authorization: ");
+                    out.append(h.authorization);
+                    out.append("\r\n");
+                }
+                break;
+            }
+            case UpstreamDialect::Azure:
+            {
+                // `api-key`, Azure's own header. A client sending Authorization is
+                // using the OpenAI SDK against an Azure endpoint, which is the
+                // normal case and the reason the bearer is accepted here at all.
+                const std::string_view key = h.x_api_key.empty() ? bearer() : h.x_api_key;
+                if (key.empty()) return false;
+                out.append("api-key: ");
+                out.append(key);
+                out.append("\r\n");
+                break;
+            }
+            case UpstreamDialect::Bedrock:
+                // Never reached: build_translated_request routes Bedrock to
+                // sign_bedrock, because a signature covers the target and the body
+                // and neither exists yet at this point. Refuse, because falling
+                // through to `return true` would emit no credential at all.
+                return false;
+            case UpstreamDialect::OpenAI:
+                break; // byte-forward path; never called, but total anyway
+        }
+        return true;
+    }
 
     /// The translation for a request, from the client's dialect (read off the request
     /// line) and the venue's. Shared by both backends; the caller handles the refusal

@@ -87,6 +87,11 @@ namespace llmbridge::detail
                                   std::string& out, std::string& body_scratch,
                                   const char*& why, std::string_view model_override = {},
                                   bool* wants_stream_usage = nullptr);
+    /// The credential headers for the translated upstream request.
+    /// Reached directly by request_test.cpp, the merged single-pass
+    /// header scan (`scan_auth_headers`) that replaced size find_header() walks.
+    bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
+                          const std::vector<std::string>& strip, std::string& out);
     std::string xlate_resp(UpstreamDialect mode, std::string_view body);
     std::string host_header_for(const Upstream& u);
     std::string aws_region_for(const Upstream& u);

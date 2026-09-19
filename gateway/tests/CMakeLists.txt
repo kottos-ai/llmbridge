@@ -26,6 +26,26 @@ target_link_libraries(gateway_corpus_test PRIVATE gateway GTest::gtest_main)
 target_compile_definitions(gateway_corpus_test
     PRIVATE LLMBRIDGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
+# auth_headers_for is declared in request.hpp but the header lives under src/,
+# same reason gateway_rebuild_test needs the include path below.
+add_executable(gateway_request_test request_test.cpp)
+target_link_libraries(gateway_request_test PRIVATE gateway GTest::gtest_main)
+target_include_directories(gateway_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+# note_served_tier is a public inline in stream.hpp, but stream.hpp lives
+# under src/, same reason as gateway_rebuild_test.
+add_executable(gateway_served_tier_test served_tier_test.cpp)
+target_link_libraries(gateway_served_tier_test PRIVATE gateway GTest::gtest_main)
+target_include_directories(gateway_served_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+# The perf half. Built by default, but deliberately never registered with
+# gtest_discover_tests below: ctest must not run it, so shared-runner jitter
+# cannot fail a PR on a timing number. Run ./bin/gateway_request_perf_test by
+# hand or from a nightly job.
+add_executable(gateway_request_perf_test request_perf_test.cpp)
+target_link_libraries(gateway_request_perf_test PRIVATE gateway)
+target_include_directories(gateway_request_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 include(GoogleTest)
 gtest_discover_tests(gateway_metrics_test)
 gtest_discover_tests(gateway_stats_test)
@@ -37,6 +57,8 @@ gtest_discover_tests(gateway_dialect_test)
 # meaningless latencies; the numbers it prints are only worth reading when it
 # has the machine to itself.
 gtest_discover_tests(gateway_rebuild_test)
+gtest_discover_tests(gateway_request_test)
+gtest_discover_tests(gateway_served_tier_test)
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
 # End-to-end TLS tests: only when the TLS transport is compiled in. The mock
