@@ -8,6 +8,29 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.60.0]. 2026-09-21
+
+### Added
+
+- **`net::Sha256`, FIPS 180-4, implemented in `net`.** A streaming `update`/`finish`,
+  a one-shot `hash`, and `truncated`, the leading eight bytes as a big-endian integer,
+  for a caller whose field is 64 bits wide.
+
+### Tests
+
+- `net_sha256_test`: the published vectors including the million-`a` long one,
+  the same digest for any split of the input, every length around the padding
+  boundaries, reset after `finish`, truncation, and empty updates.
+- `net_sha256_ni_test`: `sha256_rounds.inc` included against a scalar model of
+  `SHA256RNDS2`, `SHA256MSG1` and `SHA256MSG2` written from the operand tables in
+  Intel's Software Developer's Manual.
+
+### Known gaps
+
+- **The intrinsics have not executed on real silicon in this tree.** The reference
+  host and the CI runners have no SHA-NI, so the fast path has only run through the
+  scalar model.
+
 ## [0.59.2]. 2026-09-19
 
 We follow u/verstands suggestions to add CI tests that caputre silent degradation

@@ -19,6 +19,14 @@ target_link_libraries(net_upstream_test PRIVATE net GTest::gtest_main)
 add_executable(net_secure_test secure_test.cpp)
 target_link_libraries(net_secure_test PRIVATE net GTest::gtest_main)
 
+add_executable(net_sha256_test sha256_test.cpp)
+target_link_libraries(net_sha256_test PRIVATE net GTest::gtest_main)
+
+# Includes src/sha256_rounds.inc against a scalar model of the SHA-NI
+# instructions, so the sequence is covered on a runner whose CPU lacks them.
+add_executable(net_sha256_ni_test sha256_ni_test.cpp)
+target_link_libraries(net_sha256_ni_test PRIVATE net GTest::gtest_main)
+
 
 include(GoogleTest)
 gtest_discover_tests(net_http_test)
@@ -26,6 +34,8 @@ gtest_discover_tests(net_http_stream_test)
 gtest_discover_tests(net_socket_util_test)
 gtest_discover_tests(net_uring_test)
 gtest_discover_tests(net_upstream_test)
+gtest_discover_tests(net_sha256_test)
+gtest_discover_tests(net_sha256_ni_test)
 gtest_discover_tests(net_secure_test)
 
 # Only when TLS is compiled in; the file is #ifdef'd but there is no point

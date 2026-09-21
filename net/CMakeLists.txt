@@ -8,6 +8,8 @@ add_library(net STATIC
         src/socket_util.cpp
         src/upstream.cpp
         src/secure.cpp
+        src/sha256.cpp
+        src/sha256_ni.cpp
         src/log.cpp
 )
 target_include_directories(net PUBLIC include)
