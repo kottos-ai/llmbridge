@@ -319,8 +319,9 @@ die with the call. It exposes no lookup helper; `net::http::find_header(facts.he
 is the safe one.
 
 One more field crosses the seam, and only on request: `prefix_hash`, a 64-bit identity
-of the body's leading bytes, computed when the policy returns true from
-`wants_prefix_hash()` and 0 otherwise.
+of the body's leading bytes (SHA-256, truncated to its leading eight bytes; the field
+promises the identity and not the function), computed when the policy returns true
+from `wants_prefix_hash()` and 0 otherwise.
 
 ### Selecting a venue
 
