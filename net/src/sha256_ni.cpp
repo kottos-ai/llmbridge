@@ -11,6 +11,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #if defined(__GNUC__) || defined(__clang__)
         #define LB_SHA_NI_BUILT 1
+        #include <cpuid.h>
         #include <immintrin.h>
     #endif
 #endif
@@ -40,10 +41,20 @@ namespace llmbridge::net
 
     bool sha256_ni_available() noexcept
     {
-        // Both, and separately. AVX2 does not imply SHA-NI: Haswell through Skylake
-        // have AVX2 and no SHA, so gating on the wrong feature costs a SIGILL on a
-        // very common desktop CPU, not a slow path.
-        return __builtin_cpu_supports("sha") != 0 && __builtin_cpu_supports("sse4.1") != 0;
+        // The cpuid leaves read directly, not __builtin_cpu_supports: GCC takes "sha" as a
+        // feature string and Clang 16 through 18 reject it at compile time, so the
+        // builtin passed every g++ job and failed every Clang one.
+        //
+        // Both bits, and separately. AVX2 does not imply SHA-NI: Haswell through
+        // Skylake have AVX2 and no SHA, so gating on the wrong feature costs a SIGILL
+        // on a very common desktop CPU, not a slow path.
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (__get_cpuid_max(0, nullptr) < 7) return false;
+        __cpuid(1, a, b, c, d);
+        const bool sse41 = (c & (1u << 19)) != 0;
+        __cpuid_count(7, 0, a, b, c, d);
+        const bool sha = (b & (1u << 29)) != 0;
+        return sse41 && sha;
     }
 #else
     bool sha256_ni_available() noexcept { return false; }
