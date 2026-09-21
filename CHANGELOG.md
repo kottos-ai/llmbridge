@@ -16,6 +16,13 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   a one-shot `hash`, and `truncated`, the leading eight bytes as a big-endian integer,
   for a caller whose field is 64 bits wide.
 
+### Changed
+
+- **`RequestFacts::prefix_hash` is SHA-256 truncated to 64 bits. It was FNV-1.**
+  Same contract, an identity of the leading `kPrefixHashBytes` of the body, 0 when
+  the policy did not ask or the body is empty, and a different number for the same
+  bytes.
+
 ### Tests
 
 - `net_sha256_test`: the published vectors including the million-`a` long one,

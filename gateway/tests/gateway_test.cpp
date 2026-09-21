@@ -4144,6 +4144,25 @@ TEST_P(ProxyPolicy, PrefixHashIdentifiesTheLeadingBytesAndNothingElse)
     EXPECT_NE(h[5], h[6]) << "and still tells two short bodies apart";
 }
 
+// The function itself, pinned to the FIPS 180-4 vector for "abc". The value crosses
+// the process boundary (a cache is keyed on it, the tape records it), so a silent
+// change of function is a silent change of identity for every stored row.
+TEST_P(ProxyPolicy, PrefixHashIsSha256TruncatedBigEndian)
+{
+    HashingPolicy pol;
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request("abc")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    const auto h = pol.seen();
+    ASSERT_EQ(h.size(), 1u);
+    EXPECT_EQ(h[0], 0xba7816bf8f01cfeaull) << "the leading eight bytes of SHA-256(\"abc\")";
+}
+
 TEST_P(ProxyPolicy, AllowForwardsUnchanged)
 {
     RecordingPolicy pol{llmbridge::Decision{.allow = true}};

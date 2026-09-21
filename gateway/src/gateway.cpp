@@ -9,6 +9,7 @@
 
 #include "loop.hpp"
 #include "net/secure.hpp"
+#include "net/sha256.hpp"
 #include "request.hpp"
 #include "response.hpp"
 #include "scan.hpp"
@@ -637,13 +638,9 @@ namespace llmbridge
         if (_wants_prefix_hash && !body.empty())
         {
             const size_t n = body.size() < kPrefixHashBytes ? body.size() : kPrefixHashBytes;
-            uint64_t h = 14695981039346656037ull;
-            for (size_t i = 0; i < n; ++i)
-            {
-                h ^= static_cast<unsigned char>(body[i]);
-                h *= 1099511628211ull;
-            }
-            c->prefix_hash = h;
+            // noexcept end to end and no allocation, so there is nothing to catch: the
+            // path is exception-free by construction
+            c->prefix_hash = net::Sha256::truncated(net::Sha256::hash(body.substr(0, n)));
         }
     }
 
