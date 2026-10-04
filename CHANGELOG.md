@@ -32,6 +32,12 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   version searched the whole 2 KiB tail for nine absent keys and cost every
   response 0.5 us; the gate is what removed that.
 
+### Fixed
+
+- **`find_fast` no longer hands `memmem` a null haystack.** An absent details block
+  reached it as an empty `string_view` whose data pointer is null, which glibc
+  declares undefined even at length zero.
+
 ### Tests
 
 - `ProxyForwardStream.TheSinkGetsEveryUsageDetailTheVenueStates`,

@@ -62,6 +62,7 @@ namespace llmbridge::detail
     {
         if (from > hay.size()) return std::string_view::npos;
         if (needle.empty()) return from;
+        if (needle.size() > hay.size() - from) return std::string_view::npos;
         const void* p = ::memmem(hay.data() + from, hay.size() - from, needle.data(), needle.size());
         return p ? static_cast<size_t>(static_cast<const char*>(p) - hay.data())
                  : std::string_view::npos;
