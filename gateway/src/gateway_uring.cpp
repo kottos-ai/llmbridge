@@ -163,10 +163,8 @@ namespace llmbridge
         if (!ur_next_sqe(&s)) { ur_abort_pair(u->peer); return false; }
         s->opcode = IORING_OP_CONNECT;
         s->fd = u->fd;
-        const sockaddr_in& dst = _upstream_addrs[static_cast<size_t>(
-            u->upstream_slot >= 0 ? u->upstream_slot : 0)];
-        s->addr = reinterpret_cast<uint64_t>(&dst);
-        s->off = sizeof(dst); // connect addrlen rides in `off`
+        s->addr = reinterpret_cast<uint64_t>(&u->up_addr);
+        s->off = sizeof(u->up_addr); // connect addrlen rides in `off`
         s->user_data = make_ud(u, UConnect);
         ++u->inflight;
         ++_uring_inflight;
@@ -246,9 +244,7 @@ namespace llmbridge
 
     Connection* Gateway::ur_acquire_upstream(int slot) noexcept
     {
-        // io_uring connects through the pre-resolved _upstream_addrs, so the record
-        // itself is read only to decide TLS: unused in a build without it.
-        [[maybe_unused]] const Upstream& up = _upstreams[static_cast<size_t>(slot)];
+        const Upstream& up = _upstreams[static_cast<size_t>(slot)];
         auto& pool = _idle_upstreams[static_cast<size_t>(slot)];
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
@@ -270,6 +266,14 @@ namespace llmbridge
         u->connected = false;
         u->from_pool = false;
         u->upstream_slot = slot; // release() indexes the pool with this
+        u->ts_accepted = now_ns(); // the connect deadline counts from here
+        // make sure the upstream ip did not rotate
+        if (!net::resolve_ipv4(up.ip.c_str(), up.port, u->up_addr))
+        {
+            ::close(fd);
+            delete u;
+            return nullptr;
+        }
         u->rbuf.reserve(kInitialBuf);
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -281,7 +285,7 @@ namespace llmbridge
         }
 #endif
         ++_stats.upstream_conns_opened;
-        LB_DEBUG("upstream open ", *u, " pool=", _idle_upstreams.size()); // see ep_ twin
+        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", _idle_upstreams.size()); // see ep_ twin
         return u;
     }
 
@@ -295,7 +299,7 @@ namespace llmbridge
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
         Connection* client = u->peer;
         if (!client) return false;
-        [[maybe_unused]] const Upstream& up = upstream_of(u); // see ur_acquire_upstream
+        const Upstream& up = upstream_of(u);
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
 
@@ -304,6 +308,15 @@ namespace llmbridge
         uf->is_client = false;
         uf->connected = false;
         uf->from_pool = false;
+        uf->ts_accepted = now_ns();
+        // make sure the upstream ip did not rotate
+        if (!net::resolve_ipv4(up.ip.c_str(), up.port, uf->up_addr))
+        {
+            ::close(fd);
+            delete uf;
+            return false;
+        }
+        client->upstream_ip = uf->up_addr.sin_addr.s_addr;
         // The same venue: a retry landing elsewhere is a silent reroute of a request
         // already translated for this dialect and carrying its credential.
         uf->upstream_slot = u->upstream_slot;
@@ -821,6 +834,7 @@ namespace llmbridge
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
         c->upstream_pooled = u->connected;
+        c->upstream_ip = u->up_addr.sin_addr.s_addr;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)
@@ -838,6 +852,7 @@ namespace llmbridge
     {
         if (res < 0)
         {
+            note_connect_failure(u->upstream_slot, std::strerror(-res));
             Connection* cl = u->peer;
             u->peer = nullptr;
             ur_close(u);
@@ -847,8 +862,11 @@ namespace llmbridge
         }
         u->connected = true;
         // t2 for a plaintext upstream only; see the epoll twin and tls_feed().
-        if (!upstream_is_tls(u) && u->peer && u->peer->ts_wire_ready == 0)
-            u->peer->ts_wire_ready = now_ns();
+        if (!upstream_is_tls(u))
+        {
+            u->wire_ready = true;
+            if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
+        }
         ur_arm_recv(u); // arm the multishot recv for this upstream's life
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
@@ -1236,14 +1254,6 @@ namespace llmbridge
                     std::strerror(_bufring.init_errno()), "); falling back to epoll");
             return run_epoll();
         }
-        // Sized once, never resized: ur_submit_connect hands the kernel a pointer into
-        // this vector that must stay valid until the connect completes.
-        _upstream_addrs.resize(_upstreams.size());
-        for (size_t i = 0; i < _upstreams.size(); ++i)
-            if (!net::resolve_ipv4(_upstreams[i].ip.c_str(), _upstreams[i].port,
-                                   _upstream_addrs[i]))
-                return 1;
-
         _uring_ts.tv_sec = kPollTickMs / 1000;
         _uring_ts.tv_nsec = static_cast<long long>(kPollTickMs % 1000) * 1000000LL;
 

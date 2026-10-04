@@ -262,6 +262,9 @@ namespace llmbridge
         u->is_client = false;
         u->from_pool = false;
         u->upstream_slot = slot;
+        u->ts_accepted = now_ns(); // the connect deadline counts from here
+        // make sure the upstream ip did not rotate
+        (void)net::resolve_ipv4(up.ip.c_str(), up.port, u->up_addr);
         u->rbuf.reserve(kInitialBuf);
         adopt_warm(u);
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -277,7 +280,7 @@ namespace llmbridge
         ++_stats.upstream_conns_opened;
         // Pairs with "upstream reuse": without it an upstream first appears in
         // the log at its second request, never at its birth.
-        LB_DEBUG("upstream open ", *u, " pool=", _idle_upstreams.size());
+        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", _idle_upstreams.size());
         return u;
     }
 
@@ -300,6 +303,10 @@ namespace llmbridge
         uf->fd = fd;
         uf->is_client = false;
         uf->from_pool = false;
+        uf->ts_accepted = now_ns(); // a retried connect gets the same deadline
+        // make sure the upstream ip did not rotate
+        (void)net::resolve_ipv4(up.ip.c_str(), up.port, uf->up_addr);
+        client->upstream_ip = uf->up_addr.sin_addr.s_addr;
         uf->upstream_slot = u->upstream_slot;
         uf->retried = true; // this request's one allowed retry is now spent
         uf->wbuf = std::move(u->wbuf); // plaintext, re-pushed through the new session
@@ -713,6 +720,7 @@ namespace llmbridge
         c->ts_up_activity = c->ts_req_built; // idle-timeout baseline for this request
         if (u->connected) c->ts_wire_ready = c->ts_req_built; // pooled: no handshake
         c->upstream_pooled = u->connected;
+        c->upstream_ip = u->up_addr.sin_addr.s_addr;
 
         // Optimistic send: if the pooled upstream is already connected (the common
         // case), write immediately and only arm EPOLLOUT if the socket buffer is
@@ -755,6 +763,7 @@ namespace llmbridge
             int err = net::connect_result(u->fd);
             if (err != 0)
             {
+                note_connect_failure(u->upstream_slot, std::strerror(err));
                 Connection* client = u->peer;
                 u->peer = nullptr;
                 ep_close_upstream(u);
@@ -766,8 +775,11 @@ namespace llmbridge
             // t2 for a plaintext upstream: the socket can carry the request now.
             // A TLS upstream is not wire-ready yet; tls_feed() stamps t2 when the
             // handshake completes.
-            if (!upstream_is_tls(u) && u->peer && u->peer->ts_wire_ready == 0)
-                u->peer->ts_wire_ready = now_ns();
+            if (!upstream_is_tls(u))
+            {
+                u->wire_ready = true;
+                if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
+            }
 #ifdef LLMBRIDGE_HAVE_TLS
             if (u->tls && !u->tls->handshake_done())
                 u->tls->start_handshake(); // ClientHello lands in the write BIO

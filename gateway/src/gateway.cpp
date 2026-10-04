@@ -29,11 +29,13 @@
 #include <cstdio>
 #include <sstream>
 #include <cstring>
+#include <algorithm>
 #include <ctime>
 #include <stdexcept>
 #include <string_view>
 
 #include "net/socket_util.hpp"
+#include "net/upstream.hpp"
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
 
 namespace llmbridge
@@ -108,6 +110,12 @@ namespace llmbridge
                     "--translate azure may carry one");
         }
         _idle_upstreams.resize(_upstreams.size());
+        for (Upstream& u : _upstreams)
+        {
+            if (u.ips.empty()) u.ips.push_back(u.ip);
+            if (u.ip.empty()) u.ip = u.ips.front();
+        }
+        _rr_inflight.assign(_upstreams.size(), 0);
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
         for (std::string& h : strip_headers)
@@ -188,6 +196,12 @@ namespace llmbridge
 
     Gateway::~Gateway()
     {
+        {
+            std::lock_guard<std::mutex> g(_rr.mutex);
+            _rr.stop = true;
+        }
+        _rr.cv.notify_all();
+        if (_rr.thread.joinable()) _rr.thread.join();
         for (auto& [id, c] : _clients)
         {
             // An in-flight (acquired, not pooled) upstream is reachable only via
@@ -547,6 +561,7 @@ namespace llmbridge
             // the entire handshake inside upwrite-us (t3-t2) and left connect-us
             // reporting the TCP leg alone. See the attribution test in
             // gateway/tests/gateway_tls_test.cpp.
+            u->wire_ready = true;
             if (u->peer) u->peer->ts_wire_ready = now_ns();
             if (u->woff < u->wbuf.size()) tls_push_wbuf(u);
         }
@@ -668,6 +683,7 @@ namespace llmbridge
         r.tag = c->policy_tag;
         r.status = status;
         r.upstream_index = c->upstream_slot;
+        r.upstream_ip = c->upstream_ip;
         r.attempts = c->failover_attempts;
         r.streamed = streamed;
         r.error_reply = !streamed && c->close_after_resp;
@@ -744,6 +760,7 @@ namespace llmbridge
         c->served_tier_len = 0;
         c->served_tier_tries = 0;
         c->upstream_pooled = false;
+        c->upstream_ip = 0;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;
         c->max_chunk_gap_ns = 0;
@@ -876,7 +893,9 @@ namespace llmbridge
         os << "client_setup_timeouts=" << _stats.client_setup_timeouts
            << " client_idle_timeouts=" << _stats.client_idle_timeouts
            << " tls_handshake_failures=" << _stats.client_tls_handshake_failures
-           << " upstream_timeouts=" << _stats.upstream_timeouts << "\n";
+           << " upstream_timeouts=" << _stats.upstream_timeouts
+           << " connect_timeouts=" << _stats.connect_timeouts
+           << " upstream_reresolved=" << _stats.upstream_reresolved << "\n";
         std::fputs(os.str().c_str(), out);
     }
 
@@ -983,6 +1002,45 @@ namespace llmbridge
             }
         }
 
+        apply_reresolved();
+
+        // A fresh connect that never became wire-ready. Independent of the idle
+        // timeout below, which starts at the request write and so never starts on a
+        // socket the kernel is still retrying SYNs on.
+        if (_connect_ns > 0)
+        {
+            std::vector<Connection*> stuck;
+            for (auto& [id, c] : _clients)
+            {
+                if (c->doomed) continue;
+                const Connection* u = c->peer;
+                if (!u || u->wire_ready || u->ts_accepted == 0) continue;
+                if (now - u->ts_accepted > _connect_ns) stuck.push_back(c);
+            }
+            for (Connection* c : stuck)
+            {
+                Connection* u = c->peer;
+                ++_stats.connect_timeouts;
+                LB_WARN(ReqId{c->req_seq}, " TIMEOUT upstream connect ", *u,
+                        " after_ns=", now - u->ts_accepted, " limit_ns=", _connect_ns);
+                note_connect_failure(u->upstream_slot, "timed out");
+                c->peer = nullptr;
+                u->peer = nullptr;
+#ifdef LLMBRIDGE_HAVE_URING
+                if (uring)
+                {
+                    ur_close(u);
+                    if (!ur_upstream_failed(c, 502, "upstream connect timeout"))
+                        ur_error_respond(c, 502, "upstream connect timeout");
+                    continue;
+                }
+#endif
+                ep_close_upstream(u);
+                if (!ep_upstream_failed(c, 502, "upstream connect timeout"))
+                    ep_error_respond(c, 502, "upstream connect timeout");
+            }
+        }
+
         // The in-flight abort below is gated on the upstream idle timeout; pool
         // eviction above is not; they are independent settings.
         if (_upstream_idle_ns <= 0) return;
@@ -1020,6 +1078,108 @@ namespace llmbridge
 #endif
             if (streaming) ep_abort_pair(c);
             else if (!ep_upstream_failed(c, 504, "upstream idle timeout")) ep_error_respond(c, 504, "upstream idle timeout");
+        }
+    }
+
+    void Gateway::note_connect_failure(int slot, const char* why) noexcept
+    {
+        if (slot < 0 || static_cast<size_t>(slot) >= _upstreams.size()) return;
+        Upstream& up = _upstreams[static_cast<size_t>(slot)];
+        const std::string failed = up.ip;
+        if (up.ips.size() > 1)
+        {
+            const auto it = std::find(up.ips.begin(), up.ips.end(), up.ip);
+            const size_t i = it == up.ips.end() ? 0 : static_cast<size_t>(it - up.ips.begin());
+            up.ip = up.ips[(i + 1) % up.ips.size()];
+        }
+        if (up.ip != failed)
+            LB_WARN("venue ", static_cast<int64_t>(slot), " connect ", why, " at ", failed, ":",
+                    static_cast<int64_t>(up.port), "; next address ", up.ip);
+        else
+            LB_WARN("venue ", static_cast<int64_t>(slot), " connect ", why, " at ", failed, ":",
+                    static_cast<int64_t>(up.port));
+        if (!up.host.empty()) request_reresolve(slot);
+    }
+
+    void Gateway::request_reresolve(int slot) noexcept
+    {
+        uint8_t& inflight = _rr_inflight[static_cast<size_t>(slot)];
+        if (inflight) return;
+        try
+        {
+            std::lock_guard<std::mutex> g(_rr.mutex);
+            if (!_rr.thread.joinable()) _rr.thread = std::thread([this] { reresolve_loop(); });
+            _rr.pending.push_back(slot);
+        }
+        catch (...)
+        {
+            LB_WARN("venue ", static_cast<int64_t>(slot), " re-resolution could not be queued");
+            return;
+        }
+        inflight = 1;
+        _rr.cv.notify_one();
+    }
+
+    void Gateway::reresolve_loop() noexcept
+    {
+        for (;;)
+        {
+            int slot = -1;
+            {
+                std::unique_lock<std::mutex> lk(_rr.mutex);
+                _rr.cv.wait(lk, [this] { return _rr.stop || !_rr.pending.empty(); });
+                if (_rr.stop) return;
+                slot = _rr.pending.front();
+                _rr.pending.erase(_rr.pending.begin());
+            }
+            // `host` is written in the constructor and never again, so reading it
+            // here races with nothing; `ip` and `ips` belong to the loop thread.
+            std::vector<std::string> ips;
+            try
+            {
+                std::string err;
+                ips = net::resolve_host_ipv4(_upstreams[static_cast<size_t>(slot)].host, &err);
+                std::lock_guard<std::mutex> g(_rr.mutex);
+                _rr.done.emplace_back(slot, std::move(ips));
+                _rr.ready.store(true, std::memory_order_release);
+            }
+            catch (...)
+            {
+                // Out of memory on the resolver thread: the venue keeps its list and
+                // the next failure asks again.
+            }
+        }
+    }
+
+    void Gateway::apply_reresolved() noexcept
+    {
+        if (!_rr.ready.load(std::memory_order_acquire)) return;
+        std::vector<std::pair<int, std::vector<std::string>>> done;
+        {
+            std::lock_guard<std::mutex> g(_rr.mutex);
+            done.swap(_rr.done);
+            _rr.ready.store(false, std::memory_order_relaxed);
+        }
+        for (auto& [slot, ips] : done)
+        {
+            _rr_inflight[static_cast<size_t>(slot)] = 0;
+            Upstream& up = _upstreams[static_cast<size_t>(slot)];
+            if (ips.empty())
+            {
+                LB_WARN("venue ", static_cast<int64_t>(slot), " re-resolving ", up.host,
+                        " failed; keeping ", up.ip);
+                continue;
+            }
+            const bool changed = ips != up.ips;
+            up.ips = std::move(ips);
+            // The rotation already moved off the failed address; keep that choice when
+            // the fresh list still has it, else start the fresh list from the top.
+            if (std::find(up.ips.begin(), up.ips.end(), up.ip) == up.ips.end())
+                up.ip = up.ips.front();
+            ++_stats.upstream_reresolved;
+            LB_INFO("venue ", static_cast<int64_t>(slot), " re-resolved ", up.host, ": ",
+                    static_cast<int64_t>(up.ips.size()), " addresses",
+                    changed ? "" : " (unchanged)", ", using ", up.ip);
         }
     }
 

@@ -8,6 +8,55 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.61.0]. 2026-10-03
+
+### Fixed
+
+- **Re-resolve address when they rotate or fail generally, for the kernel's SYN 
+  retry schedule.**
+  - **A connect deadline, `--connect-timeout SECONDS` and `timeouts.connect_s`,
+    5 s by default.** A fresh upstream that is not wire-ready (TCP connected and,
+    on a TLS venue, handshake done) by then is abandoned on the shared sweep: the
+    request fails over when a policy allows it and answers `502 upstream connect
+    timeout` otherwise. `Stats::connect_timeouts` counts them. 0 disables it.
+  - **A failed connect moves the venue to its next resolved address and re-resolves
+    its name.** `Upstream` carries every address the name resolved to (`ips`) and
+    the name itself (`host`).
+
+### Changed
+
+- **io_uring dials the address stored on the connection, not a table entry.** The
+  connect SQE used to point into `_upstream_addrs`, sized once at startup; a table
+  that can now change under an in-flight submission is the wrong place for a
+  kernel-held pointer, so each upstream `Connection` carries its own `sockaddr_in`.
+- `RequestRecord::upstream_ip`: the address the serving venue was dialled at,
+  network byte order, 0 when none was. One name is several addresses and they
+  retire, so a record that named only the venue could not say which one it hit.
+- `Connection::ts_accepted` is now set on an upstream connection at socket
+  creation, which the field's comment had claimed since the stamp was introduced.
+
+### Tests
+
+- `ProxyRoute.AConnectThatNeverCompletesIsAbandonedAtTheDeadline`: a loopback
+  listener with a full accept queue drops every further SYN, which reproduces the
+  incident without root; the request gets its 502 at the deadline on both backends
+  and reads nothing at all without it.
+- `GatewayTls.ConnectDeadlineAbandonsAStalledHandshakeWith502`: connected but
+  stalled before `SSL_accept`, the state neither the refusal path nor the idle
+  timeout covers.
+- `ProxyStream.TheConnectDeadlineEndsAtTheWire`: a provider that took the request
+  and went quiet is the idle timeout's case; the deadline must stop counting at
+  wire-ready or every slow prefill would be a connect failure.
+- `ProxyRoute.AFailedConnectMovesTheVenueToItsNextAddress` and
+  `AFailedConnectReresolvesTheVenueName`: a refused 127.0.0.2 moves the venue to
+  127.0.0.1, by list and by resolving `localhost`.
+
+### Known gaps
+
+- The deadline and the rotation are exercised against a refusal and a full
+  accept queue; the retired-address case itself is confirmed only on the hosted
+  gateway, against the address the incident named.
+
 ## [0.60.0]. 2026-09-21
 
 ### Added

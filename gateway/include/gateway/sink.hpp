@@ -61,6 +61,7 @@ namespace llmbridge
         uint64_t tag = 0;         ///< Decision::tag, verbatim
         int status = 0;           ///< as sent to the client
         int upstream_index = -1;  ///< venue that served (or last tried)
+        uint32_t upstream_ip = 0;
         int attempts = 0;         ///< failovers before this outcome
         int32_t tokens_in = -1;   ///< streaming only, from the provider's usage; -1 unknown
         int32_t tokens_out = -1;
