@@ -446,7 +446,8 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
 {
     std::string in = R"({"candidates":[{"content":{"role":"model","parts":[
         {"text":"hello "},{"text":"world"}]},"finishReason":"STOP"}],
-        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11},
+        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11,
+        "cachedContentTokenCount":5,"thoughtsTokenCount":2},
         "modelVersion":"gemini-2.0"})";
     Value out = P(gemini_to_openai_response(in));
     EXPECT_EQ(out.str_or("object"), "chat.completion");
@@ -459,6 +460,19 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
     EXPECT_EQ(u->num_or("prompt_tokens"), "8");
     EXPECT_EQ(u->num_or("completion_tokens"), "3");
     EXPECT_EQ(u->num_or("total_tokens"), "11");
+    // Gemini's cache read and thinking count, in the OpenAI shape the scanner reads.
+    EXPECT_EQ(u->find("prompt_tokens_details")->num_or("cached_tokens"), "5");
+    EXPECT_EQ(u->find("completion_tokens_details")->num_or("reasoning_tokens"), "2");
+}
+
+TEST(GeminiResp, NoDetailsBlockWhenGeminiStatesNone)
+{
+    std::string in = R"({"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}],
+        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11}})";
+    Value out = P(gemini_to_openai_response(in));
+    const Value* u = out.find("usage");
+    EXPECT_EQ(u->find("prompt_tokens_details"), nullptr);
+    EXPECT_EQ(u->find("completion_tokens_details"), nullptr);
 }
 
 class GemFinish : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};

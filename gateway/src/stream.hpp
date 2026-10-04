@@ -180,6 +180,13 @@ namespace llmbridge::detail
             if (client->usage_cw_1h < 0 && u.cache_write_1h >= 0)
                 client->usage_cw_1h = u.cache_write_1h;
             if (u.out >= 0) client->usage_out = u.out;
+            // The details ride the final usage chunk, so last-wins like output.
+            if (u.reasoning >= 0) client->usage_reasoning = u.reasoning;
+            if (u.audio_in >= 0) client->usage_audio_in = u.audio_in;
+            if (u.audio_out >= 0) client->usage_audio_out = u.audio_out;
+            if (u.accepted_prediction >= 0) client->usage_accepted_pred = u.accepted_prediction;
+            if (u.rejected_prediction >= 0) client->usage_rejected_pred = u.rejected_prediction;
+            if (u.tool_prompt >= 0) client->usage_tool_prompt = u.tool_prompt;
         }
         // Trimmed last, so the buffer stays bounded across reads while every read
         // is searched whole.
@@ -209,7 +216,9 @@ namespace llmbridge::detail
         // Accumulated by stream_note_usage as the stream ran. Reading the tail
         // here instead would miss anything stated before the last 2 KiB.
         return {c->usage_in, c->usage_out, c->usage_cached, c->usage_cache_write,
-                c->usage_cw_5m, c->usage_cw_1h};
+                c->usage_cw_5m, c->usage_cw_1h, c->usage_reasoning, c->usage_audio_in,
+                c->usage_audio_out, c->usage_accepted_pred, c->usage_rejected_pred,
+                c->usage_tool_prompt};
     }
 
     // Did this stream end, or did it just stop? The two are not the same, and one

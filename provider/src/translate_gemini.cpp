@@ -108,12 +108,15 @@ namespace llmbridge::provider
                    : "stop";
         }
 
-        long long in_tok = 0, out_tok = 0, total = 0;
+        long long in_tok = 0, out_tok = 0, total = 0, cached = 0, thoughts = -1;
         if (const json::Value* u = v.find("usageMetadata"))
         {
             in_tok = detail::to_ll(u->num_or("promptTokenCount", "0"));
             out_tok = detail::to_ll(u->num_or("candidatesTokenCount", "0"));
             total = detail::to_ll(u->num_or("totalTokenCount", "0"));
+            cached = detail::to_ll(u->num_or("cachedContentTokenCount", "0"));
+            if (u->find("thoughtsTokenCount"))
+                thoughts = detail::to_ll(u->num_or("thoughtsTokenCount", "0"));
         }
         if (total == 0) total = in_tok + out_tok;
 
@@ -127,7 +130,16 @@ namespace llmbridge::provider
         out += finish;
         out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(total) + "}}";
+               ",\"total_tokens\":" + std::to_string(total);
+        // Gemini's cache read and thinking count, in the shape an OpenAI client reads
+        // and the gateway's scanner records. Thinking is inside candidatesTokenCount
+        // the way reasoning is inside completion_tokens.
+        if (cached > 0)
+            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(cached) + "}";
+        if (thoughts >= 0)
+            out += ",\"completion_tokens_details\":{\"reasoning_tokens\":" +
+                   std::to_string(thoughts) + "}";
+        out += "}}";
         return out;
     }
 } // namespace llmbridge::provider

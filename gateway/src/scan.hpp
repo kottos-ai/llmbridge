@@ -30,6 +30,18 @@ namespace llmbridge::detail
         // The write split by entry lifetime. Priced differently (1.25x the input
         // rate at Anthropic's five minutes, 2x at one hour).
         long long cache_write_5m = -1, cache_write_1h = -1;
+        /// The rest of what a venue says about its tokens, -1 when it says nothing.
+        /// OpenAI: completion_tokens_details.reasoning_tokens, inside `out`;
+        /// Gemini's thoughtsTokenCount is the same fact.
+        long long reasoning = -1;
+        /// OpenAI: prompt_tokens_details.audio_tokens and
+        /// completion_tokens_details.audio_tokens, priced at their own rates.
+        long long audio_in = -1, audio_out = -1;
+        /// OpenAI predicted outputs: completion_tokens_details.accepted_ and
+        /// rejected_prediction_tokens; the rejected ones are billed and not shown.
+        long long accepted_prediction = -1, rejected_prediction = -1;
+        /// Gemini's toolUsePromptTokenCount: prompt tokens a server tool added.
+        long long tool_prompt = -1;
     };
 
     /// Bytes of a response worth searching for a usage block.
@@ -50,6 +62,7 @@ namespace llmbridge::detail
     {
         if (from > hay.size()) return std::string_view::npos;
         if (needle.empty()) return from;
+        if (needle.size() > hay.size() - from) return std::string_view::npos;
         const void* p = ::memmem(hay.data() + from, hay.size() - from, needle.data(), needle.size());
         return p ? static_cast<size_t>(static_cast<const char*>(p) - hay.data())
                  : std::string_view::npos;
@@ -130,7 +143,42 @@ namespace llmbridge::detail
         // prompt_tokens, as cached_tokens already is.
         const long long oai_write = num_after("\"cache_write_tokens\"");
         if (oai_write > 0) u.cache_write = oai_write;
-        if (u.in >= 0 || u.out >= 0) return u; // OpenAI shape, done
+        if (u.in >= 0 || u.out >= 0) // OpenAI shape
+        {
+            constexpr size_t kDetailsWindow = 700;
+            const std::string_view end =
+                tail.size() > kDetailsWindow ? tail.substr(tail.size() - kDetailsWindow) : tail;
+            if (find_fast(end, "_details\"") == std::string_view::npos) return u;
+            const auto block_at = [&end](std::string_view block_key) -> std::string_view {
+                const size_t at = find_fast(end, block_key);
+                if (at == std::string_view::npos) return {};
+                const size_t close = end.find('}', at);
+                return end.substr(at, close == std::string_view::npos ? std::string_view::npos
+                                                                      : close - at);
+            };
+            const auto num_in = [](std::string_view block, std::string_view key) -> long long {
+                const size_t k = find_fast(block, key);
+                if (k == std::string_view::npos) return -1;
+                size_t i = k + key.size();
+                while (i < block.size() && (block[i] == ':' || block[i] == ' ')) ++i;
+                long long v = 0;
+                bool any = false;
+                for (; i < block.size() && block[i] >= '0' && block[i] <= '9'; ++i)
+                {
+                    v = v * 10 + (block[i] - '0');
+                    any = true;
+                }
+                return any ? v : -1;
+            };
+            const std::string_view pd = block_at("\"prompt_tokens_details\"");
+            const std::string_view cd = block_at("\"completion_tokens_details\"");
+            u.audio_in = num_in(pd, "\"audio_tokens\"");
+            u.audio_out = num_in(cd, "\"audio_tokens\"");
+            u.reasoning = num_in(cd, "\"reasoning_tokens\"");
+            u.accepted_prediction = num_in(cd, "\"accepted_prediction_tokens\"");
+            u.rejected_prediction = num_in(cd, "\"rejected_prediction_tokens\"");
+            return u;
+        }
 
         // Anthropic names the same three things differently, and a byte-forwarded
         // stream is exactly where nothing translates them for us. Claude Code
@@ -138,7 +186,21 @@ namespace llmbridge::detail
         // tokens and therefore zero cost.
         const long long fresh = num_after("\"input_tokens\"");
         u.out = num_at("\"output_tokens\"", /*last=*/true);
-        if (fresh < 0) return u; // no Anthropic usage block either
+        if (fresh < 0)
+        {
+            // Neither shape. Gemini's own body names its counts differently, and only
+            // reaches here untranslated, so this is the one place to read them.
+            if (find_fast(tail, "\"candidatesTokenCount\"") != std::string_view::npos)
+            {
+                u.in = num_after("\"promptTokenCount\"");
+                u.out = num_after("\"candidatesTokenCount\"");
+                const long long gc = num_after("\"cachedContentTokenCount\"");
+                if (gc >= 0) u.cached = gc;
+                u.reasoning = num_after("\"thoughtsTokenCount\"");
+                u.tool_prompt = num_after("\"toolUsePromptTokenCount\"");
+            }
+            return u;
+        }
         // Normalize to the OpenAI convention so `in` and `cached` mean the same thing
         // whatever the venue. OpenAI's `prompt_tokens` is the entire prompt with
         // `cached_tokens` a subset of it; Anthropic's `input_tokens` is the fresh
