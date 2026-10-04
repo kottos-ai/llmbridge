@@ -86,6 +86,8 @@ namespace llmbridge::detail
         // The counts the stream produced.
         c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
         c->usage_cw_5m = c->usage_cw_1h = -1;
+        c->usage_reasoning = c->usage_audio_in = c->usage_audio_out = -1;
+        c->usage_accepted_pred = c->usage_rejected_pred = c->usage_tool_prompt = -1;
         c->ts_first_token = 0;
         c->ts_first_thinking = 0;
         c->ts_last_chunk = 0;

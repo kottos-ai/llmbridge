@@ -6372,6 +6372,100 @@ TEST_P(ProxyForwardStream, AFullSizeProviderUsageChunkIsStillFound)
     EXPECT_EQ(recs[0].r.cached_tokens, 7);
 }
 
+// The rest of the usage block. GPT-6 Sol at its default effort spent all 8 tokens of
+// an 8-token cap reasoning and returned no content (2026-10-04); the tape recorded 8
+// tokens out and a first-token wait, and could not say the wait was the model and not
+// the venue. Every detail the venue states now reaches the sink, and a detail it does
+// not state stays -1, which is "not stated" and never "zero".
+TEST_P(ProxyForwardStream, TheSinkGetsEveryUsageDetailTheVenueStates)
+{
+    const std::string events =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+        "data: {\"choices\":[],"
+        "\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":8,\"total_tokens\":25,"
+        "\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0,\"audio_tokens\":3},"
+        "\"completion_tokens_details\":{\"reasoning_tokens\":8,\"audio_tokens\":2,"
+        "\"accepted_prediction_tokens\":5,\"rejected_prediction_tokens\":1}}}\n\n"
+        "data: [DONE]\n\n";
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(events, 4096));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.tokens_out, 8);
+    EXPECT_EQ(r.reasoning_tokens, 8);
+    // audio_tokens appears in both blocks and must land on the right side of each.
+    EXPECT_EQ(r.audio_in_tokens, 3);
+    EXPECT_EQ(r.audio_out_tokens, 2);
+    EXPECT_EQ(r.accepted_prediction_tokens, 5);
+    EXPECT_EQ(r.rejected_prediction_tokens, 1);
+    EXPECT_EQ(r.tool_prompt_tokens, -1) << "OpenAI states none; Gemini does";
+}
+
+// Gemini states its counts under its own names and reaches the scanner untranslated
+// on the raw-body read, so a Gemini venue's thinking and cache counts must land on the
+// same fields an OpenAI venue's do.
+TEST_P(ProxyForwardStream, GeminisOwnCountsLandOnTheSameFields)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(http_ok(
+        "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},"
+        "\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":40,"
+        "\"candidatesTokenCount\":9,\"totalTokenCount\":49,\"cachedContentTokenCount\":32,"
+        "\"thoughtsTokenCount\":4,\"toolUsePromptTokenCount\":6},\"modelVersion\":\"gemini-3\"}"));
+    start(0, true, UpstreamDialect::Gemini, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    (void)c.recv_response();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.tokens_in, 40);
+    EXPECT_EQ(r.tokens_out, 9);
+    EXPECT_EQ(r.cached_tokens, 32);
+    EXPECT_EQ(r.reasoning_tokens, 4);
+    EXPECT_EQ(r.tool_prompt_tokens, 6);
+    EXPECT_EQ(r.audio_in_tokens, -1) << "Gemini states no audio split";
+}
+
+// The same block without the details: every one of them is "not stated".
+TEST_P(ProxyForwardStream, AnUnstatedUsageDetailStaysUnstated)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(openai_sse_response(4096));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request_with_usage()));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.reasoning_tokens, -1);
+    EXPECT_EQ(recs[0].r.audio_in_tokens, -1);
+    EXPECT_EQ(recs[0].r.audio_out_tokens, -1);
+    EXPECT_EQ(recs[0].r.accepted_prediction_tokens, -1);
+    EXPECT_EQ(recs[0].r.rejected_prediction_tokens, -1);
+}
+
 // OpenAI began charging for cache writes with the GPT-5.6 family, at 1.25x the uncached
 // input rate, and reports the count at usage.prompt_tokens_details.cache_write_tokens.
 // Verified against a live gpt-5.6-luna response on 2026-09-11: two identical calls over

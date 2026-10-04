@@ -918,6 +918,12 @@ namespace llmbridge
                 client->tok_cache_write = up.cache_write;
                 client->tok_cw_5m = up.cache_write_5m;
                 client->tok_cw_1h = up.cache_write_1h;
+                client->tok_reasoning = up.reasoning;
+                client->tok_audio_in = up.audio_in;
+                client->tok_audio_out = up.audio_out;
+                client->tok_accepted_pred = up.accepted_prediction;
+                client->tok_rejected_pred = up.rejected_prediction;
+                client->tok_tool_prompt = up.tool_prompt;
             }
             if (tbody.empty())
             {
@@ -966,6 +972,12 @@ namespace llmbridge
             client->tok_cache_write = bu.cache_write;
             client->tok_cw_5m = bu.cache_write_5m;
             client->tok_cw_1h = bu.cache_write_1h;
+            client->tok_reasoning = bu.reasoning;
+            client->tok_audio_in = bu.audio_in;
+            client->tok_audio_out = bu.audio_out;
+            client->tok_accepted_pred = bu.accepted_prediction;
+            client->tok_rejected_pred = bu.rejected_prediction;
+            client->tok_tool_prompt = bu.tool_prompt;
         }
         // Pool the upstream only if it will stay open: the response must say
         // keep-alive and (for passthrough, where the client's Connection header was

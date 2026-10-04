@@ -705,6 +705,7 @@ namespace llmbridge
             r.cache_write_tokens = static_cast<int32_t>(c->sse_xlate->cache_write_tokens());
             r.cache_write_5m_tokens = static_cast<int32_t>(c->sse_xlate->cache_write_5m_tokens());
             r.cache_write_1h_tokens = static_cast<int32_t>(c->sse_xlate->cache_write_1h_tokens());
+            // An Anthropic stream states none of the details; -1 stands.
         }
         else if (streamed)
         {
@@ -718,6 +719,12 @@ namespace llmbridge
             r.cache_write_tokens = static_cast<int32_t>(u.cache_write);
             r.cache_write_5m_tokens = static_cast<int32_t>(u.cache_write_5m);
             r.cache_write_1h_tokens = static_cast<int32_t>(u.cache_write_1h);
+            r.reasoning_tokens = static_cast<int32_t>(u.reasoning);
+            r.audio_in_tokens = static_cast<int32_t>(u.audio_in);
+            r.audio_out_tokens = static_cast<int32_t>(u.audio_out);
+            r.accepted_prediction_tokens = static_cast<int32_t>(u.accepted_prediction);
+            r.rejected_prediction_tokens = static_cast<int32_t>(u.rejected_prediction);
+            r.tool_prompt_tokens = static_cast<int32_t>(u.tool_prompt);
         }
         else if (!streamed)
         {
@@ -727,6 +734,12 @@ namespace llmbridge
             r.cache_write_tokens = static_cast<int32_t>(c->tok_cache_write);
             r.cache_write_5m_tokens = static_cast<int32_t>(c->tok_cw_5m);
             r.cache_write_1h_tokens = static_cast<int32_t>(c->tok_cw_1h);
+            r.reasoning_tokens = static_cast<int32_t>(c->tok_reasoning);
+            r.audio_in_tokens = static_cast<int32_t>(c->tok_audio_in);
+            r.audio_out_tokens = static_cast<int32_t>(c->tok_audio_out);
+            r.accepted_prediction_tokens = static_cast<int32_t>(c->tok_accepted_pred);
+            r.rejected_prediction_tokens = static_cast<int32_t>(c->tok_rejected_pred);
+            r.tool_prompt_tokens = static_cast<int32_t>(c->tok_tool_prompt);
         }
         for (size_t i = 0; i < kSinkCaptureMax; ++i)
             r.captured[i] = std::string_view(c->sink_cap[i], c->sink_cap_len[i]);
@@ -745,11 +758,15 @@ namespace llmbridge
         c->sse_scratch.shrink_to_fit();
         c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
         c->usage_cw_5m = c->usage_cw_1h = -1;
+        c->usage_reasoning = c->usage_audio_in = c->usage_audio_out = -1;
+        c->usage_accepted_pred = c->usage_rejected_pred = c->usage_tool_prompt = -1;
         // The non-streaming counters. They are assigned only where a body is scanned,
         // so a keep-alive request that fails before that (an upstream non-200, a translate failure)
         //  emitted a record carrying the token counts of the request before it.
         c->tok_in = c->tok_out = c->tok_cached = c->tok_cache_write = -1;
         c->tok_cw_5m = c->tok_cw_1h = -1;
+        c->tok_reasoning = c->tok_audio_in = c->tok_audio_out = -1;
+        c->tok_accepted_pred = c->tok_rejected_pred = c->tok_tool_prompt = -1;
         c->ts_first_token = 0;
         // Per request, like the stamps around it: a pooled connection serving the next
         // caller must not report the last one's tier.

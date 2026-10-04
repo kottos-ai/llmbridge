@@ -73,6 +73,18 @@ namespace llmbridge
         /// the input rate and the one-hour entry at 2x.
         int32_t cache_write_5m_tokens = -1;
         int32_t cache_write_1h_tokens = -1;
+        /// The rest of the venue's token accounting. Reasoning
+        /// is inside `tokens_out` (OpenAI's completion_tokens_details, Gemini's
+        /// thoughtsTokenCount); audio in and out are priced at their own rates; the
+        /// prediction pair is OpenAI's predicted outputs, rejected ones billed and
+        /// never shown; tool_prompt_tokens is Gemini's server-tool addition to the
+        /// prompt. Anthropic states none of these: its thinking is in output_tokens.
+        int32_t reasoning_tokens = -1;
+        int32_t audio_in_tokens = -1;
+        int32_t audio_out_tokens = -1;
+        int32_t accepted_prediction_tokens = -1;
+        int32_t rejected_prediction_tokens = -1;
+        int32_t tool_prompt_tokens = -1;
         bool streamed = false;
         /// The venue connection was reused from the pool. Not the same as
         /// `client_conn_reused`, which is the client's leg.

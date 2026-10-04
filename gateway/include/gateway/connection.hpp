@@ -208,6 +208,9 @@ namespace llmbridge
         long long tok_cached = -1; // non-streaming: prompt_tokens_details.cached_tokens
         long long tok_cache_write = -1; // usage.cache_creation_input_tokens, when stated
         long long tok_cw_5m = -1, tok_cw_1h = -1; // usage.cache_creation, when stated
+        /// The details blocks, non-streaming; see BodyUsage. -1 = not stated.
+        long long tok_reasoning = -1, tok_audio_in = -1, tok_audio_out = -1;
+        long long tok_accepted_pred = -1, tok_rejected_pred = -1, tok_tool_prompt = -1;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool wire_ready = false;
@@ -345,6 +348,8 @@ namespace llmbridge
         long long usage_in = -1, usage_out = -1, usage_cached = -1;
         long long usage_cache_write = -1; // cache_creation_input_tokens, first-wins
         long long usage_cw_5m = -1, usage_cw_1h = -1; // usage.cache_creation, first-wins
+        long long usage_reasoning = -1, usage_audio_in = -1, usage_audio_out = -1;
+        long long usage_accepted_pred = -1, usage_rejected_pred = -1, usage_tool_prompt = -1;
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         /// io_uring streaming only: translated output accumulates here while a client
         /// send SQE is in flight, so `wbuf` is never reallocated under the kernel.

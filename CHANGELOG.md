@@ -8,6 +8,42 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.62.0]. 2026-10-04
+
+### Added
+
+- **Every token count a venue states now reaches the sink.** `RequestRecord` gains
+  `reasoning_tokens`, `audio_in_tokens`, `audio_out_tokens`,
+  `accepted_prediction_tokens`, `rejected_prediction_tokens` and
+  `tool_prompt_tokens`, -1 when the venue stated none. Read from OpenAI's
+  `prompt_tokens_details` and `completion_tokens_details` on both backends, on a
+  non-streamed body and on the usage chunk of a byte-forwarded stream, with the two
+  `audio_tokens` keys kept to their own blocks; Gemini's `thoughtsTokenCount` and
+  `toolUsePromptTokenCount` land in the same fields.
+- **Gemini's translated response carries its cache read and thinking count** in the
+  OpenAI shape, `prompt_tokens_details.cached_tokens` and
+  `completion_tokens_details.reasoning_tokens`, emitted only when Gemini stated them.
+
+### Changed
+
+- **The usage scanner's cost, measured on a 1.6 KB body:** unchanged for an
+  Anthropic usage block, +110 ns for an OpenAI block without details (one search of
+  the last 700 bytes), +0.5 us for one with them (1,050 ns against 560). The first
+  version searched the whole 2 KiB tail for nine absent keys and cost every
+  response 0.5 us; the gate is what removed that.
+
+### Tests
+
+- `ProxyForwardStream.TheSinkGetsEveryUsageDetailTheVenueStates`,
+  `GeminisOwnCountsLandOnTheSameFields` and
+  `AnUnstatedUsageDetailStaysUnstated`, both backends; `GeminiResp` gains the
+  details round trip and the no-details case.
+
+### Known gaps
+
+- Cohere's billed units and Anthropic's `server_tool_use` request count are not
+  token counts and are not recorded.
+
 ## [0.61.0]. 2026-10-03
 
 ### Fixed
