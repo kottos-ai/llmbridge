@@ -62,6 +62,8 @@ namespace llmbridge::app
         double client_idle_s = 0;
         bool has_pool_idle_s = false;
         double pool_idle_s = 0;
+        bool has_connect_s = false;
+        double connect_s = 0;
 
         // runtime
         std::string io;              // "auto" | "epoll" | "uring"

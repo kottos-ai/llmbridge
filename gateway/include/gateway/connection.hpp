@@ -12,11 +12,14 @@
 // Which buffer holds what, who may free a connection on each backend, and how the
 // two TLS legs fit: GATEWAY-INTERNALS.md.
 
+#include <netinet/in.h>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "gateway/sink.hpp"
 #include "net/http.hpp"
@@ -99,7 +102,10 @@ namespace llmbridge
     /// because it is what makes cross-venue routing possible.
     struct Upstream
     {
-        std::string ip{};     ///< resolved at startup; the table is not re-resolved
+        /// The address in use. Resolved by the caller at startup; the gateway moves
+        /// to the next entry of `ips` after a failed connect and, when `host` is set,
+        /// re-resolves it off the loop and installs the fresh list.
+        std::string ip{};
         uint16_t port = 0;
         bool tls = false;     ///< originate TLS to this venue
         std::string sni_host{}; ///< DNS name for SNI, hostname verification and the
@@ -121,6 +127,10 @@ namespace llmbridge
         /// the name carries none, which makes a Bedrock venue refuse every request
         /// instead of signing with a guess.
         std::string aws_region{};
+
+
+        std::vector<std::string> ips{};
+        std::string host{};
     };
 
     /// Event-loop backend. Auto is io_uring when the kernel has it, else epoll.
@@ -176,6 +186,8 @@ namespace llmbridge
         /// which is how the response leg knows the dialect after the upstream went
         /// back to its pool.
         int upstream_slot = -1;
+        sockaddr_in up_addr{};
+        uint32_t upstream_ip = 0;
         /// The translation resolved for the request in flight, from the client dialect
         /// and the venue's. See gateway/dialect.hpp. `effective_dialect` is meaningful
         /// only when `translate_body`.
@@ -198,6 +210,7 @@ namespace llmbridge
         long long tok_cw_5m = -1, tok_cw_1h = -1; // usage.cache_creation, when stated
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
+        bool wire_ready = false;
         bool request_pending = false; // client-only: full request buffered, awaiting forward
         /// Closed, not yet freed. epoll frees at the end of the event batch; io_uring
         /// only once `inflight` hits 0, because a submitted SQE still references this

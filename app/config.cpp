@@ -225,7 +225,8 @@ namespace llmbridge::app
         if (const json::Value* g = root.find("timeouts"))
         {
             if (!g->is_object()) return fail(err, "config: \"timeouts\" must be an object");
-            if (!only(*g, "timeouts", {"upstream_s", "client_idle_s", "pool_idle_s"}, err))
+            if (!only(*g, "timeouts", {"upstream_s", "client_idle_s", "pool_idle_s", "connect_s"},
+                      err))
                 return false;
             // Upper bounds are sanity, not policy: a value this large is a typo (an
             // operator meaning milliseconds), and silently accepting it disables the
@@ -237,6 +238,9 @@ namespace llmbridge::app
                           out.client_idle_s, 0, 31536000, err))
                 return false;
             if (!want_num(*g, "timeouts", "pool_idle_s", out.has_pool_idle_s, out.pool_idle_s, 0,
+                          31536000, err))
+                return false;
+            if (!want_num(*g, "timeouts", "connect_s", out.has_connect_s, out.connect_s, 0,
                           31536000, err))
                 return false;
         }

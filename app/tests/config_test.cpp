@@ -31,7 +31,8 @@ TEST(Config, FullFileAppliesEveryGroup)
       "listen":   { "port": 8443, "tls": true, "cert": "/c.pem", "key": "/k.pem" },
       "upstream": { "url": "https://api.anthropic.com", "dialect": "anthropic",
                     "strip_headers": ["authorization", "X-Internal"] },
-      "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45 },
+      "timeouts": { "upstream_s": 90, "client_idle_s": 259200, "pool_idle_s": 45,
+                    "connect_s": 7 },
       "runtime":  { "io": "uring", "workers": 3, "timing_headers": true,
                     "duration_s": 12, "warmup_s": 2, "log_level": "debug",
                     "prefault_mb": 16 }
@@ -53,6 +54,8 @@ TEST(Config, FullFileAppliesEveryGroup)
     EXPECT_DOUBLE_EQ(c.upstream_s, 90);
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
     EXPECT_DOUBLE_EQ(c.pool_idle_s, 45);
+    EXPECT_TRUE(c.has_connect_s);
+    EXPECT_DOUBLE_EQ(c.connect_s, 7);
     EXPECT_EQ(c.io, "uring");
     EXPECT_EQ(c.log_level, "debug");
     EXPECT_EQ(c.workers, 3);
@@ -228,6 +231,8 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
                      static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9);
     EXPECT_DOUBLE_EQ(c.pool_idle_s,
                      static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9);
+    EXPECT_DOUBLE_EQ(c.connect_s,
+                     static_cast<double>(llmbridge::Gateway::kDefaultConnectNs) / 1e9);
     EXPECT_EQ(c.io, "auto");
     EXPECT_EQ(c.log_level, "info");
     EXPECT_EQ(c.workers, 1);
@@ -238,7 +243,7 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
 
     // Every settable key must appear, or the example silently stops documenting one.
     EXPECT_TRUE(c.has_listen_port && c.has_listen_tls && c.has_upstream_s &&
-                c.has_client_idle_s && c.has_pool_idle_s && c.has_workers &&
+                c.has_client_idle_s && c.has_pool_idle_s && c.has_connect_s && c.has_workers &&
                 c.has_timing_headers && c.has_duration_s && c.has_warmup_s &&
                 c.has_prefault_mb)
         << "the example is missing a key it is supposed to document";

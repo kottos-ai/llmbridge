@@ -38,6 +38,9 @@
     "_client_idle_s": "An established client that goes quiet loses its descriptor. Three days by default. This is a descriptor bound for an exposed listener, NOT a load-balancing device: a short window charges a reconnecting client a fresh TCP+TLS handshake to solve a problem the client cannot see. Requests and streams in flight are never reaped. 0 disables.",
     "client_idle_s": 259200,
 
+    "_connect_s": "How long a fresh upstream connect may take, TCP and TLS handshake together, before the request fails over or gets a 502. The kernel keeps retrying a SYN for about two minutes, and a provider that retires an address (AWS rotates its front ends on a short TTL) answers nothing at all, so without this a request to it waited that long. On a timeout the venue moves to its next resolved address and its name is resolved again. 0 disables.",
+    "connect_s": 5,
+
     "_pool_idle_s": "How long a pooled upstream connection may sit unused before it is closed. Every worker keeps its OWN pool, so offered traffic divides across them, each pool crosses this line more often, and every crossing costs the next request a full reconnect and TLS handshake. Raise it when running several workers, or once routing spreads traffic across several upstreams. 0 disables reaping.",
     "pool_idle_s": 30
   },

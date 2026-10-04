@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <charconv>
+#include <chrono>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -133,6 +134,43 @@ namespace
     // Bound and never listened: Linux answers a connect with ECONNREFUSED when there
     // is no listen queue, and a second bind gets EADDRINUSE. Both verified before this
     // was written, not assumed.
+    /// A listener whose accept queue is full and never drained. The kernel drops
+    /// every further SYN, so a connect to it sits in SYN-SENT and retries for ~127 s:
+    /// exactly what a retired provider address looks like, reproduced on loopback
+    /// without root. backlog 0 admits one connection, and `_filler` is it.
+    class BlackHole
+    {
+      public:
+        BlackHole()
+        {
+            _lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = 0;
+            ::bind(_lfd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            socklen_t len = sizeof(a);
+            ::getsockname(_lfd, reinterpret_cast<sockaddr*>(&a), &len);
+            _port = ntohs(a.sin_port);
+            ::listen(_lfd, 0);
+            _filler = ::socket(AF_INET, SOCK_STREAM, 0);
+            ::connect(_filler, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        }
+        ~BlackHole()
+        {
+            if (_filler >= 0) ::close(_filler);
+            if (_lfd >= 0) ::close(_lfd);
+        }
+        BlackHole(const BlackHole&) = delete;
+        BlackHole& operator=(const BlackHole&) = delete;
+        uint16_t port() const noexcept { return _port; }
+
+      private:
+        int _lfd = -1;
+        int _filler = -1;
+        uint16_t _port = 0;
+    };
+
     class DeadPort
     {
       public:
@@ -683,6 +721,7 @@ namespace
             if (client_idle_ns >= 0) _gw->set_client_idle_ns(client_idle_ns);
             if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
             if (_heartbeat_ns >= 0) _gw->set_heartbeat_ns(_heartbeat_ns);
+            if (_connect_ns >= 0) _gw->set_connect_ns(_connect_ns);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -716,6 +755,7 @@ namespace
         /// Heartbeat interval, -1 leaving the 5 minute default. A member and not a
         /// tenth positional argument, for the reason start() already gives.
         int64_t _heartbeat_ns = -1;
+        int64_t _connect_ns = -1; // set before start(), like the heartbeat
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -3359,6 +3399,23 @@ TEST_P(ProxyStream, HealthyStreamIsNotTimedOut)
     EXPECT_EQ(_gw->stats().upstream_timeouts, 0u);
 }
 
+TEST_P(ProxyStream, TheConnectDeadlineEndsAtTheWire)
+{
+    // A provider that took the request and went quiet is the idle timeout's case,
+    // not the connect deadline's: once the socket is wire-ready the deadline must
+    // stop counting, or every slow prefill would be a connect failure.
+    _backend.set_stall(1);
+    _connect_ns = 100'000'000LL; // 100 ms, far inside the stall below
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/5'000'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_request("hi")));
+    EXPECT_EQ(c.recv_status(1000), 0) << "a connected upstream is not a connect in progress";
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().connect_timeouts, 0u);
+}
+
 // ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
 // Deterministic: a tiny client receive window + a multi-MB stream + a client that
 // stalls before reading forces the gateway's writes to block, which must engage
@@ -4350,12 +4407,13 @@ class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
   protected:
     void start(std::vector<llmbridge::Upstream> table, llmbridge::Policy* pol,
                llmbridge::RequestSink* sink = nullptr,
-               std::vector<std::string> capture = {})
+               std::vector<std::string> capture = {}, int64_t connect_ns = 0)
     {
         _gw = std::make_unique<Gateway>(0, std::move(table), 0, GetParam(),
                                         Gateway::kDefaultUpstreamIdleNs, llmbridge::TlsConfig{},
                                         false, pol, std::vector<std::string>{});
         if (sink) _gw->set_request_sink(sink, std::move(capture));
+        if (connect_ns > 0) _gw->set_connect_ns(connect_ns); // before the loop thread
         _port = _gw->bound_port();
         _th = std::thread([this] { _gw->run(); });
     }
@@ -4373,6 +4431,88 @@ class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
     uint16_t _port = 0;
     bool _shut = false;
 };
+
+// ── A venue address that answers nothing ─────────────────────────────────
+// 2026-10-03: AWS retired a bedrock-runtime front-end address the gateway had
+// pinned at startup. Every request to that venue sat in SYN-SENT for the kernel's
+// ~127 s of retries, inside the 300 s idle allowance, with no error to fail over on.
+
+TEST_P(ProxyRoute, AConnectThatNeverCompletesIsAbandonedAtTheDeadline)
+{
+    BlackHole hole;
+    start({{"127.0.0.1", hole.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr, nullptr,
+          {}, /*connect_ns=*/300'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response(2000);
+    ASSERT_FALSE(r.empty()) << "a connect in SYN-SENT must be abandoned, not waited out";
+    EXPECT_EQ(Client::status_of(r), 502);
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().connect_timeouts, 1u);
+}
+
+TEST_P(ProxyRoute, AFailedConnectMovesTheVenueToItsNextAddress)
+{
+    // The backend listens on 127.0.0.1 only; 127.0.0.2 is loopback too and refuses
+    // at once. The venue lists both, dead one first. Nothing retries within a
+    // request here (no policy), so the first request reports the refusal and the
+    // second lands on the address the failure moved the venue to.
+    NamedBackend a;
+    a.start("alpha");
+    llmbridge::Upstream up{"127.0.0.2", a.port(), false, "", UpstreamDialect::OpenAI, ""};
+    up.ips = {"127.0.0.2", "127.0.0.1"};
+    start({up}, nullptr);
+
+    Client c1;
+    ASSERT_TRUE(c1.connect(_port));
+    ASSERT_TRUE(c1.send(make_request()));
+    EXPECT_EQ(c1.recv_status(), 502);
+    c1.close();
+
+    Client c2;
+    ASSERT_TRUE(c2.connect(_port));
+    ASSERT_TRUE(c2.send(make_request()));
+    EXPECT_NE(c2.recv_response().find("alpha"), std::string::npos) << "the next address did not serve";
+    c2.close();
+    shutdown();
+    a.stop();
+}
+
+TEST_P(ProxyRoute, AFailedConnectReresolvesTheVenueName)
+{
+    // One stale address and a name. The refusal queues a resolution of `localhost`
+    // on the resolver thread; the sweep installs the answer, and the venue dials
+    // 127.0.0.1 from then on. Polled, because the resolver runs off the loop.
+    NamedBackend a;
+    a.start("alpha");
+    llmbridge::Upstream up{"127.0.0.2", a.port(), false, "", UpstreamDialect::OpenAI, ""};
+    up.ips = {"127.0.0.2"};
+    up.host = "localhost";
+    start({up}, nullptr);
+
+    Client c1;
+    ASSERT_TRUE(c1.connect(_port));
+    ASSERT_TRUE(c1.send(make_request()));
+    EXPECT_EQ(c1.recv_status(), 502);
+    c1.close();
+
+    int status = 0;
+    for (int i = 0; i < 60 && status != 200; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        Client c;
+        ASSERT_TRUE(c.connect(_port));
+        ASSERT_TRUE(c.send(make_request()));
+        status = c.recv_status();
+        c.close();
+    }
+    EXPECT_EQ(status, 200) << "the venue never moved to the re-resolved address";
+    shutdown();
+    a.stop();
+    EXPECT_GE(_gw->stats().upstream_reresolved, 1u);
+}
 
 // The feature. Two venues, and the policy decides which one serves each request.
 TEST_P(ProxyRoute, ThePolicyChoosesWhichVenueServes)

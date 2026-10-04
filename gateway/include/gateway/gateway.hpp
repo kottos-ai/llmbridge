@@ -32,12 +32,16 @@
 #include <netinet/in.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "gateway/connection.hpp"
@@ -84,6 +88,8 @@ namespace llmbridge
         /// tls_out.size() instead grew with total bytes streamed, not the backlog.
         uint64_t tls_buffered_peak = 0;
         uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
+        uint64_t connect_timeouts = 0;  // fresh upstream connects abandoned at the deadline
+        uint64_t upstream_reresolved = 0; // venue address lists replaced after a connect failure
         uint64_t client_idle_timeouts = 0;  // established clients dropped after going quiet
         uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
                                             // first request (stall, or the wrong protocol)
@@ -115,6 +121,11 @@ namespace llmbridge
         /// gateway gives up (0 = disabled), so a stalled provider cannot pin a client
         /// and two fds forever. Once streaming, it bounds the gap between events.
         static constexpr int64_t kDefaultUpstreamIdleNs = 120LL * 1000 * 1000 * 1000; // 120 s
+
+        /// How long a fresh upstream connect may take, TCP and TLS handshake together,
+        /// before the request fails over or gets a 502 (0 = disabled). Not less than 3s,
+        /// because Linux retransmits a lost SYN at 1s.
+        static constexpr int64_t kDefaultConnectNs = 5LL * 1000 * 1000 * 1000; // 5 s
 
         /// Keep-alive pool bound. Too small and it stops bounding and starts killing
         /// reuse: 256 cost the non-streaming path 2.4x its throughput, git-bisected.
@@ -189,6 +200,7 @@ namespace llmbridge
         void set_client_setup_ns(int64_t ns) noexcept { _client_setup_ns = ns; }
         void set_client_idle_ns(int64_t ns) noexcept { _client_idle_ns = ns; }
         void set_pool_idle_ns(int64_t ns) noexcept { _pool_idle_ns = ns; }
+        void set_connect_ns(int64_t ns) noexcept { _connect_ns = ns; }
         void set_heartbeat_ns(int64_t ns) noexcept { _heartbeat_ns = ns; }
         /// Bytes to reserve and then write through in the two scratch strings at
         /// run(), before any request. A reserve alone maps nothing, the first write
@@ -460,10 +472,6 @@ namespace llmbridge
 
         net::uring::Ring _ring;
         net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
-        /// One resolved address per upstream, in table order. An SQE holds a pointer
-        /// to the entry for the life of the connect, so this is sized once at startup
-        /// and never resized.
-        std::vector<sockaddr_in> _upstream_addrs;
         struct __kernel_timespec _uring_ts{};
         long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
         bool _draining = false;   // post-stop: completions just decrement, no re-arm
@@ -479,11 +487,28 @@ namespace llmbridge
         int64_t _client_setup_ns = kClientSetupNs;
         int64_t _client_idle_ns = kDefaultClientIdleNs;
         int64_t _pool_idle_ns = kDefaultPoolIdleNs;
+        int64_t _connect_ns = kDefaultConnectNs;
         size_t _prefault_bytes = 0;
         /// Reserve `_prefault_bytes` in `s` and touch every page. Shared by both backends.
         void prefault(std::string& s) const;
         IoBackend _io;
         int64_t _upstream_idle_ns;         // 0 = no idle timeout
+
+        void note_connect_failure(int slot, const char* why) noexcept;
+        void request_reresolve(int slot) noexcept;
+        void reresolve_loop() noexcept;
+        void apply_reresolved() noexcept;
+        struct Reresolver
+        {
+            std::thread thread;
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::vector<int> pending;
+            std::vector<std::pair<int, std::vector<std::string>>> done;
+            bool stop = false;
+            std::atomic<bool> ready{false}; ///< `done` is non-empty; the loop's cheap check
+        } _rr;
+        std::vector<uint8_t> _rr_inflight; ///< per slot: a resolution is outstanding
         TlsConfig _tls; // both legs; each flag inits its own context in the ctor
         bool _timing_headers = false;      // emit x-llmbridge-* timing on responses
         /// `const` so there is no setter: swapping it while the loop runs would be a

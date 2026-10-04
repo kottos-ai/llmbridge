@@ -767,7 +767,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
   protected:
     void start(UpstreamDialect mode = UpstreamDialect::OpenAI, const std::string& backend_mode = "json",
                const std::string& sni = kHost, int handshake_delay_ms = 0,
-               bool timing_headers = false)
+               bool timing_headers = false, int64_t connect_ns = 0)
     {
         _backend.start(_id, backend_mode, handshake_delay_ms);
         TlsConfig tls;
@@ -776,6 +776,8 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         tls.ca_file = _id.write_pem();
         _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),
                                         Gateway::kDefaultUpstreamIdleNs, tls, timing_headers);
+        // Before the loop thread exists, like setup_ns in start_inbound.
+        if (connect_ns > 0) _gw->set_connect_ns(connect_ns);
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
@@ -1072,6 +1074,27 @@ TEST_P(GatewayTls, UpstreamClosingMidHandshakeYields502)
     const std::string r = c.recv_response();
     ASSERT_FALSE(r.empty()) << "expected 502, got hang/close";
     EXPECT_EQ(Client::status_of(r), 502);
+}
+
+TEST_P(GatewayTls, ConnectDeadlineAbandonsAStalledHandshakeWith502)
+{
+    // The server accepts TCP and then sleeps before SSL_accept, so the upstream is
+    // connected and not wire-ready: the state the idle timeout cannot see, because
+    // nothing has been written yet. Without the deadline the client reads nothing
+    // for the whole stall; with it the 502 arrives within the sweep's resolution.
+    start(UpstreamDialect::OpenAI, "json", kHost, /*handshake_delay_ms=*/2000, false,
+          /*connect_ns=*/200'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string r = c.recv_response(1500);
+    ASSERT_FALSE(r.empty()) << "a stalled handshake must be abandoned at the deadline, not waited out";
+    EXPECT_EQ(Client::status_of(r), 502);
+    c.close();
+    _gw->request_stop();
+    _gt.join();
+    EXPECT_GE(_gw->stats().connect_timeouts, 1u);
+    EXPECT_EQ(_backend.requests(), 0);
 }
 
 // ---------------------------------------------------------------------------

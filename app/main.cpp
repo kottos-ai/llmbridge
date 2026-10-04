@@ -10,7 +10,7 @@
 //   llmbridge [--listen PORT] [--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]]
 //          [--duration SECONDS]
 //          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere|bedrock|azure]
-//          [--upstream-timeout SECONDS]
+//          [--upstream-timeout SECONDS] [--connect-timeout SECONDS]
 //          [--io auto|epoll|uring]
 //
 // One self-contained event-loop class (llmbridge::Gateway) does everything:
@@ -110,6 +110,7 @@ static int run(int argc, char** argv)
     double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
     double client_idle = static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9;
     double pool_idle = static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9;
+    double connect_timeout = static_cast<double>(llmbridge::Gateway::kDefaultConnectNs) / 1e9;
     double prefault_mb = 0;
     std::string log_level = "info";
     int workers = 1;
@@ -184,6 +185,7 @@ static int run(int argc, char** argv)
         if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
         if (cfg.has_client_idle_s) client_idle = cfg.client_idle_s;
         if (cfg.has_pool_idle_s) pool_idle = cfg.pool_idle_s;
+        if (cfg.has_connect_s) connect_timeout = cfg.connect_s;
         if (cfg.has_prefault_mb) prefault_mb = cfg.prefault_mb;
         if (!cfg.io.empty())
             io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
@@ -214,6 +216,7 @@ static int run(int argc, char** argv)
         else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
         else if (a == "--client-idle")      { if (const char* v = nextarg()) client_idle = std::atof(v); }
         else if (a == "--pool-idle")        { if (const char* v = nextarg()) pool_idle = std::atof(v); }
+        else if (a == "--connect-timeout")  { if (const char* v = nextarg()) connect_timeout = std::atof(v); }
         else if (a == "--prefault-mb")      { if (const char* v = nextarg()) prefault_mb = std::atof(v); }
         else if (a == "--log-level")        { if (const char* v = nextarg()) log_level = v; }
         else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
@@ -258,6 +261,7 @@ static int run(int argc, char** argv)
                         "[--duration SECONDS] [--warmup SECONDS] "
                         "[--upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure] "
                         "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
+                        "[--connect-timeout SECONDS] "
                         "[--prefault-mb MB] "
                         "[--log-level trace|debug|info|warn|error|off] "
                         "[--listen-tls --tls-cert PATH --tls-key PATH] "
@@ -337,9 +341,9 @@ static int run(int argc, char** argv)
     const std::string& upstream_ip = ips.front();
     const uint16_t upstream_port = up.port;
     if (ips.size() > 1)
-        LB_WARN(up.host, " resolved to ", static_cast<int64_t>(ips.size()),
-                " addresses; using ", upstream_ip,
-                " (list several venues under \"upstream\" to reach the rest)");
+        LB_INFO(up.host, " resolved to ", static_cast<int64_t>(ips.size()),
+                " addresses; dialling ", upstream_ip,
+                " first and the rest after a failed connect");
 
     // Credentials over plaintext: the gateway forwards the client's provider key
     // upstream, so a non-TLS upstream that is not loopback puts that key on the
@@ -364,7 +368,9 @@ static int run(int argc, char** argv)
                             .sni_host = up.host,
                             .dialect = dialect,
                             .base_path = up.path,
-                            .query = up.query});
+                            .query = up.query,
+                            .ips = ips,
+                            .host = up.host});
     for (const auto& e : extra_upstreams)
     {
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
@@ -390,7 +396,9 @@ static int run(int argc, char** argv)
                                                      .sni_host = s2.host,
                                                      .dialect = dialect_from(e.dialect),
                                                      .base_path = s2.path,
-                                                     .query = s2.query});
+                                                     .query = s2.query,
+                                                     .ips = ips2,
+                                                     .host = s2.host});
     }
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -416,6 +424,7 @@ static int run(int argc, char** argv)
         // Before run(): the loop thread reads it, so setting it later is a data race.
         gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
         gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));
+        gw->set_connect_ns(static_cast<int64_t>(connect_timeout * 1e9));
         gw->set_prefault_bytes(static_cast<size_t>(prefault_mb * (1 << 20)));
         gateways.push_back(std::move(gw));
     }
