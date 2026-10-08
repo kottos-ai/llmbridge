@@ -4078,6 +4078,7 @@ namespace
 
         llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
         {
+            std::lock_guard<std::mutex> lk(_mu);
             ++calls;
             // Copy, never retain: `head` dies with the call, and the assertions run
             // after the loop thread is joined.
@@ -4096,6 +4097,15 @@ namespace
             return _d;
         }
 
+        // For a test that asserts between requests with the loop still running. A
+        // socket does not order the two threads for TSan when the loop is io_uring.
+        struct Flags { std::string model; bool stream, include_usage; };
+        Flags flags() const
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return {seen_model, seen_stream, seen_include_usage};
+        }
+
         std::atomic<int> calls{0};
         std::string seen_head, seen_auth, seen_spoofable, seen_model;
         size_t seen_body_bytes = 0;
@@ -4104,6 +4114,7 @@ namespace
 
     private:
         llmbridge::Decision _d;
+        mutable std::mutex _mu;
     };
 
     /// Opts in to the prefix hash and keeps every value it was handed, in order.
@@ -8595,8 +8606,9 @@ TEST_P(ProxyPolicy, ThePolicySeesTheTopLevelStreamFlags)
         c.close();
         ASSERT_EQ(pol.calls.load(), ++n);
         EXPECT_NE(resp.find(" 403 "), std::string::npos) << resp;
-        EXPECT_EQ(pol.seen_stream, k.stream) << k.body;
-        EXPECT_EQ(pol.seen_include_usage, k.usage) << k.body;
+        const auto seen = pol.flags();
+        EXPECT_EQ(seen.stream, k.stream) << k.body;
+        EXPECT_EQ(seen.include_usage, k.usage) << k.body;
     }
     shutdown();
     EXPECT_EQ(_backend.requests_seen(), 0);
@@ -8667,9 +8679,10 @@ TEST_P(ProxyPolicy, AnotherDialectIsServedWithAmbiguousKeysAndNoStreamFlags)
         c.close();
         EXPECT_EQ(resp.rfind("HTTP/1.1 200 ", 0), 0u) << body << "\n" << resp;
         EXPECT_EQ(pol.calls.load(), ++n);
-        EXPECT_EQ(pol.seen_model, "claude-a") << "the first model, as model_of reads it";
-        EXPECT_FALSE(pol.seen_stream) << "stream is an OpenAI option";
-        EXPECT_FALSE(pol.seen_include_usage);
+        const auto seen = pol.flags();
+        EXPECT_EQ(seen.model, "claude-a") << "the first model, as model_of reads it";
+        EXPECT_FALSE(seen.stream) << "stream is an OpenAI option";
+        EXPECT_FALSE(seen.include_usage);
     }
     shutdown();
     EXPECT_EQ(_backend.requests_seen(), 2);

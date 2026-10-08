@@ -32,7 +32,9 @@ namespace
 
 TEST(BodyFacts, AnOpenAIClientGetsTheStreamFlagsAndTheKeyCheck)
 {
-    const auto f = body_facts(kOpenAi, agent_body(4000, true));
+    // The facts are views into the body, so it has to outlive them.
+    const std::string body = agent_body(4000, true);
+    const auto f = body_facts(kOpenAi, body);
     EXPECT_EQ(f.model, "gpt-6");
     EXPECT_TRUE(f.stream);
     EXPECT_TRUE(f.include_usage);
