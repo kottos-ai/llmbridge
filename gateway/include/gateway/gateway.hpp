@@ -349,8 +349,8 @@ namespace llmbridge
         void ep_abort_pair(Connection* client) noexcept;
         /// Reply with `code` and abandon any upstream. `why` is for the log, so an
         /// incident can ask why and not only whether. `detail` is what the client
-        /// sees, and only a 4xx shows it: pass one only when the reason is the
-        /// caller's own request; a policy's deny reason is free reconnaissance.
+        /// sees, and only a 4xx shows it: pass one for the caller's own error or a
+        /// policy's checked message, never its reason, which is free reconnaissance.
         void ep_error_respond(Connection* client, int code, const char* why,
                                  const char* detail = nullptr) noexcept;
 

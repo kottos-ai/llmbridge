@@ -4125,8 +4125,64 @@ namespace
         std::vector<uint64_t> hashes, seqs;
     };
 
+    /// Refuses every request with `status`, the i-th carrying the i-th message.
+    class MessagePolicy final : public llmbridge::Policy
+    {
+    public:
+        MessagePolicy(int status, std::vector<const char*> msgs)
+            : _status(status), _msgs(std::move(msgs)) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            const size_t i = _calls.fetch_add(1);
+            return {.allow = false, .deny_status = _status, .reason = "scripted refusal",
+                    .message = i < _msgs.size() ? _msgs[i] : nullptr};
+        }
+
+    private:
+        int _status;
+        std::vector<const char*> _msgs;
+        std::atomic<size_t> _calls{0};
+    };
+
+    /// The error envelope as a strict JSON reader sees it; `parsed` is false when it
+    /// is not JSON at all, which is what an unescaped quote would make it.
+    struct ErrorBody
+    {
+        bool parsed = false;
+        std::string message, type;
+    };
+
+    ErrorBody error_body(const std::string& resp)
+    {
+        const std::string body = body_of(resp); // parse() keeps views into it
+        bool ok = false;
+        const llmbridge::provider::json::Value v = llmbridge::provider::json::parse(body, ok);
+        const llmbridge::provider::json::Value* e = ok ? v.find("error") : nullptr;
+        if (!e) return {};
+        return {true, std::string(e->str_or("message")), std::string(e->str_or("type"))};
+    }
+
     class ProxyPolicy : public ProxyIT,
-                        public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+                        public ::testing::WithParamInterface<llmbridge::IoBackend>
+    {
+    protected:
+        /// One refusal per connection, since a refusal closes it.
+        std::vector<std::string> refuse_each(llmbridge::Policy& pol, size_t n)
+        {
+            _policy = &pol;
+            start(0, true, UpstreamDialect::OpenAI, GetParam());
+            std::vector<std::string> out;
+            for (size_t i = 0; i < n; ++i)
+            {
+                Client c;
+                if (!c.connect(_proxy_port) || !c.send(make_request())) break;
+                out.push_back(c.recv_response());
+                c.close();
+            }
+            shutdown();
+            return out;
+        }
+    };
 } // namespace
 
 // The stock build: no policy, nothing consulted. This fails if "default deny" is
@@ -4297,6 +4353,92 @@ TEST_P(ProxyPolicy, OutOfRangeDenyStatusStillRefuses)
     shutdown();
     EXPECT_EQ(_gw->stats().policy_denied, 1u);
     EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// A policy names what the caller is told and the status it is told with. 402 is in
+// the table, so a refusal for payment never reads as a provider failure, and a
+// message at the length bound is sent whole.
+TEST_P(ProxyPolicy, ADenialMessageReachesTheClientWithItsStatus)
+{
+    constexpr const char* kMsg = "Credits exhausted. Add credits at https://example.com/account";
+    const std::string longest(llmbridge::kMaxDenyMessage, 'a');
+    MessagePolicy pol{402, {kMsg, longest.c_str()}};
+    const std::vector<std::string> resps = refuse_each(pol, 2);
+    ASSERT_EQ(resps.size(), 2u);
+    for (size_t i = 0; i < resps.size(); ++i)
+    {
+        EXPECT_EQ(resps[i].rfind("HTTP/1.1 402 Payment Required\r\n", 0), 0u) << resps[i];
+        const ErrorBody e = error_body(resps[i]);
+        EXPECT_TRUE(e.parsed) << "not JSON a client can read: " << resps[i];
+        EXPECT_EQ(e.message, i == 0 ? std::string(kMsg) : longest);
+        EXPECT_EQ(e.type, "billing_error");
+        EXPECT_EQ(resps[i].find("scripted refusal"), std::string::npos) << "the reason is the log's";
+    }
+    EXPECT_EQ(_gw->stats().policy_denied, 2u);
+    EXPECT_EQ(_backend.requests_seen(), 0) << "a denied request reached the upstream";
+}
+
+// The message is spliced into JSON with no escaping, so each of these would break the
+// body, forge a field or carry bytes a client cannot read. The refusal still stands;
+// only the words fall back to the table's.
+TEST_P(ProxyPolicy, AnUnsendableDenialMessageFallsBackToTheGenericOne)
+{
+    const std::string too_long(llmbridge::kMaxDenyMessage + 1, 'a');
+    const std::vector<const char*> bad = {
+        R"(credit","type":"forged)", R"(credit\n)", "credit\r\nX-Injected: 1",
+        "credit\x01", "credit\x7f", "cr\xc3\xa9" "dit", "", too_long.c_str()};
+    MessagePolicy pol{402, bad};
+    const std::vector<std::string> resps = refuse_each(pol, bad.size());
+    ASSERT_EQ(resps.size(), bad.size());
+    for (size_t i = 0; i < bad.size(); ++i)
+    {
+        EXPECT_EQ(Client::status_of(resps[i]), 402) << resps[i];
+        const ErrorBody e = error_body(resps[i]);
+        EXPECT_TRUE(e.parsed) << resps[i];
+        EXPECT_EQ(e.message, "payment required") << "message " << i << " was sent: " << resps[i];
+        EXPECT_EQ(e.type, "billing_error") << resps[i];
+    }
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// No message: answered exactly as before the field existed.
+TEST_P(ProxyPolicy, ADenialWithoutAMessageIsAnsweredAsBefore)
+{
+    MessagePolicy pol{429, {nullptr}};
+    const std::vector<std::string> resps = refuse_each(pol, 1);
+    ASSERT_EQ(resps.size(), 1u);
+    EXPECT_EQ(resps[0].rfind("HTTP/1.1 429 Too Many Requests\r\n", 0), 0u) << resps[0];
+    const ErrorBody e = error_body(resps[0]);
+    EXPECT_EQ(e.message, "rate limit exceeded");
+    EXPECT_EQ(e.type, "rate_limit_error");
+}
+
+// A 5xx is ours, not the caller's, and shows no detail, a policy's message included.
+TEST_P(ProxyPolicy, ADenialMessageIsNeverShownOnA5xx)
+{
+    MessagePolicy pol{503, {"try the other region"}};
+    const std::vector<std::string> resps = refuse_each(pol, 1);
+    ASSERT_EQ(resps.size(), 1u);
+    EXPECT_EQ(Client::status_of(resps[0]), 503) << resps[0];
+    EXPECT_EQ(error_body(resps[0]).message, "service unavailable");
+}
+
+// The check at its edges: every printable byte but the two JSON metacharacters, and
+// nothing past the bound.
+TEST(PolicyMessage, AcceptsPrintableAsciiWithinTheBoundAndNothingElse)
+{
+    EXPECT_FALSE(llmbridge::deny_message_ok(nullptr));
+    EXPECT_FALSE(llmbridge::deny_message_ok(""));
+    for (int b = 1; b < 256; ++b)
+    {
+        const char m[2] = {static_cast<char>(b), '\0'};
+        const bool want = b >= 0x20 && b <= 0x7E && b != '"' && b != '\\';
+        EXPECT_EQ(llmbridge::deny_message_ok(m), want) << "byte " << b;
+    }
+    EXPECT_TRUE(llmbridge::deny_message_ok(std::string(llmbridge::kMaxDenyMessage, 'a').c_str()));
+    EXPECT_FALSE(
+        llmbridge::deny_message_ok(std::string(llmbridge::kMaxDenyMessage + 1, 'a').c_str()));
+    static_assert(llmbridge::deny_message_ok("payment required"), "usable at compile time");
 }
 
 // The facts have to be usable, or the seam is a boolean with extra steps.

@@ -35,6 +35,25 @@ namespace llmbridge
         uint64_t seq = 0;
     };
 
+    inline constexpr size_t kMaxDenyMessage = 256;
+
+    /// The rule the gateway applies to Decision::message, public so a policy can
+    /// static_assert its own. The message lands in a JSON string with no escaping,
+    /// hence printable ASCII without `"` or `\`, 1 to kMaxDenyMessage bytes. Reads at
+    /// most kMaxDenyMessage + 1 bytes however long the string is.
+    [[nodiscard]] constexpr bool deny_message_ok(const char* m) noexcept
+    {
+        if (!m) return false;
+        size_t n = 0;
+        for (; m[n] != '\0'; ++n)
+        {
+            const auto c = static_cast<unsigned char>(m[n]);
+            if (n == kMaxDenyMessage || c < 0x20 || c > 0x7E || c == '"' || c == '\\')
+                return false;
+        }
+        return n > 0;
+    }
+
     struct Decision
     {
         /// `= false` so `Decision d;` refuses too; `Decision{}` zeroes it either way.
@@ -68,6 +87,7 @@ namespace llmbridge
         /// Logged, never sent to the client. Must outlive the call, and must not carry
         /// credential material.
         const char* reason = "policy denied";
+        const char* message = nullptr;
         uint64_t tag = 0;
     };
 

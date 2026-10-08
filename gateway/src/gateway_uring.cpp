@@ -707,7 +707,7 @@ namespace llmbridge
         if (_policy)
         {
             const Decision d = policy_decision(c, m);
-            if (!d.allow) { ur_error_respond(c, d.deny_status, d.reason); return; }
+            if (!d.allow) { ur_error_respond(c, d.deny_status, d.reason, d.message); return; }
             // Out of range is the default, not an error: a policy that does not route
             // leaves this at -1, and one that names a venue that has since left the
             // table must not send the request somewhere arbitrary.
