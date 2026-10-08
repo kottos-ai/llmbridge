@@ -811,6 +811,14 @@ namespace llmbridge
                     " (", d.reason, "); refusing with 403");
             d.deny_status = 403;
         }
+        // The one policy string a client sees, spliced into JSON unescaped. Never
+        // printed here: a message that failed the check is not safe in a log line.
+        if (d.message && !deny_message_ok(d.message))
+        {
+            LB_WARN(ReqId{c->req_seq}, " policy message refused (", d.reason,
+                    "); sending the generic one");
+            d.message = nullptr;
+        }
         // Never log `facts`: the head carries the client's Authorization.
         ++_stats.policy_denied;
         return d;

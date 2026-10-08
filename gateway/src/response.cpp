@@ -38,6 +38,7 @@ namespace llmbridge::detail
             {
                 case 400: return {"HTTP/1.1 400 Bad Request", "invalid_request_error", "malformed request"};
                 case 401: return {"HTTP/1.1 401 Unauthorized", "authentication_error", "unauthorized"};
+                case 402: return {"HTTP/1.1 402 Payment Required", "billing_error", "payment required"};
                 case 403: return {"HTTP/1.1 403 Forbidden", "permission_error", "forbidden"};
                 case 404: return {"HTTP/1.1 404 Not Found", "invalid_request_error", "not found"};
                 case 413: return {"HTTP/1.1 413 Content Too Large", "invalid_request_error", "request too large"};
@@ -45,9 +46,9 @@ namespace llmbridge::detail
                 case 429: return {"HTTP/1.1 429 Too Many Requests", "rate_limit_error", "rate limit exceeded"};
                 case 503: return {"HTTP/1.1 503 Service Unavailable", "service_error", "service unavailable"};
                 case 504: return {"HTTP/1.1 504 Gateway Timeout", "timeout_error", "upstream timed out"};
-                // Anything unlisted keeps the historical fallback. It is reachable
-                // only from our own call sites, all of which pass a code above; the
-                // policy seam validates its status before it gets here.
+                // Anything unlisted keeps the historical fallback, a policy's status
+                // included: the seam checks only that it is 400-599, so a code a
+                // policy refuses with belongs above or it goes out as a 502.
                 default: return {"HTTP/1.1 502 Bad Gateway", "upstream_error", "bad gateway: upstream failure"};
             }
         }
@@ -153,9 +154,9 @@ namespace llmbridge::detail
     // stays in the log: a client has no use for our internals and an attacker
     // has several.
     //
-    // Every detail passed here is a string literal from this file, so nothing
-    // client-supplied is echoed back. Keep it that way: this string lands inside
-    // a JSON body with no escaping.
+    // Every detail passed here is a literal in this tree or a policy message that
+    // passed deny_message_ok, so nothing client-supplied is echoed back. Keep it
+    // that way: this string lands inside a JSON body with no escaping.
     std::string build_error(int code, const char* detail)
     {
         const auto [line, type, msg] = error_shape(code);

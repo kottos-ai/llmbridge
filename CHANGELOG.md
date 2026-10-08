@@ -8,6 +8,41 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.63.0]. 2026-10-08
+
+### Added
+
+- **A policy can say why it refused.** `Decision::message` is sent as the error
+  message of a 4xx refusal; null keeps the status's generic one, and a 5xx never
+  shows it. `reason` is still logged and never sent.
+- **The message is checked before it is sent**, because it lands in a JSON string
+  with no escaping: 1 to 256 bytes of printable ASCII without `"` or `\`. Anything
+  else is dropped with a WARN and the generic message goes out; the refusal stands.
+  The rule is `deny_message_ok`, public and `constexpr` so a policy can
+  `static_assert` its own messages.
+- **402 renders as `402 Payment Required`**, type `billing_error`, message
+  `payment required`. A policy refusing with 402 used to go out as
+  `502 Bad Gateway`, blaming the provider for our own refusal.
+
+### Changed
+
+- Minor: `Decision` gains a field after `reason`, so a policy built against 0.62
+  keeps compiling and behaves identically.
+
+### Tests
+
+- `ProxyPolicy.ADenialMessageReachesTheClientWithItsStatus`,
+  `AnUnsendableDenialMessageFallsBackToTheGenericOne` (a quote, a backslash, CR LF,
+  other control bytes, 0x7F, non-ASCII, empty, one byte over the bound),
+  `ADenialWithoutAMessageIsAnsweredAsBefore` and `ADenialMessageIsNeverShownOnA5xx`,
+  both backends; `PolicyMessage.AcceptsPrintableAsciiWithinTheBoundAndNothingElse`.
+
+### Known gaps
+
+- A policy status in 400-599 that `error_shape` does not list (405, 409, 422, 500
+  and others) still goes out as `502 Bad Gateway`. The seam checks the range, not the
+  table.
+
 ## [0.62.0]. 2026-10-04
 
 ### Added
