@@ -639,12 +639,27 @@ namespace llmbridge
     // a policy installed. A stock build parses nothing here, as before.
     // Split out of sink_capture because a policy needs it too and needs it before the
     // decision, while sink_capture's other work is only ever read at the end.
-    void Gateway::capture_model(Connection* c) noexcept
+    const char* Gateway::capture_model(Connection* c) noexcept
     {
         c->sink_model_len = 0;
         c->prefix_hash = 0;
         const std::string_view body(c->rbuf.data() + c->msg.header_len, c->msg.body_len);
-        const std::string_view model = provider::model_of(body);
+        // One walk of the top level for everything a policy or the sink reads: a key
+        // sent last, as the OpenAI SDK sends them, costs a whole-body walk per read.
+        const provider::TopLevelFacts top =
+            detail::body_facts(std::string_view(c->rbuf.data(), c->msg.header_len), body);
+        c->asked_stream = top.stream;
+        c->asked_usage = top.include_usage;
+        // What a policy or the sink reads here must be what the provider reads. Our
+        // readers take the first raw match; a provider unescapes and may take the last.
+        switch (top.keys)
+        {
+            case provider::KeyCheck::Ok: break;
+            case provider::KeyCheck::DuplicateKey: return "duplicate top-level key";
+            case provider::KeyCheck::EscapedKey: return "escaped top-level key";
+            case provider::KeyCheck::TooManyKeys: return "too many top-level keys";
+        }
+        const std::string_view model = top.model;
         if (!model.empty() && model.size() <= sizeof(c->sink_model))
         {
             std::memcpy(c->sink_model, model.data(), model.size());
@@ -657,6 +672,7 @@ namespace llmbridge
             // path is exception-free by construction
             c->prefix_hash = net::Sha256::truncated(net::Sha256::hash(body.substr(0, n)));
         }
+        return nullptr;
     }
 
     void Gateway::sink_emit(Connection* c, int status, bool streamed) noexcept
@@ -696,6 +712,7 @@ namespace llmbridge
         r.venue_req_id = std::string_view(c->venue_req_id, c->venue_req_id_len);
         r.prefix_hash = c->prefix_hash;
         r.served_tier = std::string_view(c->served_tier, c->served_tier_len);
+        r.served_model = std::string_view(c->served_model, c->served_model_len);
         r.from_pool = c->upstream_pooled;
         if (streamed && c->sse_xlate)
         {
@@ -776,6 +793,8 @@ namespace llmbridge
         c->venue_req_id_len = 0;
         c->served_tier_len = 0;
         c->served_tier_tries = 0;
+        c->served_model_len = 0;
+        c->served_model_tries = 0;
         c->upstream_pooled = false;
         c->upstream_ip = 0;
         c->ts_first_thinking = 0;
@@ -790,11 +809,12 @@ namespace llmbridge
 
     Decision Gateway::policy_decision(Connection* c, const net::http::Message& m) noexcept
     {
-        // Head, plus the model identifier and nothing else from the body. This is the
-        // line where "metadata only, no prompt text".
+        // Head, plus the model and two streaming flags and nothing else from the body.
+        // This is the line where "metadata only, no prompt text". All three were read
+        // by capture_model, which both backends run first when a policy exists.
         const RequestFacts facts{std::string_view(c->rbuf.data(), m.header_len), m.body_len,
                                  std::string_view(c->sink_model, c->sink_model_len),
-                                 c->prefix_hash, c->req_seq};
+                                 c->prefix_hash, c->req_seq, c->asked_stream, c->asked_usage};
 
         Decision d = _policy->decide(facts);
         if (d.allow)

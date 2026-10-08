@@ -20,6 +20,7 @@
 
 #include "gateway/dialect.hpp"
 #include "gateway/gateway.hpp"
+#include "provider/translate.hpp"
 
 namespace llmbridge::detail
 {
@@ -63,6 +64,10 @@ namespace llmbridge::detail
 
     constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";
 
+    /// Everything a policy or the sink reads from the body; the gateway calls this
+    /// once per request.
+    [[nodiscard]] provider::TopLevelFacts body_facts(std::string_view head,
+                                                     std::string_view body) noexcept;
     TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept;
     const char* translate_failure(std::string_view body) noexcept;
     const char* dialect_name(UpstreamDialect m) noexcept;

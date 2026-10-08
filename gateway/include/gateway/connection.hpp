@@ -179,6 +179,10 @@ namespace llmbridge
         char sink_model[64] = {};
         uint8_t sink_model_len = 0;
         uint64_t prefix_hash = 0;
+        /// The client's top-level `stream` and `stream_options.include_usage`, read
+        /// in the same pass as the model; meaningful only after capture_model.
+        bool asked_stream = false;
+        bool asked_usage = false;
 
         /// Index into the upstream table, -1 when none applies. On an upstream
         /// connection the venue this socket talks to, so release finds the right
@@ -330,6 +334,11 @@ namespace llmbridge
         /// Reads searched for the served tier so far, so a venue without the field
         /// is given up on quickly instead of searched on every chunk.
         uint8_t served_tier_tries = 0;
+        /// The model the reply names, cut at 64 bytes: longer ids exist only as
+        /// Bedrock ARNs, and a prefix that long still tells one model from another.
+        char served_model[64] = {};
+        uint8_t served_model_len = 0;
+        uint8_t served_model_tries = 0;
 
         /// The Anthropic-to-OpenAI SSE translator, null when the stream needs none.
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;

@@ -40,6 +40,11 @@ namespace llmbridge::detail
                                int64_t client_upload_us);
     void append_usage_headers(std::string& out, std::string_view translated_body);
     std::string build_error(int code, const char* detail = nullptr);
+
+    /// The 400 for a body whose top-level keys we could read differently from the
+    /// provider. A literal: nothing from the body is echoed.
+    inline constexpr const char* kAmbiguousKeysMessage =
+        "request body repeats a top-level key or escapes one";
     std::string sse_head_with_timing(std::string_view extra, std::string_view base);
     std::string build_http_status(int status, std::string_view reason, std::string_view body);
     const char* reason_for(int status);

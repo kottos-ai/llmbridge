@@ -46,6 +46,16 @@ add_executable(gateway_request_perf_test request_perf_test.cpp)
 target_link_libraries(gateway_request_perf_test PRIVATE gateway)
 target_include_directories(gateway_request_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# The same split for the body pass: body_facts_test runs in ctest with loose bounds,
+# this prints percentiles and is run by hand.
+add_executable(gateway_body_perf_test body_perf_test.cpp)
+target_link_libraries(gateway_body_perf_test PRIVATE gateway)
+target_include_directories(gateway_body_perf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+add_executable(gateway_body_facts_test body_facts_test.cpp)
+target_link_libraries(gateway_body_facts_test PRIVATE gateway GTest::gtest_main)
+target_include_directories(gateway_body_facts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 include(GoogleTest)
 gtest_discover_tests(gateway_metrics_test)
 gtest_discover_tests(gateway_stats_test)
@@ -58,6 +68,8 @@ gtest_discover_tests(gateway_dialect_test)
 # has the machine to itself.
 gtest_discover_tests(gateway_rebuild_test)
 gtest_discover_tests(gateway_request_test)
+# RUN_SERIAL: its bounds are timing ratios, measured with the machine to itself.
+gtest_discover_tests(gateway_body_facts_test PROPERTIES RUN_SERIAL TRUE)
 gtest_discover_tests(gateway_served_tier_test)
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 

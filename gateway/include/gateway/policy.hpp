@@ -33,6 +33,10 @@ namespace llmbridge
         uint64_t prefix_hash = 0;
         /// The gateway's request sequencer.
         uint64_t seq = 0;
+        /// Top-level `"stream": true`, and top-level `stream_options.include_usage`
+        /// true. Anything else, nested or not a boolean, reads false.
+        bool stream = false;
+        bool include_usage = false;
     };
 
     inline constexpr size_t kMaxDenyMessage = 256;

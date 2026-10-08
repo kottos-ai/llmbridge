@@ -8,6 +8,101 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.64.0]. 2026-10-08
+
+### Added
+
+- **A policy sees whether an OpenAI client asked to stream, and whether it asked
+  for usage.** `RequestFacts` gains `stream` (top-level `"stream": true`) and
+  `include_usage` (top-level `stream_options.include_usage: true`). Absent, false,
+  not a boolean, or nested anywhere else, such as a tool schema, reads false.
+- **`RequestRecord::served_model`**, the model the venue's reply names: the
+  top-level `model` of a non-streamed body or of an OpenAI chunk, and
+  `message.model` of Anthropic's `message_start`. Read on both backends where the
+  served tier is, at most four reads per stream, cut at 64 bytes, never a nested
+  `model`. A sink compares it with the model asked, which is how a body naming
+  `model` twice is caught for a client whose body is not key-checked (below).
+- `provider::top_level_facts`, one walk of the top level returning the model, both
+  stream flags and the key verdict; `provider::reply_model`;
+  `provider::top_level_member_count`, the bare walk, for tests to price against.
+
+### Security
+
+- **An OpenAI client's body whose top-level keys we could read differently from
+  the provider is refused with 400**, before the policy is asked and before any
+  upstream is contacted. Our readers compare raw bytes and take the first match; a
+  provider unescapes keys and may keep the last duplicate. So
+  `"stream":false,"stream":true` read as not streaming here and streamed there, and
+  a policy could bill, route or meter a request on a value the provider never used.
+  Refused: a repeated key, a key spelled with a backslash escape, or more than 256
+  keys, in the top-level object or in `stream_options`. Keys anywhere else are the
+  client's schema and pass. The WARN names which rule fired and never prints the
+  body; the client gets a fixed message.
+- **Any other client's body is read for the model alone and not key-checked.** The
+  stream trick cannot apply to it, since its usage is read from the venue's events,
+  and a second `model` is caught after the fact by comparing with `served_model`.
+  The read stops at the model, so Claude Code, which sends it first, pays about
+  0.1 us at any body size instead of a walk of its whole context.
+- All of this runs only where the gateway reads the body for a decision, with a
+  policy or a sink installed. A stock build reads nothing and checks nothing.
+
+### Performance
+
+- **One walk per request.** The gateway calls `top_level_facts` once, through
+  `detail::body_facts`; `model_of`, `wants_stream`, `stream_usage_of` and
+  `top_level_key_check` are thin wrappers for other callers. Reading each key on
+  its own walked the whole body once per key whenever the key came late or was
+  absent, and the OpenAI SDK puts `model` and `stream` after `messages`.
+- **String contents are skipped with `memchr`**, and a closing quote is the one
+  with an even run of backslashes before it. What remains is dense structure, such
+  as tool schemas, read one token at a time.
+- Measured on an i7-9750H laptop, Release, median, OpenAI client, a Claude Code
+  shaped body (system prompt, tool schemas, messages), keys first / keys last. The
+  single pass is within 2% of a bare walk.
+
+  | body | before: four reads, byte by byte | staged: four reads, memchr | now: one pass |
+  |---|---|---|---|
+  | 2 KB | 2.0 / 9.0 us | 1.2 / 5.6 us | 1.1 / 1.1 us |
+  | 30 KB | 20 / 118 us | 11 / 73 us | 11 / 12 us |
+  | 200 KB | 134 / 787 us | 74 / 484 us | 73 / 73 us |
+  | 800 KB | 549 / 3155 us | 306 / 1942 us | 290 / 289 us |
+
+### Fixed
+
+- **`wants_stream` read `"stream": true` followed by whitespace as not streaming.**
+  A bare literal ran to the next `,` or `}`, so a pretty-printed body ending in
+  `true\n}` compared as `"true\n"`. The one caller decides whether a request to a
+  Bedrock venue is refused for streaming, so such a request was signed and sent
+  instead of refused.
+
+### Changed
+
+- Minor: the new fields sit at the end of `RequestFacts` and `RequestRecord` gains
+  one, so aggregate initializers written against 0.63 keep compiling.
+- Breaking for input only: with a policy or sink installed, an OpenAI client's body
+  0.63 forwarded is refused when it repeats or escapes a top-level key. No SDK we
+  know emits one.
+
+### Tests
+
+- Both backends: `ProxyPolicy.ThePolicySeesTheTopLevelStreamFlags`,
+  `AnAmbiguousTopLevelKeyIsRefusedBeforeThePolicyAndTheUpstream` and
+  `AnotherDialectIsServedWithAmbiguousKeysAndNoStreamFlags`;
+  `ProxyRoute.TheServedModelIsReadOff{AnOpenAIStream,AnOpenAIBody,AnAnthropicStream,AnAnthropicBody}`,
+  `TheServedModelIsEmptyWhenOnlyANestedOneExists` and `TheServedModelIsCutAt64Bytes`.
+- `TopLevelKeys`, `TopLevelFacts`, `TopLevelWalk` (escaped quotes, backslash runs,
+  structure inside strings, a quote at every offset, unterminated and unbalanced
+  input, depth), `StreamUsage`, `WantsStream.WhitespaceAfterTheLiteralIsNotPartOfIt`,
+  `ServedModel`, `BodyFacts`.
+- **`BodyFactsPerf`**, run by ctest outside the sanitizers, bounds loose enough
+  that only a pathological shape trips them: the OpenAI pass under 2x a bare walk
+  in the same process (four reads were ~6x), under 1,000 us at 200 KB (73 us
+  measured), cost per KB at 800 KB within 3x of 30 KB (a quadratic skip is ~27x),
+  and another dialect's 800 KB body within 3x of its 2 KB body.
+- `gateway_body_perf_test` prints p50/p95/p99 for both key orders and both client
+  dialects; built by default, never run by ctest.
+- `fuzz_json` now also runs the top-level readers on every input.
+
 ## [0.63.0]. 2026-10-08
 
 ### Added

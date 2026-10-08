@@ -21,6 +21,7 @@ namespace
 {
     using llmbridge::Connection;
     using llmbridge::detail::kTierTries;
+    using llmbridge::detail::note_served_model;
     using llmbridge::detail::note_served_tier;
 } // namespace
 
@@ -94,4 +95,41 @@ TEST(ServedTier, GivingUpIsPermanentEvenIfATierAppearsLater)
     const std::string late = R"({"service_tier":"flex","choices":[]})";
     note_served_tier(&c, late, /*tail=*/false);
     EXPECT_EQ(c.served_tier_len, 0);
+}
+
+// note_served_model shares the budget's shape: found once, or given up on after
+// kTierTries reads, and it reads only the top-level model of each event.
+TEST(ServedModel, ReadsTheTopLevelModelOfEachDialectAndNothingNested)
+{
+    Connection a;
+    note_served_model(&a, "event: message_start\ndata: {\"type\":\"message_start\","
+                          "\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n", true);
+    EXPECT_EQ(std::string(a.served_model, a.served_model_len), "claude-x");
+
+    Connection o;
+    note_served_model(&o, "data: {\"id\":\"c\",\"meta\":{\"model\":\"decoy\"},\"model\":\"gpt-x\"}\n\n",
+                      true);
+    EXPECT_EQ(std::string(o.served_model, o.served_model_len), "gpt-x");
+
+    Connection n;
+    note_served_model(&n, R"({"choices":[{"message":{"model":"decoy"}}]})", false);
+    EXPECT_EQ(n.served_model_len, 0);
+    // A model in a later event of the first read is found; one in a ping is not a model.
+    Connection l;
+    note_served_model(&l, "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+                          "data: {\"model\":\"later\"}\n\n", true);
+    EXPECT_EQ(std::string(l.served_model, l.served_model_len), "later");
+}
+
+TEST(ServedModel, GivesUpAfterFourTriesAndCutsAt64Bytes)
+{
+    Connection c;
+    for (int i = 0; i < 10; ++i) note_served_model(&c, "data: {\"choices\":[]}\n\n", true);
+    EXPECT_EQ(c.served_model_tries, kTierTries);
+    note_served_model(&c, "data: {\"model\":\"late\"}\n\n", true);
+    EXPECT_EQ(c.served_model_len, 0) << "giving up is permanent";
+
+    Connection t;
+    note_served_model(&t, R"({"model":")" + std::string(100, 'm') + R"("})", false);
+    EXPECT_EQ(std::string(t.served_model, t.served_model_len), std::string(64, 'm'));
 }

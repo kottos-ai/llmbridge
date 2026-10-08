@@ -101,6 +101,8 @@ namespace llmbridge
         /// The `service_tier` the client's own body carried, empty when it named none.
         std::string_view asked_tier;
         std::string_view served_tier;
+        /// The model the venue's reply names, which is what the client was served.
+        std::string_view served_model;
         /// The venue's own name for this failure, read from its error body when it
         /// answered 4xx or 5xx: `invalid_request_error`, `context_length_exceeded`,
         /// `overloaded_error`.
