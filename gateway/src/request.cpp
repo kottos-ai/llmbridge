@@ -392,6 +392,15 @@ namespace llmbridge::detail
     /// line) and the venue's. Shared by both backends; the caller handles the refusal
     /// so each can use its own error path. A free function, not a Gateway method,
     /// because TranslationPlan lives in dialect.hpp which already includes gateway.hpp.
+    provider::TopLevelFacts body_facts(std::string_view head, std::string_view body) noexcept
+    {
+        if (client_dialect_from_target(request_line(head)) == Dialect::OpenAI)
+            return provider::top_level_facts(body);
+        provider::TopLevelFacts f;
+        f.model = provider::model_of(body);
+        return f;
+    }
+
     TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept
     {
         const std::string_view head(c->rbuf.data(), c->msg.header_len);

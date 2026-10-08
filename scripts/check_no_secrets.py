@@ -15,7 +15,7 @@ repo, separated only by .gitignore. One mis-added file is unrecoverable once pus
 rotating the key fixes the key, not the git history or the forks of it.
 
 So this checks what is actually tracked, not what is on disk. A key sitting in
-`private/` or `~/.anthropic_key` is fine and expected; the same bytes in `git
+`private/` or `~/.kottos/keys/.anthropic_key` is fine and expected; the same bytes in `git
 ls-files` are not.
 
 Scope note: this is a cheap last line of defence, not a replacement for gitleaks or

@@ -1175,6 +1175,166 @@ TEST(WantsStream, OnlyATopLevelTrueCounts)
     EXPECT_TRUE(wants_stream(R"({"tools":[{"input_schema":{"properties":{"stream":true}}}],"stream":true})"));
 }
 
+// A pretty-printed body put a newline between `true` and the closing brace, and that
+// newline used to be read as part of the value.
+TEST(WantsStream, WhitespaceAfterTheLiteralIsNotPartOfIt)
+{
+    using llmbridge::provider::wants_stream;
+    EXPECT_TRUE(wants_stream("{\n  \"stream\": true\n}"));
+    EXPECT_TRUE(wants_stream("{\"stream\":true \t\r\n, \"model\":\"m\"}"));
+    EXPECT_FALSE(wants_stream("{\"stream\": truex }"));
+}
+
+// Our readers take the first raw match; a provider unescapes keys and Python's json
+// keeps the last duplicate. Any body where the two can differ is refused.
+TEST(TopLevelKeys, ARepeatedOrEscapedKeyIsAmbiguousOnlyWhereWeRead)
+{
+    using llmbridge::provider::KeyCheck;
+    using llmbridge::provider::top_level_key_check;
+    EXPECT_EQ(top_level_key_check(R"({"model":"m","stream":true,"messages":[]})"), KeyCheck::Ok);
+    EXPECT_EQ(top_level_key_check(R"({"stream":false,"stream":true})"), KeyCheck::DuplicateKey);
+    EXPECT_EQ(top_level_key_check(R"({"stream":true,"model":"m","stream":false})"),
+              KeyCheck::DuplicateKey);
+    EXPECT_EQ(top_level_key_check(R"({"model":"a","x":1,"model":"b"})"), KeyCheck::DuplicateKey);
+    EXPECT_EQ(top_level_key_check(R"({"str\u0065am":true})"), KeyCheck::EscapedKey);
+    EXPECT_EQ(top_level_key_check(R"({"a\"b":1})"), KeyCheck::EscapedKey);
+    // stream_options is read one level down, so it is held to the same rule.
+    EXPECT_EQ(top_level_key_check(
+                  R"({"stream_options":{"include_usage":true,"include_usage":false}})"),
+              KeyCheck::DuplicateKey);
+    EXPECT_EQ(top_level_key_check(R"({"stream_options":{"include\u005fusage":true}})"),
+              KeyCheck::EscapedKey);
+    // Anywhere else, keys are the client's schema and none of our business.
+    EXPECT_EQ(top_level_key_check(
+                  R"({"tools":[{"parameters":{"str\u0065am":1,"a":1,"a":2}}],)"
+                  R"("metadata":{"k":1,"k":2},"messages":[{"role":"user","content":"\"stream\""}]})"),
+              KeyCheck::Ok);
+    EXPECT_EQ(top_level_key_check(R"({"model":"str\u0065am"})"), KeyCheck::Ok) << "a value";
+    EXPECT_EQ(top_level_key_check("{}"), KeyCheck::Ok);
+    EXPECT_EQ(top_level_key_check(""), KeyCheck::Ok);
+    EXPECT_EQ(top_level_key_check("[1,2]"), KeyCheck::Ok);
+    std::string many = "{";
+    for (int i = 0; i < 257; ++i) many += (i ? ",\"k" : "\"k") + std::to_string(i) + "\":0";
+    EXPECT_EQ(top_level_key_check(many + "}"), KeyCheck::TooManyKeys);
+}
+
+// The walker finds a string's end with memchr and the parity of the backslashes
+// before each quote, and skips nested values over whole strings. These are the
+// inputs where that can differ from reading byte by byte.
+TEST(TopLevelWalk, StringsEndAtTheFirstQuoteNotEscaped)
+{
+    using llmbridge::provider::wants_stream;
+    // An escaped quote right before the closing one.
+    EXPECT_TRUE(wants_stream(R"({"a":"x\"","stream":true})"));
+    // Runs of backslashes: even closes the string, odd escapes the quote.
+    EXPECT_TRUE(wants_stream(R"({"a":"x\\\\","stream":true})"));
+    EXPECT_TRUE(wants_stream(R"({"a":"x\\\"y","stream":true})"));
+    EXPECT_FALSE(wants_stream(R"({"a":"x\\\","stream":true})")) << "the string swallows stream";
+    EXPECT_TRUE(wants_stream(R"({"a":"\\","stream":true})"));
+    // Structure inside strings, at the top level and nested, is text.
+    EXPECT_TRUE(wants_stream(R"({"a":"}],{","stream":true})"));
+    EXPECT_TRUE(wants_stream(R"({"tools":[{"d":"}]},{\"x","e":["]"]}],"stream":true})"));
+}
+
+TEST(TopLevelWalk, UnterminatedAndUnbalancedInputReadsAsAbsent)
+{
+    using llmbridge::provider::KeyCheck;
+    using llmbridge::provider::top_level_key_check;
+    using llmbridge::provider::wants_stream;
+    EXPECT_FALSE(wants_stream(R"({"a":"abc)" R"(,"stream":true)"));
+    EXPECT_FALSE(wants_stream(R"({"a":"abc\"})" R"(,"stream":true})"));
+    EXPECT_FALSE(wants_stream(R"({"tools":[{"a":"}]}],"stream":true)"));
+    EXPECT_FALSE(wants_stream(R"({"tools":[{"a":1}],"stream":true)" "\\"));
+    EXPECT_FALSE(wants_stream(R"({"str)"));
+    EXPECT_EQ(top_level_key_check(R"({"a":1,"a)"), KeyCheck::Ok) << "unwalkable: no opinion";
+    // Depth: a thousand levels is still one value, and one bracket short is malformed.
+    const std::string deep = std::string(1000, '[') + std::string(1000, ']');
+    EXPECT_TRUE(wants_stream("{\"x\":" + deep + ",\"stream\":true}"));
+    EXPECT_FALSE(wants_stream("{\"x\":" + deep.substr(1) + ",\"stream\":true}"));
+}
+
+// memchr reads in wide chunks, so a key or a closing quote at every offset across
+// several chunk widths must land where a byte-by-byte read would.
+TEST(TopLevelWalk, AQuoteAtEveryOffsetIsFound)
+{
+    using llmbridge::provider::KeyCheck;
+    using llmbridge::provider::stream_usage_of;
+    using llmbridge::provider::top_level_key_check;
+    using llmbridge::provider::wants_stream;
+    for (size_t pad = 0; pad < 140; ++pad)
+    {
+        const std::string fill(pad, 'a');
+        const std::string esc = pad % 2 ? "\\\"" : "\\\\";
+        const std::string body = "{\"p\":\"" + fill + esc + "\",\"stream\":true,"
+                                 "\"stream_options\":{\"include_usage\":true}}";
+        EXPECT_TRUE(wants_stream(body)) << pad;
+        EXPECT_TRUE(stream_usage_of(body)) << pad;
+        EXPECT_EQ(top_level_key_check(body), KeyCheck::Ok) << pad;
+        EXPECT_EQ(top_level_key_check(body.substr(0, body.size() - 1) + ",\"" + fill + "\":1,\"" +
+                                      fill + "\":2}"),
+                  KeyCheck::DuplicateKey)
+            << pad;
+    }
+}
+
+// The gateway reads all four facts in one walk. It must answer exactly as the four
+// single-key readers do, first occurrence included, on bodies they disagree about.
+TEST(TopLevelFacts, OnePassMatchesTheSingleKeyReaders)
+{
+    namespace p = llmbridge::provider;
+    const char* bodies[] = {
+        R"({"model":"m","stream":true,"stream_options":{"include_usage":true}})",
+        R"({"messages":[{"role":"user","content":"hi"}],"model":"gpt","stream":true})",
+        R"({"stream":false,"stream":true,"model":"a","model":"b"})",
+        R"({"stream":true,"stream":false,"stream_options":{"include_usage":true},"stream_options":{}})",
+        R"({"stream_options":{"include_usage":true,"include_usage":false},"stream":true})",
+        R"({"model":,"model":"b"})",
+        R"({"model":"a\"b","stream":true})",
+        R"({"model":"m","stream":true,"x":"unterminated)",
+        R"({"x":"unterminated,"model":"m"})",
+        R"({"str\u0065am":true,"model":"m","stream":true})",
+        R"({"tools":[{"parameters":{"stream":true,"model":"n"}}],"model":"m"})",
+        R"([{"model":"m"}])",
+        "",
+        "{}",
+    };
+    for (const char* b : bodies)
+    {
+        const p::TopLevelFacts f = p::top_level_facts(b);
+        EXPECT_EQ(f.model, p::model_of(b)) << b;
+        EXPECT_EQ(f.model.data(), p::model_of(b).data()) << b;
+        EXPECT_EQ(f.stream, p::wants_stream(b)) << b;
+        EXPECT_EQ(f.include_usage, p::stream_usage_of(b)) << b;
+        EXPECT_EQ(f.keys, p::top_level_key_check(b)) << b;
+    }
+    const p::TopLevelFacts dup = p::top_level_facts(R"({"stream":false,"stream":true})");
+    EXPECT_FALSE(dup.stream) << "the first occurrence, as wants_stream reads it";
+    EXPECT_EQ(dup.keys, p::KeyCheck::DuplicateKey);
+}
+
+TEST(StreamUsage, OnlyATopLevelStreamOptionsIncludeUsageTrueCounts)
+{
+    using llmbridge::provider::stream_usage_of;
+    EXPECT_TRUE(stream_usage_of(R"({"stream":true,"stream_options":{"include_usage":true}})"));
+    EXPECT_TRUE(stream_usage_of("{ \"stream_options\" : { \"x\":[1], \"include_usage\" : true\n }\n}"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream":true})"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":{"include_usage":false}})"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":{}})"));
+    // Not a boolean, so not true: the provider would refuse it or ignore it.
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":{"include_usage":"true"}})"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":{"include_usage":1}})"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":true})"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":"{\"include_usage\":true}"})"));
+    // Top level only: the same key in a tool schema or at the root is not the option.
+    EXPECT_FALSE(stream_usage_of(R"({"include_usage":true})"));
+    EXPECT_FALSE(stream_usage_of(
+        R"({"tools":[{"parameters":{"stream_options":{"include_usage":true}}}]})"));
+    EXPECT_FALSE(stream_usage_of(R"({"metadata":{"stream_options":{"include_usage":true}}})"));
+    EXPECT_FALSE(stream_usage_of(""));
+    EXPECT_FALSE(stream_usage_of("[]"));
+    EXPECT_FALSE(stream_usage_of(R"({"stream_options":{"include_usage":tr)"));
+}
+
 // ── cache_control ───────────────────────────────────────────────────────────
 //
 // Anthropic caches what precedes a block marked `cache_control`, and nothing at all

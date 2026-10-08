@@ -652,6 +652,7 @@ namespace llmbridge
             note_venue_req_id(c->peer, std::string_view(c->rbuf.data(), r.head.header_len));
             note_upstream_error(c->peer, r.head, r.body);
             note_served_tier(c->peer, r.body, /*tail=*/true);
+            note_served_model(c->peer, r.body, /*streamed=*/false);
             ur_on_response(c, r.head, r.body, r.total_len);
         }
     }
@@ -698,7 +699,12 @@ namespace llmbridge
         if (c->msg.encoded) { ur_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
-        if (_sink || _policy) capture_model(c);
+        if (_sink || _policy)
+            if (const char* why = capture_model(c))
+            {
+                ur_error_respond(c, 400, why, kAmbiguousKeysMessage);
+                return;
+            }
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam; see the epoll mirror for why it sits exactly here.
         // Default to the first upstream, so a build with no policy, and a policy that

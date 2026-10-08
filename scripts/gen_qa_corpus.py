@@ -311,7 +311,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("-n", type=int, default=2000)
-    ap.add_argument("--key", default="~/.anthropic_key")
+    ap.add_argument("--key", default="~/.kottos/keys/.anthropic_key")
     ap.add_argument("--seed", type=int, default=20260803)
     ap.add_argument("--workers", type=int, default=12)
     # The backend_stress answers come back at ~15 KB and are 55% of the fixture, so

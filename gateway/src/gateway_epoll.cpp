@@ -572,7 +572,12 @@ namespace llmbridge
         if (c->msg.encoded) { ep_error_respond(c, 415, "compressed request body"); return; }
         c->policy_tag = 0;
         if (_sink) sink_capture(c);
-        if (_sink || _policy) capture_model(c);
+        if (_sink || _policy)
+            if (const char* why = capture_model(c))
+            {
+                ep_error_respond(c, 400, why, kAmbiguousKeysMessage);
+                return;
+            }
         LB_DEBUG(ReqId{c->req_seq}, " ", request_line(c->rbuf), " on ", *c);
         // The policy seam, one call site per backend. Here because framing has
         // succeeded but nothing is translated, no credential mapped and no upstream
@@ -910,6 +915,7 @@ namespace llmbridge
         note_venue_req_id(client, std::string_view(u->rbuf.data(), h.header_len));
         note_upstream_error(client, h, body_buf);
         note_served_tier(client, body_buf, /*tail=*/true);
+        note_served_model(client, body_buf, /*streamed=*/false);
 
         if (client->translate_body)
         {

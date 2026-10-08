@@ -121,6 +121,35 @@ namespace llmbridge::detail
         if (n) std::memcpy(c->served_tier, t.data(), n);
     }
 
+    inline void keep_served_model(Connection* c, std::string_view m) noexcept
+    {
+        const size_t n = m.size() < sizeof c->served_model ? m.size() : sizeof c->served_model;
+        c->served_model_len = static_cast<uint8_t>(n);
+        if (n) std::memcpy(c->served_model, m.data(), n);
+    }
+
+    /// The model a reply names. A non-streamed body is read whole, top level only;
+    /// a stream is read in the head of each of its first reads, one `data:` line at
+    /// a time, since both dialects name the model in their first event.
+    inline void note_served_model(Connection* c, std::string_view bytes, bool streamed) noexcept
+    {
+        if (c->served_model_len || c->served_model_tries >= kTierTries) return;
+        ++c->served_model_tries;
+        if (!streamed) return keep_served_model(c, provider::reply_model(bytes));
+        const std::string_view head = bytes.substr(0, kTierHead);
+        constexpr std::string_view kData = "data:";
+        for (size_t at = 0; at < head.size();)
+        {
+            size_t eol = head.find('\n', at);
+            if (eol == std::string_view::npos) eol = head.size();
+            std::string_view line = head.substr(at, eol - at);
+            at = eol + 1;
+            if (line.substr(0, kData.size()) != kData) continue;
+            const std::string_view m = provider::reply_model(line.substr(kData.size()));
+            if (!m.empty()) return keep_served_model(c, m);
+        }
+    }
+
     /// Keep the tail of a byte-forwarded stream, so the final usage chunk can be
     /// read at the end.
     ///
@@ -283,6 +312,7 @@ namespace llmbridge::detail
             // Beside the gap stamp, and for the same reason: this is the one point
             // every chunk crosses in either dialect.
             note_served_tier(client, sse_in, /*tail=*/false);
+            note_served_model(client, sse_in, /*streamed=*/true);
         }
 
         // No translator = BYTE-FORWARD. An OpenAI-compatible venue already speaks

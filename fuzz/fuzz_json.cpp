@@ -14,6 +14,7 @@
 //   ./build-fuzz/bin/fuzz_json -max_total_time=120
 
 #include "provider/json.hpp"
+#include "provider/translate.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,5 +28,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     // Touch the result so nothing is optimised away; no assertion. The invariant
     // is simply "does not crash / ASAN-clean on any input".
     if (ok && v.is_object()) (void)v.find("model");
+    // The top-level readers the gateway runs on every body when a policy or sink is
+    // installed, ahead of the parser. Same invariant: any bytes, no over-read.
+    const std::string_view b(reinterpret_cast<const char*>(data), size);
+    (void)llmbridge::provider::top_level_facts(b);
+    (void)llmbridge::provider::top_level_key_check(b);
+    (void)llmbridge::provider::model_of(b);
+    (void)llmbridge::provider::wants_stream(b);
+    (void)llmbridge::provider::stream_usage_of(b);
+    (void)llmbridge::provider::reply_model(b);
     return 0;
 }

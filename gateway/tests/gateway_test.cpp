@@ -253,6 +253,9 @@ namespace
 
         // Test knobs (set before start(), or before the request that uses them).
         void set_response(std::string r) { _resp_override = std::move(r); }
+        // The nth request gets the nth of these, wrapping. Set before start(): the
+        // handler threads read it unlocked.
+        void set_responses(std::vector<std::string> r) { _sequence = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
         // Respond once (keep-alive), then close the connection, which simulates a
@@ -396,10 +399,12 @@ namespace
                     _last_request.assign(buf.data(), m.total_len);
                     _all_requests.append(buf.data(), m.total_len);
                 }
-                _requests_seen.fetch_add(1, std::memory_order_relaxed);
+                const int nth = _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
 
                 std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
+                if (!_sequence.empty())
+                    resp = _sequence[static_cast<size_t>(nth) % _sequence.size()];
                 if (_chunked_chunks > 0) resp = to_chunked(resp, _chunked_chunks);
                 if (_stall == 1) // never answer; hold the connection open
                 {
@@ -455,6 +460,7 @@ namespace
         int _fd = -1;
         uint16_t _port = 0;
         std::string _resp_override;
+        std::vector<std::string> _sequence;
         int _trickle_chunk = 0;
         int _chunked_chunks = 0;
         bool _close_mid = false;
@@ -4072,6 +4078,7 @@ namespace
 
         llmbridge::Decision decide(const llmbridge::RequestFacts& f) noexcept override
         {
+            std::lock_guard<std::mutex> lk(_mu);
             ++calls;
             // Copy, never retain: `head` dies with the call, and the assertions run
             // after the loop thread is joined.
@@ -4085,16 +4092,29 @@ namespace
             seen_body_bytes = f.body_bytes;
             seen_model.assign(f.model.data(), f.model.size());
             seen_hash = f.prefix_hash;
+            seen_stream = f.stream;
+            seen_include_usage = f.include_usage;
             return _d;
+        }
+
+        // For a test that asserts between requests with the loop still running. A
+        // socket does not order the two threads for TSan when the loop is io_uring.
+        struct Flags { std::string model; bool stream, include_usage; };
+        Flags flags() const
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return {seen_model, seen_stream, seen_include_usage};
         }
 
         std::atomic<int> calls{0};
         std::string seen_head, seen_auth, seen_spoofable, seen_model;
         size_t seen_body_bytes = 0;
         uint64_t seen_hash = 0;
+        bool seen_stream = false, seen_include_usage = false;
 
     private:
         llmbridge::Decision _d;
+        mutable std::mutex _mu;
     };
 
     /// Opts in to the prefix hash and keeps every value it was handed, in order.
@@ -5443,6 +5463,7 @@ namespace
             c.asked_tier.assign(r.asked_tier);  // and this
             c.upstream_error.assign(r.upstream_error); // and this
             c.served_tier.assign(r.served_tier);       // and this
+            c.served_model.assign(r.served_model);     // and this
             c.venue_req_id.assign(r.venue_req_id);     // and this
             _records.push_back(std::move(c));
         }
@@ -5454,6 +5475,7 @@ namespace
             std::string asked_tier;
             std::string upstream_error;
             std::string served_tier;
+            std::string served_model;
             std::string venue_req_id;
         };
         std::vector<Copy> records()
@@ -8554,6 +8576,118 @@ TEST_P(ProxyPolicy, ThePromptStillDoesNotReachThePolicy)
     EXPECT_EQ(pol.seen_model.find("SECRETPROMPT"), std::string::npos);
 }
 
+// A streamed OpenAI request carries token counts only when it sets
+// stream_options.include_usage, so a policy that bills needs both flags. Refused, so
+// nothing reaches the mock and each case is one fresh request.
+TEST_P(ProxyPolicy, ThePolicySeesTheTopLevelStreamFlags)
+{
+    struct Case { const char* body; bool stream, usage; };
+    const Case cases[] = {
+        {R"({"model":"m","stream":true,"stream_options":{"include_usage":true}})", true, true},
+        {R"({"model":"m","stream":true})", true, false},
+        {R"({"model":"m","stream":true,"stream_options":{"include_usage":false}})", true, false},
+        {R"({"model":"m","stream":false,"stream_options":{"include_usage":true}})", false, true},
+        {R"({"model":"m","messages":[]})", false, false},
+        {R"({"model":"m","tools":[{"function":{"parameters":{"stream":true,)"
+         R"("stream_options":{"include_usage":true}}}}]})", false, false},
+        {R"({"model":"m","stream":"true","stream_options":{"include_usage":1}})", false, false},
+        {"{\n \"stream\": true,\n \"stream_options\": {\"include_usage\": true\n }\n}", true, true},
+    };
+    RecordingPolicy pol{llmbridge::Decision{.allow = false, .deny_status = 403, .reason = "t"}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    int n = 0;
+    for (const Case& k : cases)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request(k.body)));
+        const std::string resp = c.recv_response();
+        c.close();
+        ASSERT_EQ(pol.calls.load(), ++n);
+        EXPECT_NE(resp.find(" 403 "), std::string::npos) << resp;
+        const auto seen = pol.flags();
+        EXPECT_EQ(seen.stream, k.stream) << k.body;
+        EXPECT_EQ(seen.include_usage, k.usage) << k.body;
+    }
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
+// A body we could read differently from the provider is refused before the policy is
+// asked, so a decision is never made on a value the provider will not use.
+TEST_P(ProxyPolicy, AnAmbiguousTopLevelKeyIsRefusedBeforeThePolicyAndTheUpstream)
+{
+    const char* refused[] = {
+        R"({"model":"m","stream":false,"stream":true})",
+        R"({"model":"m","stream":true,"stream":false})",
+        R"({"model":"cheap","messages":[],"model":"dear"})",
+        R"({"model":"m","str\u0065am":true})",
+        R"({"model":"m","stream":true,"stream_options":{"include_usage":true,"include_usage":false}})",
+    };
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    for (const char* body : refused)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(make_request(body)));
+        const std::string resp = c.recv_response();
+        c.close();
+        EXPECT_EQ(resp.rfind("HTTP/1.1 400 ", 0), 0u) << body << "\n" << resp;
+        EXPECT_NE(resp.find("request body repeats a top-level key or escapes one"),
+                  std::string::npos) << resp;
+    }
+    EXPECT_EQ(pol.calls.load(), 0) << "the policy decided on an ambiguous body";
+    // Nested keys belong to the client's schema and pass.
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","tools":[{"function":{"parameters":{"str\u0065am":1,"a":1,"a":2}}}],)"
+        R"("messages":[{"role":"user","content":"hi"}]})")));
+    const std::string ok = c.recv_response();
+    c.close();
+    shutdown();
+    EXPECT_EQ(ok.rfind("HTTP/1.1 200 ", 0), 0u) << ok;
+    EXPECT_EQ(pol.calls.load(), 1);
+    EXPECT_EQ(_backend.requests_seen(), 1) << "a refused body reached the upstream";
+}
+
+// Any client but an OpenAI one has its body read for the model alone. Its usage
+// comes from the venue's events, so a repeated or escaped key changes nothing the
+// gateway bills on, and its `stream` is not the OpenAI option a policy refuses on.
+TEST_P(ProxyPolicy, AnotherDialectIsServedWithAmbiguousKeysAndNoStreamFlags)
+{
+    const char* bodies[] = {
+        R"({"model":"claude-a","stream":true,"model":"claude-b","max_tokens":8,"messages":[]})",
+        R"({"model":"claude-a","str\u0065am":true,"stream":true,"max_tokens":8,"messages":[]})",
+    };
+    RecordingPolicy pol{llmbridge::Decision{.allow = true}};
+    _policy = &pol;
+    _backend.set_response(http_ok(anthropic_resp_body("ok")));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    int n = 0;
+    for (const char* body : bodies)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(std::string("POST /v1/messages HTTP/1.1\r\nHost: x\r\n"
+                                       "Content-Length: ") +
+                           std::to_string(std::string_view(body).size()) + "\r\n\r\n" + body));
+        const std::string resp = c.recv_response();
+        c.close();
+        EXPECT_EQ(resp.rfind("HTTP/1.1 200 ", 0), 0u) << body << "\n" << resp;
+        EXPECT_EQ(pol.calls.load(), ++n);
+        const auto seen = pol.flags();
+        EXPECT_EQ(seen.model, "claude-a") << "the first model, as model_of reads it";
+        EXPECT_FALSE(seen.stream) << "stream is an OpenAI option";
+        EXPECT_FALSE(seen.include_usage);
+    }
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 2);
+}
+
 namespace
 {
     /// Collects finished log lines. The loop thread writes them, so every assertion
@@ -9362,4 +9496,199 @@ TEST_P(ProxyRoute, TheServedTierIsReadOnATranslatedBody)
     ASSERT_EQ(recs.size(), 1u);
     EXPECT_TRUE(recs[0].r.translated);
     EXPECT_EQ(recs[0].served_tier, "standard");
+}
+
+// ── the model the reply names ───────────────────────────────────────────────
+//
+// A body naming `model` twice can be read one way by the gateway and another by the
+// venue. For a client whose body is read for the model alone, the check is after the
+// fact: the record carries the model the reply names, top level only, and a sink
+// compares. One case per corner: two dialects, streamed or not.
+namespace
+{
+    const char* const kSse = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                             "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n"
+                             "Connection: keep-alive\r\n\r\n";
+} // namespace
+
+TEST_P(ProxyRoute, TheServedModelIsReadOffAnOpenAIStream)
+{
+    // A nested `model` first, which a substring search would take.
+    const std::string events =
+        "data: {\"id\":\"x\",\"meta\":{\"model\":\"decoy\"},\"model\":\"gpt-served\","
+        "\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    TestBackend b;
+    b.set_response(kSse + sse_chunk_encode(events, 64));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"gpt-asked","stream":true})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.streamed);
+    EXPECT_EQ(recs[0].model, "gpt-asked");
+    EXPECT_EQ(recs[0].served_model, "gpt-served");
+}
+
+TEST_P(ProxyRoute, TheServedModelIsReadOffAnOpenAIBody)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"x","object":"chat.completion","model":"gpt-served",)"
+                R"("choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_model, "gpt-served");
+}
+
+// Anthropic names it once, inside the message message_start opens.
+TEST_P(ProxyRoute, TheServedModelIsReadOffAnAnthropicStream)
+{
+    const std::string events =
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\","
+        "\"role\":\"assistant\",\"model\":\"claude-served\",\"content\":[],"
+        "\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n"
+        "event: content_block_delta\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    TestBackend b;
+    b.set_response(kSse + sse_chunk_encode(events, 4096));
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink,
+          {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(
+        R"({"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.streamed);
+    EXPECT_EQ(recs[0].served_model, "claude-served") << "what the venue served, not the translation";
+}
+
+TEST_P(ProxyRoute, TheServedModelIsReadOffAnAnthropicBody)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"m","type":"message","role":"assistant","model":"claude-served",)"
+                R"("content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",)"
+                R"("usage":{"input_tokens":9,"output_tokens":2}})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::Anthropic, ""}}, &pol, &sink,
+          {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_model, "claude-served");
+}
+
+// No top-level model reads empty, a nested one included; an id past 64 bytes is cut.
+TEST_P(ProxyRoute, TheServedModelIsEmptyWhenOnlyANestedOneExists)
+{
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK",
+                R"({"id":"x","choices":[{"message":{"model":"decoy","content":"hi"}}]})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_model, "");
+}
+
+TEST_P(ProxyRoute, TheServedModelIsCutAt64Bytes)
+{
+    const std::string long_id(100, 'm');
+    NamedBackend b;
+    b.start_raw("HTTP/1.1 200 OK", R"({"id":"x","model":")" + long_id + R"(","choices":[]})");
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    c.recv_response();
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].served_model, long_id.substr(0, 64));
+}
+
+// A keep-alive client's next request must not report the last reply's model or tier.
+// Both are reset per request; each record carries its own, and a reply that names
+// neither records empty, not the previous request's.
+TEST_P(ProxyRoute, EachRequestOnAKeepAliveConnectionRecordsItsOwnServedModelAndTier)
+{
+    const auto body = [](const std::string& fields) {
+        const std::string b = "{\"id\":\"x\"," + fields + "\"choices\":[]}";
+        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\n"
+               "Content-Length: " + std::to_string(b.size()) + "\r\n\r\n" + b;
+    };
+    TestBackend b;
+    b.set_responses({body(R"("model":"first","service_tier":"flex",)"),
+                     body(R"("model":"second","service_tier":"priority",)"), body("")});
+    b.start();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    for (int i = 0; i < 3; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request()));
+        c.recv_response();
+    }
+    c.close();
+    shutdown();
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 3u);
+    EXPECT_EQ(recs[0].served_model, "first");
+    EXPECT_EQ(recs[1].served_model, "second");
+    EXPECT_EQ(recs[2].served_model, "") << "the previous request's model leaked";
+    EXPECT_EQ(recs[0].served_tier, "flex");
+    EXPECT_EQ(recs[1].served_tier, "priority");
+    EXPECT_EQ(recs[2].served_tier, "") << "the previous request's tier leaked";
 }

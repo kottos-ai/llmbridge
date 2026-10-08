@@ -83,6 +83,33 @@ namespace llmbridge::provider
     /// Whether the request body asks for a streamed response: top-level `stream: true`.
     bool wants_stream(std::string_view body) noexcept;
 
+    /// Top-level `stream_options.include_usage: true`; anything else reads false.
+    bool stream_usage_of(std::string_view body) noexcept;
+
+    /// Whether the readers above can disagree with a provider's parser about this
+    /// body.
+    enum class KeyCheck { Ok, DuplicateKey, EscapedKey, TooManyKeys };
+    KeyCheck top_level_key_check(std::string_view body) noexcept;
+
+    /// model_of, wants_stream, stream_usage_of and top_level_key_check in one walk of
+    /// the top level, with the same answers.
+    struct TopLevelFacts
+    {
+        std::string_view model;
+        bool stream = false;
+        bool include_usage = false;
+        KeyCheck keys = KeyCheck::Ok;
+    };
+    TopLevelFacts top_level_facts(std::string_view body) noexcept;
+
+    /// The model a reply says served it: the top-level `model` of a non-streamed body
+    /// or an OpenAI chunk, and `message.model` of an Anthropic `message_start` event.
+    std::string_view reply_model(std::string_view json) noexcept;
+
+    /// Members of the top-level object, 0 when it cannot be walked. The bare walk the
+    /// readers above are built on, public so a test can price them against it.
+    size_t top_level_member_count(std::string_view body) noexcept;
+
     /// `wants_stream_usage`, when given, reports the request's top-level
     /// `stream_options.include_usage`.
     std::string openai_to_anthropic_request(std::string_view openai_body,

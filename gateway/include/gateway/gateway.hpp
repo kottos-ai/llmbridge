@@ -292,8 +292,9 @@ namespace llmbridge
         /// Sink plumbing, shared verbatim by both loops: sink_capture runs at framing,
         /// capture_model separately because the policy reads the model before
         /// deciding, sink_emit at every completion, streams and error replies included.
+        /// capture_model returns why the body must be refused, or null.
         void sink_capture(Connection* c) noexcept;
-        void capture_model(Connection* c) noexcept;
+        [[nodiscard]] const char* capture_model(Connection* c) noexcept;
         void sink_emit(Connection* c, int status, bool streamed) noexcept;
 
         /// Ask the policy for another venue and re-dispatch there. True when the

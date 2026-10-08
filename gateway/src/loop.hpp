@@ -94,6 +94,8 @@ namespace llmbridge::detail
         c->max_chunk_gap_ns = 0;
         c->served_tier_len = 0;
         c->served_tier_tries = 0;
+        c->served_model_len = 0;
+        c->served_model_tries = 0;
         c->venue_req_id_len = 0;
     }
 
