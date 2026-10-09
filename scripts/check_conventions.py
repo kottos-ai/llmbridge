@@ -90,7 +90,8 @@ def strip_comments(text):
     return re.sub(r"//[^\n]*", "", out)
 
 
-DENSITY_LIMIT = 0.8
+DENSITY_LIMIT = 0.8  # fails the check
+DENSITY_WARN = 0.7   # warns, so a file is trimmed before it reaches the limit
 
 
 def comment_density(text):
@@ -406,16 +407,20 @@ def main():
     # ---------------------------------------------------------------- 6
     # Comment density: comment-only lines per code line, per source file. Long
     # rationale belongs in DESIGN.md or GATEWAY-INTERNALS.md, where it is read once,
-    # not next to code that is read on every change. Warn-only until the files over
-    # the limit are trimmed; it then becomes a failure like the checks above.
-    dense = []
+    # not next to code that is read on every change. The license header counts.
+    n_dense_warn = 0
     for f in src:
         com, code = comment_density(f.read_text(encoding="utf-8"))
-        if code and com / code >= DENSITY_LIMIT:
-            dense.append((com / code, com, code, f.relative_to(ROOT)))
-    for ratio, com, code, rel in sorted(dense, reverse=True):
-        print(f"warning: {rel}: DENSITY {ratio:.2f} ({com} comment / {code} code lines), "
-              f"limit {DENSITY_LIMIT}", file=sys.stderr)
+        ratio = com / code if code else 0.0
+        rel = f.relative_to(ROOT)
+        if ratio >= DENSITY_LIMIT:
+            failures.append(f"{rel}: DENSITY {ratio:.2f} ({com} comment / {code} code lines) "
+                            f"is at or over {DENSITY_LIMIT}; move rationale into DESIGN.md "
+                            f"or GATEWAY-INTERNALS.md")
+        elif ratio >= DENSITY_WARN:
+            n_dense_warn += 1
+            print(f"warning: {rel}: DENSITY {ratio:.2f} ({com} comment / {code} code lines), "
+                  f"fails at {DENSITY_LIMIT}", file=sys.stderr)
 
     # ---------------------------------------------------------------- report
     if failures:
@@ -432,7 +437,7 @@ def main():
           f"LATENCY.md stamp refs resolve, release version agrees, "
           f"{n_consts} constants + {n_types} types correctly cased, "
           f"{n_checked} constant backend prefixes agree with use, "
-          f"{len(dense)} files at or over comment density {DENSITY_LIMIT} (warn-only)")
+          f"comment density under {DENSITY_LIMIT} everywhere ({n_dense_warn} over {DENSITY_WARN})")
     return 0
 
 

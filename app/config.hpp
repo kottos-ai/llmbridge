@@ -5,25 +5,9 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Optional JSON configuration for the gateway daemon (`--config FILE`).
-//
-// Why it exists. Fourteen flags is uncomfortable; the fifteenth is impossible.
-// Multi-upstream routing needs an ordered list with per-upstream fields, which flat
-// flags cannot express without inventing a mini-language. The grouped shape below
-// lets `upstream` become an array later without disturbing anything else.
-//
-// The contract:
-//   1. Unknown keys, wrong types and out-of-range values are startup errors. A
-//      parser that skips a misspelled `listen_tls` fails open in the shape this
-//      project has already been bitten by: `--listen-tls` on a non-TLS build was
-//      accepted and ignored, serving plaintext while the operator believed otherwise.
-//   2. Keys beginning with `_` are comments. JSON has none and an edited file needs them.
-//   3. Paths, never secrets, or the file becomes a credential store on disk.
-//   4. The CLI wins, so a one-off override needs no edit.
-//
-// Lifetime footgun. `provider::json` is a zero-copy DOM: every string in a parsed
-// `Value` points into the input buffer. So `Config` owns the file bytes in `raw` and
-// every field below is copied out during parsing.
+// Optional JSON configuration for the daemon (`--config FILE`). Strict: unknown keys, wrong
+// types and bad values fail startup; `_` keys are comments; paths, never secrets; the CLI
+// wins. Every value is copied out of the zero-copy DOM. DESIGN.md "Configuration".
 
 #pragma once
 
@@ -33,8 +17,8 @@
 
 namespace llmbridge::app
 {
-    /// Everything `--config` can set. Defaults here are never consulted: only keys
-    /// Present in the file are overwritten, so absent means "leave the caller's value".
+    /// Everything `--config` can set. Only keys present in the file are written; absent keys
+    /// leave the caller's value, so these defaults are never consulted.
     struct ConfigFile
     {
         // listen
@@ -80,9 +64,7 @@ namespace llmbridge::app
         double prefault_mb = 0;
     };
 
-    /// Parse `text` into `out`. On failure sets `err` to one line naming the offending
-    /// key: "config error" with no key is a message an operator cannot act on. `text`
-    /// need not outlive the call; every value is copied.
+    /// Parse `text` into `out`; on failure `err` is one line naming the offending key.
     bool parse_config(std::string_view text, ConfigFile& out, std::string& err);
 
     /// Read `path` and parse it. Same contract; `err` also covers an unreadable file.

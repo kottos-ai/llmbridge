@@ -8,6 +8,18 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.67.0]. 2026-10-09
+
+### Changed
+
+- **12 files comments are shortened**.
+- **Rationale moved into the docs instead of being deleted.** DESIGN.md gains
+  "Upstream URLs", "Body edits and top-level readers", "Signing for Bedrock", the
+  memory-BIO call protocol, the comment-density rule and two smaller additions;
+  GATEWAY-INTERNALS.md gains section 9b on how `secure_clear` erases.
+- `sse.hpp` no longer claims the stream translator is text-only: it has handled tool
+  calls for several releases.
+
 ## [0.66.0]. 2026-10-09
 
 ### Added

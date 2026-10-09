@@ -24,38 +24,20 @@ namespace llmbridge::detail
     constexpr int kEpMaxEvents = 1024;
     constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
 
-    // A credential is a transient string_view over the client's request buffer,
-    // written straight into the upstream bytes and never copied anywhere that
-    // outlives the request. What does outlive it is the pooled upstream, which idles
-    // up to _pool_idle_ns (30 s default) holding the request that carried the key,
-    // so that buffer is scrubbed before it can serve another client. See
-    // net/secure.hpp for why this is not a plain memset. Measured: 2.4 ns for a
-    // typical ~96 B request buffer, once per request (~0.02% of one core at 84k RPS).
+    // A pooled upstream idles holding the request that carried the client's key, so its
+    // buffer is scrubbed before it serves anyone else: GATEWAY-INTERNALS.md §9.
     using llmbridge::net::secure_clear;
 
     // Defined in gateway.cpp, beside the reasoning for it being a sequencer.
     extern std::atomic<uint64_t> g_seq;
 
-    // May this streaming upstream go back into the keep-alive pool?
-    //
-    // Same spirit as the non-streaming rule ("pool only what will stay open"),
-    // plus the framing conditions that make the end of the body knowable. Every
-    // clause is load-bearing:
-    //
-    //   stream_keep_alive  the provider didn't say Connection: close; pooling a
-    //                      conn it is about to close just buys a retry later
-    //   stream_chunked     a close-delimited body has no end marker except EOF,
-    //                      so "the response finished" and "the connection died"
-    //                      are indistinguishable, so never reuse one
-    //   chunkdec.done()    the terminal 0-length chunk was consumed, so we are
-    //                      at a real message boundary instead of mid-body
-    //   rbuf empty         no trailing/pipelined bytes left over; anything still
-    //                      buffered would be mis-read as the next response
-    //   !close_after_resp  aborted, corrupt, or idle-timed-out streams are never
-    //                      pooled; we don't trust framing we already distrusted
-    //
-    // Conservative by construction: any doubt falls through to close, which is
-    // exactly the behaviour that shipped before reuse existed.
+    // May this streaming upstream go back into the pool? Every clause is load-bearing, and
+    // any doubt closes it:
+    //   stream_keep_alive  the provider did not say Connection: close
+    //   stream_chunked     a close-delimited body cannot tell "finished" from "died"
+    //   chunkdec.done()    the terminal chunk was consumed: a real message boundary
+    //   rbuf empty         leftover bytes would be read as the next response
+    //   !close_after_resp  aborted, corrupt or timed-out streams are never pooled
     inline bool stream_upstream_reusable(const Connection* client, const Connection* u) noexcept
     {
         return client != nullptr && u != nullptr && !u->doomed && u->fd >= 0

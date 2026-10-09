@@ -110,6 +110,12 @@ system header that defines `ERROR`, and `min`, `max` and `DEBUG` are the same st
 Reserving the shape for macros makes that impossible, and not merely unlikely. The
 checker rejects an ALL_CAPS constant and names the `kPascalCase` form to use.
 
+**Comment density is capped**: comment-only lines (the license header included) per
+code line, per source file under `gateway/`, `net/`, `provider/` and `app/`, must stay
+under 0.8, with a warning from 0.7. Long rationale belongs in this file or in
+`GATEWAY-INTERNALS.md`, where it is read once, not beside code that is read on every
+change; a header keeps its contracts and points here for the reasons.
+
 ## Threading & I/O model
 
 - **Shared-nothing workers.** Each worker is a single thread owning one event loop
@@ -227,6 +233,70 @@ return a `std::string` (empty on parse failure, no exceptions). Coverage is the 
 chat path: model, system prompt, multi-turn messages, `max_tokens`/`temperature`/`top_p`;
 and on the response, content / finish-reason / usage.
 
+Coverage per target: Anthropic Messages (system extraction, content blocks,
+`stop_reason`), Gemini `generateContent` (`contents`/`parts`, role `model`,
+`generationConfig`) and Cohere Chat v2 (`messages`, `top_p` to `p`). OpenAI-compatible
+providers (Groq, Together, Fireworks, DeepInfra, Mistral, Perplexity, xAI, OpenRouter,
+Cerebras, vLLM, ...) need no body translation: the gateway byte-forwards them and only
+rewrites auth and the endpoint. Streaming deltas, tool calling and `cache_control` are
+built for Anthropic; vision is not.
+
+### Body edits and top-level readers
+
+`rewrite_model`, `upsert_string` and `apply_overrides` **splice, never re-serialise.**
+The body goes to a venue that already speaks this dialect, so re-emitting it from a
+parse would silently drop any field this parser does not model, and providers add
+fields faster than we adopt them. Only the value span moves.
+
+- **Top-level keys only.** A message whose content contains `"model"` is text, and
+  rewriting inside it would corrupt a prompt.
+- **A replacement carrying a quote, a backslash or a control byte is refused.** Those
+  would need escaping, a model id never contains them, and guessing at the escaping of
+  a string that lands in a request body is how an injection starts.
+- **`upsert_string` can insert.** `rewrite_model` only replaces, because a request with
+  no `model` is not one this gateway serves; `service_tier` is usually absent and the
+  route deciding the tier has to be able to put it there.
+- **`model_of` refuses an escaped value instead of unescaping it.** It is compared with
+  configured names, an escape means it was never one of them, and unescaping would need
+  an allocation on a path that has none.
+
+**Bedrock** differs from Anthropic direct in two required ways: no `model` field,
+because Bedrock takes the id in the path (`/model/{id}/invoke`), and `anthropic_version`
+inside the JSON, where Anthropic wants a header. `model_out` is empty only when the body
+named no model, in which case there is no path to build and the request is refused.
+
+**Upstream errors** become the OpenAI envelope: Anthropic's
+`{"type":"error","error":{"type":"overloaded_error","message":"..."}}` is sent as
+`{"error":{"message":"...","type":"...","code":null}}`, so a rate limit, an overload or
+a context-length error reaches the client as an actionable error.
+
+### Signing for Bedrock (`net/sigv4.hpp`)
+
+SigV4 is a defined procedure, not a format to approximate: canonical request, string
+to sign, a date-scoped HMAC chain, then one header. Every step has an exact
+serialisation, and a mismatch anywhere fails closed with a 403 whose body says nothing
+useful, so the implementation is built against AWS's published test vectors and never
+against a reading of the prose. It needs SHA-256 and HMAC-SHA256 from the OpenSSL a TLS
+build already links; a dependency-free build cannot reach a venue that requires signing.
+
+- **Credentials pass through per request.** llmbridge holds no AWS credential of its
+  own: the customer's travels with their request and is gone when it completes, which
+  keeps the gateway stateless and a long-lived secret out of any store the request
+  path can read. Temporary credentials carry a session token, which most real
+  deployments use; omitting it works in a demo and fails at a customer.
+- **The bearer value is colon-separated** (`AKID:SECRET[:SESSION_TOKEN]`) because AWS's
+  alphabets exclude the colon: an access key id is uppercase alphanumeric, and a secret
+  and session token are base64. A value that does not split into two or three non-empty
+  parts is malformed and refused.
+- **The canonical URI is encoded one more time than the wire.** AWS encodes a non-S3
+  path segment twice counting from the raw path, and the request line already holds
+  the first pass: a model-id colon travels as `%3A` and is signed as `%253A`. Signing
+  the wire form unchanged, or encoding it twice more (`%25253A`), returns 403 with an
+  empty body for every versioned model id.
+- **One encoder.** `uri_encode` is inline and free of OpenSSL because the gateway builds
+  the Bedrock path with it even in a build without TLS; two encoders that must agree
+  byte for byte is how a signature silently stops matching a path.
+
 ### Dialect resolution (client dialect x venue dialect)
 
 Folding two questions into the venue's dialect field, what the venue speaks and what
@@ -329,6 +399,11 @@ from `wants_prefix_hash()` and 0 otherwise.
 is fixed at construction and every venue carries its own address, TLS setting and
 Dialect, so routing Claude to Anthropic and a Llama to an OpenAI-compatible host means
 one request is rebuilt and the other forwarded, decided per request.
+
+`Decision::model` exists because the same product is named differently at each venue:
+`gpt-4o` at OpenAI, a deployment name at Azure,
+`us.anthropic.claude-haiku-4-5-20251001-v1:0` at Bedrock. Without it the caller would
+have to know which venue it lands on, which defeats routing.
 
 Two rules make the single-upstream gateway a special case of this one, not a different
 thing. An index that is unset (-1) or past the end of the table means the
@@ -438,8 +513,43 @@ a config parser that skips a misspelled `listen_tls` fails open, and unlike a co
 line there is no `ps` output to catch it. Wrong types, bad enum values and
 out-of-range numbers are refused the same way, each naming the key. Keys beginning
 with `_` are comments, which is what makes strictness affordable in a format that has
-none. `app/llmbridge.example.json` documents every key at its default value, and a
+none. The file holds paths, never secrets, so it never becomes a credential store on
+disk. `app/llmbridge.example.json` documents every key at its default value, and a
 test pins those values against the constants so the example cannot drift.
+
+### Upstream URLs (`--upstream`)
+
+`net::parse_upstream` accepts these forms:
+
+| Form | Example | Transport |
+|---|---|---|
+| `IP:PORT` | `127.0.0.1:9001` | plain HTTP |
+| `HOST:PORT` | `mock.internal:9001` | plain HTTP |
+| `http://HOST[:PORT]` | default port 80 | plain HTTP |
+| `https://HOST[:PORT]` | default port 443 | TLS |
+| `https://HOST/BASE` | `https://api.groq.com/openai` | TLS |
+
+The base path is a prefix, not a target: it is joined in front of whatever path the
+request would otherwise use, so `/openai` + `/v1/chat/completions` reaches
+`/openai/v1/chat/completions`. Several providers serve an OpenAI-compatible API below
+the root (Groq at `/openai`, OpenRouter at `/api`, Fireworks at `/inference`). A base
+path is rebuilt, never echoed: it lands in a request line, so anything that could split
+or retarget that line is refused at parse time, never sanitised (`normalize_base_path`).
+
+Refused, with a reason in `error` instead of a guess:
+
+- **userinfo** (`https://a@b`), the classic URL-confusion trick where the host a person
+  reads and the host we connect to differ.
+- **a fragment**, anywhere: it never travels on the wire, so a URL carrying one is a
+  paste error worth naming.
+- **a query on a byte-forwarding venue.** Azure OpenAI needs `?api-version=`, which is
+  parsed and kept, because a translating mode builds the whole target itself. A
+  byte-forward has a client query to merge with, so the Gateway refuses that pairing at
+  startup, where the mode is known; `parse_upstream` only reports what it found.
+- **IPv6 literals**: the transport is `sockaddr_in`/`AF_INET` end to end, and
+  half-accepting `[::1]:443` would fail later with a worse message.
+- **host characters outside `[A-Za-z0-9.-]`**: the host is written into the Host header
+  and the TLS SNI field, so a stray CR or LF is a header-injection primitive.
 
 ## TLS on both legs (`-DLLMBRIDGE_TLS=ON`)
 
@@ -476,6 +586,19 @@ into kernel-provided buffers; there is no read left for OpenSSL to perform. So t
 loop keeps the socket and the `SSL` object is a pure byte transform behind a pair of
 memory BIOs, identical on both backends. The cost is one memcpy per direction; the
 crypto itself (AES-GCM with AES-NI) is noise next to the handshake RTTs.
+
+The call protocol, identical on both backends:
+
+1. `start_handshake()`, then loop: `pull_ciphertext()` and send; recv and
+   `feed_ciphertext()`, until `handshake_done()`.
+2. Steady state: `write_plaintext()`, then `pull_ciphertext()` and send; recv,
+   `feed_ciphertext()`, then `read_plaintext()`.
+3. **Drain `pull_ciphertext()` after any call that advances the state machine.**
+   OpenSSL emits protocol bytes (key updates, alerts, close_notify) with no application
+   data involved, and forgetting them is the classic memory-BIO stall.
+
+Nothing on the steady-state path allocates beyond OpenSSL's own internals; the BIO pair
+is created once per connection.
 
 ### Data flow
 
