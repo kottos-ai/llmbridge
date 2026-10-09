@@ -607,6 +607,12 @@ namespace llmbridge
 
         if (c->is_client)
         {
+            if (c->rbuf.size() > kMaxClientBuffered) // see the epoll mirror
+            {
+                LB_WARN("CAP client buffered ", c->rbuf.size(), " bytes on ", *c, "; closing");
+                ur_abort_pair(c);
+                return;
+            }
             ur_try_forward_buffered(c); // forward a framed request iff the client is idle
         }
         else

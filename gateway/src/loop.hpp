@@ -23,6 +23,8 @@ namespace llmbridge::detail
     constexpr size_t kInitialBuf = 4096;
     constexpr int kEpMaxEvents = 1024;
     constexpr int kPollTickMs = 200; // so request_stop() is observed promptly
+    // No request is larger, so more buffered client bytes than this is never legitimate.
+    constexpr size_t kMaxClientBuffered = net::http::kMaxHeaderLen + net::http::kMaxBodyLen;
 
     // A pooled upstream idles holding the request that carried the client's key, so its
     // buffer is scrubbed before it serves anyone else: GATEWAY-INTERNALS.md §9.

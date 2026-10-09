@@ -2296,6 +2296,26 @@ TEST_P(ProxyBackend, RoundTripAndKeepAlive)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
+// Reading continues while a request is in flight, and nothing bounded what a client
+// could pipeline behind it: one slow upstream let a client grow the buffer until OOM.
+TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
+{
+    _backend.set_stall(1); // read the request, never reply
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string junk(1 << 20, 'x');
+    bool refused = false;
+    for (int i = 0; i < 40 && !refused; ++i) refused = !c.send(junk);
+    EXPECT_TRUE(refused || c.wait_closed(3000)) << "40 MiB pipelined without the gateway closing";
+    c.close();
+    Client d; // and the worker still serves others
+    ASSERT_TRUE(d.connect(_proxy_port));
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+}
+
 TEST_P(ProxyBackend, MultipleClients)
 {
     start(0, true, UpstreamDialect::OpenAI, GetParam());

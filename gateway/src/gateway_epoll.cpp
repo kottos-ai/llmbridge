@@ -521,6 +521,14 @@ namespace llmbridge
             else ep_close_client(c);
             return;
         }
+        // Reading continues while a request is in flight, so this is the only bound on
+        // what a client can pipeline behind it.
+        if (c->rbuf.size() > kMaxClientBuffered)
+        {
+            LB_WARN("CAP client buffered ", c->rbuf.size(), " bytes on ", *c, "; closing");
+            ep_abort_pair(c);
+            return;
+        }
         // One request in flight at a time per client.
         if (c->peer != nullptr || !c->wbuf.empty()) return;
         if (c->rbuf.empty()) return;
