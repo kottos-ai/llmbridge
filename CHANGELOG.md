@@ -23,8 +23,12 @@ minor (0.x) releases.** Breaking changes are always called out explicitly below.
   | Translated stream, 20 deltas | 59 |
   | Each further stream delta | 2 (2.01 on io_uring) |
 
+  Under TSan nothing is replaced and the ceilings skip: its runtime defines operator
+  new and delete itself, and a second definition does not link, which is what failed
+  the ThreadSanitizer job's build. They still run under ASan.
+
 - **`bench/protocol_micro`**: p50/p95/p99 of the protocol work outside the loop,
-  on inputs shaped like production rather than the bench mocks.
+  on inputs shaped like production, not like the bench mocks.
 
   | Call | p50 |
   |---|---|

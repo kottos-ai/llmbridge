@@ -29,11 +29,29 @@
 #include <string>
 #include <thread>
 
+// TSan's runtime defines operator new and delete itself, and a second definition does
+// not link, so under TSan nothing is replaced and the ceilings are skipped. ASan's
+// runtime links beside these and the test runs there.
+#if defined(__SANITIZE_THREAD__)
+    #define LLMBRIDGE_ALLOC_UNDER_TSAN 1
+#elif defined(__has_feature)
+    #if __has_feature(thread_sanitizer)
+        #define LLMBRIDGE_ALLOC_UNDER_TSAN 1
+    #endif
+#endif
+#ifndef LLMBRIDGE_ALLOC_UNDER_TSAN
+    #define LLMBRIDGE_ALLOC_UNDER_TSAN 0
+#endif
+
 namespace
 {
     thread_local bool t_counted = false;
     std::atomic<uint64_t> g_allocs{0};
+} // namespace
 
+#if !LLMBRIDGE_ALLOC_UNDER_TSAN
+namespace
+{
     void* counted_alloc(std::size_t n)
     {
         if (t_counted) g_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -70,6 +88,7 @@ void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+#endif
 
 namespace
 {
@@ -290,6 +309,10 @@ namespace
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {
     protected:
+        void SetUp() override
+        {
+            if (LLMBRIDGE_ALLOC_UNDER_TSAN) GTEST_SKIP() << "TSan owns operator new";
+        }
         const Ceiling& ceiling() const { return GetParam() == IoBackend::Epoll ? kEpoll : kUring; }
     };
 
