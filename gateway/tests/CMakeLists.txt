@@ -56,6 +56,11 @@ add_executable(gateway_body_facts_test body_facts_test.cpp)
 target_link_libraries(gateway_body_facts_test PRIVATE gateway GTest::gtest_main)
 target_include_directories(gateway_body_facts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# Heap allocations per request on the loop thread, held to exact ceilings. Its own
+# binary because it replaces global operator new.
+add_executable(gateway_alloc_test alloc_test.cpp)
+target_link_libraries(gateway_alloc_test PRIVATE gateway GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(gateway_metrics_test)
 gtest_discover_tests(gateway_stats_test)
@@ -71,6 +76,7 @@ gtest_discover_tests(gateway_request_test)
 # RUN_SERIAL: its bounds are timing ratios, measured with the machine to itself.
 gtest_discover_tests(gateway_body_facts_test PROPERTIES RUN_SERIAL TRUE)
 gtest_discover_tests(gateway_served_tier_test)
+gtest_discover_tests(gateway_alloc_test)
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
 # End-to-end TLS tests: only when the TLS transport is compiled in. The mock

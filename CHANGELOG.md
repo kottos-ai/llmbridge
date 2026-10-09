@@ -8,6 +8,35 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.66.0]. 2026-10-09
+
+### Added
+
+- **Allocation ceilings for the request path** (`gateway_alloc_test`, in ctest).
+  Global operator new is replaced and counts only on the event-loop thread; each
+  case warms up 20 requests, then averages 50, on both backends.
+
+  | Path | Allocations |
+  |---|---|
+  | Passthrough request | 3 |
+  | Translated request (OpenAI to Anthropic) | 16 |
+  | Translated stream, 20 deltas | 59 |
+  | Each further stream delta | 2 (2.01 on io_uring) |
+
+  Under TSan nothing is replaced and the ceilings skip: its runtime defines operator
+  new and delete itself, and a second definition does not link, which is what failed
+  the ThreadSanitizer job's build. They still run under ASan.
+
+- **`bench/protocol_micro`**: p50/p95/p99 of the protocol work outside the loop,
+  on inputs shaped like production, not like the bench mocks.
+
+  | Call | p50 |
+  |---|---|
+  | `parse_response_head`, 26-line ~1 KB Anthropic head | 2.5 us |
+  | `anthropic_to_openai_response`, ~400 B body | 1.3 us |
+  | `AnthropicToOpenAiSse::feed`, one text delta | 0.35 us |
+  | `openai_to_anthropic_request`, 130 KB agent turn | 180 us |
+
 ## [0.65.0]. 2026-10-09
 
 ### Fixed
