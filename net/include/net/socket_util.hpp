@@ -7,15 +7,7 @@
 
 #pragma once
 
-// Thin BSD-socket helpers for the llmbridge proxy. Linux/epoll target; the calls
-// used here (fcntl O_NONBLOCK, SO_REUSEPORT, TCP_NODELAY) are all standard on
-// Linux. SIGPIPE is suppressed process-wide (the event loop ignores it) rather
-// than per-socket, since Linux has no SO_NOSIGPIPE. Kept deliberately small so
-// swapping the poller doesn't touch this file.
-//
-// Connection *setup* is not on the hot path (it happens once per connection,
-// not per request), so these live out-of-line in socket_util.cpp; the per-
-// request framing that is hot stays header-only inline in net/http.hpp.
+// Socket setup helpers; out of line because setup runs once per connection, not per request.
 
 #include <cstdint>
 
@@ -23,36 +15,15 @@ struct sockaddr_in; // fwd-declared; callers that use resolve_ipv4 include <neti
 
 namespace llmbridge::net
 {
-    // Set O_NONBLOCK. Returns false on fcntl failure.
-    bool set_nonblocking(int fd) noexcept;
+    bool set_nonblocking(int fd) noexcept; // false on fcntl failure
+    void set_nodelay(int fd) noexcept;     // TCP_NODELAY: a proxy never wants Nagle's delay
+    void set_nosigpipe(int fd) noexcept;   // SO_NOSIGPIPE; no-op on Linux, which ignores SIGPIPE
+    int make_listener(uint16_t port, int backlog = 1024) noexcept; // 0.0.0.0:port, -1 on error
 
-    // Disable Nagle (TCP_NODELAY); we never want coalescing delay on a proxy.
-    void set_nodelay(int fd) noexcept;
-
-    // Suppress SIGPIPE for this fd where the platform supports it
-    // (SO_NOSIGPIPE). On Linux this is a no-op: the process ignores SIGPIPE
-    // globally instead (see Gateway's constructor and each tool's main()).
-    void set_nosigpipe(int fd) noexcept;
-
-    // Create a non-blocking IPv4 listening socket bound to 0.0.0.0:port, with
-    // SO_REUSEADDR + SO_REUSEPORT (clean restarts; multiple loops can share the
-    // port later). Returns the fd, or -1 on error.
-    int make_listener(uint16_t port, int backlog = 1024) noexcept;
-
-    // Begin a non-blocking connect to ip:port (dotted-quad ip). Returns the fd;
-    // the connect may still be in progress (EINPROGRESS); wait for writability
-    // then check connect_result(). Returns -1 only on immediate failure.
+    // Non-blocking connect to a dotted-quad ip. It may still be in progress: wait for
+    // writability, then call connect_result. -1 only on immediate failure.
     int start_connect(const char* ip, uint16_t port) noexcept;
-
-    // After a connect socket reports writable, returns 0 on success or the
-    // SO_ERROR errno otherwise.
-    int connect_result(int fd) noexcept;
-
-    // Create a non-blocking TCP socket with TCP_NODELAY but don'T connect it, for
-    // the io_uring path, which issues the connect as a ring op (IORING_OP_CONNECT).
-    // Returns the fd, or -1 on error.
-    int make_client_socket() noexcept;
-
-    // Fill `out` (a sockaddr_in) for ip:port. Returns false on a bad dotted-quad.
-    bool resolve_ipv4(const char* ip, uint16_t port, sockaddr_in& out) noexcept;
+    int connect_result(int fd) noexcept; // after writability: 0, or the SO_ERROR errno
+    int make_client_socket() noexcept;   // unconnected, for io_uring's IORING_OP_CONNECT
+    bool resolve_ipv4(const char* ip, uint16_t port, sockaddr_in& out) noexcept; // false: bad ip
 } // namespace llmbridge::net

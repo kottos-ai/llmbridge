@@ -13,38 +13,28 @@
 
 #include "net/http.hpp"
 
-/// May this request proceed? llmbridge does not answer that: it authenticates nobody
-/// and meters nobody. Anyone who needs it supplies a Policy and keeps it in their own
-/// code. A stock build installs none, so nothing is called and requests forward.
+/// May this request proceed? llmbridge authenticates and meters nobody: whoever needs it
+/// supplies a Policy. A stock build installs none. Design: DESIGN.md "The policy seam".
 namespace llmbridge
 {
-    /// Metadata only: no route to the body, so "no prompt text" is a property of the
-    /// type. `head` does carry the client's Authorization, so never log a RequestFacts
-    /// and never retain a view: it points into the connection buffer.
-    ///
-    /// No lookup helper on purpose; net::http::find_header(head, name) is the safe one.
+    /// Metadata only, no route to the body. `head` carries the client's Authorization: never
+    /// log a RequestFacts or keep a view; read headers with net::http::find_header.
     struct RequestFacts
     {
         std::string_view head;  ///< request line + headers, through the CRLFCRLF
         size_t body_bytes = 0;  ///< Content-Length as framed. Bytes, not tokens
-        /// The top-level `model` the client asked for, empty when the body named none
-        /// or spelled it as anything but a plain string.
-        std::string_view model;
+        std::string_view model; ///< top-level plain-string `model`, else empty
         uint64_t prefix_hash = 0;
-        /// The gateway's request sequencer.
-        uint64_t seq = 0;
-        /// Top-level `"stream": true`, and top-level `stream_options.include_usage`
-        /// true. Anything else, nested or not a boolean, reads false.
+        uint64_t seq = 0; ///< the gateway's request sequencer
+        /// Top-level `"stream": true` and `stream_options.include_usage`; anything else is false.
         bool stream = false;
         bool include_usage = false;
     };
 
     inline constexpr size_t kMaxDenyMessage = 256;
 
-    /// The rule the gateway applies to Decision::message, public so a policy can
-    /// static_assert its own. The message lands in a JSON string with no escaping,
-    /// hence printable ASCII without `"` or `\`, 1 to kMaxDenyMessage bytes. Reads at
-    /// most kMaxDenyMessage + 1 bytes however long the string is.
+    /// The rule for Decision::message, public so a policy can static_assert its own. It lands
+    /// unescaped in a JSON string: 1 to kMaxDenyMessage bytes of printable ASCII, no `"` or `\`.
     [[nodiscard]] constexpr bool deny_message_ok(const char* m) noexcept
     {
         if (!m) return false;
@@ -64,44 +54,26 @@ namespace llmbridge
         bool allow = false;
         /// Must be 400-599; the gateway substitutes 403 for anything else and warns.
         int deny_status = 401;
-        /// Which upstream serves this request, as an index into the gateway's table.
-        /// Out of range (including the -1 default) means the first upstream, so a
-        /// policy that only authenticates need not know the table exists.
-        ///
-        /// Ignored when `allow` is false: a refused request reaches no venue.
+        /// Index into the gateway's upstream table; out of range (the -1 default too) means
+        /// the first one. Ignored when `allow` is false.
         int upstream_index = -1;
 
-        /// Rewrite the request's `model` to this before sending it. Empty leaves the
-        /// client's untouched, which is what a stock build with no policy always does.
-        ///
-        /// The same product is named differently at each venue: `gpt-4o` at OpenAI, a
-        /// deployment at Azure, `us.anthropic.claude-haiku-4-5-20251001-v1:0` at
-        /// Bedrock. Without this the caller must know which venue it will land on,
-        /// which defeats routing.
-        ///
-        /// Must stay valid until the gateway returns from framing this request; it is
-        /// copied into the outgoing bytes there and never retained.
+        /// Rewrite the request's `model` before sending; empty leaves the client's. Must stay
+        /// valid until the gateway returns from framing this request, and is not retained.
         std::string_view model{};
 
-        /// Set the request's `service_tier` to this before sending it. Empty leaves the
-        /// body alone, which is what every build without a policy does.
-        /// Same lifetime rule as `model`: valid until framing returns.
+        /// Set the request's `service_tier`; empty leaves the body alone. Same lifetime as `model`.
         std::string_view service_tier{};
 
-        /// Logged, never sent to the client. Must outlive the call, and must not carry
-        /// credential material.
+        /// Logged, never sent; must outlive the call and carry no credential material.
         const char* reason = "policy denied";
         const char* message = nullptr;
         uint64_t tag = 0;
     };
 
-    /// A venue failed before the client saw a single byte. Handed to the policy so it
-    /// can send the request somewhere else, which is what failover is.
-    ///
-    /// Only "the venue did not answer" reaches here: a refused connect, a failed write,
-    /// an EOF before the response, an idle timeout. A venue that did answer with
-    /// something we could not parse does not, because retrying elsewhere would mask a
-    /// real incompatibility as a transient blip.
+    /// A venue did not answer (refused connect, failed write, EOF before the response, idle
+    /// timeout) and the client has seen nothing: the policy may fail over. An unparseable
+    /// answer never reaches here, since retrying would mask an incompatibility.
     struct FailureFacts
     {
         int upstream_index = -1; ///< the venue that just failed
@@ -111,18 +83,15 @@ namespace llmbridge
         uint64_t tag = 0;        ///< Decision::tag of this request, verbatim; 0 if unset
     };
 
-    /// What to do about it. Value-initialised means give up and let the client see the
-    /// error, so a policy that ignores failures behaves exactly as before this existed.
+    /// Value-initialised means give up and let the client see the error.
     struct Retry
     {
         bool retry = false;
         int upstream_index = -1; ///< must be in range, and not the one that just failed
     };
 
-    /// Supplied at Gateway construction, non-owning, no setter. Called on that
-    /// Gateway's loop thread, once per framed request. A policy shared across workers
-    /// is called from several threads and must handle that itself: a lock here would
-    /// sit on the per-request path.
+    /// Non-owning, fixed at Gateway construction, called on its loop thread once per framed
+    /// request. A policy shared across workers must be thread-safe itself.
     class Policy
     {
       public:
@@ -131,10 +100,8 @@ namespace llmbridge
         /// noexcept and allocation-free on the allow path: every request pays for it.
         virtual Decision decide(const RequestFacts& facts) noexcept = 0;
 
-        /// Called only after a venue failed with nothing yet sent to the client. The
-        /// Default never retries: llmbridge has no opinion about which venue is healthy,
-        /// because health is measured and it measures nothing. Ordering, ejection
-        /// thresholds and cooldown belong to whoever implements this.
+        /// After a venue failed with nothing sent to the client. The default never retries:
+        /// llmbridge measures no health, so ordering, ejection and cooldown are the policy's.
         virtual Retry on_failure(const FailureFacts&) noexcept { return {}; }
 
         virtual bool wants_prefix_hash() const noexcept { return false; }

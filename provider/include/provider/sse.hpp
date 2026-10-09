@@ -7,21 +7,9 @@
 
 #pragma once
 
-// Incremental SSE translation: the streaming analog of translate.hpp. Where
-// translate.hpp is whole-body in / whole-body out, this is a *stateful pump*:
-// raw upstream Server-Sent-Events bytes in, OpenAI-shaped SSE chunks out, one
-// arbitrarily-fragmented network read at a time.
-//
-// Why stateful: a single TCP read can split an SSE event mid-line or mid-JSON,
-// and OpenAI's chunk protocol carries cross-event context (a stable id/model, a
-// once-emitted role delta, the final finish_reason). So you hold one translator
-// per in-flight response and feed() it as bytes arrive, then finish() at EOF.
-//
-// Scope (Phase B, slice 1): Anthropic Messages stream -> OpenAI chat.completion
-// .chunk stream, text only: message_start, content_block_delta/text_delta,
-// message_delta (stop_reason), message_stop. Tool-call deltas, vision, and the
-// reverse direction are later slices. I/O-agnostic: operates on in-memory
-// buffers; the gateway owns the sockets and back-pressure.
+// Anthropic Messages SSE in, OpenAI chat.completion.chunk SSE out, one fragmented read at a
+// time: text and tool-call deltas. Stateful, because a read can split an event and OpenAI
+// chunks carry cross-event context: one translator per response, feed(), then finish().
 
 #include <string>
 #include <vector>
@@ -32,62 +20,38 @@ namespace llmbridge::provider
     class AnthropicToOpenAiSse
     {
     public:
-        // The upstream is untrusted network input, so both internal buffers are
-        // hard-capped: an endless line (no '\n') or an endless event (no blank
-        // line) is a malfunctioning-or-malicious peer, not a workload. Generous
-        // vs. real Anthropic events (KBs), tight vs. a memory-exhaustion attempt.
+        // Caps on untrusted input: an endless line or event is a bad peer, not a workload.
         static constexpr size_t kMaxPending = 1 << 20;  // 1 MiB: longest single line
         static constexpr size_t kMaxEvent = 4 << 20;    // 4 MiB: one event's data
 
-        // `created_secs` is the OpenAI `created` epoch stamp, held constant across
-        // every chunk of the stream (OpenAI's own invariant). Default (-1) means
-        // "stamp it once, lazily, from the wall clock": the production path. Pass
-        // a fixed value to make the output fully deterministic (tests, and so the
-        // gateway can align a stream's `created` with its non-streaming path).
-        // `include_usage` mirrors OpenAI's `stream_options.include_usage`: when set,
-        // every chunk carries `"usage": null` and one extra chunk, with empty `choices`
-        // plus the real token counts, is emitted just before `data: [DONE]`.
-        // Anthropic supplies the numbers itself (input in message_start, cumulative
-        // output in message_delta), so this is pure re-shaping, never estimation.
+        // `created_secs` fixes every chunk's `created` stamp (-1: the wall clock, read once).
+        // `include_usage` mirrors stream_options.include_usage: `"usage": null` on each chunk,
+        // then a usage chunk with empty choices before [DONE], from Anthropic's own counts.
         explicit AnthropicToOpenAiSse(long long created_secs = -1, bool include_usage = false)
             : _created_secs(created_secs), _include_usage(include_usage)
         {
         }
 
-        // Feed raw upstream SSE bytes; append translated OpenAI SSE to `out`. An
-        // incomplete trailing event is buffered internally until the next call.
-        // Odd-but-skippable upstream data (unknown event types, unparseable data
-        // payloads) is ignored, never fatal, so one malformed frame can't tear
-        // down a live stream. Returns false permanently, only when a buffer
-        // cap is exceeded: the caller must treat that as a protocol failure and
-        // drop the upstream connection.
+        // Append the translation of these bytes to `out`; an incomplete event waits for the
+        // next call, and unknown or unparseable events are skipped. False, permanently,
+        // only when a cap is exceeded: the caller must drop the upstream.
         bool feed(std::string_view bytes, std::string& out);
 
-        // Signal upstream EOF. If the stream didn't already end with message_stop,
-        // emit a terminal finish chunk followed by "data: [DONE]".
+        // Upstream EOF: a terminal finish chunk and [DONE], unless message_stop already sent them.
         bool finish(std::string& out);
 
-        /// Provider-reported token counts seen so far. Input arrives in
-        /// `message_start`, output accumulates through `message_delta`, so both are
-        /// final only once the stream ends. Exposed because a stream is otherwise
-        /// unmeterable: these were private with no accessor. Reading them costs
-        /// nothing and changes no state.
+        /// Provider-reported token counts so far; final only once the stream ends.
         [[nodiscard]] long long input_tokens() const noexcept { return _in_tok; }
         [[nodiscard]] long long output_tokens() const noexcept { return _out_tok; }
-        /// Input tokens the provider served from cache, from message_start's
-        /// usage.cache_read_input_tokens; 0 when the provider reported none.
+        /// usage.cache_read_input_tokens from message_start; 0 when none was reported.
         [[nodiscard]] long long cached_tokens() const noexcept { return _cached_tok; }
-        /// Input tokens written to the provider's cache, from message_start's
-        /// usage.cache_creation_input_tokens. Billed above the input rate, so it is
-        /// reported separately instead of disappearing into the prompt total.
+        /// usage.cache_creation_input_tokens: billed above the input rate, so kept apart.
         [[nodiscard]] long long cache_write_tokens() const noexcept { return _cache_write_tok; }
-        /// The cache-creation write split by entry lifetime, from message_start's
-        /// usage.cache_creation.
+        /// The cache write split by entry lifetime, from usage.cache_creation.
         [[nodiscard]] long long cache_write_5m_tokens() const noexcept { return _cw_5m; }
         [[nodiscard]] long long cache_write_1h_tokens() const noexcept { return _cw_1h; }
 
-        /// True once the first content chunk has been emitted (a text delta, or a
-        /// tool call's name/arguments).
+        /// True once a text delta or a tool call's name or arguments has been emitted.
         [[nodiscard]] bool content_started() const noexcept { return _content_started; }
 
 
@@ -107,21 +71,13 @@ namespace llmbridge::provider
         std::string _cur_data;  // concatenated `data:` lines of the in-progress event
         bool _have_data = false;
         bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
-        // ── Streamed tool calls ──────────────────────────────────────────────
-        // Anthropic indexes every content block (text blocks included); OpenAI's
-        // tool_calls[].index counts only tool calls. The two diverge the moment a
-        // text block precedes a call, so a mapping is required, using Anthropic's
-        // index directly would emit tool_calls[1] with no tool_calls[0] and break
-        // client-side reassembly.
-        //
-        // Sparse and tiny: the vector is indexed by Anthropic block index, holds -1
-        // for "not a tool block", and is capped so a hostile index cannot make us
-        // allocate. Blocks beyond the cap are ignored instead of trusted.
+        // Anthropic indexes every content block; OpenAI's tool_calls[].index counts only
+        // calls, so block indices map to ordinals (-1: not a tool). Capped so a hostile index
+        // cannot make us allocate; blocks past the cap are ignored.
         static constexpr size_t kMaxBlocks = 256;
         std::vector<int> _block_tool_ord;  // block index -> OpenAI ordinal, or -1
         int _next_tool_ord = 0;
-        // A tool call was opened and the message has not reported a stop_reason.
-        // At EOF that means truncated arguments; see finish().
+        // A tool call is open with no stop_reason yet: at EOF its arguments are truncated.
         bool _tool_open = false;
 
         // Cross-chunk context (copied out of the frag buffer, which churns).

@@ -7,92 +7,40 @@
 
 #pragma once
 
-// Provider dialect translation: the C++ analog of LiteLLM's
-// transform_request / transform_response. The OpenAI chat-completions dialect is
-// the canonical "in" format; each target is a structurally-different provider
-// wire format we translate to and back from.
-//
-// Covered targets (the high-demand, structurally-distinct ones):
-//   - Anthropic Messages         (system extraction, content blocks, stop_reason)
-//   - Google Gemini              (contents/parts, role "model", generationConfig)
-//   - Cohere Chat v2             (messages, top_p -> "p", content blocks)
-// OpenAI-compatible providers (Groq, Together, Fireworks, DeepInfra, Mistral,
-// Perplexity, xAI, OpenRouter, Cerebras, vLLM, ...) need no body translation because
-// the gateway byte-forwards them (UpstreamDialect::OpenAI) and only rewrites
-// auth/endpoint. So this module covers the cases where the body actually changes.
-//
-// Scope per target: the common chat path (model, system, user/assistant turns,
-// max_tokens/temperature/top_p; response content / finish-reason / usage).
-// Representative, not 100% provider-complete: streaming deltas, tool-calling and
-// cache_control are built; vision is not. Operates on the JSON *body* (the
-// gateway handles HTTP re-framing). Returns "" on parse failure so the caller
-// can fail the request.
+// OpenAI chat-completion bodies to and from Anthropic, Bedrock, Gemini and Cohere. Edits
+// are splices of top-level keys, never re-serialisations: DESIGN.md "Translation model".
 
 #include <string>
 #include <string_view>
 
 namespace llmbridge::provider
 {
-    // ── Anthropic Messages ──────────────────────────────────────────────────
-    // OpenAI chat-completion request body  ->  Anthropic Messages request body.
-    /// Replace the top-level `"model"` value in an OpenAI request body, leaving every
-    /// other byte alone. Empty return = refuse, never a partial edit.
-    ///
-    /// A splice, not a re-serialisation. The body is forwarded to a venue that already
-    /// speaks this dialect, so re-emitting it from a parse would silently drop any
-    /// field this parser does not model, and providers add fields faster than we
-    /// adopt them. Only the model's value span moves.
-    ///
-    /// The TOP-LEVEL key only. A message whose content happens to contain `"model"` is
-    /// text, and rewriting inside it would corrupt a prompt.
-    ///
-    /// Refuses a replacement carrying a quote, a backslash or a control byte: those
-    /// would need escaping, a model id never contains them, and guessing at the
-    /// escaping of a string that lands in a request body is how an injection starts.
+    /// Replace the top-level `"model"` value; empty means refused, never a partial edit.
     std::string rewrite_model(std::string_view openai_body, std::string_view model);
 
-    /// Set a top-level string key, inserting it when the body does not already carry
-    /// one. Returns the new body, or empty to refuse.
-    ///
-    /// `rewrite_model` can only replace, because a request without a `model` is not one
-    /// this gateway serves. `service_tier` is different: most callers never send it,
-    /// and the route deciding the tier has to be able to put it there. Same splice,
-    /// same top-level-only rule, one more case.
+    /// Set a top-level string key, inserting it when absent; empty means refused.
     std::string upsert_string(std::string_view openai_body, std::string_view key,
                               std::string_view value, std::string_view* had = nullptr);
 
-    /// Both of the route's overrides in one pass. Either may be empty, and both empty
-    /// returns the body unchanged.
+    /// Both of the route's overrides in one pass; either may be empty.
     std::string apply_overrides(std::string_view openai_body, std::string_view model,
                                 std::string_view service_tier,
                                 std::string_view* had_tier = nullptr);
-    /// The same, into `out`, whose capacity is kept across calls; false on refusal.
     bool apply_overrides(std::string_view openai_body, std::string_view model,
                          std::string_view service_tier, std::string_view* had_tier,
-                         std::string& out);
+                         std::string& out); // into `out`, capacity kept; false on refusal
 
-    /// The model the client asked for, as a view into `body`. Empty when the body is
-    /// not an object, names no top-level `model`, or spells it with anything other
-    /// than a plain string.
-    ///
-    /// Top-level only. A value carrying a backslash is refused instead of unescaped: this is compared
-    /// against configured names, an escape means it was never one of them, and
-    /// unescaping here would need an allocation on a path that has none.
+    /// The top-level `model` as a view into `body`; empty unless it is a plain string.
     std::string_view model_of(std::string_view body) noexcept;
 
-    /// Whether the request body asks for a streamed response: top-level `stream: true`.
-    bool wants_stream(std::string_view body) noexcept;
+    bool wants_stream(std::string_view body) noexcept;    // top-level `stream: true`
+    bool stream_usage_of(std::string_view body) noexcept; // `stream_options.include_usage`
 
-    /// Top-level `stream_options.include_usage: true`; anything else reads false.
-    bool stream_usage_of(std::string_view body) noexcept;
-
-    /// Whether the readers above can disagree with a provider's parser about this
-    /// body.
+    /// Whether the readers above can disagree with a provider's parser about this body.
     enum class KeyCheck { Ok, DuplicateKey, EscapedKey, TooManyKeys };
     KeyCheck top_level_key_check(std::string_view body) noexcept;
 
-    /// model_of, wants_stream, stream_usage_of and top_level_key_check in one walk of
-    /// the top level, with the same answers.
+    /// The four readers above in one walk of the top level, with the same answers.
     struct TopLevelFacts
     {
         std::string_view model;
@@ -102,57 +50,29 @@ namespace llmbridge::provider
     };
     TopLevelFacts top_level_facts(std::string_view body) noexcept;
 
-    /// The model a reply says served it: the top-level `model` of a non-streamed body
-    /// or an OpenAI chunk, and `message.model` of an Anthropic `message_start` event.
+    /// The model a reply says served it: top-level `model`, or `message.model` in message_start.
     std::string_view reply_model(std::string_view json) noexcept;
+    size_t top_level_member_count(std::string_view body) noexcept; // the bare walk, for tests
 
-    /// Members of the top-level object, 0 when it cannot be walked. The bare walk the
-    /// readers above are built on, public so a test can price them against it.
-    size_t top_level_member_count(std::string_view body) noexcept;
-
-    /// `wants_stream_usage`, when given, reports the request's top-level
-    /// `stream_options.include_usage`.
     std::string openai_to_anthropic_request(std::string_view openai_body,
                                             bool* wants_stream_usage = nullptr);
-    /// The same, into `out`, whose capacity is kept across calls: a gateway that
-    /// translates a growing agent context every turn must not allocate, and fault
-    /// in, a fresh copy of it each time. False refuses the body and leaves `out` empty.
+    /// The same into `out`, capacity kept across agent turns; false refuses, `out` empty.
     bool openai_to_anthropic_request(std::string_view openai_body, std::string& out,
                                      bool* wants_stream_usage = nullptr);
 
-    /// The same Messages body as Bedrock wants it, and the model id it names.
-    ///
-    /// Two differences from Anthropic direct, both required: no `model` field, because
-    /// Bedrock takes the model id in the request path, and `anthropic_version` inside
-    /// the JSON, where Anthropic wants a header. `model_out` receives the id so the
-    /// caller can build `/model/{id}/invoke`; it is empty only when the body named no
-    /// model, in which case there is no path to build and the request must be refused.
+    /// Bedrock's Messages body; `model_out` gets the id for `/model/{id}/invoke`, empty if none.
     std::string openai_to_bedrock_request(std::string_view openai_body,
                                           std::string& model_out);
-    /// The same, into `out`, capacity kept; false refuses and leaves `out` empty.
     bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,
-                                   std::string& out);
-    // Anthropic Messages response body  ->  OpenAI chat-completion response body.
+                                   std::string& out); // into `out`; false refuses
     std::string anthropic_to_openai_response(std::string_view anthropic_body);
 
-    // An upstream ERROR body -> the OpenAI error envelope, so a failing provider
-    // (rate limit, overloaded GPU, context-length, auth) reaches the client as a
-    // real, actionable error instead of a generic gateway failure. Anthropic sends
-    // {"type":"error","error":{"type":"overloaded_error","message":"..."}}; we emit
-    // {"error":{"message":"...","type":"...","code":null}}. Never returns empty.
-    // An unparseable/foreign body still yields a valid envelope carrying `fallback`
-    // as the type, so the caller can always relay the upstream's status code.
+    /// An upstream error body as the OpenAI error envelope. Never empty: a foreign body
+    /// still yields one, typed `fallback_type`, so the upstream's status can be relayed.
     std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
 
-    // ── Google Gemini (generateContent) ─────────────────────────────────────
-    // OpenAI chat-completion request body  ->  Gemini generateContent body.
     std::string openai_to_gemini_request(std::string_view openai_body);
-    // Gemini generateContent response body  ->  OpenAI chat-completion body.
     std::string gemini_to_openai_response(std::string_view gemini_body);
-
-    // ── Cohere Chat v2 ──────────────────────────────────────────────────────
-    // OpenAI chat-completion request body  ->  Cohere /v2/chat request body.
     std::string openai_to_cohere_request(std::string_view openai_body);
-    // Cohere /v2/chat response body  ->  OpenAI chat-completion response body.
     std::string cohere_to_openai_response(std::string_view cohere_body);
 } // namespace llmbridge::provider

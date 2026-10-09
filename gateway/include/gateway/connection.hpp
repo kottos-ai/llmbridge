@@ -71,17 +71,13 @@ namespace llmbridge
         /// in place of a header swap. Needs a TLS build for the signing, so selecting
         /// it without one fails at startup instead of sending unsigned bytes.
         Bedrock,
-        /// Azure OpenAI: OpenAI's body untouched, the deployment in the path, the
-        /// api-version in the query, the credential in `api-key`. Byte-forwarding
-        /// cannot do it, because it would have to merge our query with the client's
-        /// target, which parse_upstream refuses.
+        /// Azure OpenAI: OpenAI's body, the deployment in the path, api-version in the query,
+        /// the key in `api-key`. Not a byte-forward: that would merge two queries.
         Azure,
     };
 
-    /// TLS on either leg. Declared unconditionally so callers need no ifdefs; a build
-    /// without TLS support fails run() when either flag is set, and never speaks
-    /// plaintext in its place. The invariant everything hangs off: `Connection::rbuf`
-    /// and `wbuf` hold plaintext always; ciphertext lives in `tls_out` and the Session.
+    /// TLS on either leg, declared without ifdefs. `rbuf` and `wbuf` always hold plaintext;
+    /// ciphertext lives in `tls_out` and the Session.
     struct TlsConfig
     {
         /// Outbound, gateway to provider: we are the TLS client and verify them.
@@ -141,16 +137,10 @@ namespace llmbridge
         Uring,
     };
 
-    /// Per-fd state, client or upstream. `is_client` says which, and several fields
-    /// change meaning with it; the buffer names are the gateway's point of view on
-    /// this socket, so the same name holds the request on a client conn and the
-    /// response on an upstream one:
-    ///
+    /// Per-fd state, client or upstream (`is_client`); buffer names are the gateway's view:
     ///   c->rbuf request in   u->wbuf request out
     ///   u->rbuf response in  c->wbuf response out
-    ///
-    /// Always plaintext on both legs. Ownership rules, including which backend may
-    /// free a connection when: GATEWAY-INTERNALS.md sections 2, 5b and 7.
+    /// Ownership, and which backend may free a connection when: GATEWAY-INTERNALS.md 2, 5b, 7.
     struct Connection
     {
         /// Live-instance count, so a test can assert every Connection the gateway
@@ -184,11 +174,8 @@ namespace llmbridge
         bool asked_stream = false;
         bool asked_usage = false;
 
-        /// Index into the upstream table, -1 when none applies. On an upstream
-        /// connection the venue this socket talks to, so release finds the right
-        /// pool; on a client connection the venue serving the request in flight,
-        /// which is how the response leg knows the dialect after the upstream went
-        /// back to its pool.
+        /// Upstream table index, -1 for none: an upstream's own venue (for its pool), or the
+        /// venue serving a client's request in flight (for the response's dialect).
         int upstream_slot = -1;
         sockaddr_in up_addr{};
         uint32_t upstream_ip = 0;
@@ -219,10 +206,8 @@ namespace llmbridge
         bool connected = false;       // upstream-only: non-blocking connect done
         bool wire_ready = false;
         bool request_pending = false; // client-only: full request buffered, awaiting forward
-        /// Closed, not yet freed. epoll frees at the end of the event batch; io_uring
-        /// only once `inflight` hits 0, because a submitted SQE still references this
-        /// object. Freeing on `doomed` alone is a use-after-free in a process holding
-        /// customer credentials. GATEWAY-INTERNALS.md section 7.
+        /// Closed, not yet freed: epoll frees at batch end, io_uring once `inflight` is 0, since
+        /// a submitted SQE still references this object. GATEWAY-INTERNALS.md section 7.
         bool doomed = false;
         bool close_after_resp = false; // client-only: this is an error reply, so close once it flushes
 
@@ -235,17 +220,12 @@ namespace llmbridge
         std::string rbuf;
         std::string wbuf;
 
-        /// How much of wbuf has been dealt with. Plaintext counts bytes on the socket,
-        /// TLS counts bytes fed into the Session; wire progress is tls_out_off. The
-        /// write path never clears wbuf, which is what keeps a request resendable on
-        /// a dead pooled connection. GATEWAY-INTERNALS.md section 2b.
+        /// Bytes of wbuf on the socket, or fed to the Session under TLS. wbuf is never cleared
+        /// by a write, so a request stays resendable. GATEWAY-INTERNALS.md section 2b.
         size_t woff = 0;
 
-        /// Two stamps change meaning with `is_client`: `ts_accepted` is accept() on a
-        /// client conn and socket creation on an upstream; `ts_first_byte` is the
-        /// first request byte against the first response byte. The `client_` prefix
-        /// marks a field meaningless on an upstream conn; `from_pool` and `retried`
-        /// are upstream-only.
+        /// `ts_accepted` and `ts_first_byte` mean accept and first request byte on a client, socket
+        /// creation and first response byte on an upstream. `client_` fields are client-only.
         int64_t ts_accepted = 0;
         /// Client conns: when this connection last completed a request. The setup
         /// deadline reaps a client that never framed anything; this reaps one that
@@ -264,10 +244,8 @@ namespace llmbridge
         Connection* peer = nullptr; // linked counterpart for the in-flight request
         net::http::Message msg{};
 
-        /// Latency stamps (ns), held on the client conn for the active request; the
-        /// t0-t6 scheme is in gateway.hpp and LATENCY.md. `client_upload_ns` is t0
-        /// minus the first byte: how long the request took to arrive, which is the
-        /// client's network and not our work.
+        /// Latency stamps (ns) for the active request, t0-t6 in LATENCY.md. `client_upload_ns` is
+        /// t0 minus the first byte: the client's network, not our work.
         int64_t ts_first_byte = 0;
         int64_t client_upload_ns = 0;
         int64_t ts_req_recvd = 0;
@@ -389,10 +367,8 @@ namespace llmbridge
 #endif
     };
 
-    /// Connection's print method, found by ADL: `LB_INFO("closed ", *c)` renders
-    /// `ClientConnection#42(fd=17,cid=2)`, so one grep separates the two halves of
-    /// the proxy. Prints nothing from rbuf or wbuf: those hold the customer's
-    /// request, including its credential.
+    /// Renders `ClientConnection#42(fd=17,cid=2)` for `LB_INFO("closed ", *c)`. Never prints
+    /// rbuf or wbuf: they hold the customer's request, credential included.
     inline void log_put(net::log::Line& l, const Connection& c)
     {
         l.put(net::log::Id{c.is_client ? "ClientConnection" : "UpstreamConnection", c.log_inst});

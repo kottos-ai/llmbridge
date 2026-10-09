@@ -5,35 +5,9 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Structured logging for the gateway, sized for a process that must not lose its
-// latency claim to its own diagnostics.
-//
-// The constraint. Roughly twenty interesting events per request at ~84k RPS is 1.7M
-// records/second, against a published budget of 41-80 us added p99 for the whole
-// request. One fprintf to stderr costs 1-5 us and takes a lock, so twenty of them
-// exceed the entire number the project is sold on. A logger here is therefore not a
-// convenience, it is a thing that can invalidate the benchmark.
-//
-// The shape that follows.
-//
-//   1. Two level gates. A compile-time floor removes call sites entirely, so a
-//      Release build carries no trace/debug code at all and the published numbers
-//      are measured on what ships. A runtime level then gates what remains, as one
-//      relaxed atomic load and a predictable branch.
-//   2. No allocation, ever. A line is formatted into a fixed stack buffer. Past the
-//      buffer it truncates and says so; it never grows, never allocates, never
-//      throws.
-//   3. No iostreams. `operator<<` on the event loop means locales, virtual dispatch
-//      and allocation. The variadic form below reads the same and costs none of it.
-//   4. One write(2) per line, so concurrent workers interleave whole lines instead
-//      of fragments. There is no mutex.
-//   5. A sink seam. The default sink writes to stderr.
-//
-// What must never be logged. No credential, at any level, ever: not an
-// Authorization value, not an x-api-key, not a bearer token, not a TLS private key.
-// Log a header's name and length, never its value. `SECURITY.md` promises
-// credentials are never logged, and this is the file where that promise is kept or
-// broken.
+// Structured logging that cannot cost the latency claim: compile- and runtime-gated, no
+// allocation, one write(2) per line. Never log a credential at any level: header names and
+// lengths, never values. DESIGN.md "Logging".
 
 #pragma once
 
@@ -42,10 +16,8 @@
 #include <cstdint>
 #include <string_view>
 
-// Compile-time floor. Anything below it is not compiled at all: the arguments are
-// not evaluated and no code is emitted. Release keeps Info and above so a running
-// process still says something; a debugging build passes 0 to get Trace.
-//   0=Trace 1=Debug 2=Info 3=Warn 4=Error 5=Off
+// Compile-time floor: levels below it emit no code and evaluate no arguments.
+//   0=Trace 1=Debug 2=Info (default) 3=Warn 4=Error 5=Off
 #ifndef LLMBRIDGE_LOG_COMPILE_LEVEL
 #define LLMBRIDGE_LOG_COMPILE_LEVEL 2
 #endif
@@ -62,19 +34,16 @@ namespace llmbridge::net::log
         Off = 5
     };
 
-    /// Parse "trace".."off". Returns false on anything else, so a typo in a config
-    /// or a flag is refused, never silently becoming a default.
+    /// Parse "trace".."off"; false on anything else, so a typo is refused, never defaulted.
     bool level_from_name(std::string_view name, Level& out) noexcept;
     const char* level_name(Level) noexcept;
 
-    /// Runtime level. Set before the worker threads start; it is read on the hot
-    /// path with a relaxed load, so changing it under load is racy by design and
-    /// only ever costs a stale decision for one line.
+    /// Runtime level, read with a relaxed load. Set it before the workers start; changing it
+    /// under load is racy by design and costs at most a stale decision for one line.
     void set_level(Level) noexcept;
     Level level() noexcept;
 
-    // Runtime default = the compile floor, so a binary built with the debug floor
-    // Emits debug without an explicit set_level.
+    // Defaults to the compile floor, so a debug-floor build emits debug without set_level.
     inline std::atomic<uint8_t> g_level_cache{static_cast<uint8_t>(LLMBRIDGE_LOG_COMPILE_LEVEL)};
 
     [[nodiscard]] inline bool enabled(Level l) noexcept
@@ -82,26 +51,14 @@ namespace llmbridge::net::log
         return static_cast<uint8_t>(l) >= g_level_cache.load(std::memory_order_relaxed);
     }
 
-    // ---------------------------------------------------------------- identity
-    //
-    // A log line is worthless if you cannot tell which connection or which request
-    // it belongs to. Three identities, all cheap:
-    //
-    //   thread   a small index and a name, assigned once per thread. Not
-    //            pthread_self(), which prints as a meaningless 15-digit number.
-    //   object   a class name plus a monotonic instance number, so a connection is
-    //            "Connection#42" for its whole life and can be grepped.
-    //   request  the existing g_seq sequencer, which already gives a total order
-    //            across workers without trusting any clock.
+    // Identity: a thread index and name, "Class#instance" per object, and g_seq per request.
 
-    /// Call once at the top of each thread. `name` must be a string literal or
-    /// otherwise outlive the thread; it is stored by pointer, never copied.
+    /// Call once at the top of each thread; `name` is stored by pointer and must outlive it.
     void register_thread(const char* name, unsigned index) noexcept;
     unsigned thread_index() noexcept;
     const char* thread_name() noexcept;
 
-    /// Monotonic instance numbers for loggable objects. Process-wide and shared
-    /// across workers, so an id is unique in the log without a per-class counter.
+    /// Monotonic, process-wide instance numbers, so an id is unique across workers.
     uint64_t next_instance() noexcept;
 
     /// "Class#instance", the object identity a reader greps for.
@@ -111,11 +68,7 @@ namespace llmbridge::net::log
         uint64_t inst;
     };
 
-    // ---------------------------------------------------------------- line buffer
-    //
-    // Fixed capacity on the stack. Appends past the end are dropped and the line is
-    // marked truncated, because a logger that reallocates under load is a latency
-    // bug that only appears under load.
+    // A fixed stack buffer: appends past the end are dropped and the line marked truncated.
     class Line
     {
     public:
@@ -140,13 +93,8 @@ namespace llmbridge::net::log
         bool _trunc = false;
     };
 
-    // Anything with a free `log_put(Line&, const T&)` in its own namespace is
-    // loggable. This is how an object gets a "print method" without iostreams:
-    // Connection defines one, and `LB_LOG_INFO("closed ", *conn)` just works.
-    // Constrained so it participates only for types that actually define log_put.
-    // Unconstrained, it beat the string_view overload for std::string (which needs a
-    // user-defined conversion) and the error surfaced as a confusing ADL failure
-    // deep inside the header.
+    // A type with a free `log_put(Line&, const T&)` found by ADL is loggable. Constrained,
+    // or it outranks the string_view overload for std::string and fails deep in the header.
     template <class T>
         requires requires(Line& li, const T& val) { log_put(li, val); }
     inline void put_one(Line& l, const T& v)
@@ -167,17 +115,9 @@ namespace llmbridge::net::log
     inline void put_one(Line& l, unsigned long long v) { l.put(static_cast<uint64_t>(v)); }
     inline void put_one(Line& l, const void* v) { l.put(v); }
 
-    // ---------------------------------------------------------------- sink
-    //
-    // The OPEN-CORE seam. The default sink formats nothing and does one write(2) to
-    // stderr, which is correct and adequate for a sidecar. A deployment that cares
-    // about the syscall installs a sink that copies the finished line into a
-    // lock-free ring and lets a writer thread do the write; that removes the 1-5 us
-    // syscall from the event loop without changing a single call site.
-    //
-    // Contract: `write` is called from the loop thread, must not block, must not
-    // throw, and must not allocate. A sink that blocks turns a diagnostic into an
-    // outage.
+    // The default sink does one write(2) to stderr; a deployment can install one that queues
+    // lines for a writer thread. Contract: `write` runs on the loop thread and must not
+    // block, throw or allocate.
     class Sink
     {
     public:
@@ -185,12 +125,10 @@ namespace llmbridge::net::log
         virtual void write(Level, std::string_view line) noexcept = 0;
     };
 
-    /// Install a sink. Not thread-safe: call before the worker threads start.
-    /// Passing nullptr restores the built-in stderr sink. The caller owns it.
+    /// Install a sink (caller-owned; nullptr restores stderr) before the workers start.
     void set_sink(Sink*) noexcept;
 
-    /// Lines the sink refused or dropped, if it reports any. A sink that silently
-    /// loses records produces a log nobody can reason about.
+    /// Lines the sink reports it refused or dropped.
     uint64_t dropped() noexcept;
     void note_dropped(uint64_t n) noexcept;
 
@@ -208,8 +146,7 @@ namespace llmbridge::net::log
     }
 } // namespace llmbridge::net::log
 
-// The `if constexpr` is what makes the compile-time floor real: below it the pack is
-// never instantiated, so the arguments are not even evaluated and nothing is emitted.
+// `if constexpr` makes the floor real: below it the arguments are never even evaluated.
 #define LB_LOG_AT(lv, ...)                                                                    \
     do {                                                                                      \
         if constexpr (static_cast<int>(lv) >= LLMBRIDGE_LOG_COMPILE_LEVEL)                    \

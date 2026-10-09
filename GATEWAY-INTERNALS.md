@@ -454,6 +454,29 @@ in `tls_out` is dropped, so a pooled reuse pays no second handshake.
 
 Both of these are mutation-verified: deleting either one fails a test.
 
+### 9b. How `secure_clear` erases (`net/include/net/secure.hpp`)
+
+There is no standard way to do it: `std::secure_clear` (P1315) was proposed and never
+adopted. So the platform primitive is chosen at CMake configure time by feature
+detection, never by guessing from `#ifdef __linux__`:
+
+| Primitive | Where | Detected as |
+|---|---|---|
+| `explicit_bzero` | glibc >= 2.25, the BSDs | `LLMBRIDGE_HAVE_EXPLICIT_BZERO` |
+| `memset_s` | C11 Annex K, MSVC | `LLMBRIDGE_HAVE_MEMSET_S` |
+| `SecureZeroMemory` | Windows | `_WIN32` |
+| `volatile` memset | everywhere else | fallback |
+
+The fallback is always correct, because `volatile` semantics are mandated by the
+standard, but it comes last because it works for an indirect reason and the named
+functions do not. To see the dead-store problem for yourself:
+`g++ -O2 -S ... | awk '/secure_clear/,/ret/' | grep call`.
+
+**Scope.** It is not a hot-path function and need not be: it runs once per request
+when a pooled upstream is released (2.4 ns for a ~96 B buffer, about 0.02% of one
+core at 84k RPS). Do not sprinkle it over transient buffers overwritten microseconds
+later; that buys nothing and costs the hot path.
+
 ## 10. TLS on both legs
 
 Two independent TLS sessions in opposite roles, never one pipe. The gateway
