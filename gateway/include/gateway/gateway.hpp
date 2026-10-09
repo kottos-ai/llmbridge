@@ -264,6 +264,7 @@ namespace llmbridge
         // scripts/check_conventions.py enforces it; DESIGN.md "Naming conventions".
         void ep_add_read(Connection* c) noexcept;
         void ep_pause_accept() noexcept;
+        void ep_sync_interest(Connection* c) noexcept;
         void ep_resume_accept() noexcept;
         void ep_arm_write(Connection* c) noexcept;
         void ep_disarm_write(Connection* c) noexcept;

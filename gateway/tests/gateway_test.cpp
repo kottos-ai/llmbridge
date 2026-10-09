@@ -260,6 +260,8 @@ namespace
         void set_responses(std::vector<std::string> r) { _sequence = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
+        // Write until the gateway stops reading (300 ms), then reset the connection.
+        void set_reset_mid_response(bool b) { _reset_mid = b; }
         // Respond once (keep-alive), then close the connection, which simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
@@ -421,6 +423,16 @@ namespace
                     ::close(c);
                     return;
                 }
+                if (_reset_mid)
+                {
+                    timeval tv{0, 300'000};
+                    ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+                    (void)!::write(c, resp.data(), resp.size());
+                    linger lg{1, 0}; // close() now sends RST
+                    ::setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+                    ::close(c);
+                    return;
+                }
                 if (_close_mid)
                 {
                     // Send a partial response then drop. This exercises the gateway's
@@ -466,6 +478,7 @@ namespace
         int _trickle_chunk = 0;
         int _chunked_chunks = 0;
         bool _close_mid = false;
+        bool _reset_mid = false;
         bool _close_after_first = false;
         std::string _late;
         int _late_ms = 0;
@@ -3503,6 +3516,40 @@ TEST_P(ProxyStream, TheConnectDeadlineEndsAtTheWire)
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().connect_timeouts, 0u);
+}
+
+// A provider that resets while its reads are paused for a slow client left a dead fd
+// registered with an empty interest mask; epoll still reports EPOLLHUP for it, so the
+// worker woke on every wait until the client drained: 100% CPU.
+TEST_P(ProxyStream, AnUpstreamResetWhilePausedDoesNotSpinTheWorker)
+{
+    const std::string filler(400, 'x');
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    for (int i = 0; i < 4000; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    _backend.set_reset_mid_response(true);
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    std::this_thread::sleep_for(std::chrono::milliseconds(800)); // paused, then reset
+    rusage r0{}, r1{};
+    ::getrusage(RUSAGE_SELF, &r0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ::getrusage(RUSAGE_SELF, &r1);
+    const auto us = [](const rusage& r)
+    { return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1'000'000L + r.ru_utime.tv_usec + r.ru_stime.tv_usec; };
+    EXPECT_LT(us(r1) - us(r0), 250'000) << "the worker spun on a reset upstream";
+    (void)c.recv_all(3000); // the client still gets what was buffered, then the close
+    c.close();
+    shutdown();
 }
 
 // ── Backpressure: a slow client must pause upstream reads (epoll) ─────────

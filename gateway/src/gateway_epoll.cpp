@@ -69,24 +69,29 @@ namespace llmbridge
         _accept_resume_ns = 0;
     }
 
+    // The one writer of a connection's interest mask, from both flags: arming a write
+    // used to set EPOLLIN too, silently undoing a backpressure pause.
+    void Gateway::ep_sync_interest(Connection* c) noexcept
+    {
+        epoll_event ev{};
+        ev.events = (c->read_paused ? 0u : static_cast<uint32_t>(EPOLLIN)) |
+                    (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
+        ev.data.ptr = c;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+    }
+
     void Gateway::ep_arm_write(Connection* c) noexcept
     {
         if (c->write_armed) return;
-        epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->write_armed = true;
+        ep_sync_interest(c);
     }
 
     void Gateway::ep_disarm_write(Connection* c) noexcept
     {
         if (!c->write_armed) return;
-        epoll_event ev{};
-        ev.events = EPOLLIN;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->write_armed = false;
+        ep_sync_interest(c);
     }
 
     // Backpressure: pause/resume reading a connection. Used to stop pulling
@@ -96,11 +101,8 @@ namespace llmbridge
     void Gateway::ep_pause_read(Connection* c) noexcept
     {
         if (c->read_paused) return;
-        epoll_event ev{};
-        ev.events = c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = true;
+        ep_sync_interest(c);
         ++_stats.stream_pauses; // observability: proves backpressure actually engaged
         // Both guards above are edge-triggered (`read_paused` early-returns), so this
         // is one line per episode, not per event. WARN like every other cap: at the
@@ -114,11 +116,8 @@ namespace llmbridge
     void Gateway::ep_resume_read(Connection* c) noexcept
     {
         if (!c->read_paused) return;
-        epoll_event ev{};
-        ev.events = static_cast<uint32_t>(EPOLLIN) | (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = false;
+        ep_sync_interest(c);
         // Same level as the pause: a log that opens an episode and never closes it
         // reads as still stuck.
         LB_WARN("CAP backpressure cleared, resuming upstream reads ", *c);
@@ -1206,6 +1205,11 @@ namespace llmbridge
         {
             stream_truncate(client);
         }
+        // Either way the stream has ended, so the upstream is done: close it now. Kept
+        // while reads were paused, its dead fd raised EPOLLHUP on every wait.
+        client->peer = nullptr;
+        u->peer = nullptr;
+        ep_close_upstream(u);
         ep_stream_flush(client);
     }
 
