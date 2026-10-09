@@ -73,6 +73,18 @@ TEST(Uring, SqesLeftByAPartialSubmitGoInOnTheNextOne)
     EXPECT_TRUE(nop_done) << "the SQE behind the rejected one was never submitted";
 }
 
+// A second init must release the first registration: re-registering the same buffer
+// group used to fail with EEXIST, and teardown left the kernel holding unmapped memory.
+TEST(Uring, ABufRingCanBeInitialisedTwice)
+{
+    if (!available()) GTEST_SKIP();
+    Ring r;
+    ASSERT_TRUE(r.init(8, 0));
+    BufRing b;
+    if (!b.init(r, 7, 8, 4096)) GTEST_SKIP() << "no provided-buffer rings: " << b.init_stage();
+    EXPECT_TRUE(b.init(r, 7, 8, 4096)) << b.init_stage() << " errno " << b.init_errno();
+}
+
 TEST(Uring, NopCompletes)
 {
     if (!available()) GTEST_SKIP();

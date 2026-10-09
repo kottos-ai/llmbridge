@@ -51,6 +51,7 @@ namespace llmbridge::net::uring
 
     bool Ring::init(unsigned entries, unsigned flags) noexcept
     {
+        teardown(); // a second init must not leak the first ring
         io_uring_params p;
         std::memset(&p, 0, sizeof(p));
         p.flags = flags;
@@ -151,6 +152,7 @@ namespace llmbridge::net::uring
 
     bool BufRing::init(Ring& ring, unsigned bgid, unsigned count, unsigned buf_size) noexcept
     {
+        teardown(); // a second init must not leak the first registration
         _init_stage = "";
         _init_errno = 0;
         if (count == 0 || (count & (count - 1)) != 0)
@@ -199,6 +201,7 @@ namespace llmbridge::net::uring
             teardown();
             return false;
         }
+        _registered = true;
 
         // Publish all buffers. (bufs[0].resv aliases the ring tail; writing
         // addr/len/bid doesn't touch it, then we store the tail with release.)
@@ -227,6 +230,16 @@ namespace llmbridge::net::uring
 
     void BufRing::teardown() noexcept
     {
+        // Unregister before unmapping: a registered ring is memory the kernel may still
+        // write into. EBADF here (the Ring went first) means there is nothing to undo.
+        if (_registered)
+        {
+            io_uring_buf_reg reg;
+            std::memset(&reg, 0, sizeof(reg));
+            reg.bgid = static_cast<uint16_t>(_bgid);
+            (void)sys_io_uring_register(_ring_fd, IORING_UNREGISTER_PBUF_RING, &reg, 1);
+            _registered = false;
+        }
         if (_bufs && _bufs != MAP_FAILED) ::munmap(_bufs, _bufs_sz);
         if (_ring && _ring != MAP_FAILED) ::munmap(_ring, _ring_sz);
         _bufs = nullptr;

@@ -154,6 +154,7 @@ namespace llmbridge::net::uring
         unsigned _mask = 0;
         unsigned _buf_size = 0;
         unsigned _tail = 0; // our producer cursor into the buf ring
+        bool _registered = false; // the kernel holds _ring until unregistered
         const char* _init_stage = ""; // last init() failure step, for diagnostics
         int _init_errno = 0;
     };

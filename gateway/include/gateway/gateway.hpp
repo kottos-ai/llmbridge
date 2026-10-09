@@ -443,7 +443,8 @@ namespace llmbridge
         bool ur_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
         [[nodiscard]] bool ur_submit_accept() noexcept;
         void ur_pause_accept(const char* why) noexcept;
-        void ur_submit_timer() noexcept;
+        [[nodiscard]] bool ur_submit_timer() noexcept;
+        void ur_drop_sq_full(Connection* c) noexcept;
         bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
         bool ur_submit_send(Connection* c) noexcept;
         /// Send wbuf to a client conn. Plaintext goes straight out; a TLS conn passes
@@ -483,6 +484,7 @@ namespace llmbridge
         net::uring::Ring _ring;
         net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
         struct __kernel_timespec _uring_ts{};
+        bool _uring_timer_lost = false; // a re-arm found the SQ full; the loop retries it
         long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
         bool _draining = false;   // post-stop: completions just decrement, no re-arm
 #endif
