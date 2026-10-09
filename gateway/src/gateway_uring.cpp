@@ -497,6 +497,8 @@ namespace llmbridge
         if (res < 0) return;                                 // transient accept error
         const int fd = res;
         net::set_nodelay(fd);
+        if (_client_sndbuf > 0)
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_client_sndbuf, sizeof(_client_sndbuf));
         Connection* c = new Connection();
         c->fd = fd;
         c->is_client = true;
