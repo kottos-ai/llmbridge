@@ -8,6 +8,68 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.68.0]. 2026-10-09
+
+Safety fixes in the event loops. Each fix is its own commit with a
+regression test that fails without it, except where noted.
+
+### Fixed
+
+- **A failover whose connect fails at once no longer duplicates the request.** The
+  copy put back in the client buffer for the attempt was inserted a second time on
+  failure; the leftover ran as a new request, failed over the same way and left
+  another: one request served indefinitely, each run billable. Both backends.
+- **Bytes pipelined behind a request in flight are bounded.** Reading continued with
+  no cap while a request was in flight, so one client holding a slow request open
+  could grow the buffer until the process ran out of memory. More than
+  `kMaxHeaderLen + kMaxBodyLen` buffered now aborts the pair.
+- **A torn `100 Continue` closes the client through its backend.** It only set
+  `doomed`: epoll spun on the still-registered fd, and io_uring freed a connection
+  still in `_clients`. Not deterministically testable (needs a torn 25-byte send).
+- **Running out of file descriptors no longer spins a worker.** epoll's listener
+  stayed readable while `accept()` failed with EMFILE/ENFILE; io_uring re-armed into
+  the same error, and a re-arm that found the SQ full left the listener dead with
+  nothing logged. The listener now pauses for 100 ms and is re-armed from the tick.
+- **epoll: one writer of the interest mask.** Arming or disarming a write re-enabled
+  reads on a backpressure-paused upstream, after which the client buffer was
+  unbounded.
+- **epoll: an upstream reset while paused no longer spins.** The dead fd stayed
+  registered with mask 0 and raised EPOLLHUP on every wait. It is now closed at
+  stream EOF; its remaining bytes are already in the client's buffer.
+- **io_uring: SQEs left by a partial submit are resubmitted.** `submit_and_wait`
+  counted from its own last tail, so ops behind one the kernel rejected were never
+  issued and their connections hung. EBUSY/EAGAIN from `io_uring_enter` no longer
+  stop the worker, and a real exit is logged.
+- **io_uring lifetimes.** A full SQ ends the client and upstream together instead of
+  freeing one under the other's pointer, and callers stop using a connection after a
+  failed arm; a timer re-arm that found the SQ full (which disabled every timeout)
+  is retried; cancel uses `IORING_ASYNC_CANCEL_ALL`; `ur_error_respond` aborts instead
+  of replacing a buffer an in-flight send reads; the provided-buffer ring is
+  unregistered before it is unmapped, and a second `init` releases the first.
+- **A pooled request is resent only if it failed within 1 s of reuse.** The
+  stale-connection retry fired however long the provider had held the request, so a
+  provider that ran it and then dropped the connection got it twice, billed twice.
+- **Byte-forwarded targets are validated with or without a base path.** Dot segments
+  and backslashes, plain or encoded (`/../`, `%2e%2e`, `%5c`), escaped the venue's
+  base path, and with no base path an absolute-form target was forwarded verbatim,
+  letting the client pick the upstream vhost. A literal `//` is still allowed.
+- **The request line is never read or stripped as a header.** A first line shaped
+  like a header was shown to the policy, then stripped, and the next line became the
+  upstream's request line. The credential scan on the translated path skips it too.
+
+### Added
+
+- `Stats::accept_backoffs`: listener pauses for lack of file descriptors.
+- Test seam: the mock upstream can reset mid-response and drop a connection's second
+  request after a delay.
+
+### Known gaps
+
+- The translated-stream amplification (a hostile upstream's long `model` echoed into
+  every chunk) and the fabricated `[DONE]` on a cut stream are fixed in the SSE
+  translator, refactor step S8; request-line syntax validation belongs to the HTTP
+  strictness step, S7.
+
 ## [0.67.0]. 2026-10-09
 
 ### Changed
