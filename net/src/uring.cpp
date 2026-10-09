@@ -113,10 +113,11 @@ namespace llmbridge::net::uring
 
     int Ring::submit_and_wait(unsigned min_complete) noexcept
     {
-        // Publish any SQEs filled since the last submit (identity array, so just
-        // advance the tail with a release store so the kernel sees the new SQEs).
-        const unsigned to_submit = _sqe_tail - *_sq_tail;
-        if (to_submit) __atomic_store_n(_sq_tail, _sqe_tail, __ATOMIC_RELEASE);
+        // Publish new SQEs (identity array: advancing the tail is enough), then submit
+        // everything the kernel has not consumed. Counting from our last tail instead
+        // stranded the SQEs a partial submit left behind.
+        if (_sqe_tail != *_sq_tail) __atomic_store_n(_sq_tail, _sqe_tail, __ATOMIC_RELEASE);
+        const unsigned to_submit = _sqe_tail - __atomic_load_n(_sq_head, __ATOMIC_ACQUIRE);
 
         if (to_submit == 0 && min_complete == 0) return 0; // nothing to do
 

@@ -1320,7 +1320,12 @@ namespace llmbridge
         while (!_stop)
         {
             const int r = _ring.submit_and_wait(1);
-            if (r < 0 && r != -EINTR && r != -ETIME) break;
+            // EBUSY (CQ overflow backlog) and EAGAIN are transient: reaping clears them.
+            if (r < 0 && r != -EINTR && r != -ETIME && r != -EBUSY && r != -EAGAIN)
+            {
+                LB_ERROR("io_uring_enter failed (", -r, "); this worker stops accepting work");
+                break;
+            }
             reap();
         }
 

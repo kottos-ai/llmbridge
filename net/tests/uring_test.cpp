@@ -47,6 +47,32 @@ TEST(Uring, AvailableProbeWorks)
     EXPECT_GE(r.ring_fd(), 0);
 }
 
+// Without IORING_SETUP_SUBMIT_ALL the kernel stops a batch at an SQE that fails to
+// submit. The ones behind it must go in on the next submit, not wait forever.
+TEST(Uring, SqesLeftByAPartialSubmitGoInOnTheNextOne)
+{
+    if (!available()) GTEST_SKIP();
+    Ring r;
+    ASSERT_TRUE(r.init(8, 0));
+    io_uring_sqe* bad = r.get_sqe();
+    ASSERT_NE(bad, nullptr);
+    bad->opcode = 0xFF; // no such op: rejected at submit
+    bad->user_data = 1;
+    io_uring_sqe* nop = r.get_sqe();
+    ASSERT_NE(nop, nullptr);
+    nop->opcode = IORING_OP_NOP;
+    nop->user_data = 2;
+
+    bool nop_done = false;
+    for (int i = 0; i < 50 && !nop_done; ++i)
+    {
+        (void)r.submit();
+        r.for_each_cqe([&](const io_uring_cqe* c) { nop_done |= c->user_data == 2; });
+        if (!nop_done) usleep(1000);
+    }
+    EXPECT_TRUE(nop_done) << "the SQE behind the rejected one was never submitted";
+}
+
 TEST(Uring, NopCompletes)
 {
     if (!available()) GTEST_SKIP();
