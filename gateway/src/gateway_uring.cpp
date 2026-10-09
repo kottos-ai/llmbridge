@@ -681,8 +681,9 @@ namespace llmbridge
                 c->client_frame_want = m.total_len;
                 c->rbuf.reserve(m.total_len);
                 if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
-                    send_interim_continue(c, /*uring=*/true);
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)) &&
+                    !send_interim_continue(c, /*uring=*/true))
+                    ur_close(c);
             }
             return; // the armed recv will deliver more
         }

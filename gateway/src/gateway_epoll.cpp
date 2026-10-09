@@ -551,8 +551,9 @@ namespace llmbridge
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
-                    send_interim_continue(c, /*uring=*/false);
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)) &&
+                    !send_interim_continue(c, /*uring=*/false))
+                    ep_close_client(c);
             }
             return;
         }

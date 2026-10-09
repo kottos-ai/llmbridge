@@ -277,7 +277,7 @@ namespace llmbridge
         /// Write the buffered response to the client; close out accounting.
         void ep_respond(Connection* client) noexcept;
         void ep_finish_client(Connection* c) noexcept;
-        void send_interim_continue(Connection* c, bool uring) noexcept;
+        [[nodiscard]] bool send_interim_continue(Connection* c, bool uring) noexcept; // false: close c
 
         // Streaming pump, epoll.
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
