@@ -8,6 +8,23 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.65.0]. 2026-10-09
+
+### Fixed
+
+- **The two slow-client backpressure tests now test backpressure on any kernel.**
+  `ProxyStream.SlowClientEngagesBackpressureAndLosesNothing` and
+  `ProxyPoolHygiene.AnUpstreamPooledAfterASlowStreamStillAnswers`.
+
+### Added
+
+- **`Gateway::set_client_sndbuf_for_test(int)`**, a test seam that pins SO_SNDBUF
+  on accepted client sockets on both backends, which turns off autotuning.
+
+### Tests
+
+- Both tests above set the seam to 4096 bytes and pass on epoll and io_uring.
+
 ## [0.64.0]. 2026-10-08
 
 ### Added

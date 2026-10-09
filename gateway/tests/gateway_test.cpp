@@ -728,6 +728,7 @@ namespace
             if (pool_idle_ns >= 0) _gw->set_pool_idle_ns(pool_idle_ns);
             if (_heartbeat_ns >= 0) _gw->set_heartbeat_ns(_heartbeat_ns);
             if (_connect_ns >= 0) _gw->set_connect_ns(_connect_ns);
+            if (_client_sndbuf >= 0) _gw->set_client_sndbuf_for_test(_client_sndbuf);
             _proxy_port = _gw->bound_port();
             // ARM the read guard only when the loop borrows something this test owns.
             // A policy or a sink is a raw pointer to a TestBody local, and TearDown
@@ -762,6 +763,7 @@ namespace
         /// tenth positional argument, for the reason start() already gives.
         int64_t _heartbeat_ns = -1;
         int64_t _connect_ns = -1; // set before start(), like the heartbeat
+        int _client_sndbuf = -1;  // set before start(); pins SO_SNDBUF on accepted clients
         std::vector<std::string> _sink_capture;
         std::vector<std::string> _strip_headers; // empty = stock build, nothing dropped
         std::vector<llmbridge::Upstream> _upstreams; // empty = the single-upstream form
@@ -3423,9 +3425,11 @@ TEST_P(ProxyStream, TheConnectDeadlineEndsAtTheWire)
 }
 
 // ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
-// Deterministic: a tiny client receive window + a multi-MB stream + a client that
-// stalls before reading forces the gateway's writes to block, which must engage
-// the pause path, and every byte must still arrive once the client drains.
+// Deterministic: a tiny client receive window, a pinned gateway send buffer, a
+// multi-MB stream and a client that stalls before reading force the gateway's
+// writes to block, which must engage the pause path, and every byte must still
+// arrive once the client drains. Without the pinned send buffer, loopback
+// autotuning (BBR starts near 4 MB) can swallow the whole stream.
 TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
 {
     // ~1.6 MB of SSE: many deltas, each large enough to fill socket buffers fast.
@@ -3441,6 +3445,7 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(ev, 16384));
+    _client_sndbuf = 4096;
     start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0); // no timeout: client is slow on purpose
 
     Client c;
@@ -7554,6 +7559,7 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                           "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
                           sse_chunk_encode(ev, 16384));
+    _client_sndbuf = 4096; // without it, autotuning can absorb the stream: no pause
     start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
     {
         Client a;
