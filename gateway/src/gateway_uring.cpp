@@ -80,15 +80,25 @@ namespace llmbridge
         return s != nullptr;
     }
 
-    void Gateway::ur_submit_accept() noexcept
+    bool Gateway::ur_submit_accept() noexcept
     {
         io_uring_sqe* s = nullptr;
-        if (!ur_next_sqe(&s)) return;
+        if (!ur_next_sqe(&s)) return false;
         s->opcode = IORING_OP_ACCEPT;
         s->fd = _listen_fd;
         s->accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
         s->ioprio = IORING_ACCEPT_MULTISHOT; // one SQE, a completion per accepted fd
         s->user_data = make_ud(_listen_conn, UAccept);
+        return true;
+    }
+
+    // The timer tick re-arms the accept. Without it, an EMFILE ends the multishot and an
+    // immediate re-arm fails again at once, and a failed re-arm left the listener dead.
+    void Gateway::ur_pause_accept(const char* why) noexcept
+    {
+        _accept_resume_ns = now_ns() + kAcceptBackoffNs;
+        ++_stats.accept_backoffs;
+        LB_WARN("CAP ", why, "; accepting paused for 100 ms, total=", _stats.accept_backoffs);
     }
 
     void Gateway::ur_submit_timer() noexcept
@@ -456,7 +466,16 @@ namespace llmbridge
         const UOp op = ud_op(user_data);
         if (op == UTimer)
         {
-            if (!_draining && !_stop) { sweep_idle(/*uring=*/true); ur_submit_timer(); }
+            if (!_draining && !_stop)
+            {
+                sweep_idle(/*uring=*/true);
+                if (_accept_resume_ns && now_ns() >= _accept_resume_ns)
+                {
+                    _accept_resume_ns = 0;
+                    if (!ur_submit_accept()) ur_pause_accept("accept re-arm found the SQ full");
+                }
+                ur_submit_timer();
+            }
             return;
         }
         if (op == UCancel) return; // control op (cancel-by-fd); not inflight-counted
@@ -493,7 +512,11 @@ namespace llmbridge
             if (res >= 0) ::close(res); // shutting down: don't take new work
             return;
         }
-        if (!(flags & IORING_CQE_F_MORE)) ur_submit_accept(); // multishot ended -> re-arm
+        if (!(flags & IORING_CQE_F_MORE)) // multishot ended -> re-arm, unless that would spin
+        {
+            if (res == -EMFILE || res == -ENFILE) ur_pause_accept("out of file descriptors");
+            else if (!ur_submit_accept()) ur_pause_accept("accept re-arm found the SQ full");
+        }
         if (res < 0) return;                                 // transient accept error
         const int fd = res;
         net::set_nodelay(fd);
@@ -1285,7 +1308,7 @@ namespace llmbridge
         _uring_ts.tv_sec = kPollTickMs / 1000;
         _uring_ts.tv_nsec = static_cast<long long>(kPollTickMs % 1000) * 1000000LL;
 
-        ur_submit_accept();
+        if (!ur_submit_accept()) ur_pause_accept("accept arm found the SQ full");
         ur_submit_timer();
 
         auto reap = [this] {

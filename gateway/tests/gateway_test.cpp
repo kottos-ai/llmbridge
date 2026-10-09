@@ -19,6 +19,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -2314,6 +2316,65 @@ TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
     ASSERT_TRUE(d.connect(_proxy_port));
     shutdown();
     EXPECT_GE(_gw->stats().errors, 1u);
+}
+
+// Out of file descriptors, accept() fails while the connection stays queued: the
+// level-triggered listener (epoll) or the immediate multishot re-arm (io_uring) then
+// spun the worker at 100% CPU. It must back off, and resume once descriptors return.
+TEST_P(ProxyBackend, RunningOutOfDescriptorsDoesNotSpinTheWorker)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    rlimit old{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);
+    int open_fds = 0;
+    for (int fd = 0; fd < 4096; ++fd) open_fds += ::fcntl(fd, F_GETFD) != -1;
+    rlimit tight = old;
+    tight.rlim_cur = static_cast<rlim_t>(open_fds + 8);
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &tight), 0);
+    std::vector<int> held; // client sockets, until socket() itself runs out
+    const auto dial = [&]
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(_proxy_port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        (void)::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        held.push_back(fd);
+        return true;
+    };
+    for (int i = 0; i < 64 && dial(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // The table may have filled exactly as the gateway accepted the last one: free one
+    // descriptor and dial with it, so a connection is certainly left pending.
+    ASSERT_FALSE(held.empty());
+    ::close(held.back());
+    held.pop_back();
+    ASSERT_TRUE(dial());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    rusage r0{}, r1{};
+    ::getrusage(RUSAGE_SELF, &r0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ::getrusage(RUSAGE_SELF, &r1);
+    const auto us = [](const rusage& r)
+    { return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1'000'000L + r.ru_utime.tv_usec + r.ru_stime.tv_usec; };
+    const long cpu_us = us(r1) - us(r0);
+    for (int fd : held) ::close(fd);
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old), 0);
+    EXPECT_LT(cpu_us, 250'000) << "the worker spun for " << cpu_us << " us of 500 ms";
+    // io_uring's multishot accept may stay armed through EMFILE instead of ending, and
+    // then no error reaches the gateway; epoll always sees it.
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+    {
+        EXPECT_GE(_gw->stats().accept_backoffs, 1u);
+    }
+
+    Client c; // descriptors are back: the listener must accept again
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_EQ(c.recv_status(3000), 200);
+    c.close();
+    shutdown();
 }
 
 TEST_P(ProxyBackend, MultipleClients)

@@ -49,6 +49,26 @@ namespace llmbridge
         ::epoll_ctl(_epfd, EPOLL_CTL_ADD, c->fd, &ev);
     }
 
+    void Gateway::ep_pause_accept() noexcept
+    {
+        epoll_event ev{};
+        ev.data.ptr = _listen_conn;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _listen_fd, &ev);
+        _accept_resume_ns = now_ns() + kAcceptBackoffNs;
+        ++_stats.accept_backoffs;
+        LB_WARN("CAP out of file descriptors; accepting paused for 100 ms, total=",
+                _stats.accept_backoffs);
+    }
+
+    void Gateway::ep_resume_accept() noexcept
+    {
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.ptr = _listen_conn;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _listen_fd, &ev);
+        _accept_resume_ns = 0;
+    }
+
     void Gateway::ep_arm_write(Connection* c) noexcept
     {
         if (c->write_armed) return;
@@ -473,6 +493,9 @@ namespace llmbridge
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
                 if (errno == EINTR) continue;
+                // The pending connection stays queued, so a level-triggered listener
+                // would report it again at once: back off instead of spinning.
+                if (errno == EMFILE || errno == ENFILE) ep_pause_accept();
                 return;
             }
             net::set_nonblocking(fd);
@@ -1282,6 +1305,7 @@ namespace llmbridge
                 }
             }
             sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
+            if (_accept_resume_ns && now_ns() >= _accept_resume_ns) ep_resume_accept();
             for (Connection* d : _doomed) { retire_wbuf(d); delete d; }
             _doomed.clear();
         }
