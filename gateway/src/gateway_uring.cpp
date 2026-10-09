@@ -812,6 +812,7 @@ namespace llmbridge
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
+            if (!c->failover_req.empty()) c->rbuf.erase(0, c->msg.total_len); // see the epoll mirror
             if (!ur_upstream_failed(c, 502, "no upstream (connect failed)"))
                 ur_error_respond(c, 502, "no upstream (connect failed)");
             return;

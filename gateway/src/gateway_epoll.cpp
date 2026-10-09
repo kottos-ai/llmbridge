@@ -697,6 +697,9 @@ namespace llmbridge
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
+            // A failover attempt runs on a copy put back in rbuf; failover_req keeps the
+            // original, so drop the copy or the next failover inserts a second one.
+            if (!c->failover_req.empty()) c->rbuf.erase(0, c->msg.total_len);
             if (!ep_upstream_failed(c, 502, "no upstream (connect failed)"))
                 ep_error_respond(c, 502, "no upstream (connect failed)");
             return;

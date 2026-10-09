@@ -4924,6 +4924,30 @@ TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
     good.stop();
 }
 
+// A failover whose connect fails at once (here ENETUNREACH) used to put the request
+// back into the client buffer a second time, so the leftover copy ran as a new
+// request, failed over the same way and left another: one request, served forever.
+TEST_P(ProxyRoute, AFailoverWhoseConnectFailsAtOnceServesTheRequestOnce)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead_sock;
+    FailoverPolicy pol(0, {1, 2});
+    start({{"127.0.0.1", dead_sock.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"255.255.255.255", 9, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    EXPECT_TRUE(c.recv_some(500).empty()) << "a response arrived for a request never sent";
+    c.close();
+    shutdown();
+    EXPECT_EQ(good.seen(), 1) << "the healthy venue ran the one request more than once";
+    good.stop();
+}
+
 // The default. A policy that does not override on_failure must behave exactly as the
 // gateway did before the hook existed: the client sees the error.
 TEST_P(ProxyRoute, WithoutAPolicyOpinionTheClientSeesTheFailure)
