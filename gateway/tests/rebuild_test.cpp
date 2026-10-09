@@ -64,6 +64,34 @@ TEST(Rebuild, ARefusedRequestLeavesTheBufferEmpty)
     EXPECT_TRUE(into.empty());
 }
 
+// The client's target is spliced after the venue's base path, so a dot segment, in
+// plain or encoded form, would reach a path outside it; and with no base path an
+// absolute-form target was forwarded verbatim, letting the client pick the vhost.
+TEST(Rebuild, ATargetThatCouldLeaveTheBasePathIsRefused)
+{
+    const std::vector<std::string> strip;
+    std::string into;
+    const auto req = [](std::string target)
+    { return "POST " + target + " HTTP/1.1\r\nContent-Length: 2\r\n\r\nxx"; };
+    for (const char* bad : {"/../admin/keys", "/v1/chat/completions/../../admin", "/%2e%2e/admin",
+                            "/.%2E/admin", "/v1/..%2fadmin", "/v1/x%5cy", "/v1\\..\\admin", "/v1/.",
+                            "/v1/..", "http://elsewhere/v1"})
+    {
+        const std::string m = req(bad);
+        EXPECT_FALSE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "/openai", {}, into))
+            << bad << " under a base path";
+        EXPECT_FALSE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "", {}, into))
+            << bad << " without a base path";
+    }
+    for (const char* good : {"/v1/chat/completions", "/v1/models?after=a..b", "/v1/files/f.json",
+                             "/v1/.well-known", "//v1/chat/completions", "/v1/x%41y"})
+    {
+        const std::string m = req(good);
+        EXPECT_TRUE(llmbridge::detail::request_without(m, head_len(m), strip, "venue", "/openai", {}, into))
+            << good;
+    }
+}
+
 // The three other producers of an upstream body get the same treatment: the
 // buffer form must yield the bytes of the value form and keep its storage.
 

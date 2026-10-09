@@ -81,15 +81,41 @@ namespace llmbridge::detail
             return false;
         }
 
+        /// Whether a client's origin-form path is safe to forward under a venue's base
+        /// path: no dot segment and no backslash, in plain or percent-encoded form, since
+        /// the upstream resolves them and `/../` would leave the configured prefix.
+        bool target_path_ok(std::string_view target)
+        {
+            const std::string_view path = target.substr(0, target.find('?'));
+            for (size_t i = 0; i < path.size(); ++i)
+            {
+                const char c = path[i];
+                if (c == '\\') return false;
+                if (c == '%' && i + 2 < path.size())
+                {
+                    const char a = path[i + 1], b = static_cast<char>(path[i + 2] | 0x20);
+                    if ((a == '2' && (b == 'e' || b == 'f')) || (a == '5' && b == 'c')) return false;
+                }
+                if (c == '/' && i + 1 < path.size() && path[i + 1] == '.')
+                {
+                    const size_t end = path.find('/', i + 1);
+                    const std::string_view seg = path.substr(i + 1, end == std::string_view::npos
+                                                                         ? std::string_view::npos
+                                                                         : end - i - 1);
+                    if (seg == "." || seg == "..") return false;
+                }
+            }
+            return true;
+        }
+
         /// Splice `base` in front of the request line's target, in place.
         ///
-        /// False means the request line is not origin-form (absolute-form, connect's
-        /// authority-form, or simply malformed), and the caller must refuse. We do
-        /// not normalize it into one: rewriting a target we do not understand is how
-        /// a proxy sends a request somewhere its operator never listed.
+        /// False means refuse: the target is not origin-form (absolute-form would pick
+        /// the upstream vhost, authority-form is CONNECT's), or its path could resolve
+        /// outside the base. Checked with or without a base. We do not normalize: rewriting
+        /// a target we do not understand sends a request where its operator never listed.
         bool prefix_target(std::string& req, std::string_view base)
         {
-            if (base.empty()) return true;
             const size_t eol = req.find("\r\n");
             if (eol == std::string::npos) return false;
             const size_t sp1 = req.find(' ');
@@ -97,7 +123,8 @@ namespace llmbridge::detail
             const size_t sp2 = req.find(' ', sp1 + 1);
             if (sp2 == std::string::npos || sp2 > eol) return false;
             if (sp2 == sp1 + 1 || req[sp1 + 1] != '/') return false;
-            req.insert(sp1 + 1, base);
+            if (!target_path_ok(std::string_view(req).substr(sp1 + 1, sp2 - sp1 - 1))) return false;
+            if (!base.empty()) req.insert(sp1 + 1, base);
             return true;
         }
 
