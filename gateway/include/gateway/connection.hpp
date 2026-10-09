@@ -354,6 +354,7 @@ namespace llmbridge
         /// after _pool_idle_ns; providers drop idle keep-alives on their own schedule,
         /// and a pooled corpse costs a retry to discover.
         int64_t ts_pooled = 0;
+        int64_t ts_pool_taken = 0; ///< when this request took it from the pool; bounds the retry
 
 #ifdef LLMBRIDGE_HAVE_TLS
         /// Null = plaintext. The Session stays attached across keep-alive pool cycles,

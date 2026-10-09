@@ -27,6 +27,9 @@ namespace llmbridge::detail
     constexpr size_t kMaxClientBuffered = net::http::kMaxHeaderLen + net::http::kMaxBodyLen;
     // Listener pause after EMFILE/ENFILE: retrying at once is a busy loop.
     constexpr int64_t kAcceptBackoffNs = 100'000'000;
+    // A pooled connection the provider had already closed fails within a round trip of
+    // reuse. Later, the provider may have run the request: a resend would bill it twice.
+    constexpr int64_t kStaleRetryWindowNs = 1'000'000'000;
 
     // A pooled upstream idles holding the request that carried the client's key, so its
     // buffer is scrubbed before it serves anyone else: GATEWAY-INTERNALS.md §9.

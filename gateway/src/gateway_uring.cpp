@@ -275,6 +275,7 @@ namespace llmbridge
             Connection* u = pool.back();
             pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
+            u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
             return u;
@@ -318,6 +319,7 @@ namespace llmbridge
         // convention: retry an idempotent-or-idle-reused request that failed before
         // any response; don't retry once a partial response has been seen.)
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // see the epoll mirror
         Connection* client = u->peer;
         if (!client) return false;
         const Upstream& up = upstream_of(u);

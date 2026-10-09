@@ -270,6 +270,7 @@ namespace llmbridge
             Connection* u = pool.back();
             pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
+            u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
             return u;
@@ -310,6 +311,7 @@ namespace llmbridge
         // dropped it idle without processing. Resend the request once on a fresh
         // connection instead of failing the client. (Same rule as the io_uring path.)
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // may have run
         Connection* client = u->peer;
         if (!client) return false;
         // The same venue: a retry that lands elsewhere is a silent reroute, and the

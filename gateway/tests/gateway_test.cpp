@@ -262,6 +262,8 @@ namespace
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
         // Write until the gateway stops reading (300 ms), then reset the connection.
         void set_reset_mid_response(bool b) { _reset_mid = b; }
+        // On each connection, read the second request, wait `ms`, then close unanswered.
+        void set_drop_second_after_ms(int ms) { _drop_second_ms = ms; }
         // Respond once (keep-alive), then close the connection, which simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
@@ -389,6 +391,7 @@ namespace
                 ::close(c);
                 return;
             }
+            int served_here = 0;
             while (!_stop)
             {
                 llmbridge::net::http::Message m;
@@ -405,6 +408,12 @@ namespace
                 }
                 const int nth = _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
+                if (_drop_second_ms > 0 && served_here++ == 1)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(_drop_second_ms));
+                    ::close(c);
+                    return;
+                }
 
                 std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
                 if (!_sequence.empty())
@@ -479,6 +488,7 @@ namespace
         int _chunked_chunks = 0;
         bool _close_mid = false;
         bool _reset_mid = false;
+        int _drop_second_ms = 0;
         bool _close_after_first = false;
         std::string _late;
         int _late_ms = 0;
@@ -2388,6 +2398,26 @@ TEST_P(ProxyBackend, RunningOutOfDescriptorsDoesNotSpinTheWorker)
     EXPECT_EQ(c.recv_status(3000), 200);
     c.close();
     shutdown();
+}
+
+// The stale-connection retry exists for a provider that closed an idle pooled
+// connection before our request reached it, which shows within a round trip. It also
+// fired when the provider read the request, worked on it, then dropped the
+// connection: the resend ran the request twice, and both runs are billed.
+TEST_P(ProxyBackend, APooledRequestTheProviderAlreadyHeldIsNotResent)
+{
+    _backend.set_drop_second_after_ms(1500);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    ASSERT_TRUE(c.send(make_request())); // rides the pooled connection
+    EXPECT_EQ(c.recv_status(4000), 502);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the request was sent to the provider twice";
+    EXPECT_EQ(_gw->stats().upstream_retries, 0u);
 }
 
 TEST_P(ProxyBackend, MultipleClients)
