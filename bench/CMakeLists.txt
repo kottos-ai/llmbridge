@@ -25,3 +25,8 @@ add_executable(faststream faststream.cpp)
 # nullrelay: the zero-work proxy, the control that separates "cost of the hop" from
 # "cost of the gateway's work". See the comment at the top of nullrelay.cpp.
 add_executable(nullrelay nullrelay.cpp)
+
+# protocol_micro: per-call cost of head parsing and translation, the refactor's
+# baseline. Not a ctest; run by hand from a Release build.
+add_executable(protocol_micro protocol_micro.cpp)
+target_link_libraries(protocol_micro PRIVATE net provider)
