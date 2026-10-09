@@ -8,6 +8,31 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.65.0]. 2026-10-09
+
+### Fixed
+
+- **The two slow-client backpressure tests now test backpressure on any kernel.**
+  `ProxyStream.SlowClientEngagesBackpressureAndLosesNothing` and
+  `ProxyPoolHygiene.AnUpstreamPooledAfterASlowStreamStillAnswers` failed every run
+  on epoll on hosts using BBR congestion control: loopback send-buffer autotuning
+  started the gateway's client socket near 4 MB, the test's 2.2 MB stream fit in
+  it, no write ever returned EAGAIN, and `stream_pauses` stayed 0. Ubuntu runners
+  (cubic, about 1.9 MB) passed by a narrow margin. The gateway was not at fault.
+
+### Added
+
+- **`Gateway::set_client_sndbuf_for_test(int)`**, a test seam that pins SO_SNDBUF
+  on accepted client sockets on both backends, which turns off autotuning. 0, the
+  default, leaves the kernel's choice; production behaviour is unchanged.
+- **Comment-density check** in `scripts/check_conventions.py`: comment-only lines
+  per code line, per source file, limit 0.8. Warn-only for now; 12 files are over
+  it today and will be trimmed before the check becomes a failure.
+
+### Tests
+
+- Both tests above set the seam to 4096 bytes and pass on epoll and io_uring.
+
 ## [0.64.0]. 2026-10-08
 
 ### Added

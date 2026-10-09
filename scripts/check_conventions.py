@@ -90,6 +90,32 @@ def strip_comments(text):
     return re.sub(r"//[^\n]*", "", out)
 
 
+DENSITY_LIMIT = 0.8
+
+
+def comment_density(text):
+    """(comment_lines, code_lines). Blank lines count as neither; a line holding
+    only a comment (or part of a block comment) is a comment line; a code line with
+    a trailing comment is a code line."""
+    com = code = 0
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if in_block:
+            com += 1
+            in_block = "*/" not in s
+        elif s.startswith("//"):
+            com += 1
+        elif s.startswith("/*"):
+            com += 1
+            in_block = "*/" not in s
+        else:
+            code += 1
+    return com, code
+
+
 def method_spans(text):
     """{name: (start_line, first_line_idx, last_line_idx)} for Gateway:: definitions.
 
@@ -377,6 +403,20 @@ def main():
                 f"CHANGELOG entry is {rel[0]}; the installed "
                 f"llmbridgeConfigVersion.cmake would lie to consumers")
 
+    # ---------------------------------------------------------------- 6
+    # Comment density: comment-only lines per code line, per source file. Long
+    # rationale belongs in DESIGN.md or GATEWAY-INTERNALS.md, where it is read once,
+    # not next to code that is read on every change. Warn-only until the files over
+    # the limit are trimmed; it then becomes a failure like the checks above.
+    dense = []
+    for f in src:
+        com, code = comment_density(f.read_text(encoding="utf-8"))
+        if code and com / code >= DENSITY_LIMIT:
+            dense.append((com / code, com, code, f.relative_to(ROOT)))
+    for ratio, com, code, rel in sorted(dense, reverse=True):
+        print(f"warning: {rel}: DENSITY {ratio:.2f} ({com} comment / {code} code lines), "
+              f"limit {DENSITY_LIMIT}", file=sys.stderr)
+
     # ---------------------------------------------------------------- report
     if failures:
         print(f"convention check FAILED ({len(failures)} violation"
@@ -391,7 +431,8 @@ def main():
           f"0 crossings, 0 unmarked, namespaces mirror directories, "
           f"LATENCY.md stamp refs resolve, release version agrees, "
           f"{n_consts} constants + {n_types} types correctly cased, "
-          f"{n_checked} constant backend prefixes agree with use")
+          f"{n_checked} constant backend prefixes agree with use, "
+          f"{len(dense)} files at or over comment density {DENSITY_LIMIT} (warn-only)")
     return 0
 
 
