@@ -625,7 +625,12 @@ namespace llmbridge::detail
         head.reserve(header_len + 128);
         std::string& out = head; // the loop below builds the head, unchanged
         bool saw_cl = false;
-        size_t start = 0, run = 0;
+        // The request line is copied, never tested as a header: a first line that looks
+        // like one (`Expect: /v1/x HTTP/1.1`) was stripped, and the next line, which the
+        // policy never saw as the request line, became the upstream's.
+        const size_t first_eol = msg.find("\r\n");
+        if (first_eol == std::string_view::npos || first_eol >= header_len) { into.clear(); return false; }
+        size_t start = first_eol + 2, run = 0;
         while (start < header_len)
         {
             const size_t eol = msg.find("\r\n", start);
@@ -737,6 +742,9 @@ namespace llmbridge::detail
         { why = "translate"; return false; }
         const std::string_view tbody = body_scratch;
 
+        // Headers only: a request line scanned as a header could carry a credential.
+        if (const size_t eol = client_hdrs.find("\r\n"); eol != std::string_view::npos)
+            client_hdrs.remove_prefix(eol + 2);
         std::string auth_hdrs;
         if (mode == UpstreamDialect::Bedrock)
         {

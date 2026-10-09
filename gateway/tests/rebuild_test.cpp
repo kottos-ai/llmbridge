@@ -92,6 +92,24 @@ TEST(Rebuild, ATargetThatCouldLeaveTheBasePathIsRefused)
     }
 }
 
+// The policy and dialect detection read the first line as the request line. If the
+// header-strip rules ran over it, a first line shaped like a header vanished and the
+// next line, unseen by the policy, became the upstream's request line.
+TEST(Rebuild, TheRequestLineIsNeverStrippedAsAHeader)
+{
+    const std::vector<std::string> strip{"authorization"};
+    std::string into;
+    for (const char* decoy : {"Expect: /v1/chat/completions HTTP/1.1", "Host: /v1/chat/completions HTTP/1.1",
+                              "Authorization: /v1/chat/completions HTTP/1.1"})
+    {
+        const std::string m = std::string(decoy) +
+                              "\r\nDELETE /v1/files/x?a:b HTTP/1.1\r\nContent-Length: 2\r\n\r\nxx";
+        if (!llmbridge::detail::request_without(m, head_len(m), strip, "venue", "", {}, into)) continue;
+        EXPECT_EQ(into.rfind(std::string(decoy) + "\r\n", 0), 0u) << "upstream request line for " << decoy
+                                                                     << ":\n" << into.substr(0, 80);
+    }
+}
+
 // The three other producers of an upstream body get the same treatment: the
 // buffer form must yield the bytes of the value form and keep its storage.
 
