@@ -8,6 +8,47 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.73.0]. 2026-10-10
+
+HTTP strictness. Each fix has a regression test that fails without it. Kept apart
+from 0.72.0 so it can be reverted alone.
+
+### Fixed
+
+- **An HTTP/1.0 upstream reply is not pooled unless it says keep-alive.** It was
+  treated as keep-alive, so under load every reuse of such a connection became a
+  stale-connection retry.
+- **`Connection` is read as a token list**, on requests and responses: `keep-alive,
+  close` closes, and `closed` is no longer read as `close`.
+- **A status code is exactly three digits**, followed by SP or the end of the line.
+  `2000` and `200x` read as 200; a missing code framed with status 0. A status line
+  with no reason phrase (`HTTP/1.1 200`) is still accepted.
+- **1xx, 204 and 304 responses end at their head** whatever Content-Length or
+  Transfer-Encoding say. A 304 carrying its resource's length waited for bytes that
+  never come, and the client got a 504 after the upstream idle timeout.
+- **A response to a forwarded HEAD ends at its head.** Byte-forward relays any
+  method, and a HEAD reply carries its GET's Content-Length, so it timed out the same
+  way and then failed over to every venue.
+- **Chunk size lines are strict hex**: digits, optional whitespace, then a chunk
+  extension (still accepted) or CRLF. `0x10` read as the last chunk and swallowed
+  the data as trailers; `5zz` and a bare CR inside the line read as 5.
+- **A malformed request line is refused with 400**: it must be `method SP target SP
+  HTTP/1.0` or `HTTP/1.1`, with a token method and no whitespace or control byte in
+  the target. Only the version was read, so such lines were forwarded.
+
+### Changed
+
+- **Breaking: `net::http::ResponseHead` gains `body`** (`net::http::Body`: `None`,
+  `Length`, `Chunked`, `UntilClose`), and `parse_response_head` / `parse_response`
+  take an optional `head_request`. `Message` gains `head`. New
+  `net::http::has_token` and `net::http::request_line_ok`. `parse_response_head` now
+  returns Error for a status line it used to accept.
+- `fuzz_http_diff` now allows the new refusals and the deliberate keep-alive and
+  bodyless-response changes, and still requires agreement on everything both framers
+  accept. The strict checks cost nothing measurable: `parse_response_head` p50 0.77
+  us against 0.75 us in 0.72.0 (`bench/protocol_micro`, 3 interleaved runs).
+
+
 ## [0.72.0]. 2026-10-10
 
 ### Changed

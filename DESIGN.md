@@ -260,8 +260,9 @@ continuously fuzzed:
     `0x1b` as 0 and `27abc` as 27; the first framed a 27-byte body as empty.
   - **The request line is `method SP target SP HTTP/1.x`** (RFC 9112 §3): single
     spaces, a token method, a target with no whitespace or control byte, and 1.0 or
-    1.1. Reading only the version after the last space framed lines an upstream could
-    split another way.
+    1.1, checked by the gateway with `request_line_ok` (not by `parse_request`, which
+    tools also use to frame responses). Reading only the version after the last space
+    forwarded lines an upstream could split another way.
   - **The status line is `HTTP/1.x SP 3DIGIT`**, then SP and a reason phrase or the
     end of the line; the reason phrase is optional because servers omit it. Bytes left
     in front of a reply (`JUNKHTTP/1.1 200 OK`) are refused, not absorbed, and
