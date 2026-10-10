@@ -11,12 +11,15 @@
 // after that many seconds (for scripted benchmark runs); otherwise it runs until
 // SIGINT/SIGTERM.
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <source_location>
 #include <span>
 #include <stdexcept>
@@ -67,20 +70,22 @@ namespace
                                 : llmbridge::UpstreamDialect::OpenAI;
     }
 
+    // Atomic so a handler never sees a half-cleared pointer; cleared before the
+    // gateways it points at are destroyed.
     using Gateways = std::vector<std::unique_ptr<llmbridge::Gateway>>;
-    Gateways* g_gateways = nullptr;
+    std::atomic<Gateways*> g_gateways{nullptr};
     void on_signal(int) noexcept
     {
-        if (g_gateways)
-            for (auto& g : *g_gateways) g->request_stop();
+        if (Gateways* gs = g_gateways.load())
+            for (auto& g : *gs) g->request_stop();
     }
 
     // SIGUSR1 prints the profile without stopping anything. Until this existed the
     // only way to read `accept(TLS)` on a running gateway was to kill it.
     void on_dump_signal(int) noexcept
     {
-        if (g_gateways)
-            for (auto& g : *g_gateways) g->request_stats_dump();
+        if (Gateways* gs = g_gateways.load())
+            for (auto& g : *gs) g->request_stats_dump();
     }
 } // namespace
 
@@ -263,31 +268,41 @@ static int run(int argc, char** argv)
         gw->set_prefault_bytes(static_cast<size_t>(cfg.prefault_mb * (1 << 20)));
         gateways.push_back(std::move(gw));
     }
-    g_gateways = &gateways;
+    g_gateways.store(&gateways);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGUSR1, on_dump_signal);
 
-    std::thread timer;
-    if (cfg.duration_s > 0)
-    {
-        timer = std::thread([&gateways, d = cfg.duration_s] {
-            std::this_thread::sleep_for(std::chrono::duration<double>(d));
-            for (auto& g : gateways) g->request_stop();
-        });
-    }
-
+    // The stop condition: the first worker to return (a signal stops them all) or the
+    // --duration deadline, whichever comes first. Waiting on it, not sleeping, is what
+    // lets SIGINT end a --duration run at once, and a worker that dies takes the others
+    // down instead of leaving them serving.
+    std::mutex m;
+    std::condition_variable cv;
+    bool finished = false;
     std::vector<std::thread> threads;
     unsigned widx = 0;
     for (auto& g : gateways)
-        threads.emplace_back([gp = g.get(), i = widx++] {
+        threads.emplace_back([gp = g.get(), i = widx++, &m, &cv, &finished] {
             // Before anything the loop logs, so every line names its worker.
             llmbridge::net::log::register_thread("worker", i);
             gp->run();
+            const std::lock_guard<std::mutex> lk(m);
+            finished = true;
+            cv.notify_all();
         });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        if (cfg.duration_s > 0)
+            cv.wait_for(lk, std::chrono::duration<double>(cfg.duration_s), [&] { return finished; });
+        else
+            cv.wait(lk, [&] { return finished; });
+    }
+    for (auto& g : gateways) g->request_stop();
     for (auto& t : threads) t.join();
-    if (timer.joinable()) timer.join();
+    // Only this thread is left, so a handler now runs here or not at all.
+    g_gateways.store(nullptr);
 
     // Aggregate per-worker stats into one profile.
     llmbridge::Stats agg;

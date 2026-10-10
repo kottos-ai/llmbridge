@@ -54,6 +54,11 @@ if (LLMBRIDGE_BUILD_TESTS)
     add_test(NAME CliDurationTakesAFraction
             COMMAND llmbridge --listen 0 --upstream 127.0.0.1:9 --duration 0.5)
     set_tests_properties(CliDurationTakesAFraction PROPERTIES TIMEOUT 20)
+    # The deadline used to be a sleep that SIGINT could not cut short.
+    add_test(NAME CliSigintEndsADurationRun
+            COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/sigint_ends_duration.sh
+            $<TARGET_FILE:llmbridge>)
+    set_tests_properties(CliSigintEndsADurationRun PROPERTIES TIMEOUT 40)
     llmbridge_cli_refuses(CliRefusesBadPort "out of range"
             --listen 70000 --upstream 127.0.0.1:9)
 
