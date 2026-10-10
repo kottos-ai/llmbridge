@@ -9,6 +9,10 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <future>
+#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -253,4 +257,37 @@ TEST_F(LogTest, SubjectsAreDistinctAndLeadTheMessage)
     log_::Line c;
     c.put(log_::Id{"Request", 99});
     EXPECT_EQ(c.view(), "Request#99");
+}
+
+// The built-in sink writes to stderr from the event loop. A full stderr pipe (a slow
+// log collector) used to block that write, and every connection on the loop with it.
+TEST(LogStderr, AFullStderrPipeDropsTheLineInsteadOfBlocking)
+{
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    const int flags = ::fcntl(fds[1], F_GETFL);
+    ::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK); // fill it without blocking here...
+    const std::string chunk(4096, 'x');
+    while (::write(fds[1], chunk.data(), chunk.size()) > 0) {}
+    ::fcntl(fds[1], F_SETFL, flags);              // ...then make it a blocking pipe again
+    const int saved = ::dup(STDERR_FILENO);
+    ::dup2(fds[1], STDERR_FILENO);
+    log_::set_sink(nullptr);
+    const log_::Level level = log_::level();
+    log_::set_level(log_::Level::Info);
+
+    const uint64_t before = log_::dropped();
+    auto done = std::async(std::launch::async, [] { LB_ERROR("into a full pipe"); });
+    const bool returned = done.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    ::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+    std::vector<char> drain(1 << 16);
+    while (::read(fds[0], drain.data(), drain.size()) > 0) {}
+    done.wait(); // the drain above unblocks it if it did block
+    ::dup2(saved, STDERR_FILENO);
+    ::close(saved);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    log_::set_level(level);
+    EXPECT_TRUE(returned) << "the log write blocked on a full stderr pipe";
+    EXPECT_EQ(log_::dropped(), before + 1);
 }
