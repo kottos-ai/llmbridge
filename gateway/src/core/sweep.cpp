@@ -9,7 +9,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "stream.hpp"
 
 #include <vector>
@@ -53,22 +53,14 @@ namespace llmbridge
         // Reap idle pooled upstreams. Providers close idle keep-alives on their own
         // schedule, and discovering a corpse costs a request its retry, so drop them
         // first. Pooled conns have peer == nullptr, so the in-flight scan below skips
-        // them and would otherwise hold them forever.
-        for (auto& pool : _idle_upstreams)
-        for (size_t i = 0; i < pool.size();)
-        {
-            Connection* u = pool[i];
-            if (_pool_idle_ns > 0 && u->ts_pooled != 0 && now - u->ts_pooled > _pool_idle_ns)
-            {
-                pool.erase(pool.begin() + static_cast<long>(i));
+        // them and would otherwise hold them forever. Only the expired are visited.
+        if (_pool_idle_ns > 0)
+            _pool->reap(now - _pool_idle_ns, [&](Connection* u) {
 #ifdef LLMBRIDGE_HAVE_URING
-                if (uring) { ur_close(u); continue; }
+                if (uring) { ur_close(u); return; }
 #endif
                 ep_close_upstream(u);
-                continue;
-            }
-            ++i;
-        }
+            });
 
         // Drop clients that never finished setting up. This runs before the
         // upstream-idle early return below, deliberately: the two are unrelated,

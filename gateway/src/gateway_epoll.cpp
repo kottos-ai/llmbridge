@@ -11,7 +11,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "net/secure.hpp"
 #include "net/socket_util.hpp"
 #include "request.hpp"
@@ -261,14 +261,11 @@ namespace llmbridge
     Connection* Gateway::ep_acquire_upstream(int slot) noexcept
     {
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
-        auto& pool = _idle_upstreams[static_cast<size_t>(slot)];
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
         // credential, to the wrong company.
-        if (!pool.empty())
+        if (Connection* u = _pool->acquire(slot))
         {
-            Connection* u = pool.back();
-            pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
@@ -300,7 +297,7 @@ namespace llmbridge
         ++_stats.upstream_conns_opened;
         // Pairs with "upstream reuse": without it an upstream first appears in
         // the log at its second request, never at its birth.
-        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", _idle_upstreams.size());
+        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", pooled_upstream_count());
         return u;
     }
 
@@ -357,62 +354,16 @@ namespace llmbridge
         return true;
     }
 
-    void Gateway::ep_release_upstream(Connection* u) noexcept
+    void Gateway::ep_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
     {
-        // Bounded pool: past the cap, close instead of accumulate. A streaming
-        // gateway pools roughly one upstream per concurrent stream, so an unbounded
-        // pool would pin an fd per stream forever.
-        if (_idle_upstreams.size() >= kMaxIdleUpstreams)
-        {
-            LB_WARN("CAP pool full, closing instead of pooling ", *u,
-                    " limit=", kMaxIdleUpstreams, " (reuse stops here)");
-            ep_close_upstream(u);
-            return;
-        }
-        // Fail closed: the response arrived before our request finished going out, so
-        // the provider saw a truncated request and this connection's state is not ours
-        // to reason about. Close it; the client keeps the response it already has.
-        // See upstream_request_sent().
-        if (!upstream_request_sent(u))
-        {
-            LB_WARN("closing instead of pooling, request was still going out ", *u);
-            ++_stats.upstream_unsent;
-            ep_close_upstream(u);
-            return;
-        }
-        unpair(u);
-        u->rbuf.clear();
-        u->rdec.reset();
-        // wbuf held the rebuilt request, including the client's credential, and this
-        // connection may now idle for 30 s before being handed to whichever client
-        // asks next. Scrub instead of clear.
-        //
-        // Guarded by ProxyAuth.CredentialIsScrubbedFromAPooledUpstreamBuffer.
-        // A mutation sweep found this line could be deleted with nothing failing:
-        // every other auth test inspects what reached the upstream, and the leak
-        // is in what stays behind.
-        secure_clear(u->wbuf);
-        u->woff = 0;
-        u->msg = net::http::Message{};
-#ifdef LLMBRIDGE_HAVE_TLS
-        u->tls_out.clear(); // per-request ciphertext; the Session itself is kept
-        u->tls_out_off = 0; // pooled reuse must not pay a second handshake
-#endif
-        u->ts_pooled = now_ns(); // idle-eviction baseline
+        if (!pool_upstream(u, keep_alive, body_ended)) { ep_close_upstream(u); return; }
         ep_disarm_write(u);
         // A pooled connection must be readable. A slow client pauses its upstream's
         // reads, and ep_stream_flush's stream_ended branch returns before the resume
-        // below it, so an upstream can reach here with its interest mask at 0. Handed
-        // to the next client it would never report readable again: that client's
-        // request goes out, the response never arrives, and it hangs until the idle
-        // timeout. Resumed here, and not at that one call site, because this is
-        // the only door into the pool and the invariant is about what is in it.
-        //
-        // Not a repair for a reproduced failure: the interleaving needs the final
-        // flush to be the one that paused, and no test provokes it. It is an
-        // invariant, and pooling a read-disarmed connection cannot be right.
+        // below it, so an upstream can arrive here with its interest mask at 0, and
+        // the next client's response would never be read. Resumed here because this
+        // is the only door into the pool; no test provokes that interleaving.
         ep_resume_read(u);
-        _idle_upstreams[static_cast<size_t>(u->upstream_slot)].push_back(u);
     }
 
     // close_* defer the free to the end of the epoll batch: an earlier event in
@@ -439,13 +390,7 @@ namespace llmbridge
     {
         if (u->doomed) return;
         unpair(u);
-        // Its own pool only: a connection is never in another venue's.
-        if (u->upstream_slot >= 0)
-        {
-            auto& pool = _idle_upstreams[static_cast<size_t>(u->upstream_slot)];
-            for (auto it = pool.begin(); it != pool.end(); ++it)
-                if (*it == u) { pool.erase(it); break; }
-        }
+        _pool->remove(*u);
         // After the erase, so `pool=` excludes this connection.
         LB_DEBUG("upstream close ", *u, " pool=", pooled_upstream_count());
         if (u->fd >= 0) { ::close(u->fd); u->fd = -1; }
@@ -963,7 +908,8 @@ namespace llmbridge
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
                 unpair(u);
-                if (h.keep_alive) ep_release_upstream(u); else ep_close_upstream(u);
+                u->rbuf.erase(0, total_len);
+                ep_release_upstream(u, h.keep_alive, true);
                 ++_stats.errors;
                 ep_respond(client);
                 return;
@@ -971,7 +917,8 @@ namespace llmbridge
             if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
             {
                 unpair(u);
-                ep_release_upstream(u); // framing was valid; the upstream conn is reusable
+                u->rbuf.erase(0, total_len); // framing was valid; the upstream conn is reusable
+                ep_release_upstream(u, h.keep_alive, true);
                 ep_error_respond(client, 502, "response translate");
                 return;
             }
@@ -1019,15 +966,13 @@ namespace llmbridge
         // open (response keep-alive, and for passthrough the client didn't ask to
         // close); otherwise it's about to close, so drop it instead of reuse a
         // stale connection.
-        const bool pool_upstream =
+        const bool keep_alive =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
         unpair(u);
-        // Drop the framed message so a pipelined next response is not mis-read as
-        // part of this one; anything left is the start of the next message.
+        // Drop the framed message; anything left is a second response and keeps the
+        // connection out of the pool.
         u->rbuf.erase(0, total_len);
-        u->rdec.reset(); // next response on this conn decodes from a clean state
-        if (pool_upstream) ep_release_upstream(u);
-        else ep_close_upstream(u);
+        ep_release_upstream(u, keep_alive, true);
         ep_respond(client);
     }
 
@@ -1196,16 +1141,11 @@ namespace llmbridge
 
     void Gateway::ep_finalize_stream(Connection* client) noexcept
     {
-        if (Connection* u = client->peer)
-        {
-            const bool reusable = stream_upstream_reusable(client, u);
-            unpair(u);
-            // Reuse is the whole point: a streaming request otherwise costs a fresh
-            // upstream connect every time, which measured as the dominant term in
-            // time-to-first-token. Pool it when the framing says that is safe.
-            if (reusable) ep_release_upstream(u);
-            else ep_close_upstream(u);
-        }
+        // Reuse is the whole point: a streaming request otherwise costs a fresh
+        // upstream connect every time, which measured as the dominant term in
+        // time-to-first-token. Pool it when the framing says that is safe.
+        if (Connection* u = unpair(client))
+            ep_release_upstream(u, stream_keeps_upstream(client), stream_body_ended(client));
         // A stream never reaches the non-streaming completion log, so without this a
         // streamed request logged its start and then nothing at all: no outcome, no
         // size, no tokens. `close_after_resp` here means the stream was truncated

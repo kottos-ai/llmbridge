@@ -29,10 +29,11 @@ gateway/    the event-loop proxy that ties net + provider together
   ├─ engine.cpp         Gateway: construction, teardown, run(), warm buffers
   ├─ resolve.cpp        next address after a failed connect, re-resolution thread
   ├─ core/              the shared methods, by concern: transport (TLS), sink,
-  │                     sweep, stream, upstream, client; conn.hpp is Connection
+  │                     sweep, stream, upstream, client, pool; conn.hpp is Connection,
+  │                     req.hpp a request, limits.hpp the shared constants
   ├─ gateway_epoll.cpp  every ep_ method and run_epoll()
   ├─ gateway_uring.cpp  every ur_ method and run_uring()
-  └─ request, response, scan, stream, loop   the helpers, by concern (src/ only)
+  └─ request, response, scan, stream   the helpers, by concern (src/ only)
 app/        the CLI daemon (llmbridge --listen ... --upstream ... --upstream-dialect ...)
 ```
 

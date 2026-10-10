@@ -28,6 +28,27 @@ namespace llmbridge::detail
         return c->msg.http_1_1 && c->msg.keep_alive;
     }
 
+    /// Can reuse only if we framed the reply so the body has an end marker, the
+    /// stream reached that marker, and the caller wanted the connection kept.
+    [[nodiscard]] inline bool stream_client_reusable(const Connection* c) noexcept
+    {
+        return c->req.f.stream_chunked_out && !c->close_after_resp && c->msg.keep_alive;
+    }
+
+    /// The upstream may outlive this stream: it said keep-alive, and the stream was not
+    /// aborted, corrupt or timed out.
+    [[nodiscard]] inline bool stream_keeps_upstream(const Connection* c) noexcept
+    {
+        return c->req.f.stream_keep_alive && !c->close_after_resp;
+    }
+
+    /// The terminal chunk was consumed: a close-delimited body cannot tell finished
+    /// from died.
+    [[nodiscard]] inline bool stream_body_ended(const Connection* c) noexcept
+    {
+        return c->req.f.stream_chunked && c->req.chunkdec.done();
+    }
+
     /// Wrap whatever was appended to `out` at or after `pos` in one chunk frame.
     /// A no-op on a close-delimited stream, so both framings share one write path.
     inline void chunk_wrap(const Connection* c, std::string& out, size_t pos)

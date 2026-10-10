@@ -112,6 +112,10 @@ namespace llmbridge
         /// after _pool_idle_ns, and when this request took it, which bounds the retry.
         int64_t ts_pooled = 0;
         int64_t ts_pool_taken = 0;
+        /// UpstreamPool's links and membership; nothing else writes them.
+        Connection* pool_newer = nullptr;
+        Connection* pool_older = nullptr;
+        bool pooled = false;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         /// Null = plaintext. Kept across pool cycles: a pooled reuse pays no handshake.

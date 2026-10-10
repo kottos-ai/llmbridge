@@ -61,7 +61,8 @@ namespace llmbridge
     /// The field promises identity of "the leading bytes" and not this number.
     inline constexpr size_t kPrefixHashBytes = 4096;
 
-    struct Connection; // src/core/conn.hpp
+    struct Connection;   // src/core/conn.hpp
+    class UpstreamPool;  // src/core/pool.hpp
 
     class Gateway
     {
@@ -171,12 +172,9 @@ namespace llmbridge
         [[nodiscard]] bool pooled_buffer_contains(std::string_view needle) const noexcept;
         /// Test seam. Like stats(), reads state owned by the loop thread, so it is
         /// valid only once that thread has been joined.
-        [[nodiscard]] size_t pooled_upstream_count() const noexcept
-        {
-            size_t n = 0;
-            for (const auto& pool : _idle_upstreams) n += pool.size();
-            return n;
-        }
+        [[nodiscard]] size_t pooled_upstream_count() const noexcept;
+        /// Test seam: the pool's total cap, kMaxIdleUpstreams unless set; before run().
+        void set_pool_cap_for_test(size_t n) noexcept;
 
         /// Test seam: the SNI/verify host recorded for an upstream, pinning the
         /// single-upstream constructor against a read-after-move that once emptied it.
@@ -275,7 +273,7 @@ namespace llmbridge
         static constexpr size_t kEpMaxReadPerEvent = 1 << 20; // 1 MiB
 
         /// The venue a connection is bound to; defined in loop.hpp beside Connection.
-        [[nodiscard]] inline const Upstream& upstream_of(const Connection* c) const noexcept;
+        [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept;
 
         /// One shared SSL_CTX covers every venue: it holds the trust store, while SNI
         /// and the verified hostname are per-connection.
@@ -293,7 +291,12 @@ namespace llmbridge
 
         /// `slot` indexes the upstream table; the pool it draws from is that venue's.
         Connection* ep_acquire_upstream(int slot) noexcept;
-        void ep_release_upstream(Connection* u) noexcept;
+        /// Pool `u` if UpstreamPool::release agrees, else close it. `keep_alive`: the
+        /// response, and for a byte-forward the client, allow it; `body_ended`: the
+        /// response reached a message boundary.
+        void ep_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
+        /// The shared half: true when `u` is now pooled; logs and counts a refusal.
+        [[nodiscard]] bool pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
         /// A pooled upstream failed before any response, so the provider dropped the
         /// idle keep-alive: resend the request once on a fresh connection.
         bool ep_retry_upstream(Connection* u) noexcept;
@@ -414,7 +417,7 @@ namespace llmbridge
         void ur_stream_flush(Connection* client) noexcept; // send pending bytes, or finalize
         void ur_finalize_stream(Connection* client) noexcept;
         Connection* ur_acquire_upstream(int slot) noexcept;
-        void ur_release_upstream(Connection* u) noexcept;
+        void ur_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept;
         /// A pooled upstream failed before any response: resend the request once on
         /// a fresh connection. True if a retry was issued.
         bool ur_retry_upstream(Connection* u) noexcept;
@@ -500,7 +503,7 @@ namespace llmbridge
         int64_t _accept_resume_ns = 0; ///< listener paused until then; 0 when accepting
 
         std::unordered_map<uint64_t, Connection*> _clients;
-        std::vector<std::vector<Connection*>> _idle_upstreams; ///< one pool per upstream
+        std::unique_ptr<UpstreamPool> _pool; ///< keep-alive upstreams, every venue
         uint64_t _next_client_id = 1;
         std::vector<Connection*> _doomed; // closed mid-batch, freed after the batch
         /// The byte-forward rebuild's destination, swapped with the upstream's `wbuf`

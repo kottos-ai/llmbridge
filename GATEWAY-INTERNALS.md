@@ -382,22 +382,30 @@ time to first token.
 ```
   ur_acquire_upstream / ep_acquire_upstream
         |
-        +-- pool non-empty? take the back, from_pool = true, ++upstream_reused
+        +-- UpstreamPool::acquire(venue): the newest, from_pool = true, ++upstream_reused
         |
         +-- else: new socket, connect (async on both backends)
 
   ...request completes...
 
-  release: pool it ONLY if the response said keep-alive
+  {ep,ur}_release_upstream -> UpstreamPool::release, the one reusability check;
+  any refusal closes the connection:
         |
-        +-- pool at kMaxIdleUpstreams (8192)? close instead of accumulate
+        +-- closed already, or not keep-alive (response, or a byte-forward's client)
+        +-- no message boundary: close-delimited, or a stream cut before its end
+        +-- bytes past the response in rbuf: a second message nobody asked for
+        +-- request not fully on the wire: ++upstream_unsent  <- see below
+        +-- kMaxIdleUpstreams (8192) connections pooled across all venues
         |
-        +-- request not fully on the wire? close, ++upstream_unsent  <- see below
-        |
-        +-- otherwise: SCRUB (section 9), stamp ts_pooled, push to _idle_upstreams
+        +-- otherwise: SCRUB (section 9), stamp ts_pooled, link as the venue's newest
 
-  sweep_idle(): evict anything idle past kIdleUpstreamNs (30 s)
+  sweep_idle(): reap what idled past --pool-idle (30 s), oldest first
 ```
+
+The pool is one intrusive list per venue: `acquire` takes the newest, removal on
+close is O(1), and the reaper visits only expired connections, which sit at the
+oldest end of each list. `peer` links are written only by `pair()` and `unpair()`,
+and every close unpairs, so neither leg keeps a pointer to a freed connection.
 
 **Why the 30 s reap.** Providers drop idle keep-alives on their own schedule, and
 discovering a corpse costs a request its retry. Reaping first is cheaper than
@@ -454,10 +462,10 @@ client asks next**. Anything left in its buffers becomes the next customer's
 problem, so release does two different things for two different reasons:
 
 ```
-  ep_release_upstream / ur_release_upstream
+  UpstreamPool::release
         |
-        +-- u->rbuf.clear()        RESIDUE. Bytes past the framed response would
-        |                          otherwise be read as the head of the NEXT
+        +-- u->rbuf non-empty      RESIDUE. Bytes past the framed response would
+        |   refuses                otherwise be read as the head of the NEXT
         |                          client's response: a cross-client desync
         |
         +-- u->rdec.reset()        chunked-decode state from the last response

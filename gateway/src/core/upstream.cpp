@@ -10,7 +10,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "scan.hpp"
 
 #include <cstring>
@@ -52,6 +52,28 @@ namespace llmbridge
         // 0 is a head we never framed, and a 3xx is not the venue naming a failure.
         if (h.status < 400) return;
         client->req.f.upstream_error.set(scan_error_type(body));
+    }
+
+    bool Gateway::pool_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
+    {
+        using R = UpstreamPool::Refusal;
+        switch (_pool->release(*u, keep_alive, body_ended, upstream_request_sent(u), now_ns()))
+        {
+            case R::None:
+                return true;
+            case R::Unsent:
+                // The provider answered before our request finished going out, so it
+                // saw a truncated request: GATEWAY-INTERNALS.md 8.
+                LB_WARN("closing instead of pooling, request was still going out ", *u);
+                ++_stats.upstream_unsent;
+                return false;
+            case R::Full:
+                LB_WARN("CAP pool full, closing instead of pooling ", *u,
+                        " limit=", static_cast<uint64_t>(_pool->cap()), " (reuse stops here)");
+                return false;
+            default:
+                return false;
+        }
     }
 
     Retry Gateway::failover_target(Connection* client, int status, const char* why) noexcept
