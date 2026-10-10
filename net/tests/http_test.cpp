@@ -805,6 +805,28 @@ TEST(ResponseFraming, BodylessStatusesEndAtTheHeadWhateverTheirHeadersSay)
     }
 }
 
+// A response to HEAD has no body, whatever its framing headers describe.
+TEST(ResponseFraming, AResponseToHeadEndsAtTheHead)
+{
+    Message m;
+    ASSERT_EQ(parse_request("HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n", m), FrameStatus::Complete);
+    EXPECT_TRUE(m.head);
+    ASSERT_EQ(parse_request("HEADER /v1/models HTTP/1.1\r\nHost: x\r\n\r\n", m), FrameStatus::Complete);
+    EXPECT_FALSE(m.head);
+
+    for (const std::string head : {"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n",
+                                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"})
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const auto r = llmbridge::net::http::parse_response(head, st, /*head_request=*/true);
+        ASSERT_EQ(r.status, FrameStatus::Complete) << head;
+        EXPECT_EQ(r.total_len, head.size());
+        llmbridge::net::http::ResponseDecoder st2;
+        EXPECT_EQ(llmbridge::net::http::parse_response(head, st2).status, FrameStatus::NeedMore)
+            << "the same head after a GET still waits for its body";
+    }
+}
+
 TEST(ResponseFraming, BodyKindNamesTheFraming)
 {
     using llmbridge::net::http::Body;

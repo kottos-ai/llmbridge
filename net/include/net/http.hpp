@@ -29,6 +29,7 @@ namespace llmbridge::net::http
         bool keep_alive = true;
         bool encoded = false;  // Content-Encoding present and not identity
         bool http_1_1 = true;  // false for 1.0, which has no chunked encoding
+        bool head = false;     // HEAD: the response to it has no body
     };
 
     // The framing tri-state, shared by every parse entry point in this header.
@@ -269,6 +270,7 @@ namespace llmbridge::net::http
                                                                  : rl.substr(sp + 1);
         out.http_1_1 = ver == "HTTP/1.1";
         if (ver == "HTTP/1.0") out.keep_alive = false;
+        out.head = rl.substr(0, rl.find(' ')) == "HEAD";
 
         bool have_cl = false, close = false, keep = false;
         const bool ok = walk_headers(head, [&](const HeaderLine& h) noexcept {
@@ -332,8 +334,10 @@ namespace llmbridge::net::http
     };
 
     // Unlike parse_request, accepts chunked (SSE and most non-streamed replies) and
-    // reports the framing. NeedMore until the CRLFCRLF is buffered.
-    inline FrameStatus parse_response_head(std::string_view buf, ResponseHead& out) noexcept
+    // reports the framing. NeedMore until the CRLFCRLF is buffered. `head_request`:
+    // the request was HEAD, so the response has no body.
+    inline FrameStatus parse_response_head(std::string_view buf, ResponseHead& out,
+                                           bool head_request = false) noexcept
     {
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
@@ -408,8 +412,9 @@ namespace llmbridge::net::http
         if (close || keep) out.keep_alive = !close;
         // Both framings present (RFC 9112 §6.3): refuse instead of picking one.
         if (out.chunked && out.has_content_length) return FrameStatus::Error;
-        // 1xx, 204 and 304 end at the head whatever their headers say.
-        if (out.status < 200 || out.status == 204 || out.status == 304) out.body = Body::None;
+        // HEAD, 1xx, 204 and 304 end at the head whatever their headers say.
+        if (head_request || out.status < 200 || out.status == 204 || out.status == 304)
+            out.body = Body::None;
         else if (out.chunked) out.body = Body::Chunked;
         else if (out.has_content_length) out.body = Body::Length;
         else out.body = Body::UntilClose;
@@ -547,11 +552,11 @@ namespace llmbridge::net::http
     };
 
     // Re-runnable like parse_request: NeedMore until the whole message is present.
-    [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf,
-                                                       ResponseDecoder& st) noexcept
+    [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf, ResponseDecoder& st,
+                                                       bool head_request = false) noexcept
     {
         ParsedResponse r;
-        const FrameStatus hs = parse_response_head(buf, r.head);
+        const FrameStatus hs = parse_response_head(buf, r.head, head_request);
         if (hs == FrameStatus::NeedMore) return r; // status stays NeedMore
         if (hs == FrameStatus::Error) { r.status = FrameStatus::Error; return r; }
 
