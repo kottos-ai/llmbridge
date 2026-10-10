@@ -8,6 +8,30 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.75.0]. 2026-10-10
+
+### Changed
+
+- **`gateway.cpp` is split by concern, with no behaviour change.** Construction,
+  teardown and `run()` are in `gateway/src/engine.cpp`, re-resolution in
+  `resolve.cpp`, and the shared methods in `gateway/src/core/`: `transport.cpp` (the
+  `tls_*` helpers and the interim 100 Continue), `sink.cpp`, `sweep.cpp`,
+  `stream.cpp`, `upstream.cpp` and `client.cpp`. Function bodies moved unchanged:
+  `git diff --color-moved` shows only moved lines, and the comment-stripped code is
+  identical apart from includes and namespace lines.
+- **Breaking (in-tree embedders only; the gateway library is not installed):
+  `gateway/connection.hpp` is gone.** Its parts are `gateway/venue.hpp`
+  (`UpstreamDialect`, `TlsConfig`, `Upstream`, `IoBackend`), `gateway/refusals.hpp`
+  (`refuse::`) and the private `gateway/src/core/conn.hpp` (`Connection`). `Stats`
+  moves from `gateway.hpp` to `gateway/stats.hpp`. `gateway.hpp` includes the three
+  public headers, so code that includes it is unaffected.
+- `scripts/check_conventions.py` reads every `.cpp` under `gateway/src`, so a new
+  source file cannot escape the `ep_`/`ur_` checks.
+- Comment essays from `connection.hpp`, `stream_truncate()`, `tls_invariant_ok()` and
+  `tls_feed()` move to DESIGN.md "Dialect resolution" and GATEWAY-INTERNALS.md 6b
+  and 10d.
+
+
 ## [0.74.0]. 2026-10-10
 
 ### Fixed
