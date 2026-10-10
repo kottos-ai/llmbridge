@@ -156,19 +156,17 @@ namespace llmbridge::detail
     //
     // Every detail passed here is a literal in this tree or a policy message that
     // passed deny_message_ok, so nothing client-supplied is echoed back.
-    std::string build_error(int code, const char* detail)
+    void append_error(std::string& out, int code, const char* detail)
     {
         const auto [line, type, msg] = error_shape(code);
         std::string body;
         provider::openai::write_error(body, (detail && code < 500) ? detail : msg, type);
-        std::string out;
-        out.reserve(body.size() + 128);
+        out.reserve(out.size() + body.size() + 128);
         out.append(line);
         out.append("\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
         out.append(std::to_string(body.size()));
         out.append("\r\n\r\n");
         out.append(body);
-        return out;
     }
 
     // Same head with a timing block spliced in before the terminating CRLF.
@@ -177,27 +175,28 @@ namespace llmbridge::detail
     // cost, and time to the provider's first byte.
     ///
     /// Takes the base head, never assuming one.
-    std::string sse_head_with_timing(std::string_view extra, std::string_view base)
+    void append_sse_head(std::string& out, std::string_view extra, std::string_view base)
     {
-        std::string out(base.substr(0, base.size() - 2)); // drop final CRLF
+        out.append(base.substr(0, base.size() - 2)); // drop final CRLF
         out.append(extra);
         out.append("\r\n");
-        return out;
     }
 
     // Build a response that preserves the upstream status code. Used to relay a
     // provider's own failure (429 rate limit, 529 overloaded, 400 context
     // length, 401 auth) to the client instead of flattening it to a gateway
     // 502. The client needs the real code to decide whether to back off/retry.
-    std::string build_http_status(int status, std::string_view reason, std::string_view body)
+    void append_http_status(std::string& out, int status, std::string_view reason,
+                            std::string_view body)
     {
-        std::string out = "HTTP/1.1 " + std::to_string(status) + " ";
+        out.append("HTTP/1.1 ");
+        out.append(std::to_string(status));
+        out.append(" ");
         out.append(reason);
         out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
         out.append(std::to_string(body.size()));
         out.append("\r\n\r\n");
         out.append(body);
-        return out;
     }
 
     // A short reason phrase for the codes providers actually return.

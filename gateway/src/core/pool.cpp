@@ -41,12 +41,10 @@ namespace llmbridge
         u.rdec.reset();
         // The request held the client's credential and the next client is someone
         // else. ProxyAuth.CredentialIsScrubbedFromAPooledUpstreamBuffer guards it.
-        net::secure_clear(u.wbuf);
-        u.woff = 0;
+        u.out.scrub();
         u.msg = net::http::Message{};
 #ifdef LLMBRIDGE_HAVE_TLS
         u.tls_out.clear(); // per-request ciphertext; the Session is kept, so no new handshake
-        u.tls_out_off = 0;
 #endif
         u.ts_pooled = now;
 

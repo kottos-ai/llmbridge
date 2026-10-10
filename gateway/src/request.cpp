@@ -530,11 +530,10 @@ namespace llmbridge::detail
     // anthropic-version here (same cost class).
     // `extra` is zero or more complete "Name: value\r\n" lines, inserted before
     // the terminating CRLF (used for the opt-in timing headers).
-    void build_http(std::string& out, std::string_view start_line, std::string_view body,
-                    std::string_view extra)
+    void append_http(std::string& out, std::string_view start_line, std::string_view body,
+                     std::string_view extra)
     {
-        out.clear();
-        const size_t need = start_line.size() + body.size() + extra.size() + 96;
+        const size_t need = out.size() + start_line.size() + body.size() + extra.size() + 96;
         if (out.capacity() < need) out.reserve(need);
         out.append(start_line);
         out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
@@ -546,7 +545,7 @@ namespace llmbridge::detail
         out.append(body);
     }
 
-    // Upstream request builder: build_http plus a Host header (HTTP/1.1
+    // Upstream request builder: append_http's shape plus a Host header (HTTP/1.1
     // requires one; the benchmark mocks never cared, real providers reject
     // without it) and the per-dialect auth/extra header lines.
     void build_http_request(std::string_view start_line, std::string_view body,

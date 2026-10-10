@@ -230,7 +230,7 @@ namespace llmbridge
         if (needle.empty()) return false;
         bool found = false;
         _pool->for_each([&](const Connection* u) {
-            found = found || u->wbuf.find(needle) != std::string::npos;
+            found = found || u->out.bytes().find(needle) != std::string::npos;
         });
         return found;
     }
@@ -289,16 +289,17 @@ namespace llmbridge
 
     void Gateway::retire_wbuf(Connection* u) noexcept
     {
-        if (u->is_client || _warm.size() >= kWarmBufs || u->wbuf.capacity() < kWarmMin) return;
+        if (u->is_client || _warm.size() >= kWarmBufs || u->out.capacity() < kWarmMin) return;
         // A closing connection may still hold a request, credential included; the pool
         // scrub runs at release, and a connection closed mid-request never got there.
-        // The ciphertext is the same request encrypted, so it is scrubbed too.
+        // The ciphertext is the same request encrypted, so it is scrubbed too. Freed
+        // only with nothing in flight, so neither is pinned and both are moved.
         WarmSet set;
-        net::secure_clear(u->wbuf);
-        set.wbuf = std::move(u->wbuf);
+        u->out.scrub();
+        set.out = u->out.take();
 #ifdef LLMBRIDGE_HAVE_TLS
-        net::secure_clear(u->tls_out);
-        set.tls_out = std::move(u->tls_out);
+        u->tls_out.scrub();
+        set.tls_out = u->tls_out.take();
 #endif
         _warm.push_back(std::move(set));
     }
@@ -308,9 +309,9 @@ namespace llmbridge
         if (_warm.empty()) return;
         WarmSet set = std::move(_warm.back());
         _warm.pop_back();
-        u->wbuf = std::move(set.wbuf);
+        u->out.adopt(std::move(set.out));
 #ifdef LLMBRIDGE_HAVE_TLS
-        u->tls_out = std::move(set.tls_out);
+        u->tls_out.adopt(std::move(set.tls_out));
 #endif
         ++_stats.warm_reuses;
     }
@@ -328,7 +329,7 @@ namespace llmbridge
         if (_prefault_bytes && _warm.empty())
         {
             WarmSet spare;
-            prefault(spare.wbuf);
+            prefault(spare.out);
 #ifdef LLMBRIDGE_HAVE_TLS
             prefault(spare.tls_out);
 #endif

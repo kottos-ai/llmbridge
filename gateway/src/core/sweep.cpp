@@ -48,14 +48,13 @@ namespace llmbridge
         if (!ep_upstream_failed(client, code, why)) ep_error_respond(client, code, why);
     }
 
-    // Plaintext not yet on the wire, a send in flight, or ciphertext not yet written.
+    // Plaintext not yet on the wire or ciphertext not yet written, sends in flight included.
     static bool owes_client(const Connection* c) noexcept
     {
-        if (c->send_inflight || !c->wpending.empty() || c->woff < c->wbuf.size()) return true;
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (c->tls_out_off < c->tls_out.size()) return true;
+        if (!c->tls_out.idle()) return true;
 #endif
-        return false;
+        return !c->out.idle();
     }
 
     // At most ~20 times a second, on the loop's periodic tick, so an idle gateway costs

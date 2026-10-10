@@ -27,8 +27,8 @@ completes. An upstream with no peer is either idle in the pool or dying.
 
 ## 2. The buffers
 
-`r` and `w` are named from the **gateway's** point of view on that socket: `rbuf`
-is what we read from the peer, `wbuf` is what we write to it. The same field name
+Both are named from the **gateway's** point of view on that socket: `rbuf` is what
+we read from the peer, `out` is what we write to it. The same field name
 therefore holds the request on one connection and the response on the other, and
 which is which depends on `is_client`. That is the most confusing thing about the
 data model, so here is one request crossing all four:
@@ -37,50 +37,53 @@ data model, so here is one request crossing all four:
    client                        gateway                        provider
      |                                                             |
      |  request bytes                                              |
-     |------------------> c->rbuf ---[frame, translate]---> u->wbuf|
+     |------------------> c->rbuf ---[frame, translate]---> u->out |
      |                                                     |-------|--->
      |                                                             |
      |                                                    response |
-     |  c->wbuf <---[translate back]--- u->rbuf <-------------------|
+     |  c->out  <---[translate back]--- u->rbuf <-------------------|
      |<------------------|                                         |
 ```
 
 | buffer | on a client conn | on an upstream conn |
 |---|---|---|
 | `rbuf` | the request the customer sent | the response the provider sent |
-| `wbuf` | the response we send the customer | the request we send the provider |
-| `woff` | how much of `wbuf` has been handed to the transport | same |
+| `out` | the response we send the customer | the request we send the provider |
 | `tls_out` | ciphertext heading for the socket (TLS conns only) | same |
-| `wpending` | io_uring streaming staging area | unused |
 
-Both `rbuf` and `wbuf` are **plaintext, always**, whether or not TLS is in use.
+`out` and `tls_out` are `OutBuf`s (`gateway/src/core/outbuf.hpp`, 2b). Both `rbuf`
+and `out` are **plaintext, always**, whether or not TLS is in use.
 TLS interposes at the socket edge only, so HTTP framing, the SSE pump and the
 stale-connection resend never know it exists.
 
-### `woff` is not "bytes sent"
+### Sent is not always "on the wire"
 
-Its meaning shifts with the transport, and this is a real trap:
+What `out` counts as sent shifts with the transport, and this is a real trap:
 
 - **plaintext**: bytes actually written to the socket
 - **TLS**: bytes fed into the `Session`, which have not necessarily left the
-  machine. Wire progress is `tls_out_off`
+  machine. Wire progress is `tls_out`'s
 
-So on a TLS connection `woff >= wbuf.size()` means "fully encrypted", never
-"fully sent". Ask `tls_wbuf_flushed()` for the second question.
+So on a TLS connection `out.idle()` means "fully encrypted", never "fully sent".
+Ask `tls_out_flushed()` for the second question.
 
+### 2b. `OutBuf`: stage, wire, pin
 
-### 2b. `woff`, whose meaning shifts with the transport
-
-| transport | what `woff` counts |
+| | |
 |---|---|
-| plaintext | bytes actually written to the socket |
-| TLS | bytes fed into the Session, which is not bytes on the wire. Wire progress is `tls_out_off`, and `woff` can reach `wbuf.size()` while nothing has left the machine |
+| `stage()` | where new bytes go. Never behind bytes already on the wire: a drained front is reset first, keeping its capacity. Every builder appends here |
+| `wire()` | what the transport writes next, out of the front |
+| `pin()` / `sent(n)` | an io_uring send holds the front from submit (`ur_submit_send`) to completion (`ur_on_send`); epoll never pins, so there it is one buffer |
+| `take()` | everything staged, for a resend: moved, or copied while a send still reads it |
 
-The write path deliberately does **not** clear `wbuf` when `woff` catches up.
-Callers do, at points they choose, and that is what keeps an upstream request
-available for a resend when a pooled connection turns out to be dead. See
-`ep_retry_upstream` / `ur_retry_upstream`, which resend only when the connection
-came from the pool and no response byte has arrived.
+While the front is pinned, `stage()` is the back half, and `sent()` folds it in when
+the send completes, so streaming output never moves memory the kernel is reading and
+neither half loses its capacity.
+
+The front keeps what was sent until it is staged over, cleared or taken. That is
+what keeps an upstream request available for a resend when a pooled connection
+turns out to be dead: `ep_retry_upstream` / `ur_retry_upstream` `take()` it, and
+resend only when the connection came from the pool and no response byte has arrived.
 
 ## 3. Request lifecycle, common to both backends
 
@@ -100,7 +103,7 @@ came from the pool and no response byte has arrived.
  acquire upstream: pooled keep-alive, or a fresh connect
    |
    v
- write u->wbuf  (credential mapped: Bearer -> x-api-key / x-goog-api-key)
+ write u->out   (credential mapped: Bearer -> x-api-key / x-goog-api-key)
    |
    v
  read provider bytes ---> u->rbuf
@@ -108,7 +111,7 @@ came from the pool and no response byte has arrived.
    +--- text/event-stream 200 ---> STREAMING PUMP (section 6)
    |
    v
- frame response, translate back, write c->wbuf
+ frame response, translate back, write c->out
    |
    v
  finish: release the upstream to the pool, or close it
@@ -144,13 +147,13 @@ Level-triggered epoll with optimistic writes. The loop owns the syscalls.
       |                                read() -> rbuf -> frame -> ep_forward()
       |
       +-- client fd writable ------> ep_on_client_writable()
-      |                                drain wbuf, or ep_stream_flush()
+      |                                drain out, or ep_stream_flush()
       |
       +-- upstream fd readable ----> ep_on_upstream_readable()
       |                                read() -> rbuf -> frame -> respond
       |
       +-- upstream fd writable ----> ep_on_upstream_writable()
-      |                                connect completed, or drain wbuf
+      |                                connect completed, or drain out
       |
       v
   sweep_idle()          reap idle pooled upstreams, drop half-open clients
@@ -197,31 +200,32 @@ Three constraints shape everything else here:
 3. **Completions arrive after the code has moved on**, so an object can be
    logically dead while the kernel still holds a reference to it.
 
-### `send_inflight`: one owner
+### The pin: one owner
 
-Means exactly "an SQE referencing this connection's send buffer is outstanding".
+`send_inflight()` means exactly "an SQE referencing this connection's wire buffer
+is outstanding": the `OutBuf` the socket reads (`tls_out` on TLS, else `out`) is
+pinned.
 
 | | |
 |---|---|
-| **set** | `ur_submit_send()` only, the sole place an SQE is submitted |
-| **cleared** | `ur_on_send()` on completion, and `ur_release_upstream()` |
-| **read** | by anyone about to touch a send buffer, to decide whether to wait |
+| **pinned** | `ur_submit_send()` only, the sole place a send SQE is submitted |
+| **unpinned** | `ur_on_send()` on completion, and `ur_on_cqe()` for a doomed connection's |
+| **read** | by anyone deciding whether to submit now or let the completion do it |
 
-Callers must never set it. Two of them used to, under different rules, and
-`ur_stream_flush()` setting it before calling into `ur_tls_flush()`, whose first
-line refuses to run when it is already set, meant the first SSE flush on a TLS
-connection did nothing and the stream hung forever, on io_uring only.
+Callers must never pin. Two of them used to set the old flag, under different
+rules, and `ur_stream_flush()` setting it before calling into `ur_tls_flush()`,
+whose first line refuses to run when it is already set, meant the first SSE flush
+on a TLS connection did nothing and the stream hung forever, on io_uring only.
 
-### `wpending`: why streaming needs a second buffer
+### Streaming output stages behind the pin
 
-`wbuf` is what a send SQE points at, so it must not move while that send is in
-flight. Newly translated stream output therefore accumulates in `wpending` and is
-moved into `wbuf` only when no send is outstanding. Past `kUrStreamBufCap` (8 MiB)
-the stream is dropped.
+New stream output goes to `stage()`, the back half while a send reads the front, and
+goes out with the next send. Past `kUrStreamBufCap` (8 MiB unsent) the stream is
+dropped.
 
 **This is the one place the two backends deliberately differ.** Under a slow
 client, epoll applies back-pressure by pausing the upstream read; io_uring bounds
-`wpending` and drops the stream past the cap. Know which one you are reasoning
+the unsent bytes and drops the stream past the cap. Know which one you are reasoning
 about before quoting streaming behaviour to a customer.
 
 
@@ -243,21 +247,9 @@ inflight says whether the kernel agrees yet.
 Multishot recv lands data in a shared provided-buffer pool, so there is no
 per-connection recv buffer to account for.
 
-**`bool send_inflight`**: an SQE referencing this connection's *send* buffer is
-outstanding. Two concurrent SENDs on one fd would interleave, and an SQE is
-immutable once submitted, so the buffer it points at must not move while this is
-set.
-
-| | where |
-|---|---|
-| set | only `ur_submit_send()`, the only place a send SQE is submitted |
-| cleared | `ur_on_send()` on completion, and `ur_release_upstream()` when per-request state is reset |
-| read | anyone about to touch a send buffer, to decide whether to wait |
-
-**Callers must never set it.** Two of them used to, under two different rules,
-and `ur_stream_flush()` setting it before calling `ur_tls_flush()` (whose first
-line refuses to run when it is already set) meant the first SSE flush on a TLS
-connection did nothing at all. The stream then hung forever, on io_uring only.
+**The pin** on the wire buffer, above: an SQE references this connection's *send*
+buffer. Two concurrent SENDs on one fd would interleave, and an SQE is immutable
+once submitted, so the buffer it points at must not move while it is pinned.
 
 ## 6. Streaming (SSE)
 
@@ -272,8 +264,8 @@ translate Anthropic events to OpenAI chunks, write to the client.
                         stream_step()            shared by both backends
                        decode chunk -> translate
                                 |
-             epoll:  -> c->wbuf -> ep_stream_flush()
-             uring:  -> c->wpending -> ur_stream_flush() -> c->wbuf -> SEND
+             epoll:  -> c->out.stage() -> ep_stream_flush()
+             uring:  -> c->out.stage() -> ur_stream_flush() -> SEND (pins the front)
                                 |
                                 v
                           client sees chunks
@@ -324,7 +316,7 @@ on our side nobody can answer "did my stream complete?" afterwards.
 ### 6c. The one place the backends deliberately differ
 
 Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
-back-pressure. **io_uring** instead bounds `wpending` with `kUrStreamBufCap` and
+back-pressure. **io_uring** instead bounds the unsent `out` with `kUrStreamBufCap` and
 drops the stream past the cap. Know which you are reasoning about before quoting
 streaming behaviour to a customer.
 
@@ -439,9 +431,8 @@ separately.
 
 **Stale-connection retry.** A pooled connection that fails before any response
 byte arrives is retry-eligible (`from_pool && !retried`): the request is resent
-on a fresh connection, and the client never sees the blip. `wbuf` is deliberately
-Not cleared by the write path for exactly this reason, so the request survives to
-be resent.
+on a fresh connection, and the client never sees the blip. The write path keeps
+`out`'s front for exactly this reason, so the request survives to be resent (2b).
 
 
 ### 8b. Sizing `kMaxIdleUpstreams`, and why it is 8192
@@ -483,10 +474,10 @@ problem, so release does two different things for two different reasons:
         |
         +-- u->rdec.reset()        chunked-decode state from the last response
         |
-        +-- secure_clear(u->wbuf)  CREDENTIAL. wbuf held the rebuilt request
+        +-- u->out.scrub()         CREDENTIAL. out held the rebuilt request
         |                          including the customer's API key
         |
-        +-- u->woff = 0, msg = {}, tls_out.clear()
+        +-- msg = {}, tls_out.clear()
 ```
 
 **`clear()` and `secure_clear()` are not the same operation.** `std::string::clear`
@@ -542,7 +533,7 @@ OpenSSL is involved. So the `Session` is a pure byte transform:
 
 ```
   socket --recv--> feed_ciphertext() -> [rbio] -> SSL -> read_plaintext() --> rbuf
-  socket <-send--  pull_ciphertext() <- [wbio] <- SSL <- write_plaintext() <-- wbuf
+  socket <-send--  pull_ciphertext() <- [wbio] <- SSL <- write_plaintext() <-- out
 ```
 
 The same four calls serve both directions and both backends. Only the handshake
@@ -553,19 +544,19 @@ leg verifies the provider's chain and its hostname, with no way to disable it.
 
 ### 10b. Two offsets, two questions
 
-For a TLS connection, `wbuf` (plaintext) is not what gets written; the plaintext
+For a TLS connection, `out` (plaintext) is not what gets written; the plaintext
 stays intact there so a stale pooled connection can be retried.
 
 | field | answers |
 |---|---|
-| `woff` | plaintext handed to the transport. For TLS that means fed into the Session, which has not necessarily left the machine |
-| `tls_out_off` | ciphertext that actually reached the socket |
+| `out` sent | plaintext handed to the transport. For TLS that means fed into the Session, which has not necessarily left the machine |
+| `tls_out` sent | ciphertext that actually reached the socket |
 
-So `woff >= wbuf.size()` means "fully encrypted", never "fully sent". Ask
-`tls_wbuf_flushed()` for the second question.
+So `out.idle()` means "fully encrypted", never "fully sent". Ask
+`tls_out_flushed()` for the second question.
 
 A transport-agnostic wrapper over the two was tried and reverted: every caller
-already sits inside a TLS-only branch, so it resolved to `tls_wbuf_flushed()` at
+already sits inside a TLS-only branch, so it resolved to `tls_out_flushed()` at
 every site and read as a safety net while changing nothing.
 
 ### 10c. Why the TLS helpers take `c` and not `u`

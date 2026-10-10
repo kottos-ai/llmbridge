@@ -365,11 +365,11 @@ namespace llmbridge
         /// handshake advances. On an upstream conn completing it also stamps t2 and
         /// pushes the pending request. False on a fatal error.
         bool tls_feed(Connection* c, const char* p, size_t n) noexcept;
-        /// Push un-fed plaintext (wbuf[woff..]) into the Session.
-        void tls_push_wbuf(Connection* c) noexcept;
-        /// True when wbuf is fully on the wire: all plaintext fed and all ciphertext
+        /// Push un-fed plaintext (`out`'s wire) into the Session.
+        void tls_push_out(Connection* c) noexcept;
+        /// True when `out` is fully on the wire: all plaintext fed and all ciphertext
         /// flushed. The TLS analogue of ep_pump_write's `done`.
-        bool tls_wbuf_flushed(const Connection* c) const noexcept;
+        bool tls_out_flushed(const Connection* c) const noexcept;
 
         /// Epoll only: write tls_out to the socket, arming EPOLLOUT on a partial
         /// write. False = socket error.
@@ -397,7 +397,7 @@ namespace llmbridge
         void ur_drop_sq_full(Connection* c) noexcept;
         bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
         bool ur_submit_send(Connection* c) noexcept;
-        /// Send wbuf to a client conn. Plaintext goes straight out; a TLS conn passes
+        /// Send `out` to a client conn. Plaintext goes straight out; a TLS conn passes
         /// through the Session first, because the SQE points at tls_out.
         void ur_client_send(Connection* c) noexcept;
         bool ur_submit_connect(Connection* u) noexcept;
@@ -510,14 +510,14 @@ namespace llmbridge
         std::unique_ptr<Registry<Connection>> _clients, _upconns, _doomed;
         std::unique_ptr<UpstreamPool> _pool; ///< keep-alive upstreams, every venue
         uint64_t _next_client_id = 1;
-        /// The byte-forward rebuild's destination, swapped with the upstream's `wbuf`
+        /// The byte-forward rebuild's destination, swapped with the upstream's `out`
         /// once the upstream is acquired, so the buffers rotate and keep their
         /// capacity instead of being allocated per request. See request_without.
         std::string _rebuild;
         /// Connection buffers are expensive to recreate. Cached as WarmSet.
         struct WarmSet
         {
-            std::string wbuf;
+            std::string out;
 #ifdef LLMBRIDGE_HAVE_TLS
             std::string tls_out;
 #endif

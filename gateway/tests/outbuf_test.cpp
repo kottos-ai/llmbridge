@@ -71,7 +71,7 @@ TEST(OutBuf, ADrainedFrontIsReusedNotGrown)
     EXPECT_EQ(b.capacity(), cap);
 }
 
-// L11: a retry takes the request while a send may still read it. Moving it then
+// A retry takes the request while a send may still read it. Moving it then
 // hands the kernel freed memory; take() copies while pinned.
 TEST(OutBuf, TakeCopiesWhilePinnedAndMovesOtherwise)
 {

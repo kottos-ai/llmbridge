@@ -161,19 +161,20 @@ namespace llmbridge
         // instead of needing a fourth copy of the logic.
         if (c->tls)
         {
-            if (c->tls->handshake_done()) tls_push_wbuf(c);
+            if (c->tls->handshake_done()) tls_push_out(c);
             bool flushed = false;
             if (!ep_tls_flush(c, &flushed)) return false;
-            *done = flushed && tls_wbuf_flushed(c);
+            *done = flushed && tls_out_flushed(c);
             return true;
         }
 #endif
-        while (c->woff < c->wbuf.size())
+        while (!c->out.wire().empty())
         {
-            ssize_t n = ::write(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff);
+            const std::string_view w = c->out.wire();
+            const ssize_t n = ::write(c->fd, w.data(), w.size());
             if (n > 0)
             {
-                c->woff += static_cast<size_t>(n);
+                c->out.sent(static_cast<size_t>(n));
                 c->sent_bytes += static_cast<uint64_t>(n);
                 continue;
             }
@@ -181,8 +182,8 @@ namespace llmbridge
             if (n < 0 && errno == EINTR) continue;
             return false;
         }
-        // Leave wbuf intact on completion: the request stays available for a
-        // stale-connection resend until the response is read; callers clear it.
+        // The bytes stay in `out` once sent: a request stays available for a
+        // stale-connection resend until the response is read.
         *done = true;
         return true;
     }
@@ -192,14 +193,14 @@ namespace llmbridge
     bool Gateway::ep_tls_flush(Connection* u, bool* done) noexcept
     {
         *done = false;
-        tls_pump_out(u); // epoll: no in-flight send to worry about; always safe
-        while (u->tls_out_off < u->tls_out.size())
+        tls_pump_out(u);
+        while (!u->tls_out.wire().empty())
         {
-            const ssize_t n = ::write(u->fd, u->tls_out.data() + u->tls_out_off,
-                                      u->tls_out.size() - u->tls_out_off);
+            const std::string_view w = u->tls_out.wire();
+            const ssize_t n = ::write(u->fd, w.data(), w.size());
             if (n > 0)
             {
-                u->tls_out_off += static_cast<size_t>(n);
+                u->tls_out.sent(static_cast<size_t>(n));
                 u->sent_bytes += static_cast<uint64_t>(n);
                 continue;
             }
@@ -212,7 +213,6 @@ namespace llmbridge
             return false;
         }
         u->tls_out.clear();
-        u->tls_out_off = 0;
         *done = true;
         return true;
     }
@@ -240,10 +240,10 @@ namespace llmbridge
         // Feeding may have produced output (handshake flights, the request itself
         // once the handshake completed). Put it on the wire before returning to
         // the parse logic, and stamp the request-sent time on the transition.
-        const bool was_flushed = u->peer && tls_wbuf_flushed(u);
+        const bool was_flushed = u->peer && tls_out_flushed(u);
         bool done = false;
         if (!ep_tls_flush(u, &done)) return false;
-        if (u->peer && !was_flushed && tls_wbuf_flushed(u))
+        if (u->peer && !was_flushed && tls_out_flushed(u))
             u->peer->req.f.ts_up_sent = now_ns();
         return true;
     }
@@ -339,8 +339,7 @@ namespace llmbridge
         client->req.f.upstream_ip = uf->up_addr.sin_addr.s_addr;
         uf->upstream_slot = u->upstream_slot;
         uf->retried = true; // this request's one allowed retry is now spent
-        uf->wbuf = std::move(u->wbuf); // plaintext, re-pushed through the new session
-        uf->woff = 0;
+        uf->out.stage() = u->out.take(); // plaintext, re-pushed through the new session
         uf->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (up.tls && !tls_attach_upstream(uf))
@@ -433,8 +432,7 @@ namespace llmbridge
                 peer.empty() ? "" : " peer=", peer);
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = unpair(client)) ep_close_upstream(u);
-        client->wbuf = build_error(code, detail);
-        client->woff = 0;
+        append_error(client->out.stage(), code, detail);
         client->close_after_resp = true; // ep_finish_client closes once it flushes
         ++_stats.errors;
         ep_respond(client);
@@ -494,7 +492,7 @@ namespace llmbridge
         if (!ok)
         {
             // EOF/error: mid-request close is a real abort; idle close is normal.
-            const bool in_flight = c->peer != nullptr || !c->wbuf.empty();
+            const bool in_flight = c->peer != nullptr || !c->out.bytes().empty();
             if (in_flight) ep_abort_pair(c);
             else ep_close_client(c);
             return;
@@ -508,7 +506,7 @@ namespace llmbridge
             return;
         }
         // One request in flight at a time per client.
-        if (c->peer != nullptr || !c->wbuf.empty()) return;
+        if (c->peer != nullptr || !c->out.bytes().empty()) return;
         if (c->rbuf.empty()) return;
 
         // Stamp just before framing so the (completing) HTTP parse is counted in
@@ -693,8 +691,7 @@ namespace llmbridge
                  " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
         // The rebuilt request is already in `_rebuild`; the swap hands it over and
         // takes the upstream's scrubbed, still-allocated buffer back as the next scratch.
-        u->wbuf.swap(_rebuild);
-        u->woff = 0;
+        u->out.stage().swap(_rebuild);
         // Keep the original bytes when a failover could use them: the rebuilt request
         // above was translated for this venue's dialect, so it cannot be resent to a
         // different one. One copy per in-flight request, and only where it can pay off.
@@ -729,14 +726,14 @@ namespace llmbridge
                 // Pooled TLS conns are always past the handshake (a fresh conn is
                 // never `connected` here). Push the plaintext through the session
                 // and flush the ciphertext; partial flushes finish on writability.
-                tls_push_wbuf(u);
+                tls_push_out(u);
                 bool done = false;
                 if (!ep_tls_flush(u, &done))
                 {
                     if (!ep_retry_upstream(u) && !ep_upstream_failed(c, 502, "upstream write failed")) ep_error_respond(c, 502, "upstream write failed, retry exhausted");
                     return;
                 }
-                if (done && tls_wbuf_flushed(u)) c->req.f.ts_up_sent = now_ns();
+                if (done && tls_out_flushed(u)) c->req.f.ts_up_sent = now_ns();
                 return;
             }
 #endif
@@ -783,7 +780,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
-            const bool was_flushed = u->peer && tls_wbuf_flushed(u);
+            const bool was_flushed = u->peer && tls_out_flushed(u);
             bool tdone = false;
             if (!ep_tls_flush(u, &tdone))
             {
@@ -794,7 +791,7 @@ namespace llmbridge
             if (u->peer && u->sent_bytes != sent) u->peer->req.f.ts_progress = now_ns();
             if (!tdone) return; // EPOLLOUT re-armed by ep_tls_flush
             ep_disarm_write(u); // ciphertext drained; handshake replies arrive via read
-            if (u->peer && !was_flushed && tls_wbuf_flushed(u))
+            if (u->peer && !was_flushed && tls_out_flushed(u))
                 u->peer->req.f.ts_up_sent = now_ns();
             return;
         }
@@ -918,10 +915,8 @@ namespace llmbridge
             // if it were a completion would fail and mask it as a generic 502.
             if (h.status != 0 && h.status != 200)
             {
-                client->wbuf = build_http_status(
-                    h.status, reason_for(h.status),
-                    provider::upstream_error_to_openai(body, "upstream_error"));
-                client->woff = 0;
+                append_http_status(client->out.stage(), h.status, reason_for(h.status),
+                                   provider::upstream_error_to_openai(body, "upstream_error"));
                 unpair(u);
                 u->rbuf.erase(0, total_len);
                 ep_release_upstream(u, h.keep_alive, true);
@@ -951,7 +946,7 @@ namespace llmbridge
                                       client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
                 append_usage_headers(timing, client->req.f.tok);
             }
-            build_http(client->wbuf, "HTTP/1.1 200 OK", client->xlate_scratch, timing);
+            append_http(client->out.stage(), "HTTP/1.1 200 OK", client->xlate_scratch, timing);
         }
         else
         {
@@ -966,16 +961,14 @@ namespace llmbridge
             // from a 200. Content-Length responses were relayed verbatim and were
             // never affected, which is why it survived: only chunkedness triggers it.
             if (h.body == net::http::Body::Chunked)
-                client->wbuf = build_http_status(h.status ? h.status : 200,
-                                                 reason_for(h.status ? h.status : 200),
-                                                 body_buf);
-            else client->wbuf.assign(u->rbuf.data(), total_len);
+                append_http_status(client->out.stage(), h.status ? h.status : 200,
+                                   reason_for(h.status ? h.status : 200), body_buf);
+            else client->out.stage().append(u->rbuf.data(), total_len);
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
             client->req.f.tok = scan_usage(body_buf);
         }
-        client->woff = 0;
 
         // Response fully read -> upstream is free. Pool it only if it will stay
         // open (response keep-alive, and for passthrough the client didn't ask to
@@ -1045,11 +1038,10 @@ namespace llmbridge
             }
         }
         ep_disarm_write(c);
-        if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
-        LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
-                 " keep_alive=", c->msg.keep_alive, " on ", *c);
-        c->wbuf.clear(); // response fully sent; ep_pump_write no longer clears it for us
-        c->woff = 0;
+        if (_sink) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
+                 " bytes=", c->out.bytes().size(), " keep_alive=", c->msg.keep_alive, " on ", *c);
+        c->out.clear();
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
         if (close_now) { ep_close_client(c); return; }
@@ -1085,12 +1077,11 @@ namespace llmbridge
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
                                   client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
-            client->wbuf.assign(sse_head_with_timing(
-                timing, client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead));
+            append_sse_head(client->out.stage(), timing,
+                            client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
         }
         else
-            client->wbuf.assign(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
-        client->woff = 0;
+            client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         ep_stream_pump(u);                 // translate any initial body + flush headers
@@ -1103,7 +1094,7 @@ namespace llmbridge
         Connection* client = u->peer;
         if (!client) { ep_close_upstream(u); return; } // lost peer mid-stream
 
-        const StreamStep st = stream_step(client, u->rbuf, client->wbuf, /*at_eof=*/false);
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/false);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
             // Truncate honestly: flush what we already translated, then close
@@ -1123,7 +1114,7 @@ namespace llmbridge
         Connection* client = u->peer;
         if (!client) { ep_close_upstream(u); return; }
 
-        const StreamStep st = stream_step(client, u->rbuf, client->wbuf, /*at_eof=*/true);
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/true);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
             stream_truncate(client);
@@ -1150,8 +1141,7 @@ namespace llmbridge
             if (client->peer && !client->peer->doomed) ep_pause_read(client->peer);
             return;
         }
-        client->wbuf.clear();
-        client->woff = 0;
+        client->out.clear();
         ep_disarm_write(client);
         if (client->req.f.stream_ended) { ep_finalize_stream(client); return; }
         if (client->peer && !client->peer->doomed) ep_resume_read(client->peer);
@@ -1186,8 +1176,7 @@ namespace llmbridge
         // Keep the connection when the framing gave the body an end marker.
         if (!stream_client_reusable(client)) { ep_close_client(client); return; }
         client->req.f.streaming = false; // over; begin() resets the rest at the next framing
-        client->wbuf.clear();
-        client->woff = 0;
+        client->out.clear();
         client->msg = net::http::Message{};
         ep_on_client_readable(client); // a pipelined next request is already in rbuf
     }

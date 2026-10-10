@@ -91,9 +91,9 @@ namespace llmbridge
         // stream_on_upstream_eof before they get here, so no test can distinguish it
         // from `true`. It stays for the same reason tls_invariant_ok() does, six call
         // sites must each keep being right for it to remain unreachable, and the cost
-        // of being wrong is a client receiving one answer twice. The `wbuf` half is
+        // of being wrong is a client receiving one answer twice. The `out` half is
         // reachable: a pipelined earlier response can still be draining.
-        if (client->req.f.streaming || !client->wbuf.empty()) return {};
+        if (client->req.f.streaming || !client->out.bytes().empty()) return {};
         if (client->req.saved.empty()) return {};
         if (client->req.f.failover_attempts >= kMaxFailoverAttempts - 1) return {};
 
