@@ -1809,3 +1809,114 @@ TEST(TranslateEnvelope, TranslatorsReturnTheCountsTheyWrote)
     EXPECT_FALSE(llmbridge::provider::cohere_to_openai_response("x", out, u));
     EXPECT_TRUE(out.empty());
 }
+
+// ── The message walk ────────────────────────────────────────────────────────
+
+namespace
+{
+    std::string anth(std::string_view body) { return openai_to_anthropic_request(body); }
+
+    // The three tool constructs, each alone in an otherwise plain request.
+    constexpr const char* kToolBodies[] = {
+        R"({"model":"g","messages":[{"role":"user","content":"w?"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]})",
+        R"({"model":"g","messages":[{"role":"user","content":"w?"},
+            {"role":"assistant","content":null,"tool_calls":[
+              {"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}]})",
+        R"({"model":"g","messages":[{"role":"tool","tool_call_id":"c","content":"sunny"}]})",
+    };
+} // namespace
+
+// P9: Gemini has no tool hooks, so the request is refused instead of losing them.
+TEST(MessageWalk, GeminiRefusesToolsInsteadOfDroppingThem)
+{
+    for (const char* body : kToolBodies) EXPECT_TRUE(openai_to_gemini_request(body).empty()) << body;
+    // An empty or null `tools` declares nothing, and an empty tool_calls is a plain turn.
+    EXPECT_FALSE(openai_to_gemini_request(
+                     R"({"messages":[{"role":"user","content":"hi"}],"tools":[]})").empty());
+    EXPECT_FALSE(openai_to_gemini_request(
+                     R"({"messages":[{"role":"user","content":"hi"}],"tools":null})").empty());
+    EXPECT_FALSE(openai_to_gemini_request(
+                     R"({"messages":[{"role":"assistant","content":"x","tool_calls":[]}]})").empty());
+}
+
+// P8: the same for Cohere, which dropped the tools and sent tool messages with no id.
+TEST(MessageWalk, CohereRefusesToolsInsteadOfDroppingThem)
+{
+    for (const char* body : kToolBodies) EXPECT_TRUE(openai_to_cohere_request(body).empty()) << body;
+    EXPECT_FALSE(openai_to_cohere_request(
+                     R"({"model":"c","messages":[{"role":"user","content":"hi"}],"tools":[]})").empty());
+}
+
+// P9: Gemini refuses an empty text part, so a message with no text is skipped.
+TEST(MessageWalk, GeminiSkipsEmptyText)
+{
+    EXPECT_EQ(openai_to_gemini_request(R"({"messages":[
+        {"role":"system","content":""},
+        {"role":"user","content":"hi"},
+        {"role":"assistant","content":""},
+        {"role":"assistant","content":null},
+        {"role":"user","content":[{"type":"text","text":""}]},
+        {"role":"user","content":"again"}]})"),
+              R"({"contents":[{"role":"user","parts":[{"text":"hi"}]},)"
+              R"({"role":"user","parts":[{"text":"again"}]}]})");
+    const Value v = P(openai_to_gemini_request(R"({"messages":[{"role":"system","content":"a"},
+        {"role":"system","content":""},{"role":"system","content":"b"}]})"));
+    EXPECT_EQ(v.find("systemInstruction")->find("parts")->arr[0].str_or("text"), "a\\nb");
+}
+
+// Anthropic refuses an empty text block, so the block form skips one.
+TEST(MessageWalk, AnthropicBlockFormSkipsEmptyTextParts)
+{
+    const Value v = P(anth(R"({"model":"m","messages":[{"role":"user","content":[
+        {"type":"text","text":""},{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},
+        {"type":"text","text":""}]}]})"));
+    const Value* c = v.find("messages")->arr[0].find("content");
+    ASSERT_TRUE(c && c->is_array());
+    ASSERT_EQ(c->arr.size(), 1u);
+    EXPECT_EQ(c->arr[0].str_or("text"), "a");
+    // A breakpoint on an empty part alone keeps the string form.
+    const Value w = P(anth(R"({"model":"m","messages":[{"role":"user","content":[
+        {"type":"text","text":"a"},{"type":"text","text":"","cache_control":{"type":"ephemeral"}}]}]})"));
+    EXPECT_EQ(w.find("messages")->arr[0].str_or("content"), "a");
+}
+
+// A missing or unknown role has no hook in any dialect.
+TEST(MessageWalk, UnknownRoleIsRefusedEverywhere)
+{
+    for (const char* body : {R"({"model":"m","messages":[{"role":"function","name":"f","content":"x"}]})",
+                             R"({"model":"m","messages":[{"content":"x"}]})",
+                             R"({"model":"m","messages":["x"]})"})
+    {
+        EXPECT_TRUE(anth(body).empty()) << body;
+        EXPECT_TRUE(openai_to_gemini_request(body).empty()) << body;
+        EXPECT_TRUE(openai_to_cohere_request(body).empty()) << body;
+    }
+}
+
+// P10: `developer` is the system prompt under a newer name, in every dialect.
+TEST(MessageWalk, DeveloperRoleIsSystem)
+{
+    const std::string body = R"({"model":"m","messages":[{"role":"developer","content":"be brief"},
+        {"role":"system","content":"and kind"},{"role":"user","content":"hi"}]})";
+    const Value a = P(anth(body));
+    EXPECT_EQ(a.str_or("system"), "be brief\\nand kind");
+    EXPECT_EQ(a.find("messages")->arr.size(), 1u);
+    const Value g = P(openai_to_gemini_request(body));
+    EXPECT_EQ(g.find("systemInstruction")->find("parts")->arr[0].str_or("text"), "be brief\\nand kind");
+    EXPECT_EQ(g.find("contents")->arr.size(), 1u);
+    const Value c = P(openai_to_cohere_request(body));
+    EXPECT_EQ(c.find("messages")->arr[0].str_or("role"), "system");
+    EXPECT_EQ(c.find("messages")->arr[0].str_or("content"), "be brief");
+}
+
+// PP1: arguments are decoded into the output and parsed there, escapes and all.
+TEST(ToolReq, ArgumentsDecodeInPlaceWithEveryEscape)
+{
+    const Value v = P(anth(R"({"model":"m","messages":[{"role":"assistant","content":null,
+      "tool_calls":[{"id":"a","type":"function","function":{"name":"f",
+      "arguments":"{\"q\":\"\\u00e9 \\\\ \\/ \\n\",\"r\":\"plain run\"}"}}]}]})"));
+    const Value* in = v.find("messages")->arr[0].find("content")->arr[0].find("input");
+    ASSERT_NE(in, nullptr);
+    EXPECT_EQ(in->sv, R"({"q":"\u00e9 \\ \/ \n","r":"plain run"})");
+}

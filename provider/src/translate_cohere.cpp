@@ -14,6 +14,7 @@
 
 #include "content.hpp"
 #include "json_scan.hpp"
+#include "messages.hpp"
 #include "openai_common.hpp" // detail::now_secs / as_written
 #include "provider/json.hpp"
 
@@ -23,40 +24,50 @@ namespace llmbridge::provider
 
     // ── Cohere (Chat API v2, /v2/chat) ──────────────────────────────────────
 
+    namespace
+    {
+        // Cohere v2 keeps OpenAI-style system/user/assistant turns. No tool hooks:
+        // Cohere tool calls and results are not translated, so they are refused.
+        struct CohereTurns
+        {
+            std::string& out;
+            bool first = true;
+
+            bool put(std::string_view role, const json::Value* content)
+            {
+                if (!first) out += ',';
+                first = false;
+                out += role;
+                if (!append_text(out, content)) return false;
+                out += "\"}";
+                return true;
+            }
+            bool system(const json::Value* c) { return put(R"({"role":"system","content":")", c); }
+            bool turn(bool assistant, const json::Value* c)
+            {
+                return put(assistant ? R"({"role":"assistant","content":")"
+                                     : R"({"role":"user","content":")", c);
+            }
+        };
+    } // namespace
+
     std::string openai_to_cohere_request(std::string_view openai_body)
     {
         bool ok = false;
-        json::Value v = json::parse(openai_body, ok);
+        const json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
-
-        // Cohere v2 keeps OpenAI-style system/user/assistant turns; the body
-        // differences are top_p -> "p" and the response shape.
-        std::string messages = "[";
-        bool first = true;
         // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
         const json::Value* msgs = v.find("messages");
-        if (!msgs || !msgs->is_array()) return {};
-        if (msgs)
-        {
-            for (const auto& m : msgs->arr)
-            {
-                const std::string_view role = m.str_or("role");
-                const json::Value* content = m.find("content");
-                if (!first) messages += ',';
-                first = false;
-                messages += "{\"role\":";
-                json::append_raw_string(messages, role);
-                messages += ",\"content\":\"";
-                if (!append_text(messages, content)) return {};
-                messages += "\"}";
-            }
-        }
-        messages += ']';
+        if (!msgs || !msgs->is_array() || detail::declares_tools(v)) return {};
 
-        std::string out = "{\"model\":";
+        std::string out;
+        out.reserve(openai_body.size() + 256);
+        out = "{\"model\":";
         json::append_raw_string(out, v.str_or("model", "command-r-plus"));
-        out += ",\"messages\":";
-        out += messages;
+        out += ",\"messages\":[";
+        CohereTurns turns{out};
+        if (!detail::walk_messages(*msgs, turns)) return {};
+        out += ']';
         if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
         if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
         if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"p\":"; out += p; } // Cohere: top_p is "p"

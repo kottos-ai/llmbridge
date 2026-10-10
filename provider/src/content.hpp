@@ -35,8 +35,8 @@ namespace llmbridge::provider::detail
         return true;
     }
 
-    // Whether any part of this content carries a breakpoint, and refusal if one is
-    // malformed. Scanned before emitting anything, because the answer decides
+    // Whether any non-empty part of this content carries a breakpoint, and refusal if
+    // one is malformed. Scanned before emitting anything, because the answer decides
     // which of the two shapes below the content takes.
     [[nodiscard]] inline bool content_cache_state(const json::Value* c, bool& any)
     {
@@ -46,7 +46,7 @@ namespace llmbridge::provider::detail
         {
             std::string_view cc;
             if (!part_cache_control(part, cc)) return false;
-            if (!cc.empty()) any = true;
+            if (!cc.empty() && !part.str_or("text").empty()) any = true;
         }
         return true;
     }
@@ -87,6 +87,7 @@ namespace llmbridge::provider::detail
             // Same refusal as the flattening path: a part this translator cannot
             // carry is refused by name, never dropped.
             if (part.str_or("type") != "text") return false;
+            if (part.str_or("text").empty()) continue; // Anthropic refuses an empty text block
             if (!first) out += ',';
             first = false;
             out += R"({"type":"text","text":)";

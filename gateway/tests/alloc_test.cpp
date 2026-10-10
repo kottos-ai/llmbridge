@@ -302,11 +302,13 @@ namespace
     // Measured 2026-10-10 at v0.74.0 (GCC 13 Release and ASan Debug agree), after the
     // response translators began writing into kept buffers and the stream translator
     // was held by value: 12 -> 3, 7 -> 3, every one of them on the request side.
+    // v0.78.0 writes the Anthropic request front to back, without a prefix string:
+    // 3 -> 2 on both translated rows.
     // Lower these when a change removes allocations; never raise them without a
     // reason in the commit message. io_uring's per-delta figure can read 0.02, not 0:
     // its 4 KiB receive buffers split the stream at different points.
-    constexpr Ceiling kEpoll{3, 3, 3, 0.03};
-    constexpr Ceiling kUring{3, 3, 3, 0.03};
+    constexpr Ceiling kEpoll{3, 2, 2, 0.03};
+    constexpr Ceiling kUring{3, 2, 2, 0.03};
 
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {
