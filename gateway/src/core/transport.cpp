@@ -37,10 +37,10 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
 
     // ── TLS plumbing ────────────────────────────────────────────────────────
-    // The invariant (see gateway.hpp): rbuf/wbuf are plaintext, always. TLS lives
-    // strictly between the socket and those buffers. For a TLS upstream, `woff`
-    // counts plaintext fed into the Session (so retry-resend still works from
-    // wbuf), and tls_out/tls_out_off track the encrypted bytes towards the socket.
+    // The invariant (see gateway.hpp): rbuf and `out` are plaintext, always. TLS lives
+    // strictly between the socket and those buffers. On a TLS connection `out` counts
+    // plaintext fed into the Session (its bytes stay for a resend), and `tls_out`
+    // holds the ciphertext on its way to the socket.
     bool Gateway::tls_required(const Connection* c) const noexcept
     {
         return c->is_client ? _tls.client_tls : upstream_of(c).tls;
@@ -87,58 +87,51 @@ namespace llmbridge
 
     void Gateway::tls_pump_out(Connection* u) noexcept
     {
-        // io_uring caution: callers there must only pump while no send SQE is in
-        // flight on this conn; appending can reallocate tls_out under the kernel.
+        // stage() is safe while a send SQE reads tls_out: it is then the back half.
         // Reserved once for what this pass moves. Growing by append cost a 4 MB
         // request 1.6 ms of reallocation on a connection's first use, more than the
         // encryption itself.
-        const size_t need = u->tls_out.size() + u->tls->pending_output_bytes() + 256;
-        if (u->tls_out.capacity() < need) u->tls_out.reserve(need + need / 8);
+        std::string& out = u->tls_out.stage();
+        const size_t need = out.size() + u->tls->pending_output_bytes() + 256;
+        if (out.capacity() < need) out.reserve(need + need / 8);
         uint8_t buf[65536];
         size_t n;
         while ((n = u->tls->pull_ciphertext({buf, sizeof buf})) > 0)
-            u->tls_out.append(reinterpret_cast<const char*>(buf), n);
-        // Unsent only: tls_out keeps the prefix already written until a full drain
-        // clears it, so counting size() measured total throughput, not backlog.
-        const uint64_t unsent = static_cast<uint64_t>(u->tls_out.size() - u->tls_out_off) +
-                                u->tls->pending_output_bytes();
+            out.append(reinterpret_cast<const char*>(buf), n);
+        // Unsent only, the backlog, not the bytes streamed.
+        const uint64_t unsent = u->tls_out.unsent() + u->tls->pending_output_bytes();
         if (unsent > _stats.tls_buffered_peak) _stats.tls_buffered_peak = unsent;
     }
 
-    void Gateway::tls_push_wbuf(Connection* u) noexcept
+    void Gateway::tls_push_out(Connection* u) noexcept
     {
-        // Feed as much request plaintext as the Session accepts. The ciphertext
-        // lands in tls_out directly, except while an io_uring send SQE points into
-        // tls_out.
-        const bool direct = !u->send_inflight;
-        if (direct)
+        // Feed as much plaintext as the Session accepts; its ciphertext lands straight
+        // in tls_out's stage, behind any flight already staged: order is the wire's.
+        tls_pump_out(u);
+        std::string& sink = u->tls_out.stage();
+        const size_t todo = u->out.wire().size();
+        // Headroom, as for the plaintext scratch: an exact reserve on a context that
+        // grows every turn is a fresh allocation, and fresh pages, per request.
+        const size_t need = sink.size() + todo + todo / 512 + 256;
+        if (sink.capacity() < need)
         {
-            tls_pump_out(u); // staged handshake flights go first: order is the wire's
-            const size_t todo = u->wbuf.size() > u->woff ? u->wbuf.size() - u->woff : 0;
-            // Headroom, as for the plaintext scratch: an exact reserve on a context
-            // that grows every turn is a fresh allocation, and fresh pages, per request.
-            const size_t need = u->tls_out.size() + todo + todo / 512 + 256;
-            if (u->tls_out.capacity() < need)
-            {
-                ++_stats.tls_out_grows;
-                u->tls_out.reserve(need + need / 8);
-            }
-            u->tls->set_sink(&u->tls_out);
+            ++_stats.tls_out_grows;
+            sink.reserve(need + need / 8);
         }
-        while (u->woff < u->wbuf.size())
+        u->tls->set_sink(&sink);
+        while (!u->out.wire().empty())
         {
-            const auto* p = reinterpret_cast<const uint8_t*>(u->wbuf.data()) + u->woff;
-            const size_t n = u->tls->write_plaintext({p, u->wbuf.size() - u->woff});
+            const std::string_view w = u->out.wire();
+            const size_t n = u->tls->write_plaintext({reinterpret_cast<const uint8_t*>(w.data()), w.size()});
             if (n == 0) break; // handshake not done, or session back-pressured
-            u->woff += n;
+            u->out.sent(n);
         }
         u->tls->set_sink(nullptr);
     }
 
-    bool Gateway::tls_wbuf_flushed(const Connection* u) const noexcept
+    bool Gateway::tls_out_flushed(const Connection* u) const noexcept
     {
-        return u->woff >= u->wbuf.size() && u->tls_out_off >= u->tls_out.size() &&
-               !u->tls->has_pending_output();
+        return u->out.idle() && u->tls_out.idle() && !u->tls->has_pending_output();
     }
 
     bool Gateway::tls_feed(Connection* u, const char* p, size_t n) noexcept
@@ -187,7 +180,7 @@ namespace llmbridge
         }
 
         // Handshake completed on this feed. On an upstream conn the request has
-        // been waiting in wbuf and can finally go through the Session. On an
+        // been waiting in `out` and can finally go through the Session. On an
         // Inbound conn there is nothing pending, because the client speaks first
         // and its request arrives as plaintext out of this very call; t2 is an
         // upstream concept and stamping it here would be meaningless.
@@ -210,7 +203,7 @@ namespace llmbridge
             // gateway/tests/gateway_tls_test.cpp.
             u->wire_ready = true;
             if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
-            if (u->woff < u->wbuf.size()) tls_push_wbuf(u);
+            if (!u->out.idle()) tls_push_out(u);
         }
         return true;
     }
@@ -219,13 +212,12 @@ namespace llmbridge
 
     bool Gateway::upstream_request_sent(const Connection* u) const noexcept
     {
-        if (u->send_inflight) return false;      // an SQE still owns the send buffer
-        if (u->woff < u->wbuf.size()) return false; // plaintext not fully handed over
+        if (u->send_inflight()) return false; // an SQE still reads the send buffer
+        if (!u->out.idle()) return false;     // plaintext not fully handed over
 #ifdef LLMBRIDGE_HAVE_TLS
-        // On TLS, woff only means "fed to the Session". Ciphertext may still be
-        // queued in tls_out or inside OpenSSL.
-        if (u->tls && (u->tls_out_off < u->tls_out.size() || u->tls->has_pending_output()))
-            return false;
+        // On TLS, a sent `out` only means "fed to the Session". Ciphertext may still
+        // be queued in tls_out or inside OpenSSL.
+        if (u->tls && (!u->tls_out.idle() || u->tls->has_pending_output())) return false;
 #endif
         return true;
     }
@@ -240,12 +232,11 @@ namespace llmbridge
             const auto* p = reinterpret_cast<const uint8_t*>(kContinue.data());
             if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return true;
 #ifdef LLMBRIDGE_HAVE_URING
-            if (uring) { ur_tls_flush(c); return true; } // completion sees an empty wbuf: nothing finishes
+            if (uring) { ur_tls_flush(c); return true; } // its completion finishes nothing: Idle
 #endif
             (void)uring;
             bool done = false;
-            if (!ep_tls_flush(c, &done)) return true;
-            if (!done) c->client_interim_inflight = true; // the writable event drains it
+            (void)ep_tls_flush(c, &done); // a partial flush finishes on writable, but nothing finishes: Idle
             return true;
         }
 #else

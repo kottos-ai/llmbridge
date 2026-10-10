@@ -13,7 +13,7 @@
 //
 // What this proves that net_tls_test cannot: the pump wiring inside both event
 // loops: handshake interleaved with connect/recv/send completions, the
-// plaintext-invariant on rbuf/wbuf, session survival across the keep-alive
+// plaintext-invariant on rbuf/out, session survival across the keep-alive
 // pool, and certificate rejection surfacing as a client-visible 502.
 
 #include "gateway/gateway.hpp"
@@ -802,6 +802,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
         _gw = std::make_unique<Gateway>(0, "127.0.0.1", _backend.port(), 0, mode, GetParam(),
                                         Gateway::kDefaultUpstreamIdleNs, tls, false);
         if (setup_ns > 0) _gw->set_client_setup_ns(setup_ns);
+        if (_write_cap > 0) _gw->set_epoll_write_cap_for_test(_write_cap);
         _port = _gw->bound_port();
         _gt = std::thread([this] { _gw->run(); });
     }
@@ -842,6 +843,7 @@ class GatewayTls : public ::testing::TestWithParam<llmbridge::IoBackend>
     std::thread _gt;
     uint16_t _port{0};
     std::string _ca_path;
+    size_t _write_cap = 0; // set before start_inbound(); epoll only
 };
 
 TEST_P(GatewayTls, RoundTripThroughTlsUpstream)
@@ -1387,7 +1389,7 @@ TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)
 }
 
 // The interim has to cross the TLS session too, and it takes a different path there:
-// into OpenSSL, then the backend's own ciphertext drain, never wbuf. That path is
+// into OpenSSL, then the backend's own ciphertext drain, never `out`. That path is
 // the one a production listener actually runs, so it gets its own test.
 TEST_P(GatewayTls, InboundAnswersExpectContinueThroughTls)
 {
@@ -1405,6 +1407,31 @@ TEST_P(GatewayTls, InboundAnswersExpectContinueThroughTls)
     const std::string resp = c.recv_response();
     EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp.substr(0, 120);
     EXPECT_EQ(resp.find("100 Continue"), std::string::npos);
+}
+
+// On epoll, a TLS 100 Continue that left the socket in pieces finished a request
+// that did not exist. The write event that drained it found nothing owed and
+// counted a reply, reset the message and closed a connection still waiting for its
+// body. A 16-byte write cap splits every flush, the handshake's and the interim's.
+TEST_P(GatewayTls, APartialInterimFlushFinishesNoRequest)
+{
+    _write_cap = 16;
+    start_inbound(UpstreamDialect::Anthropic);
+    TlsClient c;
+    ASSERT_TRUE(c.connect(_port, _ca_path));
+    ASSERT_TRUE(c.handshake());
+    const std::string body = R"({"model":"m","messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       "Expect: 100-continue\r\nContent-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n"));
+    ASSERT_EQ(c.recv_until("\r\n\r\n"), "HTTP/1.1 100 Continue\r\n\r\n");
+    ASSERT_TRUE(c.send(body));
+    const std::string resp = c.recv_response();
+    EXPECT_NE(resp.find("200 OK"), std::string::npos) << resp.substr(0, 120);
+    _gw->request_stop();
+    _gt.join();
+    EXPECT_EQ(_gw->stats().requests, 1u) << "the interim was counted as a request";
+    EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
 TEST_P(GatewayTls, InboundKeepAliveServesSeveralRequestsOnOneSession)
@@ -1869,11 +1896,11 @@ TEST_P(GatewayTls, ClientTlsWithPlaintextUpstreamStreams)
 //
 // What it does not test, stated because the first version of this comment
 // claimed otherwise. It does not distinguish "fed to the Session" from "on the
-// wire", even though that distinction is real and documented on `woff`.
+// wire", even though that distinction is real and documented on `OutBuf`.
 // Replacing wbuf_on_wire() with woff alone leaves this test passing, because
 // both call sites already establish the same fact by other means: on epoll
 // `*done` is gated on ep_tls_flush's `flushed`, which is set only after tls_out
-// drains completely, and on io_uring the send_inflight guard covers it. So
+// drains completely, and on io_uring the pin covers it. So
 // wbuf_on_wire() is defensive today and not load-bearing, and no test at the
 // current call sites can show otherwise. It earns its place by being the correct
 // thing for a future call site that lacks those guards, which is a weaker claim

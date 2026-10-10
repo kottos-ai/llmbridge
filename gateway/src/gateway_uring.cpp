@@ -153,27 +153,14 @@ namespace llmbridge
         if (!ur_next_sqe(&s)) { ur_drop_sq_full(c); return false; }
         s->opcode = IORING_OP_SEND;
         s->fd = c->fd;
-#ifdef LLMBRIDGE_HAVE_TLS
-        if (c->tls)
-        {
-            // TLS on either leg: the wire sees ciphertext. wbuf (plaintext) is fed
-            // to the Session elsewhere; woff tracks that, not this send.
-            s->addr = reinterpret_cast<uint64_t>(c->tls_out.data() + c->tls_out_off);
-            s->len = static_cast<unsigned>(c->tls_out.size() - c->tls_out_off);
-        }
-        else
-#endif
-        {
-            s->addr = reinterpret_cast<uint64_t>(c->wbuf.data() + c->woff);
-            s->len = static_cast<unsigned>(c->wbuf.size() - c->woff);
-        }
+        // TLS on either leg: the wire sees ciphertext, and `out` is fed to the Session.
+        OutBuf& w = c->wire();
+        s->addr = reinterpret_cast<uint64_t>(w.wire().data());
+        s->len = static_cast<unsigned>(w.wire().size());
         s->user_data = make_ud(c, USend);
-        // The only place send_inflight is set. It means exactly "an SQE referencing
-        // this connection's send buffer is outstanding", and an SQE is submitted
-        // only here, so this is the only line that can truthfully assert it.
-        // Callers must not set it: two of them used to, under two different rules,
-        // and one calling into the other silently deadlocked a stream.
-        c->send_inflight = true;
+        // The only pin: the kernel reads w's front until ur_on_send, so new bytes stage
+        // behind it. Nothing else may pin; GATEWAY-INTERNALS.md 5b.
+        w.pin();
         ++c->inflight;
         ++_uring_inflight;
         return true;
@@ -210,27 +197,19 @@ namespace llmbridge
 
     void Gateway::ur_tls_flush(Connection* u) noexcept
     {
-        // Serialized sends, same discipline as the client streaming pump: a send
-        // SQE points into tls_out, so tls_out must be immutable while one is in
-        // flight; appending could reallocate it under the kernel. Ciphertext
-        // produced meanwhile stages inside the Session's write BIO; we pump it
-        // out here once the previous send has fully completed.
-        if (u->send_inflight) return;
-        if (u->tls_out_off >= u->tls_out.size())
-        {
-            u->tls_out.clear();
-            u->tls_out_off = 0;
-            tls_pump_out(u);
-        }
-        if (u->tls_out.empty()) return;
-        ur_submit_send(u); // sets send_inflight; see the note there
+        // One send at a time: the completion calls back here for whatever staged
+        // behind the pinned front meanwhile.
+        if (u->tls_out.pinned()) return;
+        tls_pump_out(u);
+        if (u->tls_out.idle()) return;
+        ur_submit_send(u);
     }
 
 #endif // LLMBRIDGE_HAVE_TLS
 
-    // Send wbuf to a client connection, whatever the transport.
+    // Send `out` to a client connection, whatever the transport.
     //
-    // The plaintext path submits a send straight out of wbuf. A TLS conn cannot:
+    // The plaintext path submits a send straight out of `out`. A TLS conn cannot:
     // the SQE points at tls_out, so the plaintext has to go through the Session
     // first or the kernel is handed a zero-length send. That is exactly the bug
     // this helper exists to make unrepeatable. It was found by running curl
@@ -240,7 +219,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
-            if (c->tls->handshake_done()) tls_push_wbuf(c);
+            if (c->tls->handshake_done()) tls_push_out(c);
             ur_tls_flush(c);
             return;
         }
@@ -317,10 +296,10 @@ namespace llmbridge
         // idle keep-alive connection without processing the request. (Industry
         // convention: retry an idempotent-or-idle-reused request that failed before
         // any response; don't retry once a partial response has been seen.)
-        if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (!u->from_pool || u->retried) return false;
         if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // see the epoll mirror
         Connection* client = u->peer;
-        if (!client) return false;
+        if (!client || !client->req.can_redispatch()) return false; // a response byte arrived
         const Upstream& up = upstream_of(u);
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
@@ -343,11 +322,10 @@ namespace llmbridge
         // already translated for this dialect and carrying its credential.
         uf->upstream_slot = u->upstream_slot;
         uf->retried = true; // this request's one allowed retry is now spent
-        // Plaintext invariant pays off here: wbuf was never consumed by the dead
-        // session (woff only tracked what was fed, wbuf itself stayed whole), so
-        // the retry re-pushes the identical request through a brand-new session.
-        uf->wbuf = std::move(u->wbuf);
-        uf->woff = 0;
+        // Plaintext invariant pays off here: `out` was never consumed by the dead
+        // session, only marked fed, so the retry re-pushes the identical request
+        // through a brand-new session. A send still reading it gets a copy.
+        uf->out.stage() = u->out.take();
         uf->rbuf.reserve(kInitialBuf);
 #ifdef LLMBRIDGE_HAVE_TLS
         if (up.tls && !tls_attach_upstream(uf))
@@ -423,12 +401,15 @@ namespace llmbridge
                                                               : std::string{};
         LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
                 peer.empty() ? "" : " peer=", peer);
-        // A send in flight is reading wbuf: replacing it would hand the kernel freed
-        // memory. Whatever the client was sent, it now gets a close.
-        if (client->send_inflight) { ur_abort_pair(client); return; }
+        // A reply already begun cannot be followed by a second one: close instead.
+        if (client->req.f.phase >= Phase::Streaming || !client->out.idle())
+        {
+            ur_abort_pair(client);
+            return;
+        }
         if (Connection* u = unpair(client)) ur_close(u);
-        client->wbuf = build_error(code, detail);
-        client->woff = 0;
+        append_error(client->out.stage(), code, detail);
+        client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
         ++_stats.errors;
         ur_client_send(client);
@@ -473,6 +454,7 @@ namespace llmbridge
 
         if (_draining || c->doomed)
         {
+            if (op == USend) c->wire().sent(0);
             if (op == URecv && (flags & IORING_CQE_F_BUFFER))
                 _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT); // return the provided buffer
             if (!armed) ur_maybe_free(c);
@@ -585,6 +567,7 @@ namespace llmbridge
                 c->rbuf.append(_bufring.data(bid), static_cast<size_t>(res));
             }
             _bufring.recycle(bid);
+            if (!c->is_client) note_response_bytes(c);
         }
         // Kernel ended the multishot (pool pressure): re-arm. A failed arm may free c.
         if (!armed && !ur_arm_recv(c)) return;
@@ -675,8 +658,8 @@ namespace llmbridge
     void Gateway::ur_try_forward_buffered(Connection* c) noexcept
     {
         // Forward the next framed request only when the client is idle. No request
-        // in flight (peer) and no response still draining to it (wbuf).
-        if (c->peer != nullptr || !c->wbuf.empty() || c->rbuf.empty()) return;
+        // in flight and no reply still draining to it.
+        if (c->req.f.phase != Phase::Idle || c->rbuf.empty()) return;
         // Same memo as the epoll twin; see the note there.
         if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
         net::http::Message m;
@@ -816,6 +799,7 @@ namespace llmbridge
             { ur_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
+        c->req.f.phase = Phase::Dispatched; // see the epoll mirror
         Connection* u = ur_acquire_upstream(c->upstream_slot);
         if (!u)
         {
@@ -830,8 +814,7 @@ namespace llmbridge
                  " dest=", upstream_of(u).ip, ":", upstream_of(u).port);
         // The rebuilt request is already in `_rebuild`; the swap hands it over and
         // takes the upstream's scrubbed, still-allocated buffer back as the next scratch.
-        u->wbuf.swap(_rebuild);
-        u->woff = 0;
+        u->out.stage().swap(_rebuild);
         // Keep the original bytes when a failover could use them: the rebuilt request
         // above was translated for this venue's dialect, so it cannot be resent to a
         // different one. One copy per in-flight request, and only where it can pay off.
@@ -857,7 +840,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->connected && u->tls)
         {
-            tls_push_wbuf(u); // pooled conns are past the handshake
+            tls_push_out(u); // pooled conns are past the handshake
             ur_tls_flush(u);
             return;
         }
@@ -888,7 +871,7 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
-            // The request waits in wbuf (plaintext) until the handshake completes;
+            // The request waits in `out` (plaintext) until the handshake completes;
             // what goes out now is the ClientHello.
             u->tls->start_handshake();
             ur_tls_flush(u);
@@ -909,10 +892,9 @@ namespace llmbridge
             // mirror): a 429/529/400 must not be flattened into a generic 502.
             if (h.status != 0 && h.status != 200)
             {
-                client->wbuf = build_http_status(
-                    h.status, reason_for(h.status),
-                    provider::upstream_error_to_openai(body, "upstream_error"));
-                client->woff = 0;
+                append_http_status(client->out.stage(), h.status, reason_for(h.status),
+                                   provider::upstream_error_to_openai(body, "upstream_error"));
+                client->req.f.phase = Phase::Replying;
                 unpair(u);
                 u->rbuf.erase(0, total_len);
                 ur_release_upstream(u, h.keep_alive, true);
@@ -941,7 +923,7 @@ namespace llmbridge
                                       client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
                 append_usage_headers(timing, client->req.f.tok);
             }
-            build_http(client->wbuf, "HTTP/1.1 200 OK", client->xlate_scratch, timing);
+            append_http(client->out.stage(), "HTTP/1.1 200 OK", client->xlate_scratch, timing);
         }
         else
         {
@@ -954,10 +936,9 @@ namespace llmbridge
             // from a 200. Content-Length responses were relayed verbatim and were
             // never affected, which is why it survived: only chunkedness triggers it.
             if (h.body == net::http::Body::Chunked)
-                client->wbuf = build_http_status(h.status ? h.status : 200,
-                                                 reason_for(h.status ? h.status : 200),
-                                                 body_buf);
-            else client->wbuf.assign(u->rbuf.data(), total_len);
+                append_http_status(client->out.stage(), h.status ? h.status : 200,
+                                   reason_for(h.status ? h.status : 200), body_buf);
+            else client->out.stage().append(u->rbuf.data(), total_len);
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
@@ -969,7 +950,7 @@ namespace llmbridge
         // upstream is about to close on us. Drop it instead of reusing a corpse.
         const bool keep_alive =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
-        client->woff = 0;
+        client->req.f.phase = Phase::Replying;
         unpair(u);
         u->rbuf.erase(0, total_len); // see the epoll mirror
         ur_release_upstream(u, keep_alive, true);
@@ -978,6 +959,8 @@ namespace llmbridge
 
     void Gateway::ur_on_send(Connection* c, int res) noexcept
     {
+        // The SQE is done with the buffer either way: unpin, and fold in what staged.
+        c->wire().sent(res > 0 ? static_cast<size_t>(res) : 0);
         if (res <= 0)
         {
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
@@ -985,11 +968,6 @@ namespace llmbridge
             { if (c->peer) { if (!ur_upstream_failed(c->peer, 502, "upstream EOF")) ur_error_respond(c->peer, 502, "upstream EOF, retry exhausted"); } else ur_close(c); }
             return;
         }
-        // This send completed, so no SQE references the buffer right now. Cleared
-        // Once here, before any branch below runs; a partial send re-arms it by
-        // calling ur_submit_send again. When each branch cleared its own, two of
-        // the four forgot, and the flag meant different things on different paths.
-        c->send_inflight = false;
         c->sent_bytes += static_cast<uint64_t>(res);
         // Bytes either peer took are progress: a client draining a stream the provider
         // has finished is not an idle request. A finished reply needs no stamp.
@@ -998,76 +976,50 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
-            // TLS on either leg: this send moved ciphertext (tls_out); woff/wbuf
-            // track plaintext fed to the Session and are not touched here.
-            c->tls_out_off += static_cast<size_t>(res);
-            if (c->tls_out_off < c->tls_out.size()) { ur_submit_send(c); return; } // partial
+            // TLS on either leg: this send moved ciphertext; `out` tracks plaintext
+            // fed to the Session and is not touched here.
+            if (!c->tls_out.idle()) { ur_submit_send(c); return; } // partial, or staged behind
             // The Session may hold more: later handshake flights, or plaintext that
             // could not be pushed before the handshake finished.
-            if (c->tls->handshake_done() && c->woff < c->wbuf.size()) tls_push_wbuf(c);
+            if (c->tls->handshake_done() && !c->out.idle()) tls_push_out(c);
             ur_tls_flush(c); // refill from the write BIO; resubmit if non-empty
-            if (c->send_inflight) return; // more ciphertext went out; wait for it
+            if (c->send_inflight()) return; // more ciphertext went out; wait for it
 
             if (!c->is_client)
             {
-                if (c->peer && tls_wbuf_flushed(c)) c->peer->req.f.ts_up_sent = now_ns();
+                if (c->peer && tls_out_flushed(c)) c->peer->req.f.ts_up_sent = now_ns();
                 return;
             }
             // Inbound leg: the response is fully encrypted and fully on the wire,
-            // so this is the same completion point the plaintext path reaches when
-            // woff catches up with wbuf. Streams continue, everything else finishes.
-            if (!tls_wbuf_flushed(c)) return;
-            if (c->req.f.streaming)
-            {
-                c->wbuf.clear();
-                c->woff = 0;
-                ur_stream_flush(c);
-            }
-            else if (!c->wbuf.empty())
-            {
-                if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
-                LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->wbuf),
-                         " bytes=", c->wbuf.size(), " tokens_in=", c->req.f.tok.in,
-                         " tokens_out=", c->req.f.tok.out, " keep_alive=", c->msg.keep_alive,
-                         " on ", *c);
-                c->wbuf.clear();
-                c->woff = 0;
-                ur_finish_client(c);
-            }
+            // the same completion point the plaintext path reaches below.
+            if (!tls_out_flushed(c)) return;
+            if (c->req.f.streaming) ur_stream_flush(c);
+            else ur_finish_client(c);
             return;
         }
 #endif
-        c->woff += static_cast<size_t>(res);
-        if (c->woff < c->wbuf.size()) { ur_submit_send(c); return; } // partial: re-arms
+        if (!c->out.idle()) { ur_submit_send(c); return; } // partial, or staged behind: re-arms
 
         if (!c->is_client)
         {
             // Request fully sent. The response arrives via the already-armed multishot
-            // recv. Keep wbuf so we can resend on a stale-connection failure.
+            // recv. `out` keeps it, for a resend on a stale-connection failure.
             if (c->peer) c->peer->req.f.ts_up_sent = now_ns();
         }
-        else if (c->req.f.streaming)
-        {
-            // This SSE buffer is fully out. Free the send slot and either send the
-            // next pending bytes or finalize if the stream has ended.
-            c->wbuf.clear();
-            c->woff = 0;
-            ur_stream_flush(c);
-        }
-        else
-        {
-            if (_sink) sink_emit(c, status_of(c->wbuf), /*streamed=*/false);
-            LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->wbuf), " bytes=", c->wbuf.size(),
-                     " tokens_in=", c->req.f.tok.in, " tokens_out=", c->req.f.tok.out,
-                     " keep_alive=", c->msg.keep_alive, " on ", *c);
-            c->wbuf.clear();
-            c->woff = 0;
-            ur_finish_client(c);
-        }
+        else if (c->req.f.streaming) ur_stream_flush(c); // finalize if the stream ended
+        else ur_finish_client(c);
     }
 
     void Gateway::ur_finish_client(Connection* c) noexcept
     {
+        // Only a staged reply finishes; an interim 100 Continue's completion is no
+        // request (see the epoll mirror).
+        if (c->req.f.phase != Phase::Replying) return;
+        if (_sink) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
+        LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
+                 " bytes=", c->out.bytes().size(), " tokens_in=", c->req.f.tok.in,
+                 " tokens_out=", c->req.f.tok.out, " keep_alive=", c->msg.keep_alive, " on ", *c);
+        c->out.clear();
         // Error replies (close_after_resp) are counted as errors, not in the latency
         // histograms; their timing stamps are unset.
         if (!c->close_after_resp)
@@ -1099,6 +1051,7 @@ namespace llmbridge
         }
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
+        c->req.f.phase = Phase::Idle;
         if (close_now) { ur_close(c); return; }
         // The client's multishot recv is still armed; a pipelined next request may
         // already sit in rbuf. Forward it, else the armed recv delivers more.
@@ -1107,8 +1060,8 @@ namespace llmbridge
 
     // ── io_uring streaming pump (Anthropic->OpenAI SSE) ─────────────────────
     // Enter streaming: send the client SSE headers, then translate the body as it
-    // arrives. Output accumulates in wpending; ur_stream_flush moves it into wbuf
-    // (kept immutable during an in-flight send) one send at a time.
+    // arrives. Output stages in `out`, behind the front a send in flight pins, and
+    // goes out one send at a time.
     void Gateway::ur_begin_stream(Connection* u, const net::http::ResponseHead& h) noexcept
     {
         Connection* client = u->peer;
@@ -1135,11 +1088,12 @@ namespace llmbridge
                                   sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                   sp.upstream_ns / 1000, "x-llmbridge-upstream-ttfb-us",
                                   client->req.f.req_seq, client->req.f.client_upload_ns / 1000);
-            client->wpending.assign(sse_head_with_timing(
-                timing, client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead));
+            append_sse_head(client->out.stage(), timing,
+                            client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
         }
         else
-            client->wpending.assign(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+            client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        client->req.f.phase = Phase::Streaming;
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         ur_stream_pump(u);
     }
@@ -1149,7 +1103,7 @@ namespace llmbridge
         Connection* client = u->peer;
         if (!client) { ur_close(u); return; }
 
-        const StreamStep st = stream_step(client, u->rbuf, client->wpending, /*at_eof=*/false);
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/false);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
             // Truncate honestly: no fabricated [DONE]. Flush what we have, then the
@@ -1158,10 +1112,10 @@ namespace llmbridge
             ur_stream_flush(client);
             return;
         }
-        if (client->wpending.size() + client->wbuf.size() > kUrStreamBufCap)
+        if (client->out.unsent() > kUrStreamBufCap)
         {
             LB_WARN("CAP stream buffer exceeded, dropping the stream ", *client,
-                    " buffered=", client->wpending.size() + client->wbuf.size(),
+                    " buffered=", client->out.unsent(),
                     " limit=", static_cast<uint64_t>(kUrStreamBufCap),
                     " (the client is slower than the provider)");
             ur_abort_pair(client);
@@ -1174,7 +1128,7 @@ namespace llmbridge
     {
         Connection* client = u->peer;
         if (!client) { ur_close(u); return; }
-        const StreamStep st = stream_step(client, u->rbuf, client->wpending, /*at_eof=*/true);
+        const StreamStep st = stream_step(client, u->rbuf, client->out.stage(), /*at_eof=*/true);
         if (st == StreamStep::Corrupt || st == StreamStep::Failed)
         {
             stream_truncate(client);
@@ -1182,21 +1136,17 @@ namespace llmbridge
         ur_stream_flush(client);
     }
 
-    // Serialize sends: only one send SQE outstanding (concurrent sends on a fd would
-    // interleave). wbuf is (re)filled from wpending only when idle, so its bytes stay
-    // put while the kernel reads them for an in-flight send: no realloc-under-kernel.
+    // Serialize sends: one send SQE at a time (concurrent sends on a fd would
+    // interleave). Output staged meanwhile waits behind the pinned front.
     void Gateway::ur_stream_flush(Connection* client) noexcept
     {
-        if (client->send_inflight) return; // a send is already draining wbuf
-        if (client->wpending.empty())
+        if (client->send_inflight()) return; // its completion flushes again
+        if (client->out.idle())
         {
             if (client->req.f.stream_ended) ur_finalize_stream(client); // nothing left + ended
             return;
         }
-        client->wbuf = std::move(client->wpending);
-        client->wpending.clear();
-        client->woff = 0;
-        ur_client_send(client); // sets send_inflight; closes the client on SQE exhaustion
+        ur_client_send(client); // closes the client on SQE exhaustion
     }
 
     void Gateway::ur_finalize_stream(Connection* client) noexcept
@@ -1219,7 +1169,8 @@ namespace llmbridge
         // Keep the connection when the framing gave the body an end marker.
         if (!stream_client_reusable(client)) { ur_close(client); return; }
         client->req.f.streaming = false; // over; begin() resets the rest at the next framing
-        client->wpending.clear();
+        client->req.f.phase = Phase::Idle;
+        client->out.clear();
         client->msg = net::http::Message{};
         // The client's multishot recv stays armed.
         ur_try_forward_buffered(client);

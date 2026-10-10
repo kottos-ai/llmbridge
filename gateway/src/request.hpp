@@ -79,8 +79,8 @@ namespace llmbridge::detail
     TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept;
     const char* translate_failure(std::string_view body) noexcept;
     const char* dialect_name(UpstreamDialect m) noexcept;
-    void build_http(std::string& out, std::string_view start_line, std::string_view body,
-                    std::string_view extra); // into `out`, capacity kept
+    void append_http(std::string& out, std::string_view start_line, std::string_view body,
+                     std::string_view extra); // appended: `out` is a stage, capacity kept
     /// Into `into`, capacity kept, like request_without.
     void build_http_request(std::string_view start_line, std::string_view body,
                             std::string_view host, std::string_view extra, std::string& into);

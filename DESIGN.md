@@ -730,11 +730,11 @@ is created once per connection.
 ```
                      PLAINTEXT ONLY                    │            CIPHERTEXT ONLY
                                                        │
- client ──► rbuf ──► translate ──► u->wbuf ────────────┤
+ client ──► rbuf ──► translate ──► u->out ─────────────┤
  (plain)                            (request,          │
                                      kept intact       ▼
                                      for retry)   write_plaintext()
-                                       woff ─────►┌─────────┐   pull_ciphertext()
+                                       sent ─────►┌─────────┐   pull_ciphertext()
                                     (plaintext    │   SSL   │──────► u->tls_out ──► socket
                                      fed so far)  │ session │                        send
                                                   │  + BIOs │   feed_ciphertext()
@@ -748,19 +748,19 @@ is created once per connection.
 
 ### The invariant everything hangs off
 
-**`Connection::rbuf` and `Connection::wbuf` hold plaintext, always.** TLS interposes
+**`Connection::rbuf` and `Connection::out` hold plaintext, always.** TLS interposes
 strictly at the socket edge. Three things fall out of this for free:
 
 1. **Nothing downstream knows TLS exists**. HTTP framing, the SSE pump, translation,
    and the response parse all read `rbuf` exactly as before.
-2. **Stale-pool retry works unchanged**. `wbuf` is never consumed by encryption
-   (`woff` counts plaintext *fed to the session*, not bytes destroyed), so a retry
+2. **Stale-pool retry works unchanged**. `out` is never consumed by encryption
+   (sent means plaintext *fed to the session*, not bytes destroyed), so a retry
    re-pushes the identical request through a brand-new session.
 3. **The two backends share all TLS logic**; only the flush/kick differs: epoll
    writes `tls_out` inline and arms `EPOLLOUT` on a partial; io_uring serializes one
-   Send at a time (`send_inflight`), because a send SQE points into `tls_out` and the
-   buffer must stay immutable while the kernel reads it. Ciphertext produced meanwhile
-   stages inside the SSL write BIO until the send completes.
+   send at a time, because a send SQE points into `tls_out` and the buffer must stay
+   immutable while the kernel reads it. `tls_out` is an `OutBuf`, so ciphertext
+   produced meanwhile stages behind the pinned front until the send completes.
 
 ### Security posture (decided, not defaulted)
 

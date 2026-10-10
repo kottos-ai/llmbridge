@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 
+#include "core/outbuf.hpp"
 #include "core/req.hpp"
 #include "gateway/venue.hpp"
 #include "net/http.hpp"
@@ -30,8 +31,8 @@
 namespace llmbridge
 {
     /// Per-fd state, client or upstream (`is_client`); buffer names are the gateway's view:
-    ///   c->rbuf request in   u->wbuf request out
-    ///   u->rbuf response in  c->wbuf response out
+    ///   c->rbuf request in   u->out request out
+    ///   u->rbuf response in  c->out response out
     /// Ownership, and which backend may free a connection when: GATEWAY-INTERNALS.md 2, 5b, 7.
     struct Connection
     {
@@ -66,10 +67,8 @@ namespace llmbridge
         net::http::ResponseDecoder rdec;
 
         std::string rbuf;
-        std::string wbuf;
-
-        /// Bytes of wbuf on the socket, or fed to the Session: GATEWAY-INTERNALS.md 2b.
-        size_t woff = 0;
+        /// Plaintext owed to the peer: on the socket, or for TLS fed to the Session.
+        OutBuf out;
         /// Bytes the socket took over the connection's life, on either transport.
         uint64_t sent_bytes = 0;
 
@@ -84,8 +83,6 @@ namespace llmbridge
         /// Total length of the request being buffered, learned from its headers on
         /// the first partial read, or 0 when none is in progress.
         size_t client_frame_want = 0;
-        /// An interim `100 Continue`'s ciphertext has not fully left the socket.
-        bool client_interim_inflight = false;
 
         Connection* peer = nullptr; // the other leg of the request in flight; pair()/unpair() only
         net::http::Message msg{};
@@ -103,14 +100,8 @@ namespace llmbridge
 
         /// The SSE translator, reset per stream; by value, so a stream allocates none.
         provider::AnthropicToOpenAiSse sse_xlate;
-        /// A translated reply body, before it is framed into `wbuf`; capacity kept.
+        /// A translated reply body, before it is framed into `out`; capacity kept.
         std::string xlate_scratch{};
-        /// io_uring streams: output staged while a send SQE reads `wbuf`.
-        std::string wpending;
-
-        /// io_uring: a send SQE reads this connection's buffer, which must not move. Set
-        /// only by ur_submit_send. GATEWAY-INTERNALS.md section 5b.
-        bool send_inflight = false;
 
         /// Upstream conns only: when this connection entered the idle pool, reaped
         /// after _pool_idle_ns, and when this request took it, which bounds the retry.
@@ -126,10 +117,25 @@ namespace llmbridge
 #ifdef LLMBRIDGE_HAVE_TLS
         /// Null = plaintext. Kept across pool cycles: a pooled reuse pays no handshake.
         std::unique_ptr<net::tls::Session> tls;
-        /// Ciphertext awaiting the socket; `woff` counts encrypted, this sent (10b).
-        std::string tls_out;
-        size_t tls_out_off = 0;
+        /// Ciphertext awaiting the socket (10b).
+        OutBuf tls_out;
 #endif
+        /// What the socket reads: the ciphertext on TLS, else the plaintext. Only an
+        /// io_uring send pins it. GATEWAY-INTERNALS.md 5b.
+        OutBuf& wire() noexcept
+        {
+#ifdef LLMBRIDGE_HAVE_TLS
+            if (tls) return tls_out;
+#endif
+            return out;
+        }
+        [[nodiscard]] bool send_inflight() const noexcept
+        {
+#ifdef LLMBRIDGE_HAVE_TLS
+            if (tls) return tls_out.pinned();
+#endif
+            return out.pinned();
+        }
     };
 
     /// The only writers of `peer`, both directions at once, so a link is never one-sided.
@@ -147,8 +153,15 @@ namespace llmbridge
         return p;
     }
 
+    /// A response byte reached `u`'s rbuf: the venue may have acted, so no retry now.
+    inline void note_response_bytes(Connection* u) noexcept
+    {
+        if (u->peer && !u->rbuf.empty() && u->peer->req.f.phase == Phase::Dispatched)
+            u->peer->req.f.phase = Phase::Responding;
+    }
+
     /// Renders `ClientConnection#42(fd=17,cid=2)` for `LB_INFO("closed ", *c)`. Never prints
-    /// rbuf or wbuf: they hold the customer's request, credential included.
+    /// rbuf or out: they hold the customer's request, credential included.
     inline void log_put(net::log::Line& l, const Connection& c)
     {
         l.put(net::log::Id{c.is_client ? "ClientConnection" : "UpstreamConnection", c.log_inst});

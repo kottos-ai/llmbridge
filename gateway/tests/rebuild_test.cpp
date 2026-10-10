@@ -205,46 +205,46 @@ TEST(Rebuild, ARetiredBufferIsHandedToTheNextConnection)
     llmbridge::Gateway gw(0, "127.0.0.1", 1);
     llmbridge::Connection dying;
     dying.is_client = false;
-    dying.wbuf.assign(1u << 20, 'k'); // a request, credential included, still in it
+    dying.out.stage().assign(1u << 20, 'k'); // a request, credential included, still in it
 #ifdef LLMBRIDGE_HAVE_TLS
-    dying.tls_out.assign(1u << 20, 'c'); // and its ciphertext
-    const char* cpages = dying.tls_out.data();
+    dying.tls_out.stage().assign(1u << 20, 'c'); // and its ciphertext
+    const char* cpages = dying.tls_out.bytes().data();
 #endif
-    const char* pages = dying.wbuf.data();
+    const char* pages = dying.out.bytes().data();
     gw.retire_wbuf(&dying);
     EXPECT_EQ(gw.warm_bufs_for_test(), 1u);
-    EXPECT_TRUE(dying.wbuf.empty());
+    EXPECT_TRUE(dying.out.bytes().empty());
     llmbridge::Connection born;
     born.is_client = false;
     gw.adopt_warm(&born);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
-    EXPECT_EQ(born.wbuf.data(), pages);
+    EXPECT_EQ(born.out.bytes().data(), pages);
 #ifdef LLMBRIDGE_HAVE_TLS
-    EXPECT_TRUE(dying.tls_out.empty());
-    EXPECT_EQ(born.tls_out.data(), cpages);
-    EXPECT_TRUE(born.tls_out.empty());
-    EXPECT_EQ(std::count(born.tls_out.data(), born.tls_out.data() + (1u << 20), 'c'), 0)
+    EXPECT_TRUE(dying.tls_out.bytes().empty());
+    EXPECT_EQ(born.tls_out.bytes().data(), cpages);
+    EXPECT_TRUE(born.tls_out.bytes().empty());
+    EXPECT_EQ(std::count(born.tls_out.bytes().data(), born.tls_out.bytes().data() + (1u << 20), 'c'), 0)
         << "the ciphertext of a credential must not survive either";
 #endif
-    EXPECT_GE(born.wbuf.capacity(), 1u << 20);
-    EXPECT_TRUE(born.wbuf.empty());
-    EXPECT_EQ(std::count(born.wbuf.data(), born.wbuf.data() + (1u << 20), 'k'), 0)
+    EXPECT_GE(born.out.capacity(), 1u << 20);
+    EXPECT_TRUE(born.out.bytes().empty());
+    EXPECT_EQ(std::count(born.out.bytes().data(), born.out.bytes().data() + (1u << 20), 'k'), 0)
         << "the credential must not survive into the next connection";
     EXPECT_EQ(gw.stats().warm_reuses, 1u);
     // Too small to matter, a client's buffer, and a full list are all left alone.
     llmbridge::Connection small;
     small.is_client = false;
-    small.wbuf.assign(1024, 'x');
+    small.out.stage().assign(1024, 'x');
     gw.retire_wbuf(&small);
     llmbridge::Connection client;
-    client.wbuf.assign(1u << 20, 'x');
+    client.out.stage().assign(1u << 20, 'x');
     gw.retire_wbuf(&client);
     EXPECT_EQ(gw.warm_bufs_for_test(), 0u);
     for (size_t i = 0; i < llmbridge::Gateway::kWarmBufs + 2; ++i)
     {
         llmbridge::Connection d;
         d.is_client = false;
-        d.wbuf.assign(1u << 17, 'x');
+        d.out.stage().assign(1u << 17, 'x');
         gw.retire_wbuf(&d);
     }
     EXPECT_EQ(gw.warm_bufs_for_test(), llmbridge::Gateway::kWarmBufs) << "the list is capped";

@@ -295,6 +295,9 @@ namespace
         // while a full response is already framed, which is what a provider doing an
         // early reject (413/401 on the headers) of a large body looks like.
         void set_reply_before_read(bool b) { _reply_before_read = b; }
+        // With set_reply_before_read: reset the connection `ms` after the reply, so a
+        // request still being written fails mid-send.
+        void set_reset_after_reply_ms(int ms) { _reset_after_reply_ms = ms; }
         // Shrink the receive window on accepted sockets, so the gateway's write to
         // this backend blocks after a few hundred KB instead of many MB.
         void set_small_rcvbuf(int b) { _rcvbuf = b; }
@@ -388,6 +391,14 @@ namespace
             {
                 const std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
                 (void)!::write(c, resp.data(), resp.size());
+                if (_reset_after_reply_ms > 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(_reset_after_reply_ms));
+                    linger lg{1, 0}; // close() now sends RST
+                    ::setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+                    ::close(c);
+                    return;
+                }
                 while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
                 ::close(c);
                 return;
@@ -497,6 +508,7 @@ namespace
         std::atomic<int> _accepted{0};
         int _stall = 0;
         bool _reply_before_read = false;
+        int _reset_after_reply_ms = 0;
         int _rcvbuf = 0;
         std::atomic<int> _requests_seen{0};
         std::string _last_request;
@@ -971,6 +983,36 @@ TEST_P(ProxyEarlyResponse, PooledUpstreamStaysUsable)
     // send happened to finish would prove nothing about the guard.
     EXPECT_GE(_gw->stats().upstream_unsent, 1u);
 }
+// Once a stream has begun, a failed request write ends it. The provider answered
+// early and reset while our large request was still going out; that failure was taken
+// for one before any response, so epoll wrote a 502 into the open stream, and a pooled
+// upstream would have been retried, re-sending the request behind a reply in progress.
+TEST_P(ProxyEarlyResponse, AWriteFailureAfterTheStreamBeganAbortsIt)
+{
+    _backend.set_small_rcvbuf(4096); // the request write stays pending
+    _backend.set_reply_before_read(true);
+    _backend.set_reset_after_reply_ms(300);
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\n\r\n"
+                          "29\r\ndata: {\"choices\":[{\"delta\":{\"x\":\"y\"}}]}\n\n\r\n");
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request(std::string(8 * 1024 * 1024, 'x'))));
+    const std::string got = c.recv_all(5000); // the gateway closes a cut stream
+    c.close();
+    shutdown();
+    EXPECT_NE(got.find("data: "), std::string::npos) << "the stream never began:\n" << got;
+    size_t lines = 0;
+    for (size_t at = got.find("HTTP/1.1 "); at != std::string::npos; at = got.find("HTTP/1.1 ", at + 1))
+        ++lines;
+    EXPECT_EQ(lines, 1u) << "a second status line inside the stream:\n" << got;
+    EXPECT_EQ(got.find("502"), std::string::npos) << got;
+    EXPECT_EQ(_gw->stats().upstream_retries, 0u);
+    EXPECT_EQ(_gw->stats().requests, 0u) << "a cut stream is not a served request";
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyEarlyResponse,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring));

@@ -84,16 +84,9 @@ namespace llmbridge
         // into a latency multiplier.
         if (!_policy || _upstreams.size() < 2) return {};
         if (!client || client->doomed) return {};
-        // Nothing may have reached the client, or a re-send duplicates output.
-        //
-        // The `streaming` half is unreachable today and is kept deliberately: all six
-        // call sites already divert a streaming client to abort_pair or
-        // stream_on_upstream_eof before they get here, so no test can distinguish it
-        // from `true`. It stays for the same reason tls_invariant_ok() does, six call
-        // sites must each keep being right for it to remain unreachable, and the cost
-        // of being wrong is a client receiving one answer twice. The `wbuf` half is
-        // reachable: a pipelined earlier response can still be draining.
-        if (client->req.f.streaming || !client->wbuf.empty()) return {};
+        // No response byte may have arrived, or the venue may have acted on the request,
+        // and nothing may be owed to the client, or a re-send duplicates output.
+        if (!client->req.can_redispatch() || !client->out.idle()) return {};
         if (client->req.saved.empty()) return {};
         if (client->req.f.failover_attempts >= kMaxFailoverAttempts - 1) return {};
 
