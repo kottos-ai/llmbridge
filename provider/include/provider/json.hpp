@@ -673,14 +673,20 @@ namespace llmbridge::provider::json
     //
     // \uXXXX is decoded to UTF-8; a lone surrogate is passed through as U+FFFD
     // instead of emitting invalid UTF-8, since the output goes to a provider that
-    // will reject a malformed body.
-    inline std::string unescape_string(std::string_view raw)
+    // will reject a malformed body. unescape_append decodes onto the end of `out`.
+    inline void unescape_append(std::string& out, std::string_view raw)
     {
-        std::string out;
-        out.reserve(raw.size());
         for (size_t i = 0; i < raw.size(); ++i)
         {
-            if (raw[i] != '\\' || i + 1 >= raw.size()) { out += raw[i]; continue; }
+            if (raw[i] != '\\' || i + 1 >= raw.size())
+            {
+                // The plain run up to the next escape, in one copy.
+                size_t j = raw.find('\\', i + 1);
+                if (j == std::string_view::npos || j + 1 >= raw.size()) j = raw.size();
+                out.append(raw.data() + i, j - i);
+                i = j - 1;
+                continue;
+            }
             switch (raw[++i])
             {
                 case '"':  out += '"';  break;
@@ -693,7 +699,7 @@ namespace llmbridge::provider::json
                 case 'f':  out += '\f'; break;
                 case 'u':
                 {
-                    if (i + 4 >= raw.size()) return out;
+                    if (i + 4 >= raw.size()) return;
                     unsigned cp = 0;
                     for (int k = 1; k <= 4; ++k)
                     {
@@ -702,7 +708,7 @@ namespace llmbridge::provider::json
                         if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
                         else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
                         else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
-                        else return out;
+                        else return;
                     }
                     i += 4;
                     // Surrogate pair -> one code point.
@@ -752,6 +758,13 @@ namespace llmbridge::provider::json
                 default: out += raw[i]; break;
             }
         }
+    }
+
+    inline std::string unescape_string(std::string_view raw)
+    {
+        std::string out;
+        out.reserve(raw.size());
+        unescape_append(out, raw);
         return out;
     }
 

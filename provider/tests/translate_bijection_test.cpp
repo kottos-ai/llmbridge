@@ -89,7 +89,7 @@ namespace
             for (const auto& msg : m->arr)
             {
                 const auto role = msg.str_or("role");
-                if (role == "system")
+                if (role == "system" || role == "developer")
                 {
                     if (has_sys) c.system += "\\n";
                     c.system += content_str(msg.find("content"));
@@ -131,7 +131,7 @@ namespace
             for (const auto& msg : m->arr)
             {
                 const auto role = msg.str_or("role");
-                if (role == "system")
+                if (role == "system" || role == "developer")
                 {
                     if (has_sys) c.system += "\\n";
                     c.system += content_str(msg.find("content"));
@@ -263,6 +263,20 @@ TEST_P(Bijection, OpenAIToGeminiIsLossless)
     Canon b = from_gemini(P(gem));
     a.model.clear(); // Gemini body carries no model field
     EXPECT_EQ(a, b) << "round-trip lost data for payload: " << GetParam().name;
+}
+
+// `developer` is the system prompt under a newer name, so it round-trips as one.
+TEST_P(Bijection, DeveloperRoleIsLosslessAsSystem)
+{
+    std::string oai = build_openai(GetParam().body);
+    oai.replace(oai.find(R"({"role":"system")"), 16, R"({"role":"developer")");
+    const Canon want = from_openai(P(oai));
+    ASSERT_FALSE(want.system.empty());
+    EXPECT_EQ(want, from_anthropic(P(openai_to_anthropic_request(oai)))) << GetParam().name;
+    EXPECT_EQ(want, from_cohere(P(openai_to_cohere_request(oai)))) << GetParam().name;
+    Canon g = want;
+    g.model.clear(); // Gemini body carries no model field
+    EXPECT_EQ(g, from_gemini(P(openai_to_gemini_request(oai)))) << GetParam().name;
 }
 
 INSTANTIATE_TEST_SUITE_P(Payloads, Bijection, ::testing::ValuesIn(payloads()),

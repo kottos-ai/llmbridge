@@ -284,6 +284,19 @@ TEST(Unescape, TruncatedEscapesDoNotReadPastTheEnd)
     EXPECT_NO_THROW((void)llmbridge::provider::json::unescape_string("\\ud83d\\u"));
 }
 
+TEST(Unescape, AppendKeepsWhatIsThereAndCopiesPlainRunsWhole)
+{
+    std::string out = "ab";
+    llmbridge::provider::json::unescape_append(out, "cd\\nef\\\\gh\\u00e9ij");
+    EXPECT_EQ(out, "abcd\nef\\gh\xC3\xA9ij");
+    out = "x";
+    llmbridge::provider::json::unescape_append(out, "plain");
+    EXPECT_EQ(out, "xplain");
+    // A trailing lone backslash is kept, as unescape_string always did.
+    EXPECT_EQ(llmbridge::provider::json::unescape_string("abc\\"), "abc\\");
+    EXPECT_EQ(llmbridge::provider::json::unescape_string("\\"), "\\");
+}
+
 // --- RFC 8259 §7 string strictness (found by the corpus concurrency test) -----
 //
 // The parser's string span is re-emitted verbatim on the passthrough path, so

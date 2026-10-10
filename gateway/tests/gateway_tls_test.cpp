@@ -1367,9 +1367,9 @@ static std::string make_req(const std::string& body)
     return "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 }
-static const std::string kBody = R"({"model":"m","messages":[{"role":"u","content":"h"}]})";
+static const std::string kBody = R"({"model":"m","messages":[{"role":"user","content":"h"}]})";
 static const std::string kStreamBody =
-    R"({"model":"m","stream":true,"messages":[{"role":"u","content":"h"}]})";
+    R"({"model":"m","stream":true,"messages":[{"role":"user","content":"h"}]})";
 static const std::string kReq = make_req(kBody);
 
 TEST_P(GatewayTls, InboundHandshakeAndRoundTrip)

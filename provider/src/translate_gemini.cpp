@@ -14,6 +14,7 @@
 
 #include "content.hpp"
 #include "json_scan.hpp"
+#include "messages.hpp"
 #include "openai_common.hpp" // detail::now_secs / gemini_usage
 #include "provider/json.hpp"
 
@@ -23,68 +24,80 @@ namespace llmbridge::provider
 
     // ── Google Gemini (generateContent) ─────────────────────────────────────
 
+    namespace
+    {
+        // The turns, for walk_messages. No tool hooks: Gemini tool calls and results
+        // are not translated, so a conversation holding them is refused. Gemini
+        // refuses an empty text part, so a message with no text is skipped.
+        struct GeminiTurns
+        {
+            std::string& out;
+            std::string& sys; // collected system content (raw), joined by \n
+            bool first = true;
+
+            bool system(const json::Value* content)
+            {
+                const size_t at = sys.size();
+                if (!sys.empty()) sys += "\\n";
+                const size_t text = sys.size();
+                if (!append_text(sys, content)) return false;
+                if (sys.size() == text) sys.resize(at);
+                return true;
+            }
+
+            bool turn(bool assistant, const json::Value* content)
+            {
+                const size_t at = out.size();
+                if (!first) out += ',';
+                out += assistant ? R"({"role":"model","parts":[{"text":")"
+                                 : R"({"role":"user","parts":[{"text":")";
+                const size_t text = out.size();
+                if (!append_text(out, content)) return false;
+                if (out.size() == text) { out.resize(at); return true; }
+                out += "\"}]}";
+                first = false;
+                return true;
+            }
+        };
+    } // namespace
+
     std::string openai_to_gemini_request(std::string_view openai_body)
     {
         bool ok = false;
-        json::Value v = json::parse(openai_body, ok);
+        const json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
-
-        std::string system;          // collected system content (raw), joined by \n
-        bool has_system = false;
-        std::string contents = "[";  // gemini "contents" turns
-        bool first = true;
         // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
         const json::Value* msgs = v.find("messages");
-        if (!msgs || !msgs->is_array()) return {};
-        if (msgs)
-        {
-            for (const auto& m : msgs->arr)
-            {
-                const std::string_view role = m.str_or("role");
-                const json::Value* content = m.find("content");
-                if (role == "system")
-                {
-                    if (has_system) system += "\\n";
-                    if (!append_text(system, content)) return {};
-                    has_system = true;
-                    continue;
-                }
-                if (!first) contents += ',';
-                first = false;
-                // OpenAI "assistant" -> Gemini "model"; everything else -> "user".
-                contents += "{\"role\":";
-                contents += role == "assistant" ? "\"model\"" : "\"user\"";
-                contents += ",\"parts\":[{\"text\":\"";
-                if (!append_text(contents, content)) return {};
-                contents += "\"}]}";
-            }
-        }
-        contents += ']';
+        if (!msgs || !msgs->is_array() || detail::declares_tools(v)) return {};
 
-        std::string out = "{\"contents\":" + contents;
-        if (has_system)
+        std::string out, system;
+        out.reserve(openai_body.size() + 256);
+        out = "{\"contents\":[";
+        GeminiTurns turns{out, system};
+        if (!detail::walk_messages(*msgs, turns)) return {};
+        out += ']';
+        if (!system.empty())
         {
             out += ",\"systemInstruction\":{\"parts\":[{\"text\":\"";
             out += system;
             out += "\"}]}";
         }
         // generationConfig: only the keys the OpenAI request actually set.
-        std::string gc;
-        if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { gc += "\"maxOutputTokens\":"; gc += mt; }
-        if (std::string_view t = v.num_or("temperature"); !t.empty())
-        {
-            if (!gc.empty()) gc += ',';
-            gc += "\"temperature\":";
-            gc += t;
-        }
-        if (std::string_view p = v.num_or("top_p"); !p.empty())
-        {
-            if (!gc.empty()) gc += ',';
-            gc += "\"topP\":";
-            gc += p;
-        }
-        if (!gc.empty()) out += ",\"generationConfig\":{" + gc + "}";
-        out += "}";
+        const size_t at = out.size();
+        out += ",\"generationConfig\":{";
+        const size_t first = out.size();
+        const auto put = [&](std::string_view key, std::string_view value) {
+            if (value.empty()) return;
+            if (out.size() != first) out += ',';
+            out += key;
+            out += value;
+        };
+        put("\"maxOutputTokens\":", detail::max_tokens_of(v));
+        put("\"temperature\":", v.num_or("temperature"));
+        put("\"topP\":", v.num_or("top_p"));
+        if (out.size() == first) out.resize(at);
+        else out += '}';
+        out += '}';
         return out;
     }
 

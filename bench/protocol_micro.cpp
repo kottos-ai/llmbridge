@@ -92,6 +92,30 @@ namespace
         b += "]}";
         return b;
     }
+
+    // The same size with what an agent loop carries: 20 tool schemas, and a history of
+    // tool calls whose arguments are escaped JSON, each answered by a tool result.
+    std::string tool_agent_request()
+    {
+        std::string b = R"({"model":"claude-opus-5-5","max_tokens":4096,"tools":[)";
+        for (int t = 0; t < 20; ++t)
+            b += std::string(t ? "," : "") + R"({"type":"function","function":{"name":"tool_)" +
+                 std::to_string(t) + R"(","parameters":{"type":"object","properties":{"path":)" +
+                 R"({"type":"string","description":")" + std::string(400, 'd') +
+                 R"("},"n":{"type":"integer"}},"required":["path"]}}})";
+        b += R"(],"messages":[{"role":"system","content":"You are a coding agent."})";
+        for (int i = 0; b.size() < 130'000; ++i)
+        {
+            const std::string id = "call_" + std::to_string(i);
+            b += R"(,{"role":"assistant","content":null,"tool_calls":[{"id":")" + id +
+                 R"(","type":"function","function":{"name":"tool_1","arguments":)" +
+                 R"("{\"path\":\"src/a/b/file.cpp\",\"text\":\")" + std::string(300, 'x') +
+                 R"(\"}"}}]},{"role":"tool","tool_call_id":")" + id + R"(","content":")" +
+                 std::string(200, 'r') + R"("})";
+        }
+        b += "]}";
+        return b;
+    }
 } // namespace
 
 int main()
@@ -119,6 +143,11 @@ int main()
     measure("openai_to_anthropic_request (130 KB)", 1, 2'000, [&] {
         if (!provider::openai_to_anthropic_request(agent, translated)) std::abort();
     });
-    std::printf("(agent body %zu bytes; head %zu bytes)\n", agent.size(), head.size());
+    const std::string tools = tool_agent_request();
+    measure("openai_to_anthropic_request (tools)", 1, 2'000, [&] {
+        if (!provider::openai_to_anthropic_request(tools, translated)) std::abort();
+    });
+    std::printf("(agent body %zu bytes, tool agent %zu; head %zu bytes)\n", agent.size(),
+                tools.size(), head.size());
     return 0;
 }
