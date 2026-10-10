@@ -261,7 +261,8 @@ namespace llmbridge::net::tls
           _hs_done(o._hs_done),
           _err(std::move(o._err)),
           _sink(std::exchange(o._sink, nullptr)),
-          _staging(std::move(o._staging))
+          _staging(std::move(o._staging)),
+          _staging_off(std::exchange(o._staging_off, 0))
     {
         if (_wbio) BIO_set_data(_wbio, this); // the BIO points back at its owner
     }
@@ -279,6 +280,7 @@ namespace llmbridge::net::tls
             _err = std::move(o._err);
             _sink = std::exchange(o._sink, nullptr);
             _staging = std::move(o._staging);
+            _staging_off = std::exchange(o._staging_off, 0);
             if (_wbio) BIO_set_data(_wbio, this);
         }
         return *this;
@@ -305,7 +307,7 @@ namespace llmbridge::net::tls
             case BIO_CTRL_PENDING:
             {
                 auto* s = static_cast<Session*>(BIO_get_data(b));
-                return s ? static_cast<long>(s->_staging.size()) : 0;
+                return s ? static_cast<long>(s->_staging.size() - s->_staging_off) : 0;
             }
             default: return 0;
         }
@@ -475,10 +477,18 @@ namespace llmbridge::net::tls
 
     size_t Session::pull_ciphertext(std::span<uint8_t> out) noexcept
     {
-        if (!_ssl || out.empty() || _staging.empty()) return 0;
-        const size_t n = std::min(out.size(), _staging.size());
-        std::memcpy(out.data(), _staging.data(), n);
-        _staging.erase(0, n);
+        if (!_ssl || out.empty() || _staging_off == _staging.size()) return 0;
+        // A read offset, not erase(0, n): erasing shifted the whole remainder on every
+        // pull, quadratic in a large staged request. Compacted only once half is read.
+        const size_t n = std::min(out.size(), _staging.size() - _staging_off);
+        std::memcpy(out.data(), _staging.data() + _staging_off, n);
+        _staging_off += n;
+        if (_staging_off == _staging.size()) { _staging.clear(); _staging_off = 0; }
+        else if (_staging_off >= (64u << 10) && _staging_off * 2 >= _staging.size())
+        {
+            _staging.erase(0, _staging_off);
+            _staging_off = 0;
+        }
         return n;
     }
 
@@ -532,12 +542,12 @@ namespace llmbridge::net::tls
 
     size_t Session::pending_output_bytes() const noexcept
     {
-        return _staging.size();
+        return _staging.size() - _staging_off;
     }
 
     bool Session::has_pending_output() const noexcept
     {
-        return !_staging.empty();
+        return _staging_off != _staging.size();
     }
 
 }  // namespace llmbridge::net::tls

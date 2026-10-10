@@ -153,6 +153,7 @@ namespace llmbridge::net::tls
         std::string _err{};
         std::string* _sink{nullptr};
         std::string _staging{};
+        size_t _staging_off{0}; ///< bytes of _staging already pulled
     };
 
 }  // namespace llmbridge::net::tls
