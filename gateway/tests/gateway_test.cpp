@@ -9983,3 +9983,205 @@ TEST_P(ProxyRoute, EachRequestOnAKeepAliveConnectionRecordsItsOwnServedModelAndT
     EXPECT_EQ(recs[1].served_tier, "priority");
     EXPECT_EQ(recs[2].served_tier, "") << "the previous request's tier leaked";
 }
+
+// ── One per-request reset (RequestCtx::begin) ────────────────────────────────
+//
+// Each request starts from a state constructed fresh at framing, before any reply,
+// so nothing a request reports can belong to the one before it on the connection.
+
+// G9: a framing error used to reply before the sequencer ran, so its record carried
+// the previous request's sequence number, stamps, venue and model.
+TEST_P(ProxyRoute, AFramingErrorAfterASuccessIsARequestOfItsOwn)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"gpt-first"})")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    ASSERT_TRUE(c.send("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n"));
+    EXPECT_EQ(c.recv_status(), 400);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].model, "gpt-first");
+    EXPECT_NE(recs[1].r.seq, recs[0].r.seq) << "the 400 reused the previous request's number";
+    EXPECT_EQ(recs[1].r.status, 400);
+    EXPECT_TRUE(recs[1].r.error_reply);
+    EXPECT_GT(recs[1].r.ts_req_recvd, recs[0].r.ts_done);
+    EXPECT_EQ(recs[1].r.ts_req_built, 0) << "an upstream stamp of the request before";
+    EXPECT_EQ(recs[1].r.ts_wire_ready, 0);
+    EXPECT_EQ(recs[1].r.ts_up_sent, 0);
+    EXPECT_EQ(recs[1].r.ts_up_recvd, 0);
+    EXPECT_EQ(recs[1].r.upstream_index, -1) << "no venue served it";
+    EXPECT_EQ(recs[1].r.upstream_ip, 0u);
+    EXPECT_FALSE(recs[1].r.from_pool);
+    EXPECT_EQ(recs[1].model, "") << "the previous request's model";
+}
+
+// G5: t2 and t3 were stamped only when still 0, so a keep-alive client's second
+// request on a fresh upstream kept the first one's: connect-us went negative and
+// upwrite-us counted the time between the two requests.
+class ProxyRequestReset : public ProxyIT,
+                          public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyRequestReset, ASecondRequestOnAColdUpstreamGetsItsOwnStamps)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          "Connection: close\r\nContent-Length: 2\r\n\r\n{}");
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 2; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request())) << i;
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200) << i;
+    }
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    for (size_t i = 0; i < recs.size(); ++i)
+    {
+        const llmbridge::RequestRecord& r = recs[i].r;
+        EXPECT_FALSE(r.from_pool) << i;
+        EXPECT_GE(r.ts_wire_ready, r.ts_req_built) << i << ": t2 is the previous request's";
+        EXPECT_GE(r.ts_up_sent, r.ts_wire_ready) << i;
+        EXPECT_GE(r.ts_up_recvd, r.ts_up_sent) << i;
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyRequestReset,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
+namespace
+{
+    /// Keeps the model it routes with in a buffer it rewrites, as a policy formatting
+    /// names per request may, and fails over with a model of its own or none.
+    class RewritingPolicy final : public llmbridge::Policy
+    {
+      public:
+        explicit RewritingPolicy(std::string retry_model) : _retry(std::move(retry_model)) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            _buf = "venue-a-model-" + std::string(40, 'a'); // on the heap, past SSO
+            return {.allow = true, .upstream_index = 0, .model = _buf};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            _buf.assign(400, 'z'); // reallocates: a view kept from decide() now dangles
+            _buf.shrink_to_fit();
+            if (f.attempt > 0) return {};
+            return {.retry = true, .upstream_index = 1, .model = _retry};
+        }
+
+      private:
+        std::string _buf;
+        std::string _retry;
+    };
+
+    /// Routes with a model name longer than the gateway keeps.
+    class LongModelPolicy final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .model = _long};
+        }
+
+      private:
+        std::string _long = std::string(256, 'm');
+    };
+} // namespace
+
+// G3: the override was a view into the policy's buffer, read again by a failover in a
+// later event; under ASan that was a use-after-free, and either way venue B was sent
+// venue A's model name. Now the failover sends Retry::model.
+TEST_P(ProxyRoute, AFailoverSendsTheRetryModelNotTheFailedVenuesOverride)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    RewritingPolicy pol("venue-b-model");
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model","messages":[]})")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string got = good.last();
+    EXPECT_NE(got.find(R"("model":"venue-b-model")"), std::string::npos) << got;
+    EXPECT_EQ(got.find("venue-a-model"), std::string::npos) << got;
+    EXPECT_EQ(got.find("zzz"), std::string::npos) << got;
+    good.stop();
+}
+
+// And a failover naming no model sends the client's own, not the failed venue's.
+TEST_P(ProxyRoute, AFailoverWithoutAModelSendsTheClientsOwn)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    RewritingPolicy pol("");
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model","messages":[]})")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string got = good.last();
+    EXPECT_NE(got.find(R"("model":"client-model")"), std::string::npos) << got;
+    EXPECT_EQ(got.find("venue-a-model"), std::string::npos) << got;
+    good.stop();
+}
+
+// An override is copied whole or not at all: a cut name would route to whatever
+// model its prefix happens to name.
+TEST_P(ProxyRoute, AnOverrideLongerThanTheGatewayKeepsIsA500)
+{
+    NamedBackend b;
+    b.start("alpha");
+    LongModelPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model"})")));
+    EXPECT_EQ(c.recv_status(), 500);
+    c.close();
+    shutdown();
+    EXPECT_EQ(b.seen(), 0) << "a cut model name reached the venue";
+    b.stop();
+}
+
+// G17: the bare IP:PORT form with only `ips` set took its Host header from the empty
+// `ip`, before the constructor defaulted it, and sent `Host: :PORT`.
+TEST_P(ProxyRoute, AVenueGivenOnlyAnAddressListNamesItInTheHostHeader)
+{
+    NamedBackend b;
+    b.start("alpha");
+    llmbridge::Upstream u;
+    u.port = b.port();
+    u.ips = {"127.0.0.1"};
+    start({u}, nullptr);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string want = "Host: 127.0.0.1:" + std::to_string(b.port()) + "\r\n";
+    EXPECT_NE(b.last().find(want), std::string::npos) << b.last();
+    b.stop();
+}

@@ -24,7 +24,7 @@ namespace llmbridge
                                          const net::http::ResponseHead& h) noexcept
     {
         if (!h.encoded) return;
-        LB_WARN(ReqId{client->req_seq},
+        LB_WARN(ReqId{client->req.f.req_seq},
                 " upstream compressed the response, so token counts are not readable "
                 "for this request; Accept-Encoding was not forwarded");
     }
@@ -36,16 +36,16 @@ namespace llmbridge
     {
         if (now_ns() - _t_start < _warmup_ns) return;
         // t4 stands in for the absent t5; only the request-side fields are read.
-        const TimingSplit sp = timing_split(client->ts_req_recvd, client->ts_req_built,
-                                            client->ts_wire_ready, client->ts_up_sent,
-                                            client->ts_up_recvd, client->ts_up_recvd);
+        const TimingSplit sp = timing_split(client->req.f.ts_req_recvd, client->req.f.ts_req_built,
+                                            client->req.f.ts_wire_ready, client->req.f.ts_up_sent,
+                                            client->req.f.ts_up_recvd, client->req.f.ts_up_recvd);
         if (sp.req_path_ns >= 0) _stats.req_path.record(static_cast<uint64_t>(sp.req_path_ns));
         if (sp.connect_ns >= 0) _stats.connect.record(static_cast<uint64_t>(sp.connect_ns));
         // Zero means no content chunk ever arrived, not an instant answer.
-        if (client->ts_first_token > 0 && client->ts_req_recvd > 0 &&
-            client->ts_first_token >= client->ts_req_recvd)
+        if (client->req.f.ts_first_token > 0 && client->req.f.ts_req_recvd > 0 &&
+            client->req.f.ts_first_token >= client->req.f.ts_req_recvd)
             _stats.first_token.record(
-                static_cast<uint64_t>(client->ts_first_token - client->ts_req_recvd));
+                static_cast<uint64_t>(client->req.f.ts_first_token - client->req.f.ts_req_recvd));
     }
 
     void Gateway::stream_truncate(Connection* client) noexcept
@@ -53,11 +53,11 @@ namespace llmbridge
         // One call for the three mutations and the log line: GATEWAY-INTERNALS.md 6b.
         // CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient guards
         // the stream_ended latch.
-        LB_WARN(ReqId{client->req_seq}, " stream TRUNCATED (no [DONE] emitted)",
+        LB_WARN(ReqId{client->req.f.req_seq}, " stream TRUNCATED (no [DONE] emitted)",
                 " tokens_in=", stream_tokens(client).in,
                 " tokens_out=", stream_tokens(client).out,
                 " on ", *client);
-        client->stream_ended = true;      // no more output will be produced
+        client->req.f.stream_ended = true;      // no more output will be produced
         client->close_after_resp = true;  // close once the client drains what we have
         ++_stats.errors;                  // and it counts as a failure, not a finish
     }

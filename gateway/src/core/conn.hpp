@@ -19,7 +19,7 @@
 #include <string>
 #include <string_view>
 
-#include "gateway/sink.hpp"
+#include "core/req.hpp"
 #include "gateway/venue.hpp"
 #include "net/http.hpp"
 #include "net/log.hpp"
@@ -35,8 +35,7 @@ namespace llmbridge
     /// Ownership, and which backend may free a connection when: GATEWAY-INTERNALS.md 2, 5b, 7.
     struct Connection
     {
-        /// Live-instance count, so a test can assert every Connection the gateway
-        /// allocates is freed, without a sanitizer.
+        /// Live instances, so a test can assert every Connection is freed.
         Connection() noexcept { s_live.fetch_add(1, std::memory_order_relaxed); }
         ~Connection() { s_live.fetch_sub(1, std::memory_order_relaxed); }
         Connection(const Connection&) = delete;
@@ -45,203 +44,79 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
-        /// Client only: the original request, kept so a failover can rebuild it for
-        /// another venue; the upstream's wbuf was translated for the venue that
-        /// failed. Empty in a stock build, so nobody pays for a copy they cannot use.
-        std::string failover_req;
-        int failover_attempts = 0; ///< venues already tried for the request in flight
-        uint64_t policy_tag = 0;   ///< Decision::tag of the request in flight; see policy.hpp
-        /// Sink capture: bounded header copies plus the wall clock at framing, taken
-        /// then because the request buffer is reused by completion.
-        int64_t wall_t0 = 0;
-        char sink_cap[kSinkCaptureMax][kSinkCaptureBytes];
-        uint8_t sink_cap_len[kSinkCaptureMax] = {};
-        /// The client's model, for the sink. 64 bytes holds Bedrock's 43-character
-        /// form, and a model name is not a prompt.
-        char sink_model[64] = {};
-        uint8_t sink_model_len = 0;
-        uint64_t prefix_hash = 0;
-        /// The client's top-level `stream` and `stream_options.include_usage`, read
-        /// in the same pass as the model; meaningful only after capture_model.
-        bool asked_stream = false;
-        bool asked_usage = false;
 
         /// Upstream table index, -1 for none: an upstream's own venue (for its pool), or the
         /// venue serving a client's request in flight (for the response's dialect).
         int upstream_slot = -1;
         sockaddr_in up_addr{};
-        uint32_t upstream_ip = 0;
-        /// The translation resolved for the request in flight, from the client dialect
-        /// and the venue's. See gateway/dialect.hpp. `effective_dialect` is meaningful
-        /// only when `translate_body`.
-        UpstreamDialect effective_dialect = UpstreamDialect::OpenAI;
-        bool translate_body = false;
-        /// Log identity, distinct from `id`: `id` is the client-map key and is 0 on
-        /// every upstream. This one is process-unique for either kind and never
-        /// changes, so a connection's whole life is greppable as "Connection#42".
+        /// Log identity, process-unique for either kind, unlike `id` (0 on upstreams).
         uint64_t log_inst = net::log::next_instance();
-        /// Client conns: the sequencer value for the request in flight, assigned once
-        /// at framing and read by the log lines and the x-llmbridge-seq header.
-        uint64_t req_seq = 0;
-        /// Provider-reported token counts for a non-streamed reply, -1 when not stated:
-        /// what the translator wrote, or a scan of a byte-forwarded body.
-        provider::openai::Usage tok;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool wire_ready = false;
-        bool request_pending = false; // client-only: full request buffered, awaiting forward
-        /// Closed, not yet freed: epoll frees at batch end, io_uring once `inflight` is 0, since
-        /// a submitted SQE still references this object. GATEWAY-INTERNALS.md section 7.
+        /// Closed, not yet freed: GATEWAY-INTERNALS.md section 7.
         bool doomed = false;
         bool close_after_resp = false; // client-only: this is an error reply, so close once it flushes
 
         uint64_t id = 0; // client conns: stable id; upstream conns: 0
 
-        /// Non-streaming chunked decode state, per connection so the decoder is fed
-        /// only new bytes across reads; the shared-scratch form was quadratic.
+        /// Non-streaming chunked decode, fed only new bytes across reads.
         net::http::ResponseDecoder rdec;
 
         std::string rbuf;
         std::string wbuf;
 
-        /// Bytes of wbuf on the socket, or fed to the Session under TLS. wbuf is never cleared
-        /// by a write, so a request stays resendable. GATEWAY-INTERNALS.md section 2b.
+        /// Bytes of wbuf on the socket, or fed to the Session: GATEWAY-INTERNALS.md 2b.
         size_t woff = 0;
 
-        /// `ts_accepted` and `ts_first_byte` mean accept and first request byte on a client, socket
-        /// creation and first response byte on an upstream. `client_` fields are client-only.
+        /// Accept and first request byte on a client; socket creation and first
+        /// response byte on an upstream.
         int64_t ts_accepted = 0;
-        /// Client conns: when this connection last completed a request. The setup
-        /// deadline reaps a client that never framed anything; this reaps one that
-        /// framed something long ago and then sat on the descriptor.
+        int64_t ts_first_byte = 0;
+        /// Client conns: when this connection last completed a request, for the idle
+        /// deadline; the setup deadline covers one that never framed anything.
         int64_t ts_client_activity = 0;
         bool ever_framed = false;
-        bool client_conn_reused = false;
-        int64_t client_conn_setup_ns = 0;
         /// Total length of the request being buffered, learned from its headers on
         /// the first partial read, or 0 when none is in progress.
         size_t client_frame_want = 0;
-        /// An interim `100 Continue` was handed to the TLS layer and its ciphertext
-        /// has not fully left the socket.
+        /// An interim `100 Continue`'s ciphertext has not fully left the socket.
         bool client_interim_inflight = false;
 
         Connection* peer = nullptr; // linked counterpart for the in-flight request
         net::http::Message msg{};
+        /// Client conns: the request in flight, reset by req.begin() at framing.
+        RequestCtx req;
 
-        /// Latency stamps (ns) for the active request, t0-t6 in LATENCY.md. `client_upload_ns` is
-        /// t0 minus the first byte: the client's network, not our work.
-        int64_t ts_first_byte = 0;
-        int64_t client_upload_ns = 0;
-        int64_t ts_req_recvd = 0;
-        /// t1, the end of our request-side compute. Separate from what follows because
-        /// a cold connection puts ~50 ms of TCP+TLS setup between it and the write,
-        /// against ~5 us on a pooled one, and one number cannot honestly carry both.
-        int64_t ts_req_built = 0;
-        int64_t ts_wire_ready = 0;
-        int64_t ts_up_sent = 0;
-        int64_t ts_up_recvd = 0;
-        /// Streaming only, outside the t0-t6 scheme: the first content token, the
-        /// first thinking delta, and the longest silence between chunks once tokens
-        /// have started.
-        int64_t ts_first_token = 0;
-        int64_t ts_first_thinking = 0;
-        int64_t ts_last_chunk = 0;
-        int64_t max_chunk_gap_ns = 0;
-        /// What the provider said about its own limits on this response.
-        uint8_t quota_exhausted = 0;
-        uint16_t retry_after_s = 0;
-        /// Last upstream progress, request forwarded or bytes received; the idle
-        /// sweep measures against it.
-        int64_t ts_up_activity = 0;
-
-        /// io_uring only: submitted-but-uncompleted SQEs referencing this conn, one
-        /// protocol with `doomed`. GATEWAY-INTERNALS.md section 5b.
+        /// io_uring only: SQEs still referencing this conn. GATEWAY-INTERNALS.md 5b.
         int inflight = 0;
-        /// io_uring stale-connection handling: reused from the pool, so a failure
-        /// before any response is retry-eligible, and already retried once.
+        /// Reused from the pool, so a failure before any response may retry once.
         bool from_pool = false;
         bool retried = false;
 
-        /// Streaming state, held on the client conn for the active request. `streaming`
-        /// is a one-way latch set in ep_begin_stream / ur_begin_stream only.
-        bool streaming = false;
-        bool stream_chunked = false; // upstream body uses chunked transfer-encoding
-
-        /// No further stream output will come. With close_after_resp set it was
-        /// truncated, with it clear the end was clean. GATEWAY-INTERNALS.md 6b.
-        bool stream_ended = false;
-
-        /// Epoll only, and the one place the backends deliberately differ: epoll applies
-        /// back-pressure to a slow client, io_uring drops the stream past kUrStreamBufCap.
-        /// Written only by ep_pause_read / ep_resume_read. GATEWAY-INTERNALS.md 6c.
+        /// Epoll back-pressure, written only by ep_pause/resume_read. GATEWAY-INTERNALS.md 6c.
         bool read_paused = false;
-        bool wants_usage = false;    // client set stream_options.include_usage
-        /// What the policy asked this request's `model` and `service_tier` to become,
-        /// empty for none, and what the client's own body carried, copied out because
-        /// the request buffer is reused before the sink runs.
-        std::string_view model_override{};
-        std::string_view tier_override{};
-        char asked_tier[16] = {};
-        uint8_t asked_tier_len = 0;
-        /// What the venue called this failure, from its own error body on a non-2xx.
-        char upstream_error[32] = {};
-        uint8_t upstream_error_len = 0;
-        /// Client-only: the upstream this request took was already connected.
-        bool upstream_pooled = false;
-        /// The venue's own id for this request.
-        char venue_req_id[64] = {};
-        uint8_t venue_req_id_len = 0;
-        char served_tier[16] = {};
-        uint8_t served_tier_len = 0;
-        /// Reads searched for the served tier so far, so a venue without the field
-        /// is given up on quickly instead of searched on every chunk.
-        uint8_t served_tier_tries = 0;
-        /// The model the reply names, cut at 64 bytes: longer ids exist only as
-        /// Bedrock ARNs, and a prefix that long still tells one model from another.
-        char served_model[64] = {};
-        uint8_t served_model_len = 0;
-        uint8_t served_model_tries = 0;
 
-        /// The Anthropic-to-OpenAI SSE translator, reset per stream and used only while
-        /// `sse_translating`; held by value so a stream allocates none.
+        /// The SSE translator, reset per stream; by value, so a stream allocates none.
         provider::AnthropicToOpenAiSse sse_xlate;
-        bool sse_translating = false;
-        /// Usage a byte-forwarded stream states, read as it arrives.
-        provider::openai::StreamUsage stream_usage;
-        /// Scratch for one streaming step's decoded bytes, reused across chunks.
-        std::string sse_scratch{};
         /// A translated reply body, before it is framed into `wbuf`; capacity kept.
         std::string xlate_scratch{};
-        /// The stream is framed to the client with chunked transfer-encoding instead
-        /// of being close-delimited. False for an HTTP/1.0 caller and for one that
-        /// asked to close.
-        bool stream_chunked_out = false;
-        net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
-        /// io_uring streaming only: translated output accumulates here while a client
-        /// send SQE is in flight, so `wbuf` is never reallocated under the kernel.
+        /// io_uring streams: output staged while a send SQE reads `wbuf`.
         std::string wpending;
 
-        /// io_uring: an SQE referencing this connection's send buffer is outstanding,
-        /// so that buffer must not move. Callers must never set it; two once did, and
-        /// one of them hung every TLS stream. GATEWAY-INTERNALS.md section 5b.
+        /// io_uring: a send SQE reads this connection's buffer, which must not move. Set
+        /// only by ur_submit_send. GATEWAY-INTERNALS.md section 5b.
         bool send_inflight = false;
-        /// Upstream said keep-alive on the streaming response, so the connection may
-        /// be pooled once the body's terminal chunk has been consumed.
-        bool stream_keep_alive = false;
 
-        /// Upstream conns only: when this connection entered the idle pool. Reaped
-        /// after _pool_idle_ns; providers drop idle keep-alives on their own schedule,
-        /// and a pooled corpse costs a retry to discover.
+        /// Upstream conns only: when this connection entered the idle pool, reaped
+        /// after _pool_idle_ns, and when this request took it, which bounds the retry.
         int64_t ts_pooled = 0;
-        int64_t ts_pool_taken = 0; ///< when this request took it from the pool; bounds the retry
+        int64_t ts_pool_taken = 0;
 
 #ifdef LLMBRIDGE_HAVE_TLS
-        /// Null = plaintext. The Session stays attached across keep-alive pool cycles,
-        /// so a pooled reuse pays no second handshake.
+        /// Null = plaintext. Kept across pool cycles: a pooled reuse pays no handshake.
         std::unique_ptr<net::tls::Session> tls;
-        /// Ciphertext awaiting the socket; wbuf keeps the plaintext for stale-conn
-        /// retry. `woff >= wbuf.size()` means fully encrypted, never fully sent; that
-        /// is tls_out_off. GATEWAY-INTERNALS.md 10b.
+        /// Ciphertext awaiting the socket; `woff` counts encrypted, this sent (10b).
         std::string tls_out;
         size_t tls_out_off = 0;
 #endif

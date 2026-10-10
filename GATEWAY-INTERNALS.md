@@ -117,6 +117,20 @@ came from the pool and no response byte has arrived.
 Everything above is shared. What differs is **how the I/O is issued and how
 completion is discovered**, which is section 4 and section 5.
 
+### 3b. One reset per request
+
+A request's state is `Connection::req` (`gateway/src/core/req.hpp`): `ReqState`, the
+trivially copyable part (sequence number, t0-t4 and the streaming stamps, usage,
+the policy's overrides and every bounded copy for the sink), and the decoders and
+buffers kept across requests. `RequestCtx::begin()` is the only reset. It runs at
+framing, as soon as the parser answers, and before any reply, a 400 included, so
+nothing a request reports can belong to the one before it on the connection. It
+constructs a fresh `ReqState` in place rather than assigning one, which writes only
+the scalars and leaves the string buffers' bytes alone. Strings the request keeps
+are `FixedStr` copies, never views: the policy's `model` and `service_tier` are
+copied at the decision (a longer one is refused with a 500, never cut), and a
+failover takes `Retry`'s.
+
 ## 4. The epoll backend
 
 Level-triggered epoll with optimistic writes. The loop owns the syscalls.
@@ -267,8 +281,9 @@ translate Anthropic events to OpenAI chunks, write to the client.
 
 Three flags carry the state, and their meanings are precise:
 
-- **`streaming`** is a one-way latch, never cleared. A streamed client response
-  is close-delimited, so the connection ends with the stream.
+- **`streaming`** latches in `*_begin_stream` and is cleared only when a stream
+  finalizes on a connection that is kept; the next request's `begin()` resets the
+  rest.
 - **`stream_ended`** means no further output will be produced. It becomes true
   two ways: cleanly, when the translator emitted its terminal `[DONE]`; or by
   truncation via `stream_truncate()`, which emits **no** `[DONE]` on purpose so a

@@ -58,11 +58,12 @@ namespace llmbridge
         /// the first one. Ignored when `allow` is false.
         int upstream_index = -1;
 
-        /// Rewrite the request's `model` before sending; empty leaves the client's. Must stay
-        /// valid until the gateway returns from framing this request, and is not retained.
+        /// Rewrite the request's `model` before sending; empty leaves the client's. Valid
+        /// until decide() returns; the gateway copies it, and a longer one than 255 bytes
+        /// gets the request a 500 instead of a cut name.
         std::string_view model{};
 
-        /// Set the request's `service_tier`; empty leaves the body alone. Same lifetime as `model`.
+        /// Set the request's `service_tier`, at most 32 bytes; empty leaves the body alone.
         std::string_view service_tier{};
 
         /// Logged, never sent; must outlive the call and carry no credential material.
@@ -88,6 +89,10 @@ namespace llmbridge
     {
         bool retry = false;
         int upstream_index = -1; ///< must be in range, and not the one that just failed
+        /// The new venue's overrides, as Decision's; empty sends the client's own, never
+        /// the failed venue's. Valid until on_failure returns.
+        std::string_view model{};
+        std::string_view service_tier{};
     };
 
     /// Non-owning, fixed at Gateway construction, called on its loop thread once per framed

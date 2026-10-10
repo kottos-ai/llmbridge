@@ -8,6 +8,57 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.76.0]. 2026-10-10
+
+### Fixed
+
+- **A failover no longer reads the policy's model after it is gone, and sends the new
+  venue its own model** (G3). `Decision::model` and `service_tier` were kept as views
+  into the policy's memory, which `policy.hpp` promises only for the decision, and a
+  failover read them again from a later event: a use-after-free under ASan, and venue
+  B sent venue A's model name in any build. The overrides are now copied at the
+  decision, and a failover takes `Retry::model` and `Retry::service_tier`.
+- **Each request's timing stamps are its own** (G5). t2 and t3 were stamped only while
+  still 0 and never reset, so a keep-alive client's next request on a fresh upstream
+  kept the first one's: `connect-us` went negative and `upwrite-us` counted the time
+  between the two requests, in the headers, the histograms and the sink. A failover's
+  new venue also gets its own t2.
+- **A framing error is a request of its own** (G9). Its 400 was sent before the
+  sequencer ran, so the log line and the sink record carried the previous request's
+  sequence number, stamps, venue and model on a keep-alive connection.
+- **A venue given only `ips` gets a Host header** (G17). The constructor built the
+  bare IP:PORT form's `Host` from `ip` before defaulting `ip` from `ips`, sending
+  `Host: :PORT`. Library callers only; the app always sets `ip`.
+
+### Changed
+
+- **One per-request reset.** A request's state is `RequestCtx`
+  (`gateway/src/core/req.hpp`), reset by `begin()` at framing and nowhere else. The
+  resets in `sink_emit` (which ran only with a sink installed) and
+  `stream_reset_for_next` are gone, and so is the `shrink_to_fit` of the stream
+  scratch on every request. Strings a request keeps are bounded `FixedStr` copies;
+  `GATEWAY-INTERNALS.md` 3b.
+- **Behaviour change: a policy's `model` or `service_tier` longer than the gateway
+  keeps (255 and 32 bytes) gets the request a 500** with a warning, where it used to be
+  spliced whole. A failover whose `Retry` names one that long is not taken: the client
+  gets the failure.
+- **Behaviour change: a failover sends the client's own `model` unless `Retry::model`
+  names another.** It used to resend the failed venue's override.
+- `policy.hpp`: `Retry` gains `model` and `service_tier` (additive). The gateway's own
+  error bodies know 500 (`api_error`); it went out as a 502 before.
+- The sink's `upstream_index` is -1 for a request refused before a venue was chosen,
+  instead of the previous request's venue.
+
+### Tests
+
+- `ProxyRoute.AFramingErrorAfterASuccessIsARequestOfItsOwn`,
+  `AVenueGivenOnlyAnAddressListNamesItInTheHostHeader`,
+  `AFailoverSendsTheRetryModelNotTheFailedVenuesOverride`,
+  `AFailoverWithoutAModelSendsTheClientsOwn`, `AnOverrideLongerThanTheGatewayKeepsIsA500`
+  and `ProxyRequestReset.ASecondRequestOnAColdUpstreamGetsItsOwnStamps`, both backends;
+  each fails with the fix reverted.
+
+
 ## [0.75.0]. 2026-10-10
 
 ### Changed

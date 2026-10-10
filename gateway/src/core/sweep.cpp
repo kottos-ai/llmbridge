@@ -38,7 +38,7 @@ namespace llmbridge
             _last_heartbeat_ns = now;
             size_t in_flight = 0;
             for (const auto& [id, c] : _clients)
-                if (!c->doomed && (c->peer != nullptr || c->streaming)) ++in_flight;
+                if (!c->doomed && (c->peer != nullptr || c->req.f.streaming)) ++in_flight;
             LB_INFO("heartbeat clients=", _clients.size(), " in_flight=", in_flight,
                     " pooled_upstreams=", pooled_upstream_count(),
                     " requests=", _stats.requests);
@@ -110,7 +110,7 @@ namespace llmbridge
             for (auto& [id, c] : _clients)
             {
                 if (c->doomed || !c->ever_framed || c->ts_client_activity == 0) continue;
-                if (c->peer != nullptr || c->streaming) continue; // in flight
+                if (c->peer != nullptr || c->req.f.streaming) continue; // in flight
                 if (now - c->ts_client_activity > _client_idle_ns) quiet.push_back(c);
             }
             for (Connection* c : quiet)
@@ -145,7 +145,7 @@ namespace llmbridge
             {
                 Connection* u = c->peer;
                 ++_stats.connect_timeouts;
-                LB_WARN(ReqId{c->req_seq}, " TIMEOUT upstream connect ", *u,
+                LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT upstream connect ", *u,
                         " after_ns=", now - u->ts_accepted, " limit_ns=", _connect_ns);
                 note_connect_failure(u->upstream_slot, "timed out");
                 c->peer = nullptr;
@@ -174,17 +174,17 @@ namespace llmbridge
         for (auto& [id, c] : _clients)
         {
             if (c->doomed) continue;
-            const bool in_flight = c->peer != nullptr || c->streaming;
-            if (!in_flight || c->ts_up_activity == 0) continue;
-            if (now - c->ts_up_activity > _upstream_idle_ns) stale.push_back(c);
+            const bool in_flight = c->peer != nullptr || c->req.f.streaming;
+            if (!in_flight || c->req.f.ts_up_activity == 0) continue;
+            if (now - c->req.f.ts_up_activity > _upstream_idle_ns) stale.push_back(c);
         }
         for (Connection* c : stale)
         {
             ++_stats.upstream_timeouts;
-            LB_WARN(ReqId{c->req_seq}, " TIMEOUT upstream silent ", *c,
-                    " after_ns=", now - c->ts_up_activity, " limit_ns=", _upstream_idle_ns,
-                    " streaming=", c->streaming);
-            const bool streaming = c->streaming;
+            LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT upstream silent ", *c,
+                    " after_ns=", now - c->req.f.ts_up_activity, " limit_ns=", _upstream_idle_ns,
+                    " streaming=", c->req.f.streaming);
+            const bool streaming = c->req.f.streaming;
             if (streaming)
             {
                 // Response headers are already out; truncate honestly (no [DONE]).

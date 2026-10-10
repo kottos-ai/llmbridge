@@ -87,6 +87,12 @@ namespace llmbridge
         // Every path below indexes the table without a bounds special case, so an empty
         // one is a programming error caught here and not a crash on the first request.
         if (_upstreams.empty()) throw std::runtime_error("Gateway: no upstreams configured");
+        // The address first: the bare IP:PORT form's Host header is built from it.
+        for (Upstream& u : _upstreams)
+        {
+            if (u.ips.empty()) u.ips.push_back(u.ip);
+            if (u.ip.empty()) u.ip = u.ips.front();
+        }
         for (Upstream& u : _upstreams)
         {
             u.host_hdr = host_header_for(u);
@@ -98,11 +104,6 @@ namespace llmbridge
                     "--translate azure may carry one");
         }
         _idle_upstreams.resize(_upstreams.size());
-        for (Upstream& u : _upstreams)
-        {
-            if (u.ips.empty()) u.ips.push_back(u.ip);
-            if (u.ip.empty()) u.ip = u.ips.front();
-        }
         _rr_inflight.assign(_upstreams.size(), 0);
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.

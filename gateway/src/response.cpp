@@ -44,6 +44,7 @@ namespace llmbridge::detail
                 case 413: return {"HTTP/1.1 413 Content Too Large", "invalid_request_error", "request too large"};
                 case 415: return {"HTTP/1.1 415 Unsupported Media Type", "invalid_request_error", "compressed request body is not supported"};
                 case 429: return {"HTTP/1.1 429 Too Many Requests", "rate_limit_error", "rate limit exceeded"};
+                case 500: return {"HTTP/1.1 500 Internal Server Error", "api_error", "internal error"};
                 case 503: return {"HTTP/1.1 503 Service Unavailable", "service_error", "service unavailable"};
                 case 504: return {"HTTP/1.1 504 Gateway Timeout", "timeout_error", "upstream timed out"};
                 // Anything unlisted keeps the historical fallback, a policy's status

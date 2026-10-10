@@ -49,39 +49,15 @@ namespace llmbridge::detail
     inline bool stream_upstream_reusable(const Connection* client, const Connection* u) noexcept
     {
         return client != nullptr && u != nullptr && !u->doomed && u->fd >= 0
-               && client->stream_keep_alive && client->stream_chunked
-               && client->chunkdec.done() && u->rbuf.empty() && !client->close_after_resp;
+               && client->req.f.stream_keep_alive && client->req.f.stream_chunked
+               && client->req.chunkdec.done() && u->rbuf.empty() && !client->close_after_resp;
     }
 
     /// Can reuse only if we framed the reply so the body has an end marker, the
     /// stream reached that marker, and the caller wanted the connection kept.
     [[nodiscard]] inline bool stream_client_reusable(const Connection* c) noexcept
     {
-        return c->stream_chunked_out && !c->close_after_resp && c->msg.keep_alive;
-    }
-
-    /// Clear the per-stream state so the next request on this connection starts clean.
-    inline void stream_reset_for_next(Connection* c) noexcept
-    {
-        c->streaming = false;
-        c->stream_ended = false;
-        c->stream_chunked = false;
-        c->stream_chunked_out = false;
-        c->stream_keep_alive = false;
-        c->wants_usage = false;
-        c->sse_translating = false;
-        c->chunkdec = net::http::ChunkDecoder{};
-        c->stream_usage.reset();
-        c->sse_scratch.clear();
-        c->ts_first_token = 0;
-        c->ts_first_thinking = 0;
-        c->ts_last_chunk = 0;
-        c->max_chunk_gap_ns = 0;
-        c->served_tier_len = 0;
-        c->served_tier_tries = 0;
-        c->served_model_len = 0;
-        c->served_model_tries = 0;
-        c->venue_req_id_len = 0;
+        return c->req.f.stream_chunked_out && !c->close_after_resp && c->msg.keep_alive;
     }
 
 } // namespace llmbridge::detail
