@@ -11,6 +11,7 @@
 // keep-alive, multi-client + upstream-pool reuse, warm-up gating,
 // upstream-refused error, and clean shutdown.
 
+#include "core/conn.hpp" // Connection::s_live
 #include "gateway/gateway.hpp"
 
 #include <gtest/gtest.h>

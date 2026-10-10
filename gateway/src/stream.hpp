@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 
+#include "core/conn.hpp"
 #include "gateway/gateway.hpp"
 #include "scan.hpp"
 

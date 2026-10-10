@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "gateway/dialect.hpp"
+#include "core/conn.hpp"
 #include "gateway/gateway.hpp"
 #include "provider/translate.hpp"
 

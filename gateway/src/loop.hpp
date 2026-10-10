@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/conn.hpp"
 #include "gateway/gateway.hpp"
 #include "net/secure.hpp"
 
@@ -84,3 +85,12 @@ namespace llmbridge::detail
     }
 
 } // namespace llmbridge::detail
+
+namespace llmbridge
+{
+    inline const Upstream& Gateway::upstream_of(const Connection* c) const noexcept
+    {
+        const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
+        return _upstreams[i < _upstreams.size() ? i : 0];
+    }
+} // namespace llmbridge
