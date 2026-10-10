@@ -15,9 +15,9 @@
 //   - Error     : non-numeric / signed / empty Content-Length, oversize header,
 //                 Transfer-Encoding, conflicting duplicate CL, over-cap body.
 //   - Pipeline  : concatenated messages -> first is framed, total_len = first.
-//   - Lenient   : documented parser quirks (identical dup CL collapses, "closed"
-//                 prefix-matching "close"). Note: "trailing garbage after CL is
-//                 accepted" used to live here as a quirk. It was a smuggling
+//   - Lenient   : documented parser quirks (identical dup CL collapses). Note:
+//                 "trailing garbage after CL is accepted" used to live here as a
+//                 quirk. It was a smuggling
 //                 primitive, not a quirk; see the HttpDesync suite, which now
 //                 asserts the rejection.
 //   - HttpDesync: framing-desync regressions from the 2026-08-03 security sweep.
@@ -451,12 +451,55 @@ TEST(HttpVersion, ParsedFromTheRequestLineAndDrivesTheKeepAliveDefault)
     EXPECT_TRUE(m10k.keep_alive) << "an explicit keep-alive overrides the 1.0 default";
 }
 
-TEST(HttpQuirk, ConnectionClosedPrefixMatchesClose)
+// N2: Connection is a token list. Reading only a leading "close" kept
+// `keep-alive, close` open and read `closed` as close.
+TEST(HttpConnection, RequestConnectionIsATokenList)
 {
+    const auto ka = [](const std::string& conn) {
+        Message m;
+        EXPECT_EQ(parse_request(build("POST", {"Connection: " + conn, "Content-Length: 1"}, "x"), m),
+                  FrameStatus::Complete);
+        return m.keep_alive;
+    };
+    EXPECT_FALSE(ka("keep-alive, close"));
+    EXPECT_FALSE(ka("Upgrade,CLOSE"));
+    EXPECT_FALSE(ka("close"));
+    EXPECT_TRUE(ka("closed"));
+    EXPECT_TRUE(ka("keep-alive"));
+
     Message m;
-    ASSERT_EQ(parse_request(build("POST", {"Connection: closed", "Content-Length: 1"}, "x"), m),
+    ASSERT_EQ(parse_request("GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n", m),
               FrameStatus::Complete);
-    EXPECT_FALSE(m.keep_alive);
+    EXPECT_FALSE(m.keep_alive) << "close in any Connection field wins";
+}
+
+// N2: an HTTP/1.0 response closes unless it says keep-alive. Pooling one sent the
+// next request into a connection the server was closing, and every reuse became a
+// stale-connection retry.
+TEST(HttpConnection, ResponseKeepAliveFollowsTheVersionAndTheTokenList)
+{
+    const auto ka = [](std::string_view head) {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(llmbridge::net::http::parse_response_head(head, h), FrameStatus::Complete) << head;
+        return h.keep_alive;
+    };
+    EXPECT_FALSE(ka("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_FALSE(ka("HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_FALSE(ka("HTTP/1.1 200 OK\r\nConnection: te, Close\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.1 200 OK\r\nConnection: closed\r\nContent-Length: 0\r\n\r\n"));
+}
+
+TEST(HttpConnection, HasTokenMatchesWholeTokensOnly)
+{
+    using llmbridge::net::http::has_token;
+    EXPECT_TRUE(has_token("close", "close"));
+    EXPECT_TRUE(has_token(" a ,\tClose\t, b", "close"));
+    EXPECT_FALSE(has_token("closed", "close"));
+    EXPECT_FALSE(has_token("un close", "close"));
+    EXPECT_FALSE(has_token("", "close"));
+    EXPECT_FALSE(has_token(",,", "close"));
 }
 TEST(HttpQuirk, IdempotentReparseGivesSameResult)
 {

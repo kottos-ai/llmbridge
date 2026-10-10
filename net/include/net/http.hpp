@@ -185,6 +185,19 @@ namespace llmbridge::net::http
         }
     } // namespace detail
 
+    /// Whether the comma-separated `list` holds `lower` as a whole token, any case.
+    inline bool has_token(std::string_view list, std::string_view lower) noexcept
+    {
+        while (!list.empty())
+        {
+            const size_t comma = list.find(',');
+            if (detail::same_ci(detail::trim_ows(list.substr(0, comma)), lower)) return true;
+            if (comma == std::string_view::npos) break;
+            list.remove_prefix(comma + 1);
+        }
+        return false;
+    }
+
     /// Calls `on_line(const HeaderLine&) -> bool` for each header line of `head`, the
     /// bytes before the terminating CRLFCRLF; the start line is checked, then skipped.
     /// False when another parser could split the head differently (a bare CR or LF
@@ -257,7 +270,7 @@ namespace llmbridge::net::http
         out.http_1_1 = ver == "HTTP/1.1";
         if (ver == "HTTP/1.0") out.keep_alive = false;
 
-        bool have_cl = false;
+        bool have_cl = false, close = false, keep = false;
         const bool ok = walk_headers(head, [&](const HeaderLine& h) noexcept {
             switch (h.field)
             {
@@ -279,17 +292,15 @@ namespace llmbridge::net::http
                     return true;
                 }
                 case Field::Connection:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
-                    else if (v.size() >= 10 && detail::line_is(v, "keep-alive")) out.keep_alive = true;
+                    close |= has_token(h.value, "close");
+                    keep |= has_token(h.value, "keep-alive");
                     return true;
-                }
                 default:
                     return true;
             }
         });
         if (!ok || out.body_len > kMaxBodyLen) return FrameStatus::Error;
+        if (close || keep) out.keep_alive = !close;
 
         out.total_len = out.header_len + out.body_len;
         if (buf.size() < out.total_len) return FrameStatus::NeedMore;
@@ -338,6 +349,8 @@ namespace llmbridge::net::http
             code = code * 10 + (rest[k] - '0');
         if (k == 3) out.status = code;
 
+        out.keep_alive = head[7] == '1'; // 1.0 closes unless it says keep-alive
+        bool close = false, keep = false;
         using Quota = ResponseHead::Quota;
         const auto quota = [&out](std::string_view v, Quota q) noexcept {
             if (detail::is_zero_count(v)) out.quota_exhausted = q;
@@ -379,16 +392,15 @@ namespace llmbridge::net::http
                     if (detail::contains_ci(h.value, "text/event-stream")) out.event_stream = true;
                     return true;
                 case Field::Connection:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
+                    close |= has_token(h.value, "close");
+                    keep |= has_token(h.value, "keep-alive");
                     return true;
-                }
                 default:
                     return true;
             }
         });
         if (!ok) return FrameStatus::Error;
+        if (close || keep) out.keep_alive = !close;
         // Both framings present (RFC 9112 §6.3): refuse instead of picking one.
         if (out.chunked && out.has_content_length) return FrameStatus::Error;
         if (out.has_content_length && out.content_length > kMaxBodyLen) return FrameStatus::Error;
