@@ -957,3 +957,120 @@ TEST(WalkHeaders, StopsWhenTheCallerRefuses)
         }));
     EXPECT_EQ(calls, 1);
 }
+
+// ── provider heads ───────────────────────────────────────────────────────────
+//
+// Smoke test for the strict framer: responses shaped like the venues' own (their
+// header sets, casing, chunking), plus the legal forms a strict reading could trip
+// on: a status line with no reason phrase, chunk extensions, an HTTP/1.0 reply.
+namespace
+{
+    struct ProviderReply
+    {
+        const char* name;
+        std::string wire;
+        int status;
+        llmbridge::net::http::Body body;
+        bool keep_alive;
+        std::string_view payload;
+    };
+
+    constexpr std::string_view kJson = R"({"id":"x","usage":{"input_tokens":3}})";
+
+    std::vector<ProviderReply> provider_replies()
+    {
+        using llmbridge::net::http::Body;
+        const std::string len = std::to_string(kJson.size());
+        const auto hex = [](size_t n) {
+            char b[16];
+            std::snprintf(b, sizeof b, "%zx", n);
+            return std::string(b);
+        };
+        const std::string chunked = hex(kJson.size()) + "\r\n" + std::string(kJson) + "\r\n0\r\n\r\n";
+        return {
+            {"anthropic", "HTTP/1.1 200 OK\r\nDate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                          "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+                          "Connection: keep-alive\r\nanthropic-ratelimit-requests-remaining: 3999\r\n"
+                          "request-id: req_011CTEST\r\nanthropic-organization-id: 0000\r\n"
+                          "via: 1.1 google\r\nCF-RAY: 8c01-IAD\r\nServer: cloudflare\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"anthropic_stream", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+                                 "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n"
+                                 "Cache-Control: no-cache\r\nrequest-id: req_011CTEST\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"openai", "HTTP/1.1 200 OK\r\ndate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                       "content-type: application/json\r\ntransfer-encoding: chunked\r\n"
+                       "connection: keep-alive\r\nopenai-processing-ms: 412\r\n"
+                       "x-ratelimit-remaining-requests: 9999\r\nx-ratelimit-remaining-tokens: 199000\r\n"
+                       "x-request-id: req_abc\r\nalt-svc: h3=\":443\"; ma=86400\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"gemini", "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n"
+                       "Vary: Origin\r\nVary: X-Origin\r\nVary: Referer\r\n"
+                       "Transfer-Encoding: chunked\r\nServer: scaffolding on HTTPServer2\r\n"
+                       "X-XSS-Protection: 0\r\nServer-Timing: gfet4t7; dur=812\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"bedrock", "HTTP/1.1 200 OK\r\nDate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                        "Content-Type: application/json\r\nContent-Length: " + len + "\r\n"
+                        "Connection: keep-alive\r\nx-amzn-RequestId: 6f1c\r\n"
+                        "X-Amzn-Bedrock-Invocation-Latency: 812\r\n\r\n" + std::string(kJson),
+             200, Body::Length, true, kJson},
+            {"no_reason_phrase", "HTTP/1.1 200\r\nContent-Type: application/json\r\nContent-Length: " +
+                                 len + "\r\n\r\n" + std::string(kJson),
+             200, Body::Length, true, kJson},
+            {"chunk_extensions", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                 "10;name=value\r\n" + std::string(kJson.substr(0, 16)) + "\r\n" +
+                                 hex(kJson.size() - 16) + " ;q=\"a b\"\r\n" +
+                                 std::string(kJson.substr(16)) + "\r\n0;last\r\nx-trailer: 1\r\n\r\n",
+             200, Body::Chunked, true, kJson},
+            {"rate_limited", "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                             "retry-after: 20\r\nx-ratelimit-remaining-requests: 0\r\n"
+                             "Content-Length: " + len + "\r\n\r\n" + std::string(kJson),
+             429, Body::Length, true, kJson},
+            {"http_1_0_proxy", "HTTP/1.0 200 OK\r\nContent-Length: " + len + "\r\n\r\n" + std::string(kJson),
+             200, Body::Length, false, kJson},
+            {"not_modified", "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 1234\r\n\r\n",
+             304, Body::None, true, ""},
+        };
+    }
+} // namespace
+
+TEST(ProviderHeads, EveryShapeFramesWholeAndByteByByte)
+{
+    for (const ProviderReply& p : provider_replies())
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const auto r = llmbridge::net::http::parse_response(p.wire, st);
+        ASSERT_EQ(r.status, FrameStatus::Complete) << p.name;
+        EXPECT_EQ(r.head.status, p.status) << p.name;
+        EXPECT_EQ(r.head.body, p.body) << p.name;
+        EXPECT_EQ(r.head.keep_alive, p.keep_alive) << p.name;
+        EXPECT_EQ(r.body, p.payload) << p.name;
+        EXPECT_EQ(r.total_len, p.wire.size()) << p.name;
+
+        llmbridge::net::http::ResponseDecoder inc;
+        std::string buf;
+        FrameStatus last = FrameStatus::NeedMore;
+        for (const char c : p.wire)
+        {
+            ASSERT_EQ(last, FrameStatus::NeedMore) << p.name << ": framed before its last byte";
+            buf += c;
+            last = llmbridge::net::http::parse_response(buf, inc).status;
+        }
+        EXPECT_EQ(last, FrameStatus::Complete) << p.name;
+    }
+}
+
+TEST(ProviderHeads, RateLimitHeadsNameTheQuota)
+{
+    for (const ProviderReply& p : provider_replies())
+    {
+        llmbridge::net::http::ResponseHead h;
+        ASSERT_EQ(llmbridge::net::http::parse_response_head(p.wire, h), FrameStatus::Complete) << p.name;
+        const bool limited = std::string_view(p.name) == "rate_limited";
+        EXPECT_EQ(h.retry_after_s, limited ? 20 : 0) << p.name;
+        EXPECT_EQ(h.quota_exhausted, limited ? llmbridge::net::http::ResponseHead::Quota::Requests
+                                             : llmbridge::net::http::ResponseHead::Quota::None)
+            << p.name;
+        EXPECT_EQ(h.event_stream, std::string_view(p.name) == "anthropic_stream") << p.name;
+    }
+}
