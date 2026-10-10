@@ -5,21 +5,14 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-#include <charconv>
 #include "provider/sse.hpp"
+
+#include <charconv>
+#include <cstring>
 
 #include "json_scan.hpp"
 #include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
 #include "provider/json.hpp"
-
-// Note (extract at second user): feed() below is two concerns bolted together
-// (a) dialect-agnostic SSE *framing* (line splitting, the fragmentation buffer,
-// the byte caps, the O(n) resume-scan) and (b) Anthropic-specific *event mapping*
-// (dispatch -> OpenAI chunks). When the second streaming dialect lands (the
-// reverse direction, or Gemini/Cohere), lift (a) into a reusable SseFrameReader
-// with a per-dialect on_event() callback. Deliberately not abstracted yet:
-// with a single consumer the seams would be guesses. See CLAUDE.md. "no
-// premature abstraction".
 
 namespace llmbridge::provider
 {
@@ -41,6 +34,106 @@ namespace llmbridge::provider
             return s;
         }
     } // namespace
+
+    void SseFrameReader::reset() noexcept
+    {
+        _in = {};
+        _at = 0;
+        _line.clear();
+        _data.clear();
+        _view = {};
+        _viewing = _have = _line_owned = _skip_lf = _stopped = _failed = false;
+    }
+
+    SseFrameReader::Step SseFrameReader::fail() noexcept
+    {
+        _failed = true;
+        _line.clear(); _line.shrink_to_fit();
+        _data.clear(); _data.shrink_to_fit();
+        return Step::Fail;
+    }
+
+    // The next whole line, or false once the input is spent (its unfinished tail is
+    // kept in _line). Each byte is searched once however the stream is split.
+    bool SseFrameReader::take_line(std::string_view& line)
+    {
+        if (_line_owned) { _line.clear(); _line_owned = false; }
+        if (_skip_lf)
+        {
+            if (_at >= _in.size()) return false;
+            if (_in[_at] == '\n') ++_at;
+            _skip_lf = false;
+        }
+        if (_at >= _in.size()) return false;
+        const char* const b = _in.data();
+        const void* lf = std::memchr(b + _at, '\n', _in.size() - _at);
+        const size_t end = lf ? static_cast<size_t>(static_cast<const char*>(lf) - b) : _in.size();
+        const void* cr = std::memchr(b + _at, '\r', end - _at);
+        const size_t k = cr ? static_cast<size_t>(static_cast<const char*>(cr) - b) : end;
+        const std::string_view piece = _in.substr(_at, k - _at);
+        if (k == _in.size())
+        {
+            _line.append(piece);
+            _at = k;
+            return false;
+        }
+        _at = k + 1;
+        if (_in[k] == '\r')
+        {
+            if (_at < _in.size()) { if (_in[_at] == '\n') ++_at; }
+            else _skip_lf = true;
+        }
+        if (_line.empty()) { line = piece; return true; }
+        _line.append(piece);
+        _line_owned = true;
+        line = _line;
+        return true;
+    }
+
+    bool SseFrameReader::add_data(std::string_view value, bool in_place)
+    {
+        if (!_have)
+        {
+            _have = true;
+            _viewing = in_place;
+            if (in_place) _view = value;
+            else _data.assign(value);
+        }
+        else
+        {
+            if (_viewing) { _data.assign(_view); _viewing = false; }
+            _data.push_back('\n'); // multi-line data is joined by LF
+            _data.append(value);
+        }
+        return (_viewing ? _view.size() : _data.size()) < kMaxEvent;
+    }
+
+    SseFrameReader::Step SseFrameReader::next(std::string_view& data)
+    {
+        if (_failed) return Step::Fail;
+        if (_stopped) return Step::More;
+        std::string_view line;
+        while (take_line(line))
+        {
+            if (line.empty())
+            {
+                if (!_have) continue;
+                _have = false;
+                data = _viewing ? _view : std::string_view(_data);
+                return Step::Event;
+            }
+            if (line.front() == ':') continue; // a comment
+            const size_t colon = line.find(':');
+            if (line.substr(0, colon) != "data") continue; // event, id, retry: unused
+            std::string_view value = colon == std::string_view::npos ? std::string_view{}
+                                                                     : line.substr(colon + 1);
+            if (!value.empty() && value.front() == ' ') value.remove_prefix(1);
+            if (!add_data(value, !_line_owned)) return fail();
+        }
+        if (_line.size() > kMaxLine) return fail();
+        if (_viewing) { _data.assign(_view); _viewing = false; } // _in goes away
+        return Step::More;
+    }
 
     // Stamp `created` exactly once: a fixed value if one was supplied, else the
     // wall clock. Constant across every chunk of the stream thereafter.
@@ -348,61 +441,17 @@ namespace llmbridge::provider
     bool AnthropicToOpenAiSse::feed(std::string_view bytes, std::string& out)
     {
         if (_failed) return false; // sticky: a capped stream stays dead
-
-        // The tail retained from the previous call is known to contain no '\n',
-        // so resume the newline search at the join point instead of rescanning
-        // it. Without this, feeding one long line one byte at a time is O(n^2)
-        // a hostile upstream dribbling bytes could pin a core (CPU-DoS the byte
-        // caps don't cover). With it, total scanning is O(bytes) regardless of
-        // how the stream is fragmented.
-        size_t from = _pending.size();
-        _pending.append(bytes);
-
-        size_t pos = 0;
-        while (true)
+        if (_done) return true;    // nothing after the terminal event is read
+        _frames.feed(bytes);
+        std::string_view data;
+        SseFrameReader::Step step;
+        while ((step = _frames.next(data)) == SseFrameReader::Step::Event)
         {
-            const size_t nl = _pending.find('\n', from);
-            if (nl == std::string::npos) break; // no complete line yet; keep the remainder
-
-            std::string_view line(_pending.data() + pos, nl - pos);
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1); // tolerate CRLF
-            pos = nl + 1;
-            from = pos;
-
-            if (line.empty()) // blank line terminates an event
-            {
-                if (_have_data) dispatch(_cur_data, out);
-                _cur_data.clear();
-                _have_data = false;
-            }
-            else if (line.rfind("data:", 0) == 0) // a data field
-            {
-                std::string_view d = line.substr(5);
-                if (!d.empty() && d.front() == ' ') d.remove_prefix(1); // one optional space
-                if (_cur_data.size() + d.size() + 1 > kMaxEvent) // endless event -> refuse
-                {
-                    _failed = true;
-                    _pending.clear(); _pending.shrink_to_fit();
-                    _cur_data.clear(); _cur_data.shrink_to_fit();
-                    return false;
-                }
-                if (_have_data) _cur_data.push_back('\n'); // SSE: multi-line data joined by \n
-                _cur_data.append(d);
-                _have_data = true;
-            }
-            // "event:" lines and ":" comments are ignored; we dispatch on the
-            // data payload's own "type" field, which is authoritative for Anthropic.
+            dispatch(data, out);
+            if (_done) { _frames.stop(); return true; }
         }
-        _pending.erase(0, pos);
-
-        if (_pending.size() > kMaxPending) // a single line this long is an attack, not a workload
-        {
-            _failed = true;
-            _pending.clear(); _pending.shrink_to_fit();
-            _cur_data.clear(); _cur_data.shrink_to_fit();
-            return false;
-        }
-        return true;
+        if (step == SseFrameReader::Step::Fail) _failed = true;
+        return !_failed;
     }
 
     bool AnthropicToOpenAiSse::finish(std::string& out)

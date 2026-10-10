@@ -1067,3 +1067,56 @@ TEST(SseTools, PlainTextStreamsAreUnaffected)
     EXPECT_NE(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
     EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
 }
+
+// ── SseFrameReader: WHATWG framing ───────────────────────────────────────────
+namespace
+{
+    std::string bare_cr(std::string_view s) // rewrite LF -> CR
+    {
+        std::string o(s);
+        for (char& c : o)
+            if (c == '\n') c = '\r';
+        return o;
+    }
+
+    std::vector<std::string> frames(std::string_view in)
+    {
+        llmbridge::provider::SseFrameReader r;
+        std::vector<std::string> v;
+        r.feed(in);
+        std::string_view d;
+        while (r.next(d) == llmbridge::provider::SseFrameReader::Step::Event) v.emplace_back(d);
+        return v;
+    }
+} // namespace
+
+TEST(SseFrames, BareCrAndCrlfEndLinesLikeLf)
+{
+    EXPECT_EQ(translate_whole(bare_cr(kAnthropicText)), translate_whole(kAnthropicText));
+    EXPECT_EQ(translate_byte_by_byte(bare_cr(kAnthropicText)), translate_whole(kAnthropicText));
+    EXPECT_EQ(translate_byte_by_byte(crlf(kAnthropicText)), translate_whole(kAnthropicText))
+        << "a CR ending one read pairs with the LF opening the next";
+}
+
+TEST(SseFrames, ADataFieldWithoutAColonIsAnEmptyDataLine)
+{
+    EXPECT_EQ(frames("data\ndata: x\n\n"), (std::vector<std::string>{"\nx"}));
+    EXPECT_EQ(frames("data\n\n"), (std::vector<std::string>{""}));
+    EXPECT_EQ(frames(": comment\nevent: e\nid: 1\ndatax: no\n\n"), (std::vector<std::string>{}));
+    EXPECT_EQ(frames("data:a\r\ndata: b\r\rdata: c\n\n"), (std::vector<std::string>{"a\nb", "c"}));
+}
+
+TEST(SseFrames, NothingAfterTheTerminalEventIsRead)
+{
+    const std::string after =
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"AFTER-STOP\"}}\n\n";
+    for (const std::string& in : {std::string(kAnthropicText) + after,
+                                  std::string(kAnthropicText) + "data: [DONE]\n\n" + after})
+    {
+        const std::string out = translate_whole(in);
+        EXPECT_EQ(out.find("AFTER-STOP"), std::string::npos) << out;
+        EXPECT_EQ(out.find("[DONE]"), out.rfind("[DONE]")) << out;
+        EXPECT_EQ(translate_byte_by_byte(in), out);
+    }
+}

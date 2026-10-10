@@ -11,18 +11,52 @@
 // time: text and tool-call deltas. Stateful, because a read can split an event and OpenAI
 // chunks carry cross-event context: one translator per response, feed(), then finish().
 
+#include <cstdint>
 #include <string>
-#include <vector>
 #include <string_view>
+#include <vector>
 
 namespace llmbridge::provider
 {
+    /// Server-sent events framing (WHATWG): lines end in CR, LF or CRLF, a `data` field
+    /// may have no colon, and an event is dispatched at a blank line. Feed bytes, then
+    /// call next() until it stops returning Event.
+    class SseFrameReader
+    {
+    public:
+        static constexpr size_t kMaxLine = 1 << 20;  // a longer unfinished line fails
+        static constexpr size_t kMaxEvent = 4 << 20; // a longer event's data fails
+        enum class Step : uint8_t { Event, More, Fail };
+
+        /// `bytes` must stay valid until next() returns More or Fail.
+        void feed(std::string_view bytes) noexcept { _in = bytes; _at = 0; }
+        /// Event: `data` is the next event's data, valid until the next call.
+        Step next(std::string_view& data);
+        /// Reads nothing more: the stream's terminal event was seen.
+        void stop() noexcept { _stopped = true; }
+        void reset() noexcept;
+
+    private:
+        bool take_line(std::string_view& line);
+        bool add_data(std::string_view value, bool in_place);
+        Step fail() noexcept;
+
+        std::string_view _in;
+        size_t _at = 0;
+        std::string _line;      // an unfinished line carried to the next feed
+        std::string _data;      // the event's data, when it cannot stay a view
+        std::string_view _view; // the event's single data line, in place in _in
+        bool _viewing = false, _have = false, _line_owned = false;
+        bool _skip_lf = false; // a CR ended the last feed; an LF opening the next is its pair
+        bool _stopped = false, _failed = false;
+    };
+
     class AnthropicToOpenAiSse
     {
     public:
         // Caps on untrusted input: an endless line or event is a bad peer, not a workload.
-        static constexpr size_t kMaxPending = 1 << 20;  // 1 MiB: longest single line
-        static constexpr size_t kMaxEvent = 4 << 20;    // 4 MiB: one event's data
+        static constexpr size_t kMaxPending = SseFrameReader::kMaxLine;
+        static constexpr size_t kMaxEvent = SseFrameReader::kMaxEvent;
 
         // `created_secs` fixes every chunk's `created` stamp (-1: the wall clock, read once).
         // `include_usage` mirrors stream_options.include_usage: `"usage": null` on each chunk,
@@ -33,8 +67,8 @@ namespace llmbridge::provider
         }
 
         // Append the translation of these bytes to `out`; an incomplete event waits for the
-        // next call, and unknown or unparseable events are skipped. False, permanently,
-        // only when a cap is exceeded: the caller must drop the upstream.
+        // next call, unknown or unparseable events are skipped, and nothing after the
+        // terminal event is read. False, permanently, when a cap is exceeded.
         bool feed(std::string_view bytes, std::string& out);
 
         // Upstream EOF: a terminal finish chunk and [DONE], unless message_stop already sent them.
@@ -67,9 +101,7 @@ namespace llmbridge::provider
         void emit_usage(std::string& out);                    // the final usage-only chunk
         void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
-        std::string _pending;   // bytes not yet forming a complete line (frag buffer)
-        std::string _cur_data;  // concatenated `data:` lines of the in-progress event
-        bool _have_data = false;
+        SseFrameReader _frames;
         bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
         // Anthropic indexes every content block; OpenAI's tool_calls[].index counts only
         // calls, so block indices map to ordinals (-1: not a tool). Capped so a hostile index
