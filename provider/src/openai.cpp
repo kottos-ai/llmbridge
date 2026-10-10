@@ -149,37 +149,10 @@ namespace llmbridge::provider::openai
         }
     } // namespace
 
-    Envelope::Envelope(std::string& out, Shape s, std::string_view id, long long created,
-                       std::string_view model)
-        : _out(out), _shape(s)
+    std::string_view decimal(char (&buf)[24], long long v) noexcept
     {
-        out += "{\"id\":\"";
-        out += id;
-        out += s == Shape::Chunk ? "\",\"object\":\"chat.completion.chunk\",\"created\":"
-                                 : "\",\"object\":\"chat.completion\",\"created\":";
-        append_count(out, created);
-        out += ",\"model\":\"";
-        out += model;
-        out += "\",\"choices\":[";
-    }
-
-    Envelope& Envelope::choice()
-    {
-        _out += _shape == Shape::Chunk ? "{\"index\":0,\"delta\":{" : "{\"index\":0,\"message\":{";
-        return *this;
-    }
-
-    Envelope& Envelope::end_choice(std::string_view finish)
-    {
-        _out += "},\"finish_reason\":";
-        if (finish.empty()) _out += "null}";
-        else
-        {
-            _out += '"';
-            _out += finish;
-            _out += "\"}";
-        }
-        return *this;
+        const auto r = std::to_chars(buf, buf + sizeof buf, v);
+        return {buf, static_cast<size_t>(r.ptr - buf)};
     }
 
     void Envelope::close(const Usage* u, bool usage_null, long long total)

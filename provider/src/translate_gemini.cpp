@@ -125,8 +125,9 @@ namespace llmbridge::provider
         if (total <= 0) total = usage.in + usage.out;
 
         if (out.capacity() < gemini_body.size() + 256) out.reserve(gemini_body.size() + 256);
+        char created[24];
         openai::Envelope e(out, openai::Shape::Completion, "chatcmpl-llmbridge",
-                           detail::now_secs(), v.str_or("modelVersion"));
+                           openai::decimal(created, detail::now_secs()), v.str_or("modelVersion"));
         e.choice();
         out += "\"role\":\"assistant\",\"content\":\"";
         if (parts)

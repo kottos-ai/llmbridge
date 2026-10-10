@@ -1769,13 +1769,13 @@ TEST(TranslateEnvelope, WritesEachShapeOnce)
     u.in = 3;
     u.out = 4;
     u.cached = 2;
-    oai::Envelope(out, oai::Shape::Completion, "i", 7, "m").choice().end_choice("stop").close(&u);
+    oai::Envelope(out, oai::Shape::Completion, "i", "7", "m").choice().end_choice("stop").close(&u);
     EXPECT_EQ(out, R"({"id":"i","object":"chat.completion","created":7,"model":"m","choices":[)"
                    R"({"index":0,"message":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,)"
                    R"("completion_tokens":4,"total_tokens":7,"prompt_tokens_details":)"
                    R"({"cached_tokens":2}}})");
     out.clear();
-    oai::Envelope(out, oai::Shape::Chunk, "i", 7, "m").choice().end_choice("").close(nullptr, true);
+    oai::Envelope(out, oai::Shape::Chunk, "i", "7", "m").choice().end_choice("").close(nullptr, true);
     EXPECT_EQ(out, R"({"id":"i","object":"chat.completion.chunk","created":7,"model":"m",)"
                    R"("choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":null})");
     out.clear();

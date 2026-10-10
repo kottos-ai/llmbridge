@@ -29,7 +29,7 @@ namespace llmbridge::provider
         enum class Step : uint8_t { Event, More, Fail };
 
         /// `bytes` must stay valid until next() returns More or Fail.
-        void feed(std::string_view bytes) noexcept { _in = bytes; _at = 0; }
+        void feed(std::string_view bytes) noexcept;
         /// Event: `data` is the next event's data, valid until the next call.
         Step next(std::string_view& data);
         /// Reads nothing more: the stream's terminal event was seen.
@@ -37,7 +37,6 @@ namespace llmbridge::provider
         void reset() noexcept;
 
     private:
-        bool take_line(std::string_view& line);
         bool add_data(std::string_view value, bool in_place);
         Step fail() noexcept;
 
@@ -48,6 +47,7 @@ namespace llmbridge::provider
         std::string_view _view; // the event's single data line, in place in _in
         bool _viewing = false, _have = false, _line_owned = false;
         bool _skip_lf = false; // a CR ended the last feed; an LF opening the next is its pair
+        bool _cr = false;      // _in holds a CR, so lines end at either byte
         bool _stopped = false, _failed = false;
     };
 
@@ -117,7 +117,8 @@ namespace llmbridge::provider
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
         std::string _model;                     // from message_start
-        long long _created = -1;                // epoch seconds, set once
+        char _created[24] = {};                 // epoch seconds as text, set once
+        size_t _created_len = 0;
         long long _created_secs = -1;           // fixed stamp, or -1 => wall clock
         const char* _finish = nullptr;          // mapped stop_reason (static literal)
         bool _role_emitted = false;

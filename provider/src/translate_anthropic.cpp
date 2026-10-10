@@ -443,8 +443,9 @@ namespace llmbridge::provider
         detail::as_written(usage);
 
         if (out.capacity() < anthropic_body.size() + 256) out.reserve(anthropic_body.size() + 256);
+        char created[24];
         openai::Envelope e(out, openai::Shape::Completion, v.str_or("id", "chatcmpl-llmbridge"),
-                           detail::now_secs(), v.str_or("model"));
+                           openai::decimal(created, detail::now_secs()), v.str_or("model"));
         e.choice();
         out += "\"role\":\"assistant\",\"content\":";
         // Text blocks verbatim. OpenAI sets content to null, not "", on a pure tool call,

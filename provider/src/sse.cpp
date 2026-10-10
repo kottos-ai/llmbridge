@@ -44,41 +44,11 @@ namespace llmbridge::provider
         return Step::Fail;
     }
 
-    // The next whole line, or false once the input is spent (its unfinished tail is
-    // kept in _line). Each byte is searched once however the stream is split.
-    bool SseFrameReader::take_line(std::string_view& line)
+    void SseFrameReader::feed(std::string_view bytes) noexcept
     {
-        if (_line_owned) { _line.clear(); _line_owned = false; }
-        if (_skip_lf)
-        {
-            if (_at >= _in.size()) return false;
-            if (_in[_at] == '\n') ++_at;
-            _skip_lf = false;
-        }
-        if (_at >= _in.size()) return false;
-        const char* const b = _in.data();
-        const void* lf = std::memchr(b + _at, '\n', _in.size() - _at);
-        const size_t end = lf ? static_cast<size_t>(static_cast<const char*>(lf) - b) : _in.size();
-        const void* cr = std::memchr(b + _at, '\r', end - _at);
-        const size_t k = cr ? static_cast<size_t>(static_cast<const char*>(cr) - b) : end;
-        const std::string_view piece = _in.substr(_at, k - _at);
-        if (k == _in.size())
-        {
-            _line.append(piece);
-            _at = k;
-            return false;
-        }
-        _at = k + 1;
-        if (_in[k] == '\r')
-        {
-            if (_at < _in.size()) { if (_in[_at] == '\n') ++_at; }
-            else _skip_lf = true;
-        }
-        if (_line.empty()) { line = piece; return true; }
-        _line.append(piece);
-        _line_owned = true;
-        line = _line;
-        return true;
+        _in = bytes;
+        _at = 0;
+        _cr = !bytes.empty() && std::memchr(bytes.data(), '\r', bytes.size());
     }
 
     bool SseFrameReader::add_data(std::string_view value, bool in_place)
@@ -99,13 +69,46 @@ namespace llmbridge::provider
         return (_viewing ? _view.size() : _data.size()) < kMaxEvent;
     }
 
+    // Each byte is searched once however the stream is split; an unfinished line is
+    // kept in _line for the next feed.
     SseFrameReader::Step SseFrameReader::next(std::string_view& data)
     {
         if (_failed) return Step::Fail;
         if (_stopped) return Step::More;
-        std::string_view line;
-        while (take_line(line))
+        const char* const b = _in.data();
+        while (true)
         {
+            if (_line_owned) { _line.clear(); _line_owned = false; }
+            if (_skip_lf && _at < _in.size())
+            {
+                if (b[_at] == '\n') ++_at;
+                _skip_lf = false;
+            }
+            if (_at >= _in.size() || _skip_lf) break;
+            const void* lf = std::memchr(b + _at, '\n', _in.size() - _at);
+            size_t k = lf ? static_cast<size_t>(static_cast<const char*>(lf) - b) : _in.size();
+            if (_cr)
+                if (const void* cr = std::memchr(b + _at, '\r', k - _at))
+                    k = static_cast<size_t>(static_cast<const char*>(cr) - b);
+            std::string_view line = _in.substr(_at, k - _at);
+            if (k == _in.size())
+            {
+                _line.append(line);
+                _at = k;
+                break;
+            }
+            _at = k + 1;
+            if (b[k] == '\r')
+            {
+                if (_at < _in.size()) { if (b[_at] == '\n') ++_at; }
+                else _skip_lf = true;
+            }
+            if (!_line.empty())
+            {
+                _line.append(line);
+                _line_owned = true;
+                line = _line;
+            }
             if (line.empty())
             {
                 if (!_have) continue;
@@ -113,11 +116,11 @@ namespace llmbridge::provider
                 data = _viewing ? _view : std::string_view(_data);
                 return Step::Event;
             }
-            if (line.front() == ':') continue; // a comment
-            const size_t colon = line.find(':');
-            if (line.substr(0, colon) != "data") continue; // event, id, retry: unused
-            std::string_view value = colon == std::string_view::npos ? std::string_view{}
-                                                                     : line.substr(colon + 1);
+            // Only `data` is read: event, id, retry and `:` comments are skipped.
+            if (line.size() < 4 || line.compare(0, 4, "data") != 0 ||
+                (line.size() > 4 && line[4] != ':'))
+                continue;
+            std::string_view value = line.substr(line.size() > 4 ? 5 : 4);
             if (!value.empty() && value.front() == ' ') value.remove_prefix(1);
             if (!add_data(value, !_line_owned)) return fail();
         }
@@ -130,7 +133,10 @@ namespace llmbridge::provider
     // wall clock. Constant across every chunk of the stream thereafter.
     void AnthropicToOpenAiSse::ensure_created()
     {
-        if (_created < 0) _created = _created_secs >= 0 ? _created_secs : detail::now_secs();
+        if (_created_len == 0)
+            _created_len = openai::decimal(_created, _created_secs >= 0 ? _created_secs
+                                                                         : detail::now_secs())
+                               .size();
     }
 
     // A chunk through the open of its delta object; the caller appends the delta's
@@ -139,7 +145,7 @@ namespace llmbridge::provider
     {
         ensure_created();
         out += "data: ";
-        openai::Envelope(out, openai::Shape::Chunk, _id, _created, _model).choice();
+        openai::Envelope(out, openai::Shape::Chunk, _id, {_created, _created_len}, _model).choice();
     }
 
     // With include_usage, OpenAI puts a null `usage` on every normal chunk; the real
@@ -164,7 +170,7 @@ namespace llmbridge::provider
         u.out = _out_tok;
         u.cached = _cached_tok;
         out += "data: ";
-        openai::Envelope(out, openai::Shape::Chunk, _id, _created, _model).close(&u);
+        openai::Envelope(out, openai::Shape::Chunk, _id, {_created, _created_len}, _model).close(&u);
         out += "\n\n";
         _usage_emitted = true;
     }
