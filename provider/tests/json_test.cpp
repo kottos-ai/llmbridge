@@ -13,6 +13,7 @@
 
 #include <deque>
 #include <cstdlib>
+#include <random>
 #include <string>
 
 using llmbridge::provider::json::Value;
@@ -237,7 +238,7 @@ TEST(EscapeRoundTrip, JsonBecomesAStringAndBack)
 {
     const std::string original = R"({"city":"Paris","q":"say \"hi\"","n":-1.5})";
     std::string escaped;
-    llmbridge::provider::json::append_escaped_string(escaped, original);
+    llmbridge::provider::json::append_escaped(escaped, original);
     bool ok = false;
     const auto v = llmbridge::provider::json::parse(escaped, ok);
     ASSERT_TRUE(ok);
@@ -248,7 +249,7 @@ TEST(EscapeRoundTrip, JsonBecomesAStringAndBack)
 TEST(EscapeRoundTrip, ControlCharactersAreEscapedNotEmittedRaw)
 {
     std::string out;
-    llmbridge::provider::json::append_escaped_string(out, std::string("a\tb\nc\x01""d"));
+    llmbridge::provider::json::append_escaped(out, std::string("a\tb\nc\x01""d"));
     // A raw control byte inside a JSON string is invalid JSON that some parsers
     // accept and others reject: exactly the ambiguity to avoid on a provider wire.
     EXPECT_EQ(out.find('\x01'), std::string::npos);
@@ -555,5 +556,76 @@ TEST(JsonArena, AFailedInnerObjectDoesNotDonateItsMembersToItsParent)
         const auto v = llmbridge::provider::json::parse(d, ok);
         EXPECT_FALSE(ok) << d;
         EXPECT_EQ(v.obj.size(), 1u) << "the outer object holds one member, \"a\": " << d;
+    }
+}
+
+// ── One escaper ──────────────────────────────────────────────────────────────
+
+namespace
+{
+    // The byte-at-a-time escaper append_escaped replaced, kept as the oracle.
+    std::string reference_escape(std::string_view text)
+    {
+        std::string out = "\"";
+        for (const char c : text)
+        {
+            switch (c)
+            {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20)
+                    {
+                        static const char* kHex = "0123456789abcdef";
+                        out += "\\u00";
+                        out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
+                        out += kHex[static_cast<unsigned char>(c) & 0xF];
+                    }
+                    else out += c;
+            }
+        }
+        return out + '"';
+    }
+} // namespace
+
+TEST(JsonBuilder, EscaperMatchesTheReferenceOnEveryByteAndRandomStrings)
+{
+    const auto check = [](const std::string& raw) {
+        std::string got = "prefix";
+        append_escaped(got, raw);
+        ASSERT_EQ(got, "prefix" + reference_escape(raw));
+        std::string alias;
+        llmbridge::provider::json::append_escaped_string(alias, raw);
+        ASSERT_EQ(alias, reference_escape(raw));
+        // And it is JSON that decodes back to the input.
+        bool ok = false;
+        const Value v = parse(alias, ok);
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(llmbridge::provider::json::unescape_string(v.sv), raw);
+    };
+    std::string all;
+    for (int b = 0; b < 256; ++b)
+    {
+        const std::string one(1, static_cast<char>(b));
+        check(one);
+        check("ab" + one + "cd");
+        all += one;
+    }
+    check(all);
+    check("");
+    std::mt19937 rng(0x5eed);
+    const char specials[] = {'"', '\\', '\n', '\r', '\t', '\b', '\f', '\x01', '\x1f', '\x7f', 'a'};
+    for (int n = 0; n < 5000; ++n)
+    {
+        std::string raw(rng() % 64, '\0');
+        for (char& c : raw)
+            c = (rng() % 3 == 0) ? specials[rng() % sizeof(specials)]
+                                 : static_cast<char>(rng() % 256);
+        check(raw);
     }
 }

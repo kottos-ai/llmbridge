@@ -41,7 +41,7 @@ namespace llmbridge::provider
         //       Anthropic  content[].input                  -> a JSON *object*
         //     So crossing this boundary means unescaping a string into JSON one way
         //     and escaping JSON into a string the other. This is the fiddly part and
-        //     the reason json.hpp grew unescape_string/append_escaped_string.
+        //     the reason json.hpp grew unescape_string/append_escaped.
         //
         //  3. The result
         //       OpenAI     a message with role:"tool" + tool_call_id
@@ -153,7 +153,7 @@ namespace llmbridge::provider
                 // input (object) -> arguments (string containing that JSON).
                 out += ",\"arguments\":";
                 const json::Value* in = blk.find("input");
-                json::append_escaped_string(out, (in && !in->sv.empty()) ? in->sv : std::string_view{"{}"});
+                json::append_escaped(out, (in && !in->sv.empty()) ? in->sv : std::string_view{"{}"});
                 out += "}}";
             }
             out += ']';

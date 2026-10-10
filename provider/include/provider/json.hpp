@@ -531,46 +531,10 @@ namespace llmbridge::provider::json
         return v;
     }
 
-    // Append a raw (already JSON-escaped) span as a quoted string literal. The
-    // zero-copy passthrough path. The bytes came from valid JSON input, so the
-    // escaping is already correct; emit verbatim, no decode/re-encode.
-    // Emit `text` as a JSON string literal (with quotes), escaping what must be
-    // escaped. Use when the source is not already JSON-escaped, e.g. turning a raw
-    // JSON subtree into OpenAI's `arguments`, which is a *string* containing JSON.
-    inline void append_escaped_string(std::string& out, std::string_view text)
-    {
-        out += '"';
-        for (const char c : text)
-        {
-            switch (c)
-            {
-                case '"':  out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\n': out += "\\n"; break;
-                case '\r': out += "\\r"; break;
-                case '\t': out += "\\t"; break;
-                case '\b': out += "\\b"; break;
-                case '\f': out += "\\f"; break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20)
-                    {
-                        // Control characters must be \u-escaped or the output is
-                        // invalid JSON that some parsers accept and others reject.
-                        static const char* kHex = "0123456789abcdef";
-                        out += "\\u00";
-                        out += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
-                        out += kHex[static_cast<unsigned char>(c) & 0xF];
-                    }
-                    else out += c;
-            }
-        }
-        out += '"';
-    }
-
-    // Decode a raw (still-escaped) string span into plain bytes. The inverse of the
-    // above, needed because OpenAI carries tool arguments as a JSON string while
-    // Anthropic carries them as a JSON object: to cross that boundary the escaped
-    // text has to become real JSON.
+    // Decode a raw (still-escaped) string span into plain bytes. The inverse of
+    // append_escaped, needed because OpenAI carries tool arguments as a JSON string
+    // while Anthropic carries them as a JSON object: to cross that boundary the
+    // escaped text has to become real JSON.
     //
     // \uXXXX is decoded to UTF-8; a lone surrogate is passed through as U+FFFD
     // instead of emitting invalid UTF-8, since the output goes to a provider that
@@ -656,6 +620,8 @@ namespace llmbridge::provider::json
         return out;
     }
 
+    /// Append a raw (already JSON-escaped) span as a quoted string literal: the
+    /// zero-copy passthrough path, emitted verbatim with no decode or re-encode.
     inline void append_raw_string(std::string& out, std::string_view raw)
     {
         out += '"';
@@ -663,9 +629,9 @@ namespace llmbridge::provider::json
         out += '"';
     }
 
-    // Append `raw` (a decoded string) as a JSON string literal, escaping as needed.
-    // Bulk-copies runs of chars that don't need escaping (the common case), only
-    // escaping the special ones individually, so most content is a few memcpys.
+    /// Append `raw` (a decoded string) as a JSON string literal, escaping as needed.
+    /// Bulk-copies runs of chars that don't need escaping (the common case), only
+    /// escaping the special ones individually, so most content is a few memcpys.
     inline void append_escaped(std::string& out, std::string_view raw)
     {
         out += '"';
@@ -697,5 +663,10 @@ namespace llmbridge::provider::json
         }
         out.append(raw.data() + start, n - start); // trailing plain run
         out += '"';
+    }
+    /// The same escaper under its older name, kept for source compatibility.
+    inline void append_escaped_string(std::string& out, std::string_view text)
+    {
+        append_escaped(out, text);
     }
 } // namespace llmbridge::provider::json
