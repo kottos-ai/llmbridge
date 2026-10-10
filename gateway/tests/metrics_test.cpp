@@ -103,6 +103,19 @@ TEST(Histogram, EmptyPercentileIsZero)
     EXPECT_EQ(h.percentile(0.5), 0u);
 }
 
+// Nearest rank: p99 of 10 samples is the largest, and a floating product just under an
+// integer (100 * 0.29) still ranks 29; floor picked one sample too low in both.
+TEST(Histogram, PercentilesUseNearestRank)
+{
+    // Samples at v us - 1 ns, so sample v sits in the bucket whose upper edge is v us.
+    llmbridge::Histogram h(1000, 100); // 1 us buckets
+    for (uint64_t v = 1; v <= 10; ++v) h.record(v * 1000 - 1);
+    EXPECT_EQ(h.percentile(0.99), 10'000u) << "p99 of 10 samples is the 10th";
+    llmbridge::Histogram g(1000, 1000);
+    for (uint64_t v = 1; v <= 100; ++v) g.record(v * 1000 - 1);
+    EXPECT_EQ(g.percentile(0.29), 29'000u) << "100 * 0.29 is 28.999... in floating point";
+}
+
 TEST(Histogram, CustomBucketConfig)
 {
     Histogram h(1000, 1000); // 1 µs buckets, 0..1 ms
