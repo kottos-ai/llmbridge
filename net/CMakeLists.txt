@@ -6,6 +6,7 @@
 
 add_library(net STATIC
         src/socket_util.cpp
+        src/tcp_rtt.cpp
         src/upstream.cpp
         src/secure.cpp
         src/sha256.cpp

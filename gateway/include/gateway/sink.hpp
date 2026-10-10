@@ -62,6 +62,10 @@ namespace llmbridge
         int status = 0;           ///< as sent to the client
         int upstream_index = -1;  ///< venue that served (or last tried)
         uint32_t upstream_ip = 0;
+        /// The kernel's round-trip estimates to the serving venue, read at its response
+        /// head, microseconds; 0 when there was no head or no sample.
+        uint32_t upstream_srtt_us = 0;
+        uint32_t upstream_min_rtt_us = 0;
         int attempts = 0;         ///< failovers before this outcome
         int32_t tokens_in = -1;   ///< streaming only, from the provider's usage; -1 unknown
         int32_t tokens_out = -1;

@@ -26,4 +26,15 @@ namespace llmbridge::net
     int connect_result(int fd) noexcept; // after writability: 0, or the SO_ERROR errno
     int make_client_socket() noexcept;   // unconnected, for io_uring's IORING_OP_CONNECT
     bool resolve_ipv4(const char* ip, uint16_t port, sockaddr_in& out) noexcept; // false: bad ip
+
+    /// The kernel's round-trip estimates for a connected TCP socket, in microseconds.
+    /// `min_us` is the minimum over the kernel's window (net.ipv4.tcp_min_rtt_wlen),
+    /// which a delayed acknowledgement cannot inflate; `srtt_us` is the smoothed value,
+    /// which it can. Zero is "no sample".
+    struct TcpRtt
+    {
+        uint32_t srtt_us = 0;
+        uint32_t min_us = 0;
+    };
+    TcpRtt tcp_rtt(int fd) noexcept; // all zero when TCP_INFO cannot be read
 } // namespace llmbridge::net

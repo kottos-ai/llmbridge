@@ -84,6 +84,9 @@ namespace llmbridge
         /// Non-streamed token counts, -1 when not stated.
         provider::openai::Usage tok{};
         uint32_t upstream_ip = 0;
+        /// The kernel's RTT to the serving venue at its response head; see net::TcpRtt.
+        uint32_t upstream_srtt_us = 0;
+        uint32_t upstream_min_rtt_us = 0;
         int failover_attempts = 0; ///< venues already tried
         /// The translation resolved for the venue in flight; `effective_dialect` only
         /// means something when `translate_body`.

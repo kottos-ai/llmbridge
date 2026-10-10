@@ -255,6 +255,15 @@ per request to an in-process integrator. It is deliberately absent from the
 response headers, because a stream's headers are written before the first token
 exists.
 
+**The network share of that wait is on the record too.** At t4 the gateway reads the
+kernel's round-trip estimates for the venue's socket (`TCP_INFO`) into
+`upstream_min_rtt_us` and `upstream_srtt_us`. Take the minimum off: a venue that holds
+back its acknowledgement until it answers puts part of its queue into the smoothed
+value, and the windowed minimum is what the handshake measured. The round trip ends at
+whatever terminates TCP for the venue, usually its edge, so the hop from there to the
+model stays in the remainder. One `getsockopt`, read after t4 is stamped: 0.73 µs at
+p50 and about 1 µs at p99 on the reference laptop, once per request.
+
 **How far the head precedes the first token is a property of the provider, and
 for Anthropic it is ~1 ms.** Measured 2026-08-06 with
 `sse_client.py`, which stamps the response head separately from
