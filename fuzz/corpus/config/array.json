@@ -1,0 +1,1 @@
+{"upstream":[{"url":"a:1","dialect":"bedrock","strip_headers":["x"]},{"url":"b:2","strip_headers":["x"]}],"runtime":{"workers":4096,"duration_s":0.5}}
