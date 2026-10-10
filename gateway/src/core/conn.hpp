@@ -83,7 +83,7 @@ namespace llmbridge
         /// An interim `100 Continue`'s ciphertext has not fully left the socket.
         bool client_interim_inflight = false;
 
-        Connection* peer = nullptr; // linked counterpart for the in-flight request
+        Connection* peer = nullptr; // the other leg of the request in flight; pair()/unpair() only
         net::http::Message msg{};
         /// Client conns: the request in flight, reset by req.begin() at framing.
         RequestCtx req;
@@ -121,6 +121,21 @@ namespace llmbridge
         size_t tls_out_off = 0;
 #endif
     };
+
+    /// The only writers of `peer`, both directions at once, so a link is never one-sided.
+    inline void pair(Connection* c, Connection* u) noexcept
+    {
+        c->peer = u;
+        u->peer = c;
+    }
+    /// Either leg; returns the other, now unlinked, or null.
+    inline Connection* unpair(Connection* c) noexcept
+    {
+        Connection* p = c->peer;
+        if (p) p->peer = nullptr;
+        c->peer = nullptr;
+        return p;
+    }
 
     /// Renders `ClientConnection#42(fd=17,cid=2)` for `LB_INFO("closed ", *c)`. Never prints
     /// rbuf or wbuf: they hold the customer's request, credential included.

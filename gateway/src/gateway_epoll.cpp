@@ -246,7 +246,7 @@ namespace llmbridge
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
                 " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
+        if (Connection* u = unpair(client)) ep_close_upstream(u);
         ++client->req.f.failover_attempts;
         client->upstream_slot = r.upstream_index;
         // Put the original request back at the front of rbuf. ep_forward rebuilds it for
@@ -352,10 +352,8 @@ namespace llmbridge
         // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
 
-        u->peer = nullptr;
-        ep_close_upstream(u); // discard the dead connection
-        client->peer = uf;
-        uf->peer = client;
+        ep_close_upstream(u); // discard the dead connection; unpairs it
+        pair(client, uf);
         return true;
     }
 
@@ -382,7 +380,7 @@ namespace llmbridge
             ep_close_upstream(u);
             return;
         }
-        u->peer = nullptr;
+        unpair(u);
         u->rbuf.clear();
         u->rdec.reset();
         // wbuf held the rebuilt request, including the client's credential, and this
@@ -425,6 +423,8 @@ namespace llmbridge
     void Gateway::ep_close_client(Connection* c) noexcept
     {
         if (c->doomed) return;
+        // Every close unpairs; an upstream mid-response is of no use to anyone else.
+        if (Connection* u = unpair(c)) ep_close_upstream(u);
         if (c->id)
         {
             _clients.erase(c->id);
@@ -438,6 +438,7 @@ namespace llmbridge
     void Gateway::ep_close_upstream(Connection* u) noexcept
     {
         if (u->doomed) return;
+        unpair(u);
         // Its own pool only: a connection is never in another venue's.
         if (u->upstream_slot >= 0)
         {
@@ -454,9 +455,7 @@ namespace llmbridge
 
     void Gateway::ep_abort_pair(Connection* client) noexcept
     {
-        Connection* u = client->peer;
-        if (u) { u->peer = nullptr; ep_close_upstream(u); }
-        ep_close_client(client);
+        ep_close_client(client); // and its upstream
         ++_stats.errors;
     }
 
@@ -477,7 +476,7 @@ namespace llmbridge
         LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
                 peer.empty() ? "" : " peer=", peer);
         // We're replying to the client ourselves, so drop any in-flight upstream.
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ep_close_upstream(u); }
+        if (Connection* u = unpair(client)) ep_close_upstream(u);
         client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ep_finish_client closes once it flushes
@@ -751,8 +750,7 @@ namespace llmbridge
             c->req.saved.resize(c->msg.total_len);
         }
         else c->rbuf.erase(0, c->msg.total_len);
-        c->peer = u;
-        u->peer = c;
+        pair(c, u);
         c->ever_framed = true;        // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
@@ -805,10 +803,9 @@ namespace llmbridge
             if (err != 0)
             {
                 note_connect_failure(u->upstream_slot, std::strerror(err));
-                Connection* client = u->peer;
-                u->peer = nullptr;
+                Connection* client = unpair(u);
                 ep_close_upstream(u);
-                if (client) { client->peer = nullptr; if (!ep_upstream_failed(client, 502, "upstream connect refused")) ep_error_respond(client, 502, "upstream connect refused"); }
+                if (client) { if (!ep_upstream_failed(client, 502, "upstream connect refused")) ep_error_respond(client, 502, "upstream connect refused"); }
                 else ++_stats.errors;
                 return;
             }
@@ -965,7 +962,7 @@ namespace llmbridge
                     h.status, reason_for(h.status),
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
-                client->peer = nullptr;
+                unpair(u);
                 if (h.keep_alive) ep_release_upstream(u); else ep_close_upstream(u);
                 ++_stats.errors;
                 ep_respond(client);
@@ -973,7 +970,7 @@ namespace llmbridge
             }
             if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
             {
-                client->peer = nullptr;
+                unpair(u);
                 ep_release_upstream(u); // framing was valid; the upstream conn is reusable
                 ep_error_respond(client, 502, "response translate");
                 return;
@@ -1024,7 +1021,7 @@ namespace llmbridge
         // stale connection.
         const bool pool_upstream =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
-        client->peer = nullptr;
+        unpair(u);
         // Drop the framed message so a pipelined next response is not mis-read as
         // part of this one; anything left is the start of the next message.
         u->rbuf.erase(0, total_len);
@@ -1173,8 +1170,6 @@ namespace llmbridge
         }
         // Either way the stream has ended, so the upstream is done: close it now. Kept
         // while reads were paused, its dead fd raised EPOLLHUP on every wait.
-        client->peer = nullptr;
-        u->peer = nullptr;
         ep_close_upstream(u);
         ep_stream_flush(client);
     }
@@ -1204,8 +1199,7 @@ namespace llmbridge
         if (Connection* u = client->peer)
         {
             const bool reusable = stream_upstream_reusable(client, u);
-            client->peer = nullptr;
-            u->peer = nullptr;
+            unpair(u);
             // Reuse is the whole point: a streaming request otherwise costs a fresh
             // upstream connect every time, which measured as the dominant term in
             // time-to-first-token. Pool it when the framing says that is safe.

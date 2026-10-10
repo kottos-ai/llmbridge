@@ -148,8 +148,7 @@ namespace llmbridge
                 LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT upstream connect ", *u,
                         " after_ns=", now - u->ts_accepted, " limit_ns=", _connect_ns);
                 note_connect_failure(u->upstream_slot, "timed out");
-                c->peer = nullptr;
-                u->peer = nullptr;
+                unpair(u);
 #ifdef LLMBRIDGE_HAVE_URING
                 if (uring)
                 {

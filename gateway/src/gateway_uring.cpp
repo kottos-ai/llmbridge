@@ -254,7 +254,7 @@ namespace llmbridge
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
                 " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
+        if (Connection* u = unpair(client)) ur_close(u);
         ++client->req.f.failover_attempts;
         client->upstream_slot = r.upstream_index;
         client->rbuf.insert(0, client->req.saved); // see the epoll mirror
@@ -360,16 +360,14 @@ namespace llmbridge
 #endif
         ++_stats.upstream_conns_opened;
 
-        u->peer = nullptr;
         // WARN, not DEBUG: it is not a cap, it is a recovered failure. A pooled
         // connection was dead when we used it, and the client never learns. That is
         // the point of the retry and also the reason it must be visible: a rising
         // rate here means the provider is dropping keep-alives faster than
         // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
-        ur_close(u); // discard the dead pooled connection
-        client->peer = uf;
-        uf->peer = client;
+        ur_close(u); // discard the dead pooled connection; unpairs it
+        pair(client, uf);
         ++_stats.upstream_retries;
         ur_submit_connect(uf); // connect fresh, then send on completion
         return true;
@@ -402,7 +400,7 @@ namespace llmbridge
             ur_close(u);
             return;
         }
-        u->peer = nullptr;
+        unpair(u);
         u->rbuf.clear();
         u->rdec.reset();
         secure_clear(u->wbuf); // see ep_release_upstream: credential must not idle in the pool
@@ -415,6 +413,8 @@ namespace llmbridge
     void Gateway::ur_close(Connection* c) noexcept
     {
         if (c->doomed) return;
+        // Every close unpairs: the other leg never keeps a pointer to a freed object.
+        Connection* other = unpair(c);
         if (c->is_client && c->id)
         {
             _clients.erase(c->id);
@@ -436,14 +436,15 @@ namespace llmbridge
         if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); ur_submit_cancel(c->fd); }
         c->doomed = true;
         _doomed.push_back(c);
+        // An upstream mid-response is of no use to anyone else.
+        if (other && c->is_client) ur_close(other);
         ur_maybe_free(c);
     }
 
     void Gateway::ur_abort_pair(Connection* client) noexcept
     {
         if (!client) return;
-        if (Connection* u = client->peer) { u->peer = nullptr; ur_close(u); }
-        ur_close(client);
+        ur_close(client); // and its upstream
         ++_stats.errors;
     }
 
@@ -459,7 +460,7 @@ namespace llmbridge
         // A send in flight is reading wbuf: replacing it would hand the kernel freed
         // memory. Whatever the client was sent, it now gets a close.
         if (client->send_inflight) { ur_abort_pair(client); return; }
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
+        if (Connection* u = unpair(client)) ur_close(u);
         client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
@@ -876,8 +877,7 @@ namespace llmbridge
             c->req.saved.resize(c->msg.total_len);
         }
         else c->rbuf.erase(0, c->msg.total_len);
-        c->peer = u;
-        u->peer = c;
+        pair(c, u);
         c->ever_framed = true;        // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
@@ -905,10 +905,9 @@ namespace llmbridge
         if (res < 0)
         {
             note_connect_failure(u->upstream_slot, std::strerror(-res));
-            Connection* cl = u->peer;
-            u->peer = nullptr;
+            Connection* cl = unpair(u);
             ur_close(u);
-            if (cl) { cl->peer = nullptr; if (!ur_upstream_failed(cl, 502, "upstream connect refused")) ur_error_respond(cl, 502, "upstream connect refused"); }
+            if (cl) { if (!ur_upstream_failed(cl, 502, "upstream connect refused")) ur_error_respond(cl, 502, "upstream connect refused"); }
             else ++_stats.errors;
             return;
         }
@@ -948,7 +947,7 @@ namespace llmbridge
                     h.status, reason_for(h.status),
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
-                client->peer = nullptr;
+                unpair(u);
                 if (h.keep_alive) ur_release_upstream(u); else ur_close(u);
                 ++_stats.errors;
                 ur_client_send(client);
@@ -956,7 +955,7 @@ namespace llmbridge
             }
             if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
             {
-                client->peer = nullptr;
+                unpair(u);
                 ur_release_upstream(u); // framing was valid; the upstream conn is reusable
                 ur_error_respond(client, 502, "response translate");
                 return;
@@ -1003,7 +1002,7 @@ namespace llmbridge
         const bool pool_upstream =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
         client->woff = 0;
-        client->peer = nullptr;
+        unpair(u);
         // Drop the framed message; anything left is the next pipelined response.
         u->rbuf.erase(0, total_len);
         u->rdec.reset(); // see the epoll mirror
@@ -1235,8 +1234,7 @@ namespace llmbridge
         if (Connection* u = client->peer)
         {
             const bool reusable = stream_upstream_reusable(client, u);
-            client->peer = nullptr;
-            u->peer = nullptr;
+            unpair(u);
             if (reusable) ur_release_upstream(u); // see the epoll mirror
             else ur_close(u);
         }
@@ -1338,7 +1336,7 @@ namespace llmbridge
         // the rest (_clients, _idle_upstreams, _doomed, listen_conn) are freed by
         // ~Gateway.
         for (auto& [id, c] : _clients)
-            if (Connection* u = c->peer) { c->peer = nullptr; if (u->fd >= 0) ::close(u->fd); delete u; }
+            if (Connection* u = unpair(c)) { if (u->fd >= 0) ::close(u->fd); delete u; }
 
         return 0;
     }
