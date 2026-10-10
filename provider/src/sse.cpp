@@ -28,10 +28,13 @@ namespace llmbridge::provider
 
     void SseFrameReader::reset() noexcept
     {
+        constexpr size_t kKeep = 64 * 1024; // capacity one large event may leave behind
         _in = {};
         _at = 0;
         _line.clear();
         _data.clear();
+        if (_line.capacity() > kKeep) _line.shrink_to_fit();
+        if (_data.capacity() > kKeep) _data.shrink_to_fit();
         _view = {};
         _viewing = _have = _line_owned = _skip_lf = _stopped = _failed = false;
     }
@@ -129,6 +132,37 @@ namespace llmbridge::provider
         return Step::More;
     }
 
+    void AnthropicToOpenAiSse::reset(long long created_secs, bool include_usage) noexcept
+    {
+        _frames.reset();
+        _failed = false;
+        _block_tool_ord.clear();
+        _next_tool_ord = 0;
+        _tool_open = false;
+        _id.assign("chatcmpl-llmbridge");
+        _model.clear();
+        _created_len = 0;
+        _created_secs = created_secs;
+        _finish = nullptr;
+        _role_emitted = _content_started = _finish_emitted = _done = false;
+        _include_usage = include_usage;
+        _usage_emitted = false;
+        _in_tok = _out_tok = _cached_tok = _cache_write_tok = 0;
+        _cw_5m = _cw_1h = -1;
+    }
+
+    openai::Usage AnthropicToOpenAiSse::usage() const noexcept
+    {
+        openai::Usage u;
+        u.in = _in_tok;
+        u.out = _out_tok;
+        u.cached = _cached_tok;
+        u.cache_write = _cache_write_tok;
+        u.cache_write_5m = _cw_5m;
+        u.cache_write_1h = _cw_1h;
+        return u;
+    }
+
     // Stamp `created` exactly once: a fixed value if one was supplied, else the
     // wall clock. Constant across every chunk of the stream thereafter.
     void AnthropicToOpenAiSse::ensure_created()
@@ -165,10 +199,7 @@ namespace llmbridge::provider
     {
         if (!_include_usage || _usage_emitted) return;
         ensure_created();
-        openai::Usage u;
-        u.in = _in_tok;
-        u.out = _out_tok;
-        u.cached = _cached_tok;
+        const openai::Usage u = usage();
         out += "data: ";
         openai::Envelope(out, openai::Shape::Chunk, _id, {_created, _created_len}, _model).close(&u);
         out += "\n\n";

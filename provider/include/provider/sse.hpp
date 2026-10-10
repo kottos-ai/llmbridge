@@ -16,6 +16,8 @@
 #include <string_view>
 #include <vector>
 
+#include "provider/openai.hpp"
+
 namespace llmbridge::provider
 {
     /// Server-sent events framing (WHATWG): lines end in CR, LF or CRLF, a `data` field
@@ -66,6 +68,8 @@ namespace llmbridge::provider
             : _created_secs(created_secs), _include_usage(include_usage)
         {
         }
+        /// Ready for the next response, as if newly constructed; buffers keep their capacity.
+        void reset(long long created_secs = -1, bool include_usage = false) noexcept;
 
         // Append the translation of these bytes to `out`; an incomplete event waits for the
         // next call, unknown or unparseable events are skipped, and nothing after the
@@ -86,6 +90,9 @@ namespace llmbridge::provider
         /// The cache write split by entry lifetime, from usage.cache_creation.
         [[nodiscard]] long long cache_write_5m_tokens() const noexcept { return _cw_5m; }
         [[nodiscard]] long long cache_write_1h_tokens() const noexcept { return _cw_1h; }
+
+        /// The counts above as one usage; the details Anthropic does not state stay -1.
+        [[nodiscard]] openai::Usage usage() const noexcept;
 
         /// True once a text delta or a tool call's name or arguments has been emitted.
         [[nodiscard]] bool content_started() const noexcept { return _content_started; }

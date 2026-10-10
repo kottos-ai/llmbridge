@@ -313,8 +313,10 @@ namespace llmbridge
         uint8_t served_model_len = 0;
         uint8_t served_model_tries = 0;
 
-        /// The Anthropic-to-OpenAI SSE translator, null when the stream needs none.
-        std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
+        /// The Anthropic-to-OpenAI SSE translator, reset per stream and used only while
+        /// `sse_translating`; held by value so a stream allocates none.
+        provider::AnthropicToOpenAiSse sse_xlate;
+        bool sse_translating = false;
         /// Usage a byte-forwarded stream states, read as it arrives.
         provider::openai::StreamUsage stream_usage;
         /// Scratch for one streaming step's decoded bytes, reused across chunks.

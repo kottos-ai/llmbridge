@@ -1172,3 +1172,26 @@ TEST(Sse, ALongIdOrModelFailsTheStreamInsteadOfRepeatingInEveryChunk)
                             std::string(AnthropicToOpenAiSse::kMaxEcho, 'm') + "\"}}\n\n" + delta,
                         out));
 }
+
+TEST(Sse, AResetTranslatorIsANewOne)
+{
+    const std::string tool =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\","
+        "\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":2,"
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":2}}}}\n\n"
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":"
+        "{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":"
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\ndata: {\"partial";
+    AnthropicToOpenAiSse t(kFixedCreated, true);
+    std::string first;
+    ASSERT_TRUE(t.feed(tool, first));
+    t.reset(kFixedCreated, false);
+    std::string again;
+    ASSERT_TRUE(t.feed(kAnthropicText, again));
+    EXPECT_TRUE(t.finish(again));
+    EXPECT_EQ(again, translate_whole(kAnthropicText));
+    EXPECT_EQ(t.usage().cache_write_5m, -1);
+}

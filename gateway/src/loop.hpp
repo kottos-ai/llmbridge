@@ -68,7 +68,7 @@ namespace llmbridge::detail
         c->stream_chunked_out = false;
         c->stream_keep_alive = false;
         c->wants_usage = false;
-        c->sse_xlate.reset();
+        c->sse_translating = false;
         c->chunkdec = net::http::ChunkDecoder{};
         c->stream_usage.reset();
         c->sse_scratch.clear();
