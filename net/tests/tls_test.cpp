@@ -515,6 +515,20 @@ TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
 // nothing. These tests pin that behaviour so a later "cleanup" cannot soften it
 // into a warning.
 
+// A failure after SSL_CTX_new used to keep the context, so ready() reported a context
+// with no trust store loaded; and a second init leaked the first.
+TEST(TlsContext, AFailedInitLeavesNoContextBehind)
+{
+    llmbridge::net::tls::Context ctx;
+    llmbridge::net::tls::Context::ClientOptions bad;
+    bad.ca_file = "/nonexistent/ca.pem";
+    EXPECT_FALSE(ctx.init_client(bad));
+    EXPECT_FALSE(ctx.ready()) << "a context without its CA bundle reports ready";
+    EXPECT_FALSE(ctx.last_error().empty());
+    EXPECT_TRUE(ctx.init_client({})); // the system store; a re-init replaces, not leaks
+    EXPECT_TRUE(ctx.ready());
+}
+
 TEST(ServerContext, ValidCertAndKeyInitialises)
 {
     SelfSigned ca;

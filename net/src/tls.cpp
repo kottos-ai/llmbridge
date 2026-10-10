@@ -72,13 +72,23 @@ namespace llmbridge::net::tls
         return *this;
     }
 
+    // A failed init leaves no context behind, so ready() never reports one that is
+    // only partly configured.
+    bool Context::discard() noexcept
+    {
+        if (_ctx) SSL_CTX_free(_ctx);
+        _ctx = nullptr;
+        return false;
+    }
+
     bool Context::init_client(const ClientOptions& opts) noexcept
     {
+        discard(); // a second init must not leak the first context
         _ctx = SSL_CTX_new(TLS_client_method());
         if (!_ctx)
         {
             _err = drain_errors();
-            return false;
+            return discard();
         }
 
         // 1.2 floor unconditionally; 1.3 when asked. Providers all speak 1.3, but a
@@ -87,7 +97,7 @@ namespace llmbridge::net::tls
         if (SSL_CTX_set_min_proto_version(_ctx, floor_ver) != 1)
         {
             _err = drain_errors();
-            return false;
+            return discard();
         }
 
         // Verification is not optional. SSL_VERIFY_PEER makes a failed chain fail the
@@ -101,7 +111,7 @@ namespace llmbridge::net::tls
         if (!ok)
         {
             _err = drain_errors();
-            return false;
+            return discard();
         }
 
         // Let OpenSSL retry a write with a moved buffer. Our plaintext spans are not
@@ -162,25 +172,26 @@ namespace llmbridge::net::tls
 
     bool Context::init_server(const ServerOptions& opts) noexcept
     {
+        discard(); // a second init must not leak the first context
         if (opts.cert_file.empty() || opts.key_file.empty())
         {
             _err = "server TLS needs both a certificate and a private key";
-            return false;
+            return discard();
         }
-        if (!key_mode_is_private(opts.key_file, _err)) return false;
+        if (!key_mode_is_private(opts.key_file, _err)) return discard();
 
         _ctx = SSL_CTX_new(TLS_server_method());
         if (!_ctx)
         {
             _err = drain_errors();
-            return false;
+            return discard();
         }
 
         const int floor_ver = opts.require_tls13 ? TLS1_3_VERSION : TLS1_2_VERSION;
         if (SSL_CTX_set_min_proto_version(_ctx, floor_ver) != 1)
         {
             _err = drain_errors();
-            return false;
+            return discard();
         }
 
         // The chain, not just the leaf. A client that cannot fetch the missing
@@ -189,12 +200,12 @@ namespace llmbridge::net::tls
         if (SSL_CTX_use_certificate_chain_file(_ctx, opts.cert_file.c_str()) != 1)
         {
             _err = "cannot load certificate chain " + opts.cert_file + ": " + drain_errors();
-            return false;
+            return discard();
         }
         if (SSL_CTX_use_PrivateKey_file(_ctx, opts.key_file.c_str(), SSL_FILETYPE_PEM) != 1)
         {
             _err = "cannot load private key " + opts.key_file + ": " + drain_errors();
-            return false;
+            return discard();
         }
         // Belt and braces, and measured to be exactly that: with the certificate
         // already loaded above, SSL_CTX_use_PrivateKey_file itself rejects a
@@ -206,7 +217,7 @@ namespace llmbridge::net::tls
         if (SSL_CTX_check_private_key(_ctx) != 1)
         {
             _err = "private key does not match the certificate: " + drain_errors();
-            return false;
+            return discard();
         }
 
         // An expired certificate produces a handshake failure at every client, and
@@ -216,7 +227,7 @@ namespace llmbridge::net::tls
             if (X509_cmp_current_time(X509_get0_notAfter(leaf)) < 0)
             {
                 _err = "certificate " + opts.cert_file + " has already expired";
-                return false;
+                return discard();
             }
         }
 
