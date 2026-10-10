@@ -1533,47 +1533,27 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
     const std::string r1 = c1.recv_response(4000);
     ASSERT_NE(r1.find("HTTP/1.1 200"), std::string::npos) << r1.substr(0, 120);
 
-    // Second client, which is what the pooled connection gets handed to.
+    // Second client: a pooled connection would be handed to it.
     Client c2;
     ASSERT_TRUE(c2.connect(_proxy_port));
     ASSERT_TRUE(c2.send(openai_request_hdrs("two", "")));
     const std::string r2 = c2.recv_response(4000);
-    ASSERT_FALSE(r2.empty()) << "second client got nothing; the pooled connection "
-                                "was left unusable by the first response";
-    // Without this the test is vacuous, and it was: it passed with the pooled
-    // rbuf.clear() deleted, because the second request had opened a fresh upstream
-    // and never touched the poisoned one. Assert the reuse actually happened.
-    // Reuse is asserted after the join at the end: stats() belongs to the loop
-    // thread, and polling it live is a data race TSan reports.
-    // The canary must contain CRLF, and the first version did not. Residue with
-    // no space and no CRLF is silently absorbed into the next response's status
-    // line, because parse_response() finds the first space anywhere in the head
-    // and reads three digits after it; it never checks the line begins with
-    // "HTTP/". So "TRAILING-GARBAGE...POOL" merged into "...POOLHTTP/1.1 200 OK",
-    // yielded status 200, and the test passed with the pooled clear deleted.
-    // Residue carrying CRLF cannot be absorbed that way, so it reaches the header
-    // parser and the message is refused, which is the difference this asserts.
-    //
-    // It proves the observable contract: an over-long upstream body does not stop
-    // the next client on a reused connection from getting a correct answer.
-    // upstream_reused is asserted above so the reuse really happens.
-    //
-    // It does not prove that ep/ur_release_upstream's rbuf.clear() is what
-    // protects that. Deleting both clears leaves this test passing and the second
-    // client still receiving a 200, so some other part of the path is keeping the
-    // connection sane. Which part is not yet identified. The clear is obviously
-    // right and stays, but calling this test its guard would be a claim the
-    // measurement does not support.
+    ASSERT_FALSE(r2.empty()) << "second client got nothing";
+    // Bytes past the response are a second message the gateway never asked for, so
+    // UpstreamPool::release refuses the connection: the residue cannot reach the next
+    // client because the connection carrying it is closed, not cleaned. The canary
+    // carries CRLF so that, were it ever prepended to a response, the header parser
+    // would refuse that response instead of absorbing it into the status line.
     EXPECT_NE(r2.find("HTTP/1.1 200"), std::string::npos)
-        << "the second client did not get a successful response, which is what a "
-           "poisoned pooled connection looks like from outside: " << r2.substr(0, 160);
+        << "the second client did not get a successful response: " << r2.substr(0, 160);
     EXPECT_EQ(r2.find("TRAILING-GARBAGE"), std::string::npos)
         << "residue from the FIRST response reached the SECOND client: " << r2.substr(0, 160);
 
     c2.close();
     shutdown();
-    EXPECT_GT(_gw->stats().upstream_reused, 0u)
-        << "no upstream was reused, so the residue path was never exercised";
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u)
+        << "a connection holding bytes past its response went back into the pool";
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 2u);
 }
 
 // N8: a 304 ends at its head whatever Content-Length says. Framed by that length, the
@@ -4842,6 +4822,7 @@ class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
                                         false, pol, std::vector<std::string>{});
         if (sink) _gw->set_request_sink(sink, std::move(capture));
         if (connect_ns > 0) _gw->set_connect_ns(connect_ns); // before the loop thread
+        if (_pool_cap > 0) _gw->set_pool_cap_for_test(_pool_cap);
         _port = _gw->bound_port();
         _th = std::thread([this] { _gw->run(); });
     }
@@ -4858,6 +4839,7 @@ class ProxyRoute : public ::testing::TestWithParam<llmbridge::IoBackend>
     std::thread _th;
     uint16_t _port = 0;
     bool _shut = false;
+    size_t _pool_cap = 0; // 0: the shipped kMaxIdleUpstreams; set before start()
 };
 
 // ── A venue address that answers nothing ─────────────────────────────────
@@ -7873,6 +7855,42 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 200);
 }
 
+// L2: io_uring pooled an upstream that had already sent EOF after its final chunk
+// when the EOF arrived while the stream's last send to the client was still in flight.
+// Its recv was over, so the next request on it was never answered.
+TEST_P(ProxyPoolHygiene, AnUpstreamThatClosedAfterTheStreamIsNeverPooled)
+{
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    for (int i = 0; i < 4000; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + std::string(400, 'x') + "\"}}\n\n";
+    ev += "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+          "data: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    _backend.set_close_after_first(true); // the final chunk, then FIN
+    _client_sndbuf = 4096; // the last send stays in flight while the EOF arrives
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+    Client a;
+    ASSERT_TRUE(a.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(a.send(openai_stream_request("hi")));
+    timespec ts{0, 400'000'000}; // stall while the upstream finishes and closes
+    nanosleep(&ts, nullptr);
+    const std::string first = a.recv_stream(15000);
+    ASSERT_NE(first.find("0\r\n\r\n"), std::string::npos) << "the first stream did not end";
+    timespec settle{0, 100'000'000};
+    nanosleep(&settle, nullptr);
+    ASSERT_TRUE(a.send(openai_stream_request("again")));
+    const std::string second = a.recv_stream(5000);
+    a.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(second), 200) << second.substr(0, 200);
+    EXPECT_NE(second.find("0\r\n\r\n"), std::string::npos) << "the second stream never ended";
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u) << "a connection the venue closed was pooled";
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyPoolHygiene,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
@@ -10184,4 +10202,34 @@ TEST_P(ProxyRoute, AVenueGivenOnlyAnAddressListNamesItInTheHostHeader)
     const std::string want = "Host: 127.0.0.1:" + std::to_string(b.port()) + "\r\n";
     EXPECT_NE(b.last().find(want), std::string::npos) << b.last();
     b.stop();
+}
+
+// G1: the cap compared the number of venues with kMaxIdleUpstreams, so it never bound
+// the connections. Three venues, a cap of two: the third connection released closes.
+TEST_P(ProxyRoute, ThePoolCapCountsConnectionsNotVenues)
+{
+    NamedBackend a, b, c;
+    a.start("alpha");
+    b.start("bravo");
+    c.start("charlie");
+    PinnedPolicy pol(0);
+    _pool_cap = 2;
+    start({{"127.0.0.1", a.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", c.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    const char* names[] = {"alpha", "bravo", "charlie"};
+    for (int i = 0; i < 3; ++i)
+    {
+        pol.set(i);
+        Client k;
+        ASSERT_TRUE(k.connect(_port));
+        ASSERT_TRUE(k.send(make_request()));
+        EXPECT_NE(k.recv_response().find(names[i]), std::string::npos) << i;
+    }
+    shutdown();
+    EXPECT_EQ(_gw->pooled_upstream_count(), 2u) << "the cap bounds connections in total";
+    EXPECT_EQ(_gw->stats().upstream_conns_opened, 3u);
+    a.stop();
+    b.stop();
+    c.stop();
 }

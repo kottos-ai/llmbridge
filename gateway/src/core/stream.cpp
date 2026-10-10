@@ -10,7 +10,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "request.hpp"
 #include "stream.hpp"
 

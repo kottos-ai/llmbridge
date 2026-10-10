@@ -8,6 +8,51 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.77.0]. 2026-10-10
+
+### Fixed
+
+- **The keep-alive pool cap bounds connections** (G1). It compared the number of
+  venues with `kMaxIdleUpstreams`, so it could fire only with 8192 venues and the
+  pool was bounded by peak concurrency alone. It now counts pooled connections across
+  every venue, and the debug `pool=` field prints that count instead of the number of
+  venues.
+- **io_uring no longer pools an upstream that already sent EOF**. When the EOF
+  arrived after the final chunk but while the stream's last send to the client was in
+  flight, the connection went back to the pool with its recv over, and the next request
+  on it was never answered. An upstream that reports EOF is never pooled, on either
+  backend.
+
+### Changed
+
+- **One reusability check.** `UpstreamPool::release` (`gateway/src/core/pool.cpp`)
+  decides for every path, streams included: open, keep-alive, a message boundary
+  reached, no EOF from the venue, nothing past the response buffered, our request fully
+  sent, and room in the pool. Two of its answers differ from before: **behaviour
+  change:** a response followed by bytes nobody asked for now closes the connection,
+  where they were discarded and the connection pooled; and the response-translation
+  failure path keeps the connection only if the venue said keep-alive.
+- **The pool is one intrusive list per venue.** Acquire takes the newest, a close
+  removes in O(1) where it scanned the venue's pool, and the idle reaper visits only
+  expired connections, where erasing from the front of a vector made reaping a large
+  pool quadratic.
+- **`peer` is written only by `pair()` and `unpair()`, and every close unpairs**; a
+  closed client takes its in-flight upstream with it. Neither leg can keep a pointer
+  to a freed connection, and `doomed` is
+  still set only by the two close functions.
+- `gateway/src/loop.hpp` is gone: its constants are in `core/limits.hpp`, its stream
+  reuse test is the comment on `UpstreamPool::release`.
+- `Gateway::set_pool_cap_for_test(size_t)`, a test seam.
+
+### Tests
+
+- `ProxyRoute.ThePoolCapCountsConnectionsNotVenues` and
+  `ProxyPoolHygiene.AnUpstreamThatClosedAfterTheStreamIsNeverPooled`, both backends;
+  the first fails with the fix reverted on both, the second on io_uring.
+- `ProxyAuth.UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest` now
+  asserts the connection with residue is closed, not cleaned and pooled.
+
+
 ## [0.76.0]. 2026-10-10
 
 ### Fixed

@@ -8,6 +8,7 @@ add_library(gateway STATIC
         src/engine.cpp
         src/resolve.cpp
         src/core/client.cpp
+        src/core/pool.cpp
         src/core/sink.cpp
         src/core/stream.cpp
         src/core/sweep.cpp

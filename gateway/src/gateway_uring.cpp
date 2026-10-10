@@ -11,7 +11,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "net/secure.hpp"
 #include "net/socket_util.hpp"
 #include "request.hpp"
@@ -254,7 +254,7 @@ namespace llmbridge
 
         LB_WARN(ReqId{client->req.f.req_seq}, " venue ", static_cast<int64_t>(client->upstream_slot),
                 " failed (", why, "); retrying on ", static_cast<int64_t>(r.upstream_index));
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
+        if (Connection* u = unpair(client)) ur_close(u);
         ++client->req.f.failover_attempts;
         client->upstream_slot = r.upstream_index;
         client->rbuf.insert(0, client->req.saved); // see the epoll mirror
@@ -266,14 +266,11 @@ namespace llmbridge
     Connection* Gateway::ur_acquire_upstream(int slot) noexcept
     {
         const Upstream& up = _upstreams[static_cast<size_t>(slot)];
-        auto& pool = _idle_upstreams[static_cast<size_t>(slot)];
         // Only this venue's pool: a connection to one provider cannot serve a request
         // bound for another, and handing one over would send the request, and its
         // credential, to the wrong company.
-        if (!pool.empty())
+        if (Connection* u = _pool->acquire(slot))
         {
-            Connection* u = pool.back();
-            pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
             u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
@@ -307,7 +304,7 @@ namespace llmbridge
         }
 #endif
         ++_stats.upstream_conns_opened;
-        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", _idle_upstreams.size()); // see ep_ twin
+        LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", pooled_upstream_count()); // see ep_ twin
         return u;
     }
 
@@ -360,72 +357,35 @@ namespace llmbridge
 #endif
         ++_stats.upstream_conns_opened;
 
-        u->peer = nullptr;
         // WARN, not DEBUG: it is not a cap, it is a recovered failure. A pooled
         // connection was dead when we used it, and the client never learns. That is
         // the point of the retry and also the reason it must be visible: a rising
         // rate here means the provider is dropping keep-alives faster than
         // --pool-idle reaps them, which is a tuning signal nobody can see otherwise.
         LB_WARN("upstream stale, resending on a fresh connection ", *u);
-        ur_close(u); // discard the dead pooled connection
-        client->peer = uf;
-        uf->peer = client;
+        ur_close(u); // discard the dead pooled connection; unpairs it
+        pair(client, uf);
         ++_stats.upstream_retries;
         ur_submit_connect(uf); // connect fresh, then send on completion
         return true;
     }
 
-    void Gateway::ur_release_upstream(Connection* u) noexcept
+    void Gateway::ur_release_upstream(Connection* u, bool keep_alive, bool body_ended) noexcept
     {
-        // Checked first: the reset below destroys the very state it reads. See
-        // ep_release_upstream for why an unsent request means close, not pool.
-        if (!upstream_request_sent(u))
-        {
-            LB_WARN("closing instead of pooling, request was still going out ", *u);
-            ++_stats.upstream_unsent;
-            ur_close(u);
-            return;
-        }
-        // send_inflight is not reset here, and must not be: the guard above returns
-        // for any connection that still has one, so it is already false. It used to
-        // be cleared at the top of this function, inside the TLS ifdef, which papered
-        // over the case the guard now refuses outright.
-#ifdef LLMBRIDGE_HAVE_TLS
-        u->tls_out.clear(); // per-request ciphertext; Session kept for reuse
-        u->tls_out_off = 0;
-#endif
-        // See ep_release_upstream: bounded pool, closed past the cap.
-        if (_idle_upstreams.size() >= kMaxIdleUpstreams)
-        {
-            LB_WARN("CAP pool full, closing instead of pooling ", *u,
-                    " limit=", kMaxIdleUpstreams, " (reuse stops here)");
-            ur_close(u);
-            return;
-        }
-        u->peer = nullptr;
-        u->rbuf.clear();
-        u->rdec.reset();
-        secure_clear(u->wbuf); // see ep_release_upstream: credential must not idle in the pool
-        u->woff = 0;
-        u->msg = net::http::Message{};
-        u->ts_pooled = now_ns(); // idle-eviction baseline
-        _idle_upstreams[static_cast<size_t>(u->upstream_slot)].push_back(u);
+        if (!pool_upstream(u, keep_alive, body_ended)) ur_close(u); // see the epoll mirror
     }
 
     void Gateway::ur_close(Connection* c) noexcept
     {
         if (c->doomed) return;
+        // Every close unpairs: the other leg never keeps a pointer to a freed object.
+        Connection* other = unpair(c);
         if (c->is_client && c->id)
         {
             _clients.erase(c->id);
             LB_DEBUG("close ", *c, " clients=", _clients.size());
         }
-        if (!c->is_client && c->upstream_slot >= 0)
-        {
-            auto& pool = _idle_upstreams[static_cast<size_t>(c->upstream_slot)];
-            for (auto it = pool.begin(); it != pool.end(); ++it)
-                if (*it == c) { pool.erase(it); break; }
-        }
+        if (!c->is_client) _pool->remove(*c);
         // This backend closes both kinds in one function where epoll has two, so
         // the upstream branch lives here. After the erase, as in the ep_ twin.
         if (!c->is_client)
@@ -436,14 +396,15 @@ namespace llmbridge
         if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); ur_submit_cancel(c->fd); }
         c->doomed = true;
         _doomed.push_back(c);
+        // An upstream mid-response is of no use to anyone else.
+        if (other && c->is_client) ur_close(other);
         ur_maybe_free(c);
     }
 
     void Gateway::ur_abort_pair(Connection* client) noexcept
     {
         if (!client) return;
-        if (Connection* u = client->peer) { u->peer = nullptr; ur_close(u); }
-        ur_close(client);
+        ur_close(client); // and its upstream
         ++_stats.errors;
     }
 
@@ -459,7 +420,7 @@ namespace llmbridge
         // A send in flight is reading wbuf: replacing it would hand the kernel freed
         // memory. Whatever the client was sent, it now gets a close.
         if (client->send_inflight) { ur_abort_pair(client); return; }
-        if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
+        if (Connection* u = unpair(client)) ur_close(u);
         client->wbuf = build_error(code, detail);
         client->woff = 0;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
@@ -593,6 +554,7 @@ namespace llmbridge
         if (res <= 0) // multishot ended: EOF (0) or error (<0)
         {
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
+            if (!c->is_client) c->peer_eof = true; // its recv is over: never pooled now
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
             else if (c->peer && c->peer->req.f.streaming) ur_stream_on_upstream_eof(c); // stream end, not a failure
             else if (!ur_retry_upstream(c))
@@ -876,8 +838,7 @@ namespace llmbridge
             c->req.saved.resize(c->msg.total_len);
         }
         else c->rbuf.erase(0, c->msg.total_len);
-        c->peer = u;
-        u->peer = c;
+        pair(c, u);
         c->ever_framed = true;        // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
@@ -905,10 +866,9 @@ namespace llmbridge
         if (res < 0)
         {
             note_connect_failure(u->upstream_slot, std::strerror(-res));
-            Connection* cl = u->peer;
-            u->peer = nullptr;
+            Connection* cl = unpair(u);
             ur_close(u);
-            if (cl) { cl->peer = nullptr; if (!ur_upstream_failed(cl, 502, "upstream connect refused")) ur_error_respond(cl, 502, "upstream connect refused"); }
+            if (cl) { if (!ur_upstream_failed(cl, 502, "upstream connect refused")) ur_error_respond(cl, 502, "upstream connect refused"); }
             else ++_stats.errors;
             return;
         }
@@ -948,16 +908,18 @@ namespace llmbridge
                     h.status, reason_for(h.status),
                     provider::upstream_error_to_openai(body, "upstream_error"));
                 client->woff = 0;
-                client->peer = nullptr;
-                if (h.keep_alive) ur_release_upstream(u); else ur_close(u);
+                unpair(u);
+                u->rbuf.erase(0, total_len);
+                ur_release_upstream(u, h.keep_alive, true);
                 ++_stats.errors;
                 ur_client_send(client);
                 return;
             }
             if (!xlate_resp(client->req.f.effective_dialect, body, client->xlate_scratch, client->req.f.tok))
             {
-                client->peer = nullptr;
-                ur_release_upstream(u); // framing was valid; the upstream conn is reusable
+                unpair(u);
+                u->rbuf.erase(0, total_len); // framing was valid; the upstream conn is reusable
+                ur_release_upstream(u, h.keep_alive, true);
                 ur_error_respond(client, 502, "response translate");
                 return;
             }
@@ -1000,15 +962,12 @@ namespace llmbridge
         // keep-alive and (for passthrough, where the client's Connection header was
         // forwarded verbatim) the client must not have asked to close. Otherwise the
         // upstream is about to close on us. Drop it instead of reusing a corpse.
-        const bool pool_upstream =
+        const bool keep_alive =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
         client->woff = 0;
-        client->peer = nullptr;
-        // Drop the framed message; anything left is the next pipelined response.
-        u->rbuf.erase(0, total_len);
-        u->rdec.reset(); // see the epoll mirror
-        if (pool_upstream) ur_release_upstream(u);
-        else ur_close(u);
+        unpair(u);
+        u->rbuf.erase(0, total_len); // see the epoll mirror
+        ur_release_upstream(u, keep_alive, true);
         ur_client_send(client);
     }
 
@@ -1232,14 +1191,8 @@ namespace llmbridge
 
     void Gateway::ur_finalize_stream(Connection* client) noexcept
     {
-        if (Connection* u = client->peer)
-        {
-            const bool reusable = stream_upstream_reusable(client, u);
-            client->peer = nullptr;
-            u->peer = nullptr;
-            if (reusable) ur_release_upstream(u); // see the epoll mirror
-            else ur_close(u);
-        }
+        if (Connection* u = unpair(client)) // see the epoll mirror
+            ur_release_upstream(u, stream_keeps_upstream(client), stream_body_ended(client));
         LB_DEBUG(ReqId{client->req.f.req_seq}, " stream ended ",
                  client->close_after_resp ? "TRUNCATED" : "clean",
                  " tokens_in=", stream_tokens(client).in,
@@ -1323,8 +1276,7 @@ namespace llmbridge
             stop_conn(c);
             if (c->peer) stop_conn(c->peer); // acquired upstreams reachable only via peer
         }
-        for (auto& pool : _idle_upstreams)
-            for (Connection* u : pool) stop_conn(u);
+        _pool->for_each(stop_conn);
         // doomed conns were already shut down + cancelled by ur_close().
 
         while (_uring_inflight > 0)
@@ -1335,10 +1287,10 @@ namespace llmbridge
         }
 
         // Free acquired (in-flight) upstreams now drained but tracked only via peer;
-        // the rest (_clients, _idle_upstreams, _doomed, listen_conn) are freed by
+        // the rest (_clients, the pool, _doomed, listen_conn) are freed by
         // ~Gateway.
         for (auto& [id, c] : _clients)
-            if (Connection* u = c->peer) { c->peer = nullptr; if (u->fd >= 0) ::close(u->fd); delete u; }
+            if (Connection* u = unpair(c)) { if (u->fd >= 0) ::close(u->fd); delete u; }
 
         return 0;
     }

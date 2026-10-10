@@ -10,7 +10,7 @@
 
 #include "gateway/gateway.hpp"
 
-#include "loop.hpp"
+#include "core/limits.hpp"
 #include "net/secure.hpp"
 #include "request.hpp"
 
@@ -103,7 +103,8 @@ namespace llmbridge
                     ") but its mode does not build its own request target; only "
                     "--translate azure may carry one");
         }
-        _idle_upstreams.resize(_upstreams.size());
+        _pool = std::make_unique<UpstreamPool>();
+        _pool->init(_upstreams.size(), kMaxIdleUpstreams);
         _rr_inflight.assign(_upstreams.size(), 0);
         // Normalize once, at construction: lower-case with the colon, so the hot path
         // compares against a raw header line with no per-request work.
@@ -200,12 +201,20 @@ namespace llmbridge
             if (c->fd >= 0) ::close(c->fd);
             delete c;
         }
-        for (auto& pool : _idle_upstreams)
-            for (Connection* u : pool) { if (u->fd >= 0) ::close(u->fd); delete u; }
+        _pool->reap(INT64_MAX, [](Connection* u) {
+            if (u->fd >= 0) ::close(u->fd);
+            delete u;
+        });
         for (Connection* d : _doomed) delete d;
         if (_listen_fd >= 0) ::close(_listen_fd);
         if (_epfd >= 0) ::close(_epfd);
         delete _listen_conn;
+    }
+
+    const Upstream& Gateway::upstream_of(const Connection* c) const noexcept
+    {
+        const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
+        return _upstreams[i < _upstreams.size() ? i : 0];
     }
 
     uint16_t Gateway::bound_port() const noexcept
@@ -220,11 +229,16 @@ namespace llmbridge
     bool Gateway::pooled_buffer_contains(std::string_view needle) const noexcept
     {
         if (needle.empty()) return false;
-        for (const auto& pool : _idle_upstreams)
-            for (const Connection* u : pool)
-                if (u->wbuf.find(needle) != std::string::npos) return true;
-        return false;
+        bool found = false;
+        _pool->for_each([&](const Connection* u) {
+            found = found || u->wbuf.find(needle) != std::string::npos;
+        });
+        return found;
     }
+
+    size_t Gateway::pooled_upstream_count() const noexcept { return _pool->size(); }
+
+    void Gateway::set_pool_cap_for_test(size_t n) noexcept { _pool->set_cap(n); }
 
     void Gateway::print_profile(std::FILE* out, const char* title) const noexcept
     {
