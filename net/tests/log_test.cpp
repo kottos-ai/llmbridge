@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <future>
 #include <chrono>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -290,4 +291,20 @@ TEST(LogStderr, AFullStderrPipeDropsTheLineInsteadOfBlocking)
     log_::set_level(level);
     EXPECT_TRUE(returned) << "the log write blocked on a full stderr pipe";
     EXPECT_EQ(log_::dropped(), before + 1);
+}
+
+// Converting NaN, infinity or anything at or past 2^64 to uint64_t is undefined.
+TEST(LogLine, NonFiniteAndHugeDoublesPrintWithoutUndefinedBehaviour)
+{
+    const auto text = [](double v)
+    {
+        log_::Line l;
+        l.put(v);
+        return std::string(l.view());
+    };
+    EXPECT_EQ(text(std::numeric_limits<double>::quiet_NaN()), "nan");
+    EXPECT_EQ(text(std::numeric_limits<double>::infinity()), "inf");
+    EXPECT_EQ(text(-std::numeric_limits<double>::infinity()), "-inf");
+    EXPECT_EQ(text(1e20), ">=2^64");
+    EXPECT_EQ(text(1.5), "1.500");
 }

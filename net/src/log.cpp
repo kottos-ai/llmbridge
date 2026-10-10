@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -163,7 +164,11 @@ namespace llmbridge::net::log
     {
         // Three decimals, no locale, no allocation. Enough for a duration in ms; a
         // logger is not the place to render a full IEEE double.
+        if (std::isnan(v)) { put("nan"); return; }
         if (v < 0) { put('-'); v = -v; }
+        // Converting infinity or anything >= 2^64 to uint64_t is undefined behaviour.
+        if (std::isinf(v)) { put("inf"); return; }
+        if (v >= 18446744073709551616.0) { put(">=2^64"); return; }
         const auto whole = static_cast<uint64_t>(v);
         put(whole);
         put('.');
