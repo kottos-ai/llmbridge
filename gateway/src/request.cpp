@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <ctime>
+#include <charconv>
 #include <string>
 
 #include "net/sigv4.hpp"
@@ -529,19 +530,20 @@ namespace llmbridge::detail
     // anthropic-version here (same cost class).
     // `extra` is zero or more complete "Name: value\r\n" lines, inserted before
     // the terminating CRLF (used for the opt-in timing headers).
-    std::string build_http(std::string_view start_line, std::string_view body,
-                           std::string_view extra)
+    void build_http(std::string& out, std::string_view start_line, std::string_view body,
+                    std::string_view extra)
     {
-        std::string out;
-        out.reserve(start_line.size() + body.size() + extra.size() + 96);
+        out.clear();
+        const size_t need = start_line.size() + body.size() + extra.size() + 96;
+        if (out.capacity() < need) out.reserve(need);
         out.append(start_line);
         out.append("\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ");
-        out.append(std::to_string(body.size()));
+        char len[24];
+        out.append(len, static_cast<size_t>(std::to_chars(len, len + sizeof len, body.size()).ptr - len));
         out.append("\r\n");
         out.append(extra);
         out.append("\r\n");
         out.append(body);
-        return out;
     }
 
     // Upstream request builder: build_http plus a Host header (HTTP/1.1
@@ -761,22 +763,30 @@ namespace llmbridge::detail
         return true;
     }
 
-    // Translate an upstream response body back to the OpenAI shape. Empty = bad.
-    std::string xlate_resp(UpstreamDialect mode, std::string_view body)
+    // Translate an upstream response body back to the OpenAI shape into `out`, with
+    // the counts it states in `u`. False: the body could not be translated.
+    bool xlate_resp(UpstreamDialect mode, std::string_view body, std::string& out,
+                    provider::openai::Usage& u)
     {
         switch (mode)
         {
             // Bedrock answers with Anthropic's Messages envelope, so the response
             // leg is the same translator; only the request leg differs.
             case UpstreamDialect::Bedrock:
-            case UpstreamDialect::Anthropic: return provider::anthropic_to_openai_response(body);
+            case UpstreamDialect::Anthropic:
+                return provider::anthropic_to_openai_response(body, out, u);
             // Azure answers in the OpenAI shape it was asked in.
-            case UpstreamDialect::Azure: return std::string(body);
-            case UpstreamDialect::Gemini: return provider::gemini_to_openai_response(body);
-            case UpstreamDialect::Cohere: return provider::cohere_to_openai_response(body);
-            case UpstreamDialect::OpenAI: return {};
+            case UpstreamDialect::Azure:
+                out.assign(body);
+                u = provider::openai::scan_usage(body);
+                return !out.empty();
+            case UpstreamDialect::Gemini: return provider::gemini_to_openai_response(body, out, u);
+            case UpstreamDialect::Cohere: return provider::cohere_to_openai_response(body, out, u);
+            case UpstreamDialect::OpenAI: break;
         }
-        return {};
+        out.clear();
+        u = {};
+        return false;
     }
 
     /// `Host:` for a rebuilt request. The parsed hostname when there is one, since

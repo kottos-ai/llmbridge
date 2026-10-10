@@ -186,22 +186,34 @@ TEST(Sse, MaxTokensMapsToLength)
     EXPECT_EQ(fin.find("choices")->arr[0].str_or("finish_reason"), "length");
 }
 
-TEST(Sse, EofWithoutMessageStopStillTerminates)
+TEST(Sse, EofBeforeAStopReasonIsACutStream)
 {
-    // Upstream drops after a delta with no message_stop: finish() must still emit
-    // a finish chunk + [DONE] so the client stream is well-formed.
+    // Upstream drops after a delta: finish() must not dress the partial answer up as
+    // a whole one with a finish chunk and [DONE].
     AnthropicToOpenAiSse t;
     std::string out;
     t.feed("data: {\"type\":\"content_block_delta\",\"index\":0,"
            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
            out);
-    t.finish(out);
+    const size_t before = out.size();
+    EXPECT_FALSE(t.finish(out));
+    EXPECT_EQ(out.size(), before) << out;
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos);
+}
+
+TEST(Sse, EofAfterTheStopReasonEndsCleanly)
+{
+    // message_delta's stop_reason states the message is whole; only message_stop is lost.
+    std::string in(kAnthropicText);
+    in.erase(in.find("event: message_stop"));
+    AnthropicToOpenAiSse t;
+    std::string out;
+    ASSERT_TRUE(t.feed(in, out));
+    EXPECT_TRUE(t.finish(out));
     const auto payloads = data_payloads(out);
     EXPECT_EQ(payloads.back(), "[DONE]");
-    // role+content chunk, finish chunk, [DONE]
-    ASSERT_GE(payloads.size(), 3u);
-    Value fin = P(payloads[payloads.size() - 2]);
-    EXPECT_EQ(fin.find("choices")->arr[0].str_or("finish_reason"), "stop");
+    EXPECT_EQ(P(payloads[payloads.size() - 2]).find("choices")->arr[0].str_or("finish_reason"),
+              "stop");
 }
 
 // ── Coverage: robustness, framing, mapping, caps ────────────────────────────
@@ -1066,4 +1078,120 @@ TEST(SseTools, PlainTextStreamsAreUnaffected)
     EXPECT_NE(out.find(R"("content":"hi")"), std::string::npos) << out;
     EXPECT_NE(out.find(R"("finish_reason":"stop")"), std::string::npos) << out;
     EXPECT_EQ(out.find("tool_calls"), std::string::npos) << out;
+}
+
+// ── SseFrameReader: WHATWG framing ───────────────────────────────────────────
+namespace
+{
+    std::string bare_cr(std::string_view s) // rewrite LF -> CR
+    {
+        std::string o(s);
+        for (char& c : o)
+            if (c == '\n') c = '\r';
+        return o;
+    }
+
+    std::vector<std::string> frames(std::string_view in)
+    {
+        llmbridge::provider::SseFrameReader r;
+        std::vector<std::string> v;
+        r.feed(in);
+        std::string_view d;
+        while (r.next(d) == llmbridge::provider::SseFrameReader::Step::Event) v.emplace_back(d);
+        return v;
+    }
+} // namespace
+
+TEST(SseFrames, BareCrAndCrlfEndLinesLikeLf)
+{
+    EXPECT_EQ(translate_whole(bare_cr(kAnthropicText)), translate_whole(kAnthropicText));
+    EXPECT_EQ(translate_byte_by_byte(bare_cr(kAnthropicText)), translate_whole(kAnthropicText));
+    EXPECT_EQ(translate_byte_by_byte(crlf(kAnthropicText)), translate_whole(kAnthropicText))
+        << "a CR ending one read pairs with the LF opening the next";
+}
+
+TEST(SseFrames, ADataFieldWithoutAColonIsAnEmptyDataLine)
+{
+    EXPECT_EQ(frames("data\ndata: x\n\n"), (std::vector<std::string>{"\nx"}));
+    EXPECT_EQ(frames("data\n\n"), (std::vector<std::string>{""}));
+    EXPECT_EQ(frames(": comment\nevent: e\nid: 1\ndatax: no\n\n"), (std::vector<std::string>{}));
+    EXPECT_EQ(frames("data:a\r\ndata: b\r\rdata: c\n\n"), (std::vector<std::string>{"a\nb", "c"}));
+}
+
+TEST(SseFrames, NothingAfterTheTerminalEventIsRead)
+{
+    const std::string after =
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"AFTER-STOP\"}}\n\n";
+    for (const std::string& in : {std::string(kAnthropicText) + after,
+                                  std::string(kAnthropicText) + "data: [DONE]\n\n" + after})
+    {
+        const std::string out = translate_whole(in);
+        EXPECT_EQ(out.find("AFTER-STOP"), std::string::npos) << out;
+        EXPECT_EQ(out.find("[DONE]"), out.rfind("[DONE]")) << out;
+        EXPECT_EQ(translate_byte_by_byte(in), out);
+    }
+}
+
+TEST(Sse, AnErrorEventFailsTheStream)
+{
+    AnthropicToOpenAiSse t(kFixedCreated);
+    std::string out;
+    EXPECT_FALSE(t.feed(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial\"}}\n\n"
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\","
+        "\"message\":\"Overloaded\"}}\n\n",
+        out));
+    EXPECT_NE(out.find("Partial"), std::string::npos) << "what arrived before it is kept";
+    EXPECT_FALSE(t.feed("data: {\"type\":\"message_stop\"}\n\n", out)) << "sticky";
+    EXPECT_FALSE(t.finish(out));
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos) << out;
+    EXPECT_EQ(out.find("\"finish_reason\":\"stop\""), std::string::npos) << out;
+}
+
+TEST(Sse, ALongIdOrModelFailsTheStreamInsteadOfRepeatingInEveryChunk)
+{
+    const std::string delta = "data: {\"type\":\"content_block_delta\",\"index\":0,"
+                              "\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    for (const char* field : {"model", "id"})
+    {
+        AnthropicToOpenAiSse t(kFixedCreated);
+        std::string out;
+        const std::string start = std::string("data: {\"type\":\"message_start\",\"message\":{\"") +
+                                  field + "\":\"" + std::string(64 * 1024, 'm') + "\"}}\n\n";
+        EXPECT_FALSE(t.feed(start + delta + delta + delta, out)) << field;
+        EXPECT_LT(out.size(), 1024u) << field << ": the long value was echoed";
+        EXPECT_FALSE(t.finish(out));
+    }
+    AnthropicToOpenAiSse ok(kFixedCreated);
+    std::string out;
+    EXPECT_TRUE(ok.feed("data: {\"type\":\"message_start\",\"message\":{\"id\":\"" +
+                            std::string(AnthropicToOpenAiSse::kMaxEcho, 'i') + "\",\"model\":\"" +
+                            std::string(AnthropicToOpenAiSse::kMaxEcho, 'm') + "\"}}\n\n" + delta,
+                        out));
+}
+
+TEST(Sse, AResetTranslatorIsANewOne)
+{
+    const std::string tool =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\","
+        "\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":2,"
+        "\"cache_creation\":{\"ephemeral_5m_input_tokens\":2}}}}\n\n"
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":"
+        "{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":"
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n\ndata: {\"partial";
+    AnthropicToOpenAiSse t(kFixedCreated, true);
+    std::string first;
+    ASSERT_TRUE(t.feed(tool, first));
+    t.reset(kFixedCreated, false);
+    std::string again;
+    ASSERT_TRUE(t.feed(kAnthropicText, again));
+    EXPECT_TRUE(t.finish(again));
+    EXPECT_EQ(again, translate_whole(kAnthropicText));
+    EXPECT_EQ(t.usage().cache_write_5m, -1);
 }

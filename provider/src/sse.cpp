@@ -5,21 +5,14 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-#include <charconv>
 #include "provider/sse.hpp"
 
-#include "json_scan.hpp"
-#include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
-#include "provider/json.hpp"
+#include <charconv>
+#include <cstring>
 
-// Note (extract at second user): feed() below is two concerns bolted together
-// (a) dialect-agnostic SSE *framing* (line splitting, the fragmentation buffer,
-// the byte caps, the O(n) resume-scan) and (b) Anthropic-specific *event mapping*
-// (dispatch -> OpenAI chunks). When the second streaming dialect lands (the
-// reverse direction, or Gemini/Cohere), lift (a) into a reusable SseFrameReader
-// with a per-dialect on_event() callback. Deliberately not abstracted yet:
-// with a single consumer the seams would be guesses. See CLAUDE.md. "no
-// premature abstraction".
+#include "json_scan.hpp"
+#include "openai_common.hpp" // detail::now_secs / anthropic_finish_reason
+#include "provider/json.hpp"
 
 namespace llmbridge::provider
 {
@@ -31,79 +24,185 @@ namespace llmbridge::provider
         // upstream inject fake events ("\n\ndata: ..."), and a raw control byte
         // anywhere makes our JSON unparseable to a strict client.
         using detail::append_sanitized;
-
-        // Sanitize into an owned string (for spans we store across events).
-        std::string sanitized(std::string_view raw)
-        {
-            std::string s;
-            s.reserve(raw.size());
-            append_sanitized(s, raw);
-            return s;
-        }
     } // namespace
+
+    void SseFrameReader::reset() noexcept
+    {
+        constexpr size_t kKeep = 64 * 1024; // capacity one large event may leave behind
+        _in = {};
+        _at = 0;
+        _line.clear();
+        _data.clear();
+        if (_line.capacity() > kKeep) _line.shrink_to_fit();
+        if (_data.capacity() > kKeep) _data.shrink_to_fit();
+        _view = {};
+        _viewing = _have = _line_owned = _skip_lf = _stopped = _failed = false;
+    }
+
+    SseFrameReader::Step SseFrameReader::fail() noexcept
+    {
+        _failed = true;
+        _line.clear(); _line.shrink_to_fit();
+        _data.clear(); _data.shrink_to_fit();
+        return Step::Fail;
+    }
+
+    void SseFrameReader::feed(std::string_view bytes) noexcept
+    {
+        _in = bytes;
+        _at = 0;
+        _cr = !bytes.empty() && std::memchr(bytes.data(), '\r', bytes.size());
+    }
+
+    bool SseFrameReader::add_data(std::string_view value, bool in_place)
+    {
+        if (!_have)
+        {
+            _have = true;
+            _viewing = in_place;
+            if (in_place) _view = value;
+            else _data.assign(value);
+        }
+        else
+        {
+            if (_viewing) { _data.assign(_view); _viewing = false; }
+            _data.push_back('\n'); // multi-line data is joined by LF
+            _data.append(value);
+        }
+        return (_viewing ? _view.size() : _data.size()) < kMaxEvent;
+    }
+
+    // Each byte is searched once however the stream is split; an unfinished line is
+    // kept in _line for the next feed.
+    SseFrameReader::Step SseFrameReader::next(std::string_view& data)
+    {
+        if (_failed) return Step::Fail;
+        if (_stopped) return Step::More;
+        const char* const b = _in.data();
+        while (true)
+        {
+            if (_line_owned) { _line.clear(); _line_owned = false; }
+            if (_skip_lf && _at < _in.size())
+            {
+                if (b[_at] == '\n') ++_at;
+                _skip_lf = false;
+            }
+            if (_at >= _in.size() || _skip_lf) break;
+            const void* lf = std::memchr(b + _at, '\n', _in.size() - _at);
+            size_t k = lf ? static_cast<size_t>(static_cast<const char*>(lf) - b) : _in.size();
+            if (_cr)
+                if (const void* cr = std::memchr(b + _at, '\r', k - _at))
+                    k = static_cast<size_t>(static_cast<const char*>(cr) - b);
+            std::string_view line = _in.substr(_at, k - _at);
+            if (k == _in.size())
+            {
+                _line.append(line);
+                _at = k;
+                break;
+            }
+            _at = k + 1;
+            if (b[k] == '\r')
+            {
+                if (_at < _in.size()) { if (b[_at] == '\n') ++_at; }
+                else _skip_lf = true;
+            }
+            if (!_line.empty())
+            {
+                _line.append(line);
+                _line_owned = true;
+                line = _line;
+            }
+            if (line.empty())
+            {
+                if (!_have) continue;
+                _have = false;
+                data = _viewing ? _view : std::string_view(_data);
+                return Step::Event;
+            }
+            // Only `data` is read: event, id, retry and `:` comments are skipped.
+            if (line.size() < 4 || line.compare(0, 4, "data") != 0 ||
+                (line.size() > 4 && line[4] != ':'))
+                continue;
+            std::string_view value = line.substr(line.size() > 4 ? 5 : 4);
+            if (!value.empty() && value.front() == ' ') value.remove_prefix(1);
+            if (!add_data(value, !_line_owned)) return fail();
+        }
+        if (_line.size() > kMaxLine) return fail();
+        if (_viewing) { _data.assign(_view); _viewing = false; } // _in goes away
+        return Step::More;
+    }
+
+    void AnthropicToOpenAiSse::reset(long long created_secs, bool include_usage) noexcept
+    {
+        _frames.reset();
+        _failed = false;
+        _block_tool_ord.clear();
+        _next_tool_ord = 0;
+        _tool_open = false;
+        _id.assign("chatcmpl-llmbridge");
+        _model.clear();
+        _created_len = 0;
+        _created_secs = created_secs;
+        _finish = nullptr;
+        _role_emitted = _content_started = _finish_emitted = _done = false;
+        _include_usage = include_usage;
+        _usage_emitted = false;
+        _in_tok = _out_tok = _cached_tok = _cache_write_tok = 0;
+        _cw_5m = _cw_1h = -1;
+    }
+
+    openai::Usage AnthropicToOpenAiSse::usage() const noexcept
+    {
+        openai::Usage u;
+        u.in = _in_tok;
+        u.out = _out_tok;
+        u.cached = _cached_tok;
+        u.cache_write = _cache_write_tok;
+        u.cache_write_5m = _cw_5m;
+        u.cache_write_1h = _cw_1h;
+        return u;
+    }
 
     // Stamp `created` exactly once: a fixed value if one was supplied, else the
     // wall clock. Constant across every chunk of the stream thereafter.
     void AnthropicToOpenAiSse::ensure_created()
     {
-        if (!_created.empty()) return;
-        _created = _created_secs >= 0 ? std::to_string(_created_secs) : detail::created_now();
+        if (_created_len == 0)
+            _created_len = openai::decimal(_created, _created_secs >= 0 ? _created_secs
+                                                                         : detail::now_secs())
+                               .size();
     }
 
-    // Chunk envelope: everything up to the open of the delta object. Callers then
-    // append the delta body (e.g. "content":"...") and call emit_tail().
+    // A chunk through the open of its delta object; the caller appends the delta's
+    // members and calls emit_tail().
     void AnthropicToOpenAiSse::emit_head(std::string& out)
     {
         ensure_created();
-        out += "data: {\"id\":\"";
-        out += _id; // raw (already JSON-safe) span from message_start, or the default
-        out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
-        out += _created;
-        out += ",\"model\":\"";
-        out += _model;
-        out += "\",\"choices\":[{\"index\":0,\"delta\":{";
+        out += "data: ";
+        openai::Envelope(out, openai::Shape::Chunk, _id, {_created, _created_len}, _model).choice();
     }
 
-    // Close the delta object + choice. `finish` == nullptr -> finish_reason:null.
+    // With include_usage, OpenAI puts a null `usage` on every normal chunk; the real
+    // numbers ride the dedicated final chunk (emit_usage).
     void AnthropicToOpenAiSse::emit_tail(std::string& out, const char* finish)
     {
-        out += "},\"finish_reason\":";
-        if (finish) { out += '"'; out += finish; out += '"'; }
-        else out += "null";
-        // With include_usage, OpenAI puts a null `usage` on every normal chunk;
-        // the real numbers ride the dedicated final chunk (emit_usage).
-        out += _include_usage ? "}],\"usage\":null}\n\n" : "}]}\n\n";
+        openai::Envelope(out, openai::Shape::Chunk)
+            .end_choice(finish ? finish : "")
+            .close(nullptr, _include_usage);
+        out += "\n\n";
     }
 
-    // The extra usage-only chunk OpenAI streams just before [DONE] when the client
-    // set stream_options.include_usage: `choices` is empty by spec, and the counts
-    // are Anthropic's own (input from message_start, cumulative output from
-    // message_delta): re-shaped, never estimated.
+    // The usage-only chunk OpenAI streams just before [DONE] when the client set
+    // stream_options.include_usage: `choices` is empty by spec, and the counts are
+    // Anthropic's own, re-shaped, never estimated.
     void AnthropicToOpenAiSse::emit_usage(std::string& out)
     {
         if (!_include_usage || _usage_emitted) return;
         ensure_created();
-        out += "data: {\"id\":\"";
-        out += _id;
-        out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
-        out += _created;
-        out += ",\"model\":\"";
-        out += _model;
-        out += "\",\"choices\":[],\"usage\":{\"prompt_tokens\":";
-        out += std::to_string(_in_tok);
-        out += ",\"completion_tokens\":";
-        out += std::to_string(_out_tok);
-        out += ",\"total_tokens\":";
-        out += std::to_string(_in_tok + _out_tok);
-        // Only when the provider reported cache reads, so a request that used no cache
-        // emits exactly the object it always did.
-        if (_cached_tok > 0)
-        {
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":";
-            out += std::to_string(_cached_tok);
-            out += "}";
-        }
-        out += "}}\n\n";
+        const openai::Usage u = usage();
+        out += "data: ";
+        openai::Envelope(out, openai::Shape::Chunk, _id, {_created, _created_len}, _model).close(&u);
+        out += "\n\n";
         _usage_emitted = true;
     }
 
@@ -117,13 +216,9 @@ namespace llmbridge::provider
         _done = true;
     }
 
-    // Strict index parse. detail::to_ll() cannot be used here: it wraps
-    // std::from_chars, which on overflow or garbage leaves its output untouched
-    // so `"index": 99999999999999999999` and `"index": "abc"` both come back as 0.
-    // Measured: that made a malformed index alias onto block 0 and attach its
-    // argument fragments to whichever call lived there, i.e. a customer's arguments
-    // routed to the wrong tool. Anything not a clean, fully-consumed, in-range
-    // integer is rejected as -1 and the event is ignored.
+    // Strict index parse: anything not a clean, fully consumed, in-range integer is -1
+    // and the event is ignored. A lenient parse read garbage as 0, which attached a
+    // malformed index's argument fragments to whichever call lived at block 0.
     static long long parse_block_index(const json::Value& v)
     {
         const std::string_view s = v.num_or("index");
@@ -172,12 +267,30 @@ namespace llmbridge::provider
 
         const std::string_view type = v.str_or("type");
 
+        if (type == "error") // overloaded, or any failure after the head was sent
+        {
+            _failed = true;
+            return;
+        }
         if (type == "message_start")
         {
             if (const json::Value* m = v.find("message"))
             {
-                if (const std::string_view id = m->str_or("id"); !id.empty()) _id = sanitized(id);
-                _model = sanitized(m->str_or("model"));
+                // Both are echoed into every chunk, so an upstream's long one would
+                // multiply each tiny delta into a large write.
+                const std::string_view id = m->str_or("id"), model = m->str_or("model");
+                if (id.size() > kMaxEcho || model.size() > kMaxEcho)
+                {
+                    _failed = true;
+                    return;
+                }
+                if (!id.empty())
+                {
+                    _id.clear();
+                    append_sanitized(_id, id);
+                }
+                _model.clear();
+                append_sanitized(_model, model);
                 if (const json::Value* u = m->find("usage"))
                 {
                     const auto n = [](const json::Value* o, std::string_view k) {
@@ -250,8 +363,8 @@ namespace llmbridge::provider
                 }
             // Anthropic reports output_tokens cumulatively on message_delta.
             if (const json::Value* u = v.find("usage"))
-                if (const std::string_view ot = u->num_or("output_tokens"); !ot.empty())
-                    _out_tok = detail::to_ll(ot);
+                if (const long long ot = json_scan::count(u->num_or("output_tokens")); ot >= 0)
+                    _out_tok = ot;
             if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);
@@ -348,82 +461,31 @@ namespace llmbridge::provider
     bool AnthropicToOpenAiSse::feed(std::string_view bytes, std::string& out)
     {
         if (_failed) return false; // sticky: a capped stream stays dead
-
-        // The tail retained from the previous call is known to contain no '\n',
-        // so resume the newline search at the join point instead of rescanning
-        // it. Without this, feeding one long line one byte at a time is O(n^2)
-        // a hostile upstream dribbling bytes could pin a core (CPU-DoS the byte
-        // caps don't cover). With it, total scanning is O(bytes) regardless of
-        // how the stream is fragmented.
-        size_t from = _pending.size();
-        _pending.append(bytes);
-
-        size_t pos = 0;
-        while (true)
+        if (_done) return true;    // nothing after the terminal event is read
+        _frames.feed(bytes);
+        std::string_view data;
+        SseFrameReader::Step step;
+        while ((step = _frames.next(data)) == SseFrameReader::Step::Event)
         {
-            const size_t nl = _pending.find('\n', from);
-            if (nl == std::string::npos) break; // no complete line yet; keep the remainder
-
-            std::string_view line(_pending.data() + pos, nl - pos);
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1); // tolerate CRLF
-            pos = nl + 1;
-            from = pos;
-
-            if (line.empty()) // blank line terminates an event
-            {
-                if (_have_data) dispatch(_cur_data, out);
-                _cur_data.clear();
-                _have_data = false;
-            }
-            else if (line.rfind("data:", 0) == 0) // a data field
-            {
-                std::string_view d = line.substr(5);
-                if (!d.empty() && d.front() == ' ') d.remove_prefix(1); // one optional space
-                if (_cur_data.size() + d.size() + 1 > kMaxEvent) // endless event -> refuse
-                {
-                    _failed = true;
-                    _pending.clear(); _pending.shrink_to_fit();
-                    _cur_data.clear(); _cur_data.shrink_to_fit();
-                    return false;
-                }
-                if (_have_data) _cur_data.push_back('\n'); // SSE: multi-line data joined by \n
-                _cur_data.append(d);
-                _have_data = true;
-            }
-            // "event:" lines and ":" comments are ignored; we dispatch on the
-            // data payload's own "type" field, which is authoritative for Anthropic.
+            dispatch(data, out);
+            if (_failed) return false;
+            if (_done) { _frames.stop(); return true; }
         }
-        _pending.erase(0, pos);
-
-        if (_pending.size() > kMaxPending) // a single line this long is an attack, not a workload
-        {
-            _failed = true;
-            _pending.clear(); _pending.shrink_to_fit();
-            _cur_data.clear(); _cur_data.shrink_to_fit();
-            return false;
-        }
-        return true;
+        if (step == SseFrameReader::Step::Fail) _failed = true;
+        return !_failed;
     }
 
+    // Upstream EOF. Anthropic states the end in-band, so EOF before message_delta's
+    // stop_reason is a cut stream however the transport closed (FIN, RST, no
+    // close_notify); a fabricated finish and [DONE] would call a partial answer whole.
     bool AnthropicToOpenAiSse::finish(std::string& out)
     {
-        if (_failed) return false; // don't fabricate a clean [DONE] on a capped stream
-        // Order matters: _done first. A stream that already emitted [DONE] is over,
-        // and reporting failure for it makes the gateway count an error and close
-        // abruptly on a response that completed correctly. (An earlier revision of
-        // this function checked _tool_open first and did exactly that whenever the
-        // upstream sent message_stop without a preceding message_delta.)
+        if (_failed || !(_done || _finish)) return false;
         if (_done) return true;
-        // A tool call still open at EOF means its arguments were cut MID-JSON. The
-        // client would concatenate them into something unparseable inside a stream
-        // that looked complete: the "corrupt framing fabricated a clean ending"
-        // failure 0.3.0 fixed for text, which streamed tool calls reintroduced.
-        // Same signal: no [DONE], and the gateway counts it as an error.
-        if (_tool_open) return false;
         if (!_finish_emitted)
         {
             emit_head(out);
-            emit_tail(out, _finish ? _finish : default_finish());
+            emit_tail(out, _finish);
             _finish_emitted = true;
         }
         emit_done(out);

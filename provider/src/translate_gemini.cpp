@@ -14,7 +14,7 @@
 
 #include "content.hpp"
 #include "json_scan.hpp"
-#include "openai_common.hpp" // detail::created_now / gemini_usage
+#include "openai_common.hpp" // detail::now_secs / gemini_usage
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -88,11 +88,14 @@ namespace llmbridge::provider
         return out;
     }
 
-    std::string gemini_to_openai_response(std::string_view gemini_body)
+    bool gemini_to_openai_response(std::string_view gemini_body, std::string& out,
+                                   openai::Usage& usage)
     {
+        out.clear();
+        usage = {};
         bool ok = false;
         json::Value v = json::parse(gemini_body, ok);
-        if (!ok || !v.is_object()) return {};
+        if (!ok || !v.is_object()) return false;
 
         const json::Value* parts = nullptr; // candidates[0].content.parts
         const char* finish = "stop";
@@ -109,35 +112,36 @@ namespace llmbridge::provider
                    : "stop";
         }
 
-        openai::Usage u;
         long long total = -1;
         if (const json::Value* m = v.find("usageMetadata"))
         {
             const auto n = [m](std::string_view k) { return json_scan::count(m->num_or(k)); };
-            u = detail::gemini_usage(n("promptTokenCount"), n("candidatesTokenCount"),
-                                     n("thoughtsTokenCount"), n("cachedContentTokenCount"), -1);
+            usage = detail::gemini_usage(n("promptTokenCount"), n("candidatesTokenCount"),
+                                         n("thoughtsTokenCount"), n("cachedContentTokenCount"),
+                                         n("toolUsePromptTokenCount"));
             total = n("totalTokenCount");
         }
-        const long long in_tok = u.in > 0 ? u.in : 0, out_tok = u.out > 0 ? u.out : 0;
-        if (total <= 0) total = in_tok + out_tok;
+        detail::as_written(usage);
+        if (total <= 0) total = usage.in + usage.out;
 
-        std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":"
-                          + detail::created_now() + ",\"model\":";
-        json::append_raw_string(out, v.str_or("modelVersion"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        if (out.capacity() < gemini_body.size() + 256) out.reserve(gemini_body.size() + 256);
+        char created[24];
+        openai::Envelope e(out, openai::Shape::Completion, "chatcmpl-llmbridge",
+                           openai::decimal(created, detail::now_secs()), v.str_or("modelVersion"));
+        e.choice();
+        out += "\"role\":\"assistant\",\"content\":\"";
         if (parts)
             for (const auto& part : parts->arr) out += part.str_or("text");
-        out += "\"},\"finish_reason\":\"";
-        out += finish;
-        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
-               ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(total);
-        if (u.cached > 0)
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(u.cached) + "}";
-        if (u.reasoning >= 0)
-            out += ",\"completion_tokens_details\":{\"reasoning_tokens\":" +
-                   std::to_string(u.reasoning) + "}";
-        out += "}}";
+        out += '"';
+        e.end_choice(finish).close(&usage, false, total);
+        return true;
+    }
+
+    std::string gemini_to_openai_response(std::string_view gemini_body)
+    {
+        std::string out;
+        openai::Usage u;
+        gemini_to_openai_response(gemini_body, out, u);
         return out;
     }
 } // namespace llmbridge::provider

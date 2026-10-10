@@ -12,7 +12,6 @@
 // scan.hpp: this runs on every read of every stream.
 
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -34,9 +33,11 @@ namespace llmbridge::detail
     {
         if (!c->stream_chunked_out || out.size() <= pos) return;
         char hdr[24];
-        const int n = std::snprintf(hdr, sizeof hdr, "%zx\r\n", out.size() - pos);
-        if (n <= 0) return;
-        out.insert(pos, hdr, static_cast<size_t>(n));
+        char* p = hdr + sizeof hdr;
+        *--p = '\n';
+        *--p = '\r';
+        for (size_t n = out.size() - pos; n; n >>= 4) *--p = "0123456789abcdef"[n & 15];
+        out.insert(pos, p, static_cast<size_t>(hdr + sizeof hdr - p));
         out.append("\r\n", 2);
     }
 
@@ -162,12 +163,7 @@ namespace llmbridge::detail
     /// dialect that learns to stream adds its own branch here.
     inline BodyUsage stream_tokens(const Connection* c) noexcept
     {
-        if (c->sse_xlate)
-            return {c->sse_xlate->input_tokens(), c->sse_xlate->output_tokens(),
-                    static_cast<long long>(c->sse_xlate->cached_tokens()),
-                    static_cast<long long>(c->sse_xlate->cache_write_tokens()),
-                    static_cast<long long>(c->sse_xlate->cache_write_5m_tokens()),
-                    static_cast<long long>(c->sse_xlate->cache_write_1h_tokens())};
+        if (c->sse_translating) return c->sse_xlate.usage();
         return c->stream_usage.usage();
     }
 
@@ -242,7 +238,7 @@ namespace llmbridge::detail
         // never reached the pump at all: streaming was detected for the Anthropic
         // path only, so a passthrough stream was framed as a whole body and
         // delivered at the end.
-        if (!client->sse_xlate)
+        if (!client->sse_translating)
         {
             if (!sse_in.empty())
             {
@@ -275,7 +271,7 @@ namespace llmbridge::detail
         // hostile/broken upstream must tear the stream down, not silently
         // produce nothing while we keep reading it forever.
         const size_t xlate_at = out.size();
-        if (!sse_in.empty() && !client->sse_xlate->feed(sse_in, out)) return StreamStep::Failed;
+        if (!sse_in.empty() && !client->sse_xlate.feed(sse_in, out)) return StreamStep::Failed;
         chunk_wrap(client, out, xlate_at);
 
         // TTFT: the first content token, stamped here because this is the one place
@@ -285,7 +281,7 @@ namespace llmbridge::detail
         // single read can carry both.
         if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
             client->ts_first_thinking = now_ns();
-        if (client->ts_first_token == 0 && client->sse_xlate->content_started())
+        if (client->ts_first_token == 0 && client->sse_xlate.content_started())
             client->ts_first_token = now_ns();
 
         if (stream_complete(client, at_eof) && !client->stream_ended)
@@ -293,7 +289,7 @@ namespace llmbridge::detail
             // The translator's trailer ([DONE] and any final event) is body, so it
             // is framed like every other write before the terminator closes it.
             const size_t fin_at = out.size();
-            if (!client->sse_xlate->finish(out)) return StreamStep::Failed;
+            if (!client->sse_xlate.finish(out)) return StreamStep::Failed;
             chunk_wrap(client, out, fin_at);
             chunk_terminate(client, out);
             client->stream_ended = true;

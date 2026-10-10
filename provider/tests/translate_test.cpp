@@ -1760,3 +1760,52 @@ TEST(JsonScanStream, CarriesOnlyWhatAnUnfinishedObjectNeeds)
     EXPECT_EQ(s.usage().in, 5);
     EXPECT_EQ(s.usage().out, 6);
 }
+
+// ── openai::Envelope and write_error: the one writer of OpenAI objects ─────────
+TEST(TranslateEnvelope, WritesEachShapeOnce)
+{
+    std::string out;
+    oai::Usage u;
+    u.in = 3;
+    u.out = 4;
+    u.cached = 2;
+    oai::Envelope(out, oai::Shape::Completion, "i", "7", "m").choice().end_choice("stop").close(&u);
+    EXPECT_EQ(out, R"({"id":"i","object":"chat.completion","created":7,"model":"m","choices":[)"
+                   R"({"index":0,"message":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,)"
+                   R"("completion_tokens":4,"total_tokens":7,"prompt_tokens_details":)"
+                   R"({"cached_tokens":2}}})");
+    out.clear();
+    oai::Envelope(out, oai::Shape::Chunk, "i", "7", "m").choice().end_choice("").close(nullptr, true);
+    EXPECT_EQ(out, R"({"id":"i","object":"chat.completion.chunk","created":7,"model":"m",)"
+                   R"("choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":null})");
+    out.clear();
+    oai::write_error(out, "a\nb", "t");
+    EXPECT_EQ(out, R"({"error":{"message":"a\u000ab","type":"t","code":null}})");
+}
+
+TEST(TranslateEnvelope, TranslatorsReturnTheCountsTheyWrote)
+{
+    std::string out;
+    oai::Usage u;
+    ASSERT_TRUE(llmbridge::provider::anthropic_to_openai_response(
+        R"({"content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5,)"
+        R"("cache_read_input_tokens":3,"cache_creation_input_tokens":2,)"
+        R"("cache_creation":{"ephemeral_1h_input_tokens":2},"output_tokens":9}})",
+        out, u));
+    EXPECT_EQ(u.in, 10);
+    EXPECT_EQ(u.out, 9);
+    EXPECT_EQ(u.cached, 3);
+    EXPECT_EQ(u.cache_write, 2);
+    EXPECT_EQ(u.cache_write_1h, 2);
+    EXPECT_EQ(oai::scan_usage(out).in, u.in) << "the body and the counts agree";
+    ASSERT_TRUE(llmbridge::provider::gemini_to_openai_response(
+        R"({"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,)"
+        R"("thoughtsTokenCount":2,"toolUsePromptTokenCount":1}})",
+        out, u));
+    EXPECT_EQ(u.out, 5);
+    EXPECT_EQ(u.reasoning, 2);
+    EXPECT_EQ(u.tool_prompt, 1);
+    EXPECT_EQ(u.cached, -1) << "none written";
+    EXPECT_FALSE(llmbridge::provider::cohere_to_openai_response("x", out, u));
+    EXPECT_TRUE(out.empty());
+}

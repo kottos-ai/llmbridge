@@ -13,6 +13,8 @@
 #include <string>
 #include <string_view>
 
+#include "provider/openai.hpp"
+
 namespace llmbridge::provider
 {
     /// Replace the top-level `"model"` value; empty means refused, never a partial edit.
@@ -66,6 +68,9 @@ namespace llmbridge::provider
     bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,
                                    std::string& out); // into `out`; false refuses
     std::string anthropic_to_openai_response(std::string_view anthropic_body);
+    /// The same into `out` (capacity kept), with the counts the reply states in `usage`.
+    bool anthropic_to_openai_response(std::string_view anthropic_body, std::string& out,
+                                      openai::Usage& usage);
 
     /// An upstream error body as the OpenAI error envelope. Never empty: a foreign body
     /// still yields one, typed `fallback_type`, so the upstream's status can be relayed.
@@ -73,6 +78,10 @@ namespace llmbridge::provider
 
     std::string openai_to_gemini_request(std::string_view openai_body);
     std::string gemini_to_openai_response(std::string_view gemini_body);
+    bool gemini_to_openai_response(std::string_view gemini_body, std::string& out,
+                                   openai::Usage& usage);
     std::string openai_to_cohere_request(std::string_view openai_body);
     std::string cohere_to_openai_response(std::string_view cohere_body);
+    bool cohere_to_openai_response(std::string_view cohere_body, std::string& out,
+                                   openai::Usage& usage);
 } // namespace llmbridge::provider

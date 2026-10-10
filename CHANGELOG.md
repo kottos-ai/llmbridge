@@ -8,6 +8,78 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.74.0]. 2026-10-10
+
+### Fixed
+
+- **A truncated translated stream is no longer presented as complete.** Anthropic states
+  the end of a message in-band, so a stream that ends before `message_delta`'s
+  `stop_reason` (FIN, RST, or TLS EOF without `close_notify` on a close-delimited
+  upstream) now fails: no fabricated `finish_reason` and `[DONE]`, an error counted, and
+  the client's stream left cut. A stream that closes after the stop reason, missing
+  only `message_stop`, still ends cleanly.
+- **An Anthropic `error` event fails the stream.** It was ignored, and a clean end of
+  body then closed the stream with `finish_reason: "stop"` and `[DONE]`.
+- **SSE framing follows the spec.** A bare CR or CRLF ends a line as LF does (a CR-only
+  stream used to buffer until the 1 MiB cap and fail), a `data` field without a colon
+  counts as an empty data line, and nothing after the terminal event (`message_stop` or
+  `[DONE]`) is read, where a later delta used to be emitted after `[DONE]`.
+- **Translated-stream amplification is bounded.** `message_start`'s id and model are
+  echoed into every chunk; one over 256 bytes now fails the stream, where a model name
+  near 1 MiB turned each one-token delta into a 1 MiB write.
+
+### Changed
+
+- **Breaking: `AnthropicToOpenAiSse::finish()` writes nothing and returns false for a
+  stream cut before its stop reason** (installed header `provider/sse.hpp`). It used
+  to append a finish chunk and `[DONE]` for any stream not already ended.
+- **One writer of OpenAI objects.** `provider::openai::Envelope` writes every
+  completion, chunk and usage block (five hand-written envelopes and four usage writers
+  before), and `write_error` both error envelopes. Translated output is byte-identical;
+  the gateway's own error bodies gain `"code":null`, as OpenAI's carry.
+- `provider/sse.hpp` gains `SseFrameReader`, `AnthropicToOpenAiSse::reset()` and
+  `usage()`; `provider/translate.hpp` gains `anthropic_`, `gemini_` and
+  `cohere_to_openai_response(body, out, usage)`, which write into a kept buffer and
+  return the counts they wrote.
+- **The gateway no longer scans translated bodies for usage**; it records the counts
+  the translator wrote (GP1). The SSE translator is held in the connection and reset
+  per stream instead of allocated per stream.
+
+### Performance
+
+- **Allocations** (`gateway_alloc_test`, ceilings lowered to match):
+
+  | Path | Before | After |
+  |---|---|---|
+  | Passthrough request | 3 | 3 |
+  | Translated request (OpenAI to Anthropic) | 12 | 3 |
+  | Translated stream, 20 deltas | 7 | 3 |
+  | Each further stream delta | 0.05 | 0.03 (measured 0.00 on both backends) |
+
+  The three left are the request side's (`build_translated_request`), on every path.
+- `bench/protocol_micro` p50, GCC Release, three interleaved runs against 0.70.0:
+  `anthropic_to_openai_response` 822 to 581 ns; `AnthropicToOpenAiSse::feed` 202 to
+  211 ns (+4.5%: one CR probe per read, which bare-CR framing needs).
+- A stream chunk's hex size is written by hand: 45 to 11 ns per chunk, `snprintf` gone.
+
+### Tests
+
+- `SseFrames.*` (CR and CRLF at every split, a colonless `data`, nothing after the end),
+  `Sse.AnErrorEventFailsTheStream`, `Sse.EofBeforeAStopReasonIsACutStream`,
+  `Sse.ALongIdOrModelFailsTheStreamInsteadOfRepeatingInEveryChunk`,
+  `Sse.AResetTranslatorIsANewOne`, `TranslateEnvelope.*`,
+  `ProxyStream.AnUpstreamErrorEventFailsTheStream`,
+  `ProxyStream.TruncatedUpstreamFailsTheClientStream` (it replaces
+  `TruncatedUpstreamStillTerminatesClientStream`, which asserted the fabricated end) and
+  `ProxyStream.UpstreamClosingAfterTheStopReasonEndsCleanly`, both backends.
+- `fuzz_sse` checks that the LF, CRLF and CR spellings of a stream translate alike.
+
+### Known gaps
+
+- No per-step output budget on the stream pump: the echo cap bounds translated output to
+  a small multiple of the input, which the existing buffer caps then hold.
+
+
 ## [0.73.0]. 2026-10-10
 
 HTTP strictness. Each fix has a regression test that fails without it. Kept apart

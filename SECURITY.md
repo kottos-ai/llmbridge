@@ -139,7 +139,9 @@ equivalent warning for a plaintext listener, so that constraint is yours to enfo
 - **No OCSP/CRL revocation checking** on the upstream certificate. This is usual for
   non-browser TLS clients, but it is a deliberate choice instead of an oversight.
 - **A provider EOF without `close_notify`** is treated as a normal end of a
-  close-delimited stream. Strict truncation detection would break real providers.
+  close-delimited stream. Strict truncation detection would break real providers. A
+  translated Anthropic stream still fails when EOF comes before the in-band
+  `stop_reason`, however the transport closed.
 - **Buffer scrubbing is targeted, not exhaustive**: the pooled request buffer is
   scrubbed because it can outlive its request; transient buffers are not, because they
   are overwritten within microseconds and doing so would put a `memset` on the hot path.

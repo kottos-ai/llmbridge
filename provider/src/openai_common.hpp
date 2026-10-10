@@ -13,7 +13,6 @@
 // paths can't drift: a new Anthropic stop_reason (or a change to how `created`
 // is stamped) must land identically for streaming and non-streaming.
 
-#include <charconv>
 #include <ctime>
 #include <string>
 #include <string_view>
@@ -45,22 +44,9 @@ namespace llmbridge::provider::detail
         out.append(raw.data() + start, raw.size() - start);
     }
 
-    // Parse a JSON number's raw text. Returns 0 for empty/garbage; usage counts
-    // are advisory, so a malformed one must not fail a translation.
-    inline long long to_ll(std::string_view s)
-    {
-        long long v = 0;
-        std::from_chars(s.data(), s.data() + s.size(), v);
-        return v;
-    }
-
-    // Current epoch seconds as text for the OpenAI `created` field. A bare 0
-    // confuses some SDK clients; we synthesize "now", which is exactly OpenAI's
-    // semantics. (time() is a fast vDSO read on Linux.)
-    inline std::string created_now()
-    {
-        return std::to_string(static_cast<long long>(std::time(nullptr)));
-    }
+    // Epoch seconds for the OpenAI `created` field. A bare 0 confuses some SDK
+    // clients; "now" is exactly OpenAI's semantics. (time() is a vDSO read on Linux.)
+    inline long long now_secs() noexcept { return static_cast<long long>(std::time(nullptr)); }
 
     // Each venue's counts in the OpenAI convention, written once for the whole-body
     // translators, the stream translator and the byte-forward scans. -1: not stated.
@@ -96,6 +82,15 @@ namespace llmbridge::provider::detail
         u.reasoning = thoughts;
         u.tool_prompt = tool_prompt;
         return u;
+    }
+
+    // The counts as an OpenAI body states them: prompt and completion always, cached
+    // only when above zero, so a reader of the body and of `u` agree.
+    inline void as_written(openai::Usage& u) noexcept
+    {
+        if (u.in < 0) u.in = 0;
+        if (u.out < 0) u.out = 0;
+        if (u.cached <= 0) u.cached = -1;
     }
 
     // Anthropic Messages stop_reason -> OpenAI finish_reason. Returns a static

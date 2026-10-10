@@ -20,6 +20,7 @@
 //   (2) Fragmentation-invariance. Feeding the same bytes one-at-a-time yields
 //       byte-identical output to a single feed(), whenever neither run trips a
 //       buffer cap. This is the property most likely to break as state grows.
+//   (3) Line endings. LF, CRLF and CR spellings of one stream translate alike.
 
 #include "provider/sse.hpp"
 
@@ -87,6 +88,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     // (c) fragmentation must not change the output, but only when neither run
     // hit a cap (a cap can stop the two feeders at different points).
     if (ok_whole && ok_frag) must(whole == frag);
+
+    // (d) line endings: input with no CR reads the same with every LF made CRLF or CR.
+    if (in.find('\r') == std::string_view::npos)
+        for (const std::string_view end : {std::string_view("\r\n"), std::string_view("\r")})
+        {
+            std::string alt;
+            for (const char c : in)
+                if (c == '\n') alt.append(end);
+                else alt.push_back(c);
+            AnthropicToOpenAiSse t(kCreated);
+            std::string out;
+            bool ok = t.feed(alt, out);
+            ok = t.finish(out) && ok;
+            if (ok && ok_whole) must(out == whole);
+        }
 
     return 0;
 }

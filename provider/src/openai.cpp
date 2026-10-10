@@ -7,6 +7,7 @@
 
 #include "provider/openai.hpp"
 
+#include <charconv>
 #include <string_view>
 
 #include "json_scan.hpp"
@@ -137,6 +138,61 @@ namespace llmbridge::provider::openai
             return p ? static_cast<size_t>(static_cast<const char*>(p) - s.data()) : kNpos;
         }
     } // namespace
+
+    namespace
+    {
+        void append_count(std::string& out, long long v)
+        {
+            char buf[24];
+            const auto r = std::to_chars(buf, buf + sizeof buf, v < 0 ? 0 : v);
+            out.append(buf, static_cast<size_t>(r.ptr - buf));
+        }
+    } // namespace
+
+    std::string_view decimal(char (&buf)[24], long long v) noexcept
+    {
+        const auto r = std::to_chars(buf, buf + sizeof buf, v);
+        return {buf, static_cast<size_t>(r.ptr - buf)};
+    }
+
+    void Envelope::close(const Usage* u, bool usage_null, long long total)
+    {
+        _out += ']';
+        if (!u)
+        {
+            _out += usage_null ? ",\"usage\":null}" : "}";
+            return;
+        }
+        const long long in = u->in < 0 ? 0 : u->in, out = u->out < 0 ? 0 : u->out;
+        _out += ",\"usage\":{\"prompt_tokens\":";
+        append_count(_out, in);
+        _out += ",\"completion_tokens\":";
+        append_count(_out, out);
+        _out += ",\"total_tokens\":";
+        append_count(_out, total < 0 ? in + out : total);
+        if (u->cached > 0)
+        {
+            _out += ",\"prompt_tokens_details\":{\"cached_tokens\":";
+            append_count(_out, u->cached);
+            _out += '}';
+        }
+        if (u->reasoning >= 0)
+        {
+            _out += ",\"completion_tokens_details\":{\"reasoning_tokens\":";
+            append_count(_out, u->reasoning);
+            _out += '}';
+        }
+        _out += "}}";
+    }
+
+    void write_error(std::string& out, std::string_view message, std::string_view type)
+    {
+        out += "{\"error\":{\"message\":\"";
+        detail::append_sanitized(out, message);
+        out += "\",\"type\":\"";
+        detail::append_sanitized(out, type);
+        out += "\",\"code\":null}}";
+    }
 
     Usage scan_usage(std::string_view body, size_t window) noexcept
     {

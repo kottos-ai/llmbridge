@@ -13,7 +13,8 @@
 #include <string_view>
 
 #include "content.hpp"
-#include "openai_common.hpp" // detail::created_now / to_ll
+#include "json_scan.hpp"
+#include "openai_common.hpp" // detail::now_secs / as_written
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -63,43 +64,48 @@ namespace llmbridge::provider
         return out;
     }
 
-    std::string cohere_to_openai_response(std::string_view cohere_body)
+    bool cohere_to_openai_response(std::string_view cohere_body, std::string& out,
+                                   openai::Usage& usage)
     {
+        out.clear();
+        usage = {};
         bool ok = false;
         json::Value v = json::parse(cohere_body, ok);
-        if (!ok || !v.is_object()) return {};
+        if (!ok || !v.is_object()) return false;
 
         // Cohere finish_reason -> OpenAI finish_reason.
         const std::string_view fr = v.str_or("finish_reason", "COMPLETE");
         const char* finish = fr == "MAX_TOKENS" ? "length" : fr == "TOOL_CALL" ? "tool_calls" : "stop";
 
-        long long in_tok = 0, out_tok = 0, cached_tok = 0;
         if (const json::Value* u = v.find("usage"))
             if (const json::Value* t = u->find("tokens"))
             {
-                in_tok = detail::to_ll(t->num_or("input_tokens", "0"));
-                out_tok = detail::to_ll(t->num_or("output_tokens", "0"));
-                cached_tok = detail::to_ll(t->num_or("cache_read_input_tokens", "0"));
+                usage.in = json_scan::count(t->num_or("input_tokens"));
+                usage.out = json_scan::count(t->num_or("output_tokens"));
+                usage.cached = json_scan::count(t->num_or("cache_read_input_tokens"));
             }
+        detail::as_written(usage);
 
-        std::string out = "{\"id\":";
-        json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
-        out += ",\"object\":\"chat.completion\",\"created\":" + detail::created_now() + ",\"model\":";
-        json::append_raw_string(out, v.str_or("model"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"";
+        if (out.capacity() < cohere_body.size() + 256) out.reserve(cohere_body.size() + 256);
+        char created[24];
+        openai::Envelope e(out, openai::Shape::Completion, v.str_or("id", "chatcmpl-llmbridge"),
+                           openai::decimal(created, detail::now_secs()), v.str_or("model"));
+        e.choice();
+        out += "\"role\":\"assistant\",\"content\":\"";
         if (const json::Value* msg = v.find("message"))
             if (const json::Value* c = msg->find("content"); c && c->is_array())
                 for (const auto& blk : c->arr)
                     if (blk.str_or("type") == "text") out += blk.str_or("text");
-        out += "\"},\"finish_reason\":\"";
-        out += finish;
-        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
-               ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(in_tok + out_tok);
-        if (cached_tok > 0)
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" +
-                   std::to_string(cached_tok) + "}";
-        out += "}}";
+        out += '"';
+        e.end_choice(finish).close(&usage);
+        return true;
+    }
+
+    std::string cohere_to_openai_response(std::string_view cohere_body)
+    {
+        std::string out;
+        openai::Usage u;
+        cohere_to_openai_response(cohere_body, out, u);
         return out;
     }
 } // namespace llmbridge::provider
