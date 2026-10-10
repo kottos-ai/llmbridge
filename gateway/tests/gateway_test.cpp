@@ -3365,6 +3365,29 @@ TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
     shutdown();
 }
 
+// Anthropic reports a failure after the head as an `error` event, then ends the
+// body cleanly; the client must see a failed stream, not finish_reason stop.
+TEST_P(ProxyStream, AnUpstreamErrorEventFailsTheStream)
+{
+    const std::string ev = anthropic_sse_events();
+    const std::string cut = ev.substr(0, ev.find("event: message_delta")) +
+                            "event: error\ndata: {\"type\":\"error\",\"error\":"
+                            "{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\n\r\n" + sse_chunk_encode(cut, 64));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_stream());
+    EXPECT_FALSE(s.done) << "an upstream error ended with a fabricated [DONE]";
+    EXPECT_NE(s.finish, "stop");
+    c.close();
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+    EXPECT_EQ(_gw->stats().requests, 0u);
+}
+
 // Corrupt chunked framing mid-stream must not fabricate a clean finish: the
 // client sees the partial content and an aborted stream (no [DONE]).
 TEST_P(ProxyStream, CorruptChunkFramingAbortsWithoutDone)

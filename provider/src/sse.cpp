@@ -265,6 +265,11 @@ namespace llmbridge::provider
 
         const std::string_view type = v.str_or("type");
 
+        if (type == "error") // overloaded, or any failure after the head was sent
+        {
+            _failed = true;
+            return;
+        }
         if (type == "message_start")
         {
             if (const json::Value* m = v.find("message"))
@@ -448,6 +453,7 @@ namespace llmbridge::provider
         while ((step = _frames.next(data)) == SseFrameReader::Step::Event)
         {
             dispatch(data, out);
+            if (_failed) return false;
             if (_done) { _frames.stop(); return true; }
         }
         if (step == SseFrameReader::Step::Fail) _failed = true;

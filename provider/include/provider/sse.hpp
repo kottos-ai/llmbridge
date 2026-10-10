@@ -68,7 +68,7 @@ namespace llmbridge::provider
 
         // Append the translation of these bytes to `out`; an incomplete event waits for the
         // next call, unknown or unparseable events are skipped, and nothing after the
-        // terminal event is read. False, permanently, when a cap is exceeded.
+        // terminal event is read. False, permanently, on an `error` event or a cap.
         bool feed(std::string_view bytes, std::string& out);
 
         // Upstream EOF: a terminal finish chunk and [DONE], unless message_stop already sent them.
@@ -102,7 +102,7 @@ namespace llmbridge::provider
         void emit_done(std::string& out);                     // usage chunk (if any) + [DONE]
 
         SseFrameReader _frames;
-        bool _failed = false;   // sticky: set on cap overflow, feed() refuses further work
+        bool _failed = false;   // sticky: an error event or a cap; feed() refuses further work
         // Anthropic indexes every content block; OpenAI's tool_calls[].index counts only
         // calls, so block indices map to ordinals (-1: not a tool). Capped so a hostile index
         // cannot make us allocate; blocks past the cap are ignored.

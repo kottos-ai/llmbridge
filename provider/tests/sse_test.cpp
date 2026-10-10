@@ -1120,3 +1120,21 @@ TEST(SseFrames, NothingAfterTheTerminalEventIsRead)
         EXPECT_EQ(translate_byte_by_byte(in), out);
     }
 }
+
+TEST(Sse, AnErrorEventFailsTheStream)
+{
+    AnthropicToOpenAiSse t(kFixedCreated);
+    std::string out;
+    EXPECT_FALSE(t.feed(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,"
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial\"}}\n\n"
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\","
+        "\"message\":\"Overloaded\"}}\n\n",
+        out));
+    EXPECT_NE(out.find("Partial"), std::string::npos) << "what arrived before it is kept";
+    EXPECT_FALSE(t.feed("data: {\"type\":\"message_stop\"}\n\n", out)) << "sticky";
+    EXPECT_FALSE(t.finish(out));
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos) << out;
+    EXPECT_EQ(out.find("\"finish_reason\":\"stop\""), std::string::npos) << out;
+}
