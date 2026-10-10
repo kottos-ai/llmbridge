@@ -53,14 +53,48 @@ namespace llmbridge::net::sigv4
             return true;
         }
 
-        void append_trimmed_lower(std::string& out, std::string_view v)
+        // A canonical header value is trimmed with inner runs of spaces collapsed to
+        // one, and never lower-cased: AWS signs the value it receives, and lower-casing
+        // a Host with capitals in it returned 403 for every request.
+        void append_trimmed_collapsed(std::string& out, std::string_view v)
         {
-            size_t b = v.find_first_not_of(" \t");
+            const size_t b = v.find_first_not_of(" \t");
             if (b == std::string_view::npos) return;
-            size_t e = v.find_last_not_of(" \t");
+            const size_t e = v.find_last_not_of(" \t");
+            bool space = false;
             for (size_t i = b; i <= e; ++i)
-                out.push_back(static_cast<char>(
-                    v[i] >= 'A' && v[i] <= 'Z' ? v[i] - 'A' + 'a' : v[i]));
+            {
+                const bool ws = v[i] == ' ' || v[i] == '\t';
+                if (ws && space) continue;
+                out.push_back(ws ? ' ' : v[i]);
+                space = ws;
+            }
+        }
+
+        int hex_value(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+
+        // Undo the wire's percent-encoding so encoding once more cannot double it: a
+        // query value sent as %3A is signed as %3A, not %253A. A malformed escape is
+        // kept as written.
+        std::string percent_decoded(std::string_view s)
+        {
+            std::string out;
+            out.reserve(s.size());
+            for (size_t i = 0; i < s.size(); ++i)
+            {
+                const int hi = s[i] == '%' && i + 2 < s.size()
+                                   ? hex_value(s[i + 1]) : -1;
+                const int lo = hi >= 0 ? hex_value(s[i + 2]) : -1;
+                if (lo >= 0) { out.push_back(static_cast<char>(hi * 16 + lo)); i += 2; }
+                else out.push_back(s[i]);
+            }
+            return out;
         }
     }
 
@@ -91,10 +125,10 @@ namespace llmbridge::net::sigv4
             {
                 const size_t eq = pair.find('=');
                 if (eq == std::string_view::npos)
-                    params.emplace_back(uri_encode(pair, true), std::string{});
+                    params.emplace_back(uri_encode(percent_decoded(pair), true), std::string{});
                 else
-                    params.emplace_back(uri_encode(pair.substr(0, eq), true),
-                                        uri_encode(pair.substr(eq + 1), true));
+                    params.emplace_back(uri_encode(percent_decoded(pair.substr(0, eq)), true),
+                                        uri_encode(percent_decoded(pair.substr(eq + 1)), true));
             }
             if (amp == std::string_view::npos) break;
             pos = amp + 1;
@@ -148,11 +182,11 @@ namespace llmbridge::net::sigv4
         if (!r.content_type.empty())
         {
             out.append("content-type:");
-            append_trimmed_lower(out, r.content_type);
+            append_trimmed_collapsed(out, r.content_type);
             out.push_back('\n');
         }
         out.append("host:");
-        append_trimmed_lower(out, r.host);
+        append_trimmed_collapsed(out, r.host);
         out.push_back('\n');
         out.append("x-amz-date:");
         out.append(r.amz_date);

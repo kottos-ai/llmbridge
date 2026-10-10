@@ -69,7 +69,7 @@ namespace llmbridge::net
                 return false;
             }
             std::string_view p = in;
-            while (p.size() > 1 && p.back() == '/') p.remove_suffix(1);
+            while (!p.empty() && p.back() == '/') p.remove_suffix(1); // "//" is no base at all
             for (const char c : p)
             {
                 const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||

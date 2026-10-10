@@ -489,7 +489,7 @@ namespace llmbridge
     {
         for (;;)
         {
-            int fd = ::accept(_listen_fd, nullptr, nullptr);
+            int fd = ::accept4(_listen_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd < 0)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -499,7 +499,6 @@ namespace llmbridge
                 if (errno == EMFILE || errno == ENFILE) ep_pause_accept();
                 return;
             }
-            net::set_nonblocking(fd);
             net::set_nodelay(fd);
             net::set_nosigpipe(fd);
             if (_client_sndbuf > 0)

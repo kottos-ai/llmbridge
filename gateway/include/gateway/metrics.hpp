@@ -14,6 +14,7 @@
 // The histogram is single-threaded by design: give each thread its own and
 // merge if needed. record() is one branch + one increment; ~5 ns.
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -125,7 +126,10 @@ namespace llmbridge
             if (_total == 0) return 0;
             if (p < 0.0) p = 0.0;
             if (p > 1.0) p = 1.0;
-            uint64_t target = static_cast<uint64_t>(_total * p);
+            // Nearest rank: ceil, so p99 of 10 samples is the 10th, with an epsilon so
+            // 100 * 0.29 (28.999...) still ranks 29. The answer stays the bucket's upper
+            // edge, a conservative bound (HistSingle.PercentileResolution pins that).
+            uint64_t target = static_cast<uint64_t>(std::ceil(static_cast<double>(_total) * p - 1e-9));
             if (target == 0) target = 1;
             uint64_t cum = 0;
             for (size_t i = 0; i < _counts.size(); ++i)

@@ -8,9 +8,12 @@
 #include "net/log.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <poll.h>
 #include <unistd.h>
 
 namespace llmbridge::net::log
@@ -27,10 +30,16 @@ namespace llmbridge::net::log
         public:
             void write(Level, std::string_view line) noexcept override
             {
-                // Deliberately ignoring the result. A logger that reacts to a failed
-                // write has nowhere to report it, and retrying would block the loop.
-                const ssize_t n = ::write(STDERR_FILENO, line.data(), line.size());
-                (void)n;
+                // Never block the loop on a full stderr pipe (a slow log collector):
+                // drop and count instead. O_NONBLOCK is not set because the file
+                // description is shared with whoever started us. A line is under
+                // PIPE_BUF, so a writable pipe takes it whole.
+                pollfd p{STDERR_FILENO, POLLOUT, 0};
+                if (::poll(&p, 1, 0) != 1 || !(p.revents & POLLOUT)) { note_dropped(1); return; }
+                ssize_t n;
+                do n = ::write(STDERR_FILENO, line.data(), line.size());
+                while (n < 0 && errno == EINTR);
+                if (n < 0) note_dropped(1);
             }
         };
 
@@ -155,7 +164,11 @@ namespace llmbridge::net::log
     {
         // Three decimals, no locale, no allocation. Enough for a duration in ms; a
         // logger is not the place to render a full IEEE double.
+        if (std::isnan(v)) { put("nan"); return; }
         if (v < 0) { put('-'); v = -v; }
+        // Converting infinity or anything >= 2^64 to uint64_t is undefined behaviour.
+        if (std::isinf(v)) { put("inf"); return; }
+        if (v >= 18446744073709551616.0) { put(">=2^64"); return; }
         const auto whole = static_cast<uint64_t>(v);
         put(whole);
         put('.');

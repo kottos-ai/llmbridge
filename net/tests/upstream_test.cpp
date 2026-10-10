@@ -189,6 +189,9 @@ TEST(ParseUpstream, DropsATrailingSlashSoTheJoinCannotDoubleIt)
 {
     EXPECT_EQ(parse_upstream("https://openrouter.ai/api/").path, "/api");
     EXPECT_EQ(parse_upstream("https://api.anthropic.com/").path, "");
+    // Trimmed down to "/" used to survive, and requests went to "//v1/...".
+    EXPECT_EQ(parse_upstream("https://api.anthropic.com//").path, "");
+    EXPECT_EQ(parse_upstream("https://api.anthropic.com///").path, "");
 }
 
 TEST(ParseUpstream, RejectsABasePathWithoutAScheme)

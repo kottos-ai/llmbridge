@@ -515,6 +515,20 @@ TEST_F(TlsPump, MultiRecordPayloadRoundTrips)
 // nothing. These tests pin that behaviour so a later "cleanup" cannot soften it
 // into a warning.
 
+// A failure after SSL_CTX_new used to keep the context, so ready() reported a context
+// with no trust store loaded; and a second init leaked the first.
+TEST(TlsContext, AFailedInitLeavesNoContextBehind)
+{
+    llmbridge::net::tls::Context ctx;
+    llmbridge::net::tls::Context::ClientOptions bad;
+    bad.ca_file = "/nonexistent/ca.pem";
+    EXPECT_FALSE(ctx.init_client(bad));
+    EXPECT_FALSE(ctx.ready()) << "a context without its CA bundle reports ready";
+    EXPECT_FALSE(ctx.last_error().empty());
+    EXPECT_TRUE(ctx.init_client({})); // the system store; a re-init replaces, not leaks
+    EXPECT_TRUE(ctx.ready());
+}
+
 TEST(ServerContext, ValidCertAndKeyInitialises)
 {
     SelfSigned ca;
@@ -641,6 +655,58 @@ TEST(ServerSession, OurClientAndOurServerCompleteAHandshake)
     }
     const size_t got = server.read_plaintext(buf);
     EXPECT_EQ(std::string(reinterpret_cast<char*>(buf), got), req);
+}
+
+// Pulling staged ciphertext erased the pulled prefix every time, quadratic in a large
+// request. The read offset and its compaction must still hand over every byte in order.
+TEST(ServerSession, StagedCiphertextPulledInSmallPiecesArrivesIntact)
+{
+    SelfSigned ca;
+    const std::string cert = ca.write_pem();
+    const std::string key = ca.write_key_pem();
+    Context sctx, cctx;
+    Context::ServerOptions so;
+    so.cert_file = cert;
+    so.key_file = key;
+    ASSERT_TRUE(sctx.init_server(so)) << sctx.last_error();
+    Context::ClientOptions co;
+    co.ca_file = cert;
+    ASSERT_TRUE(cctx.init_client(co)) << cctx.last_error();
+    Session client, server;
+    ASSERT_TRUE(client.init_client(cctx, kHost));
+    ASSERT_TRUE(server.init_server(sctx));
+    (void)client.start_handshake();
+    uint8_t buf[8192];
+    for (int round = 0; round < 24 && !(client.handshake_done() && server.handshake_done()); ++round)
+    {
+        for (size_t n; (n = client.pull_ciphertext(buf)) != 0;) ASSERT_EQ(server.feed_ciphertext({buf, n}), n);
+        (void)server.start_handshake();
+        for (size_t n; (n = server.pull_ciphertext(buf)) != 0;) ASSERT_EQ(client.feed_ciphertext({buf, n}), n);
+        (void)client.start_handshake();
+    }
+    ASSERT_TRUE(client.handshake_done() && server.handshake_done());
+
+    std::string sent(1 << 20, '\0');
+    for (size_t i = 0; i < sent.size(); ++i) sent[i] = static_cast<char>('a' + i * 7 % 26);
+    size_t off = 0;
+    while (off < sent.size())
+        off += client.write_plaintext({reinterpret_cast<const uint8_t*>(sent.data()) + off,
+                                       sent.size() - off});
+    const size_t staged = client.pending_output_bytes();
+    EXPECT_GT(staged, sent.size());
+    std::string got;
+    uint8_t piece[997]; // odd-sized pulls cross every record and the compaction point
+    size_t pulled = 0;
+    for (size_t n; (n = client.pull_ciphertext(piece)) != 0;)
+    {
+        pulled += n;
+        EXPECT_EQ(client.pending_output_bytes(), staged - pulled);
+        ASSERT_EQ(server.feed_ciphertext({piece, n}), n);
+        for (size_t m; (m = server.read_plaintext(buf)) != 0;) got.append(reinterpret_cast<char*>(buf), m);
+    }
+    EXPECT_FALSE(client.has_pending_output());
+    EXPECT_EQ(got.size(), sent.size());
+    EXPECT_TRUE(got == sent);
 }
 
 // A handshake that never completes must not let a peer buffer without bound.

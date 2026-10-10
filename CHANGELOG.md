@@ -8,6 +8,31 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.70.0]. 2026-10-10
+
+### Fixed
+
+- **SigV4 canonical form.** Header values keep their case (only trimmed, with inner
+  spaces collapsed), so a capitalised host no longer fails with 403. Query names and
+  values are percent-decoded before they are encoded, so `%3A` no longer signs as `%253A`.
+- **The stderr log sink never blocks the loop.** When the stderr pipe is full the line is
+  dropped and counted, and a write interrupted by a signal is retried.
+- **Logging a double** that is NaN, infinite or past 2^64 no longer hits undefined behaviour.
+- **A base path of several slashes** (`https://host//`) normalises to no path instead of
+  keeping one slash and sending requests to `//v1/...`.
+- **Sockets are created non-blocking and close-on-exec** in one call, and the epoll
+  backend accepts with `accept4`, so no descriptor leaks into a child process.
+- **A failed `TlsContext` init leaves no context behind**, and a second init replaces the
+  first instead of leaking it.
+- **Histogram percentiles use the nearest rank**: p99 of ten samples is the tenth, and a
+  rank such as `100 * 0.29` no longer rounds one sample too low.
+
+### Performance
+
+- **TLS ciphertext staging** advances a read offset instead of erasing the pulled prefix
+  on every pull, so draining a large response in small pieces is linear.
+
+
 ## [0.69.0]. 2026-10-09
 
 ### Changed

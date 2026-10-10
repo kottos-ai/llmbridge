@@ -133,6 +133,26 @@ TEST(SocketUtil, MakeListenerIsNonblocking)
     ::close(fd);
 }
 
+// Created non-blocking and close-on-exec: a socket without FD_CLOEXEC leaks into any
+// child an embedding process forks and execs.
+TEST(SocketUtil, EverySocketIsCreatedNonblockingAndCloseOnExec)
+{
+    const int l = make_listener(0);
+    ASSERT_GE(l, 0);
+    sockaddr_in a{};
+    socklen_t len = sizeof(a);
+    ASSERT_EQ(::getsockname(l, reinterpret_cast<sockaddr*>(&a), &len), 0);
+    const int c = start_connect("127.0.0.1", ntohs(a.sin_port));
+    const int u = make_client_socket();
+    for (const int fd : {l, c, u})
+    {
+        ASSERT_GE(fd, 0);
+        EXPECT_TRUE(::fcntl(fd, F_GETFD) & FD_CLOEXEC) << "fd " << fd;
+        EXPECT_TRUE(::fcntl(fd, F_GETFL) & O_NONBLOCK) << "fd " << fd;
+        ::close(fd);
+    }
+}
+
 TEST(SocketUtil, MakeListenerSetsReuseAddrAndPort)
 {
     int fd = make_listener(0);

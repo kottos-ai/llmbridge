@@ -85,6 +85,7 @@ namespace llmbridge::net::tls
         [[nodiscard]] ssl_ctx_st* native() const noexcept { return _ctx; }
 
       private:
+        bool discard() noexcept; // frees _ctx; returns false for the failure paths
         ssl_ctx_st* _ctx{nullptr};
         std::string _err{};
     };
@@ -152,6 +153,7 @@ namespace llmbridge::net::tls
         std::string _err{};
         std::string* _sink{nullptr};
         std::string _staging{};
+        size_t _staging_off{0}; ///< bytes of _staging already pulled
     };
 
 }  // namespace llmbridge::net::tls
