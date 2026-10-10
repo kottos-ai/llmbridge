@@ -342,12 +342,12 @@ namespace llmbridge::net::http
             (head[7] != '0' && head[7] != '1') || head[8] != ' ')
             return FrameStatus::Error;
 
-        const std::string_view rest = detail::ltrim(head.substr(9));
-        int code = 0;
-        size_t k = 0;
-        for (; k < rest.size() && k < 3 && rest[k] >= '0' && rest[k] <= '9'; ++k)
-            code = code * 10 + (rest[k] - '0');
-        if (k == 3) out.status = code;
+        // Exactly 3 digits, then SP and a reason phrase, or the end of the line.
+        const auto digit = [head](size_t i) { return i < head.size() && head[i] >= '0' && head[i] <= '9'; };
+        if (!digit(9) || !digit(10) || !digit(11) ||
+            (head.size() > 12 && head[12] != ' ' && head[12] != '\r'))
+            return FrameStatus::Error;
+        out.status = (head[9] - '0') * 100 + (head[10] - '0') * 10 + (head[11] - '0');
 
         out.keep_alive = head[7] == '1'; // 1.0 closes unless it says keep-alive
         bool close = false, keep = false;

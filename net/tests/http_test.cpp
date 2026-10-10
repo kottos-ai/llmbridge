@@ -395,6 +395,31 @@ TEST(HttpDesync, ResponseWithoutAnHttpVersionStatusLineIsRejected)
     EXPECT_EQ(h.status, 503);
 }
 
+// N8: the status code is exactly three digits followed by SP or the end of the line.
+// "2000" and "200x" read as 200, and a missing code left status 0 on a Complete head.
+TEST(HttpDesync, StatusCodeIsExactlyThreeDigits)
+{
+    using llmbridge::net::http::FrameStatus;
+    using llmbridge::net::http::parse_response_head;
+    for (const char* line : {"HTTP/1.1 2000 OK", "HTTP/1.1 200x", "HTTP/1.1 20 OK", "HTTP/1.1  200 OK",
+                             "HTTP/1.1 \t200 OK", "HTTP/1.1 OK", "HTTP/1.1 ", "HTTP/1.1 2O0 OK"})
+    {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(parse_response_head(std::string(line) + "\r\nContent-Length: 0\r\n\r\n", h),
+                  FrameStatus::Error) << line;
+    }
+    for (const char* line : {"HTTP/1.1 200 OK", "HTTP/1.1 200", "HTTP/1.1 200 ", "HTTP/1.1 429 Too Many"})
+    {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(parse_response_head(std::string(line) + "\r\nContent-Length: 0\r\n\r\n", h),
+                  FrameStatus::Complete) << line;
+        EXPECT_EQ(h.status, line[9] == '4' ? 429 : 200) << line;
+    }
+    llmbridge::net::http::ResponseHead h;
+    EXPECT_EQ(parse_response_head("HTTP/1.1 204\r\n\r\n", h), FrameStatus::Complete);
+    EXPECT_EQ(h.status, 204);
+}
+
 TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 {
     Message m;
