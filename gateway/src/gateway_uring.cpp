@@ -80,25 +80,46 @@ namespace llmbridge
         return s != nullptr;
     }
 
-    void Gateway::ur_submit_accept() noexcept
+    bool Gateway::ur_submit_accept() noexcept
     {
         io_uring_sqe* s = nullptr;
-        if (!ur_next_sqe(&s)) return;
+        if (!ur_next_sqe(&s)) return false;
         s->opcode = IORING_OP_ACCEPT;
         s->fd = _listen_fd;
         s->accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
         s->ioprio = IORING_ACCEPT_MULTISHOT; // one SQE, a completion per accepted fd
         s->user_data = make_ud(_listen_conn, UAccept);
+        return true;
     }
 
-    void Gateway::ur_submit_timer() noexcept
+    // The timer tick re-arms the accept. Without it, an EMFILE ends the multishot and an
+    // immediate re-arm fails again at once, and a failed re-arm left the listener dead.
+    void Gateway::ur_pause_accept(const char* why) noexcept
+    {
+        _accept_resume_ns = now_ns() + kAcceptBackoffNs;
+        ++_stats.accept_backoffs;
+        LB_WARN("CAP ", why, "; accepting paused for 100 ms, total=", _stats.accept_backoffs);
+    }
+
+    bool Gateway::ur_submit_timer() noexcept
     {
         io_uring_sqe* s = nullptr;
-        if (!ur_next_sqe(&s)) return;
+        if (!ur_next_sqe(&s)) return false;
         s->opcode = IORING_OP_TIMEOUT;
         s->addr = reinterpret_cast<uint64_t>(&_uring_ts);
         s->len = 1;
         s->user_data = UTimer; // conn = nullptr
+        return true;
+    }
+
+    // The SQ is full even after a flush, so this connection cannot make progress: end it
+    // and its peer together. Closing only `c` left the peer pointing at a freed object.
+    void Gateway::ur_drop_sq_full(Connection* c) noexcept
+    {
+        LB_WARN("CAP io_uring submission queue full; closing ", *c);
+        Connection* client = c->is_client ? c : c->peer;
+        if (client) ur_abort_pair(client);
+        else ur_close(c);
     }
 
     bool Gateway::ur_arm_recv(Connection* c) noexcept
@@ -108,7 +129,7 @@ namespace llmbridge
         // so we never re-submit a recv per read. Armed once per connection; only
         // re-armed if the kernel ends the multishot (e.g. pool exhaustion).
         io_uring_sqe* s = nullptr;
-        if (!ur_next_sqe(&s)) { ur_close(c); return false; }
+        if (!ur_next_sqe(&s)) { ur_drop_sq_full(c); return false; }
         s->opcode = IORING_OP_RECV;
         s->fd = c->fd;
         s->addr = 0;
@@ -126,9 +147,9 @@ namespace llmbridge
     {
         io_uring_sqe* s = nullptr;
 #ifdef LLMBRIDGE_HAVE_TLS
-        if (!tls_invariant_ok(c)) { ur_close(c); return false; } // never plaintext
+        if (!tls_invariant_ok(c)) { ur_drop_sq_full(c); return false; } // never plaintext
 #endif
-        if (!ur_next_sqe(&s)) { ur_close(c); return false; }
+        if (!ur_next_sqe(&s)) { ur_drop_sq_full(c); return false; }
         s->opcode = IORING_OP_SEND;
         s->fd = c->fd;
 #ifdef LLMBRIDGE_HAVE_TLS
@@ -180,7 +201,7 @@ namespace llmbridge
         if (!ur_next_sqe(&s)) return;
         s->opcode = IORING_OP_ASYNC_CANCEL;
         s->fd = fd;
-        s->cancel_flags = IORING_ASYNC_CANCEL_FD;
+        s->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL; // a recv and a send
         s->user_data = UCancel; // sentinel: not inflight-counted, completion ignored
     }
 
@@ -254,6 +275,7 @@ namespace llmbridge
             Connection* u = pool.back();
             pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
+            u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
             return u;
@@ -297,6 +319,7 @@ namespace llmbridge
         // convention: retry an idempotent-or-idle-reused request that failed before
         // any response; don't retry once a partial response has been seen.)
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // see the epoll mirror
         Connection* client = u->peer;
         if (!client) return false;
         const Upstream& up = upstream_of(u);
@@ -433,6 +456,9 @@ namespace llmbridge
                                                               : std::string{};
         LB_WARN(ReqId{client->req_seq}, " reply ", code, " ", why, " on ", *client,
                 peer.empty() ? "" : " peer=", peer);
+        // A send in flight is reading wbuf: replacing it would hand the kernel freed
+        // memory. Whatever the client was sent, it now gets a close.
+        if (client->send_inflight) { ur_abort_pair(client); return; }
         if (Connection* u = client->peer) { client->peer = nullptr; u->peer = nullptr; ur_close(u); }
         client->wbuf = build_error(code, detail);
         client->woff = 0;
@@ -456,7 +482,16 @@ namespace llmbridge
         const UOp op = ud_op(user_data);
         if (op == UTimer)
         {
-            if (!_draining && !_stop) { sweep_idle(/*uring=*/true); ur_submit_timer(); }
+            if (!_draining && !_stop)
+            {
+                sweep_idle(/*uring=*/true);
+                if (_accept_resume_ns && now_ns() >= _accept_resume_ns)
+                {
+                    _accept_resume_ns = 0;
+                    if (!ur_submit_accept()) ur_pause_accept("accept re-arm found the SQ full");
+                }
+                if (!ur_submit_timer()) _uring_timer_lost = true;
+            }
             return;
         }
         if (op == UCancel) return; // control op (cancel-by-fd); not inflight-counted
@@ -493,7 +528,11 @@ namespace llmbridge
             if (res >= 0) ::close(res); // shutting down: don't take new work
             return;
         }
-        if (!(flags & IORING_CQE_F_MORE)) ur_submit_accept(); // multishot ended -> re-arm
+        if (!(flags & IORING_CQE_F_MORE)) // multishot ended -> re-arm, unless that would spin
+        {
+            if (res == -EMFILE || res == -ENFILE) ur_pause_accept("out of file descriptors");
+            else if (!ur_submit_accept()) ur_pause_accept("accept re-arm found the SQ full");
+        }
         if (res < 0) return;                                 // transient accept error
         const int fd = res;
         net::set_nodelay(fd);
@@ -580,7 +619,8 @@ namespace llmbridge
             }
             _bufring.recycle(bid);
         }
-        if (!armed) ur_arm_recv(c); // kernel ended the multishot (pool pressure) -> re-arm
+        // Kernel ended the multishot (pool pressure): re-arm. A failed arm may free c.
+        if (!armed && !ur_arm_recv(c)) return;
 #ifdef LLMBRIDGE_HAVE_TLS
         if (!tls_ok)
         {
@@ -607,6 +647,12 @@ namespace llmbridge
 
         if (c->is_client)
         {
+            if (c->rbuf.size() > kMaxClientBuffered) // see the epoll mirror
+            {
+                LB_WARN("CAP client buffered ", c->rbuf.size(), " bytes on ", *c, "; closing");
+                ur_abort_pair(c);
+                return;
+            }
             ur_try_forward_buffered(c); // forward a framed request iff the client is idle
         }
         else
@@ -675,8 +721,9 @@ namespace llmbridge
                 c->client_frame_want = m.total_len;
                 c->rbuf.reserve(m.total_len);
                 if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
-                    send_interim_continue(c, /*uring=*/true);
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)) &&
+                    !send_interim_continue(c, /*uring=*/true))
+                    ur_close(c);
             }
             return; // the armed recv will deliver more
         }
@@ -812,6 +859,7 @@ namespace llmbridge
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
+            if (!c->failover_req.empty()) c->rbuf.erase(0, c->msg.total_len); // see the epoll mirror
             if (!ur_upstream_failed(c, 502, "no upstream (connect failed)"))
                 ur_error_respond(c, 502, "no upstream (connect failed)");
             return;
@@ -875,7 +923,7 @@ namespace llmbridge
             u->wire_ready = true;
             if (u->peer && u->peer->ts_wire_ready == 0) u->peer->ts_wire_ready = now_ns();
         }
-        ur_arm_recv(u); // arm the multishot recv for this upstream's life
+        if (!ur_arm_recv(u)) return; // arm the multishot recv for this upstream's life; may free u
 #ifdef LLMBRIDGE_HAVE_TLS
         if (u->tls)
         {
@@ -1277,8 +1325,8 @@ namespace llmbridge
         _uring_ts.tv_sec = kPollTickMs / 1000;
         _uring_ts.tv_nsec = static_cast<long long>(kPollTickMs % 1000) * 1000000LL;
 
-        ur_submit_accept();
-        ur_submit_timer();
+        if (!ur_submit_accept()) ur_pause_accept("accept arm found the SQ full");
+        if (!ur_submit_timer()) _uring_timer_lost = true;
 
         auto reap = [this] {
             _ring.for_each_cqe([this](const io_uring_cqe* cqe) {
@@ -1289,8 +1337,15 @@ namespace llmbridge
         while (!_stop)
         {
             const int r = _ring.submit_and_wait(1);
-            if (r < 0 && r != -EINTR && r != -ETIME) break;
+            // EBUSY (CQ overflow backlog) and EAGAIN are transient: reaping clears them.
+            if (r < 0 && r != -EINTR && r != -ETIME && r != -EBUSY && r != -EAGAIN)
+            {
+                LB_ERROR("io_uring_enter failed (", -r, "); this worker stops accepting work");
+                break;
+            }
             reap();
+            // A lost timer disables every timeout and the accept backoff: re-arm it now.
+            if (_uring_timer_lost && ur_submit_timer()) _uring_timer_lost = false;
         }
 
         // Graceful drain: stop taking new work, force every live fd's in-flight ops

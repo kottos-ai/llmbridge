@@ -51,6 +51,7 @@ namespace llmbridge::net::uring
 
     bool Ring::init(unsigned entries, unsigned flags) noexcept
     {
+        teardown(); // a second init must not leak the first ring
         io_uring_params p;
         std::memset(&p, 0, sizeof(p));
         p.flags = flags;
@@ -113,10 +114,11 @@ namespace llmbridge::net::uring
 
     int Ring::submit_and_wait(unsigned min_complete) noexcept
     {
-        // Publish any SQEs filled since the last submit (identity array, so just
-        // advance the tail with a release store so the kernel sees the new SQEs).
-        const unsigned to_submit = _sqe_tail - *_sq_tail;
-        if (to_submit) __atomic_store_n(_sq_tail, _sqe_tail, __ATOMIC_RELEASE);
+        // Publish new SQEs (identity array: advancing the tail is enough), then submit
+        // everything the kernel has not consumed. Counting from our last tail instead
+        // stranded the SQEs a partial submit left behind.
+        if (_sqe_tail != *_sq_tail) __atomic_store_n(_sq_tail, _sqe_tail, __ATOMIC_RELEASE);
+        const unsigned to_submit = _sqe_tail - __atomic_load_n(_sq_head, __ATOMIC_ACQUIRE);
 
         if (to_submit == 0 && min_complete == 0) return 0; // nothing to do
 
@@ -150,6 +152,7 @@ namespace llmbridge::net::uring
 
     bool BufRing::init(Ring& ring, unsigned bgid, unsigned count, unsigned buf_size) noexcept
     {
+        teardown(); // a second init must not leak the first registration
         _init_stage = "";
         _init_errno = 0;
         if (count == 0 || (count & (count - 1)) != 0)
@@ -198,6 +201,7 @@ namespace llmbridge::net::uring
             teardown();
             return false;
         }
+        _registered = true;
 
         // Publish all buffers. (bufs[0].resv aliases the ring tail; writing
         // addr/len/bid doesn't touch it, then we store the tail with release.)
@@ -226,6 +230,16 @@ namespace llmbridge::net::uring
 
     void BufRing::teardown() noexcept
     {
+        // Unregister before unmapping: a registered ring is memory the kernel may still
+        // write into. EBADF here (the Ring went first) means there is nothing to undo.
+        if (_registered)
+        {
+            io_uring_buf_reg reg;
+            std::memset(&reg, 0, sizeof(reg));
+            reg.bgid = static_cast<uint16_t>(_bgid);
+            (void)sys_io_uring_register(_ring_fd, IORING_UNREGISTER_PBUF_RING, &reg, 1);
+            _registered = false;
+        }
         if (_bufs && _bufs != MAP_FAILED) ::munmap(_bufs, _bufs_sz);
         if (_ring && _ring != MAP_FAILED) ::munmap(_ring, _ring_sz);
         _bufs = nullptr;

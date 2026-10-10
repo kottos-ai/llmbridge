@@ -99,6 +99,7 @@ namespace llmbridge
         uint64_t client_tls_handshake_failures = 0;
         uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
         uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
+        uint64_t accept_backoffs = 0;   // listener paused: out of file descriptors
         /// Requests an installed Policy refused; a subset of `errors`, not a sibling.
         /// Denials climbing while `errors - denials` stays flat is a brute-force
         /// attempt, not an outage.
@@ -262,6 +263,9 @@ namespace llmbridge
         // write-arming or completion handling is valid in the other.
         // scripts/check_conventions.py enforces it; DESIGN.md "Naming conventions".
         void ep_add_read(Connection* c) noexcept;
+        void ep_pause_accept() noexcept;
+        void ep_sync_interest(Connection* c) noexcept;
+        void ep_resume_accept() noexcept;
         void ep_arm_write(Connection* c) noexcept;
         void ep_disarm_write(Connection* c) noexcept;
 
@@ -277,7 +281,7 @@ namespace llmbridge
         /// Write the buffered response to the client; close out accounting.
         void ep_respond(Connection* client) noexcept;
         void ep_finish_client(Connection* c) noexcept;
-        void send_interim_continue(Connection* c, bool uring) noexcept;
+        [[nodiscard]] bool send_interim_continue(Connection* c, bool uring) noexcept; // false: close c
 
         // Streaming pump, epoll.
         void ep_pause_read(Connection* c) noexcept;   // drop EPOLLIN (backpressure)
@@ -437,8 +441,10 @@ namespace llmbridge
         /// only when its `inflight` SQEs all complete.
         int run_uring();
         bool ur_next_sqe(struct io_uring_sqe** out) noexcept; // get an SQE, flushing if full
-        void ur_submit_accept() noexcept;
-        void ur_submit_timer() noexcept;
+        [[nodiscard]] bool ur_submit_accept() noexcept;
+        void ur_pause_accept(const char* why) noexcept;
+        [[nodiscard]] bool ur_submit_timer() noexcept;
+        void ur_drop_sq_full(Connection* c) noexcept;
         bool ur_arm_recv(Connection* c) noexcept; // arm a multishot recv (provided buffers)
         bool ur_submit_send(Connection* c) noexcept;
         /// Send wbuf to a client conn. Plaintext goes straight out; a TLS conn passes
@@ -478,6 +484,7 @@ namespace llmbridge
         net::uring::Ring _ring;
         net::uring::BufRing _bufring; // provided-buffer pool for multishot recv
         struct __kernel_timespec _uring_ts{};
+        bool _uring_timer_lost = false; // a re-arm found the SQ full; the loop retries it
         long _uring_inflight = 0; // global in-flight SQEs (drain barrier on stop)
         bool _draining = false;   // post-stop: completions just decrement, no re-arm
 #endif
@@ -546,6 +553,7 @@ namespace llmbridge
         int _epfd = -1;
         int _listen_fd = -1;
         Connection* _listen_conn = nullptr;
+        int64_t _accept_resume_ns = 0; ///< listener paused until then; 0 when accepting
 
         std::unordered_map<uint64_t, Connection*> _clients;
         std::vector<std::vector<Connection*>> _idle_upstreams; ///< one pool per upstream

@@ -887,32 +887,31 @@ namespace llmbridge
     }
 
     /// Answer `Expect: 100-continue` without entering the response path.
-    void Gateway::send_interim_continue(Connection* c, bool uring) noexcept
+    bool Gateway::send_interim_continue(Connection* c, bool uring) noexcept
     {
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
-            if (!c->tls->handshake_done()) return;
+            if (!c->tls->handshake_done()) return true;
             const auto* p = reinterpret_cast<const uint8_t*>(kContinue.data());
-            if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return;
+            if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return true;
 #ifdef LLMBRIDGE_HAVE_URING
-            if (uring) { ur_tls_flush(c); return; } // completion sees an empty wbuf: nothing finishes
+            if (uring) { ur_tls_flush(c); return true; } // completion sees an empty wbuf: nothing finishes
 #endif
             (void)uring;
             bool done = false;
-            if (!ep_tls_flush(c, &done)) return;
+            if (!ep_tls_flush(c, &done)) return true;
             if (!done) c->client_interim_inflight = true; // the writable event drains it
-            return;
+            return true;
         }
 #else
         (void)uring;
 #endif
         const ssize_t n = ::send(c->fd, kContinue.data(), kContinue.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (n > 0 && static_cast<size_t>(n) < kContinue.size())
-        {
-            // A torn interim line is a protocol error the client cannot recover from.
-            c->doomed = true;
-        }
+        // A torn interim line is a protocol error the client cannot recover from. The
+        // caller closes through its backend: setting `doomed` here left epoll spinning on
+        // a registered fd and let io_uring free a connection still in _clients.
+        return n <= 0 || static_cast<size_t>(n) == kContinue.size();
     }
 
     // Abort requests whose upstream has gone silent. Runs on the loop's existing

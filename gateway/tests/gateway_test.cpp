@@ -19,6 +19,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -258,6 +260,10 @@ namespace
         void set_responses(std::vector<std::string> r) { _sequence = std::move(r); }
         void set_trickle(int chunk) { _trickle_chunk = chunk; }        // write reply in chunks
         void set_close_mid_response(bool b) { _close_mid = b; }         // simulate upstream abort
+        // Write until the gateway stops reading (300 ms), then reset the connection.
+        void set_reset_mid_response(bool b) { _reset_mid = b; }
+        // On each connection, read the second request, wait `ms`, then close unanswered.
+        void set_drop_second_after_ms(int ms) { _drop_second_ms = ms; }
         // Respond once (keep-alive), then close the connection, which simulates a
         // provider dropping an idle pooled keep-alive connection.
         void set_close_after_first(bool b) { _close_after_first = b; }
@@ -385,6 +391,7 @@ namespace
                 ::close(c);
                 return;
             }
+            int served_here = 0;
             while (!_stop)
             {
                 llmbridge::net::http::Message m;
@@ -401,6 +408,12 @@ namespace
                 }
                 const int nth = _requests_seen.fetch_add(1, std::memory_order_relaxed);
                 buf.erase(0, m.total_len);
+                if (_drop_second_ms > 0 && served_here++ == 1)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(_drop_second_ms));
+                    ::close(c);
+                    return;
+                }
 
                 std::string resp = _resp_override.empty() ? canned_response() : _resp_override;
                 if (!_sequence.empty())
@@ -416,6 +429,16 @@ namespace
                 {
                     (void)!::write(c, resp.data(), resp.size() / 2);
                     while (!_stop) { timespec ts{0, 20000000}; nanosleep(&ts, nullptr); }
+                    ::close(c);
+                    return;
+                }
+                if (_reset_mid)
+                {
+                    timeval tv{0, 300'000};
+                    ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+                    (void)!::write(c, resp.data(), resp.size());
+                    linger lg{1, 0}; // close() now sends RST
+                    ::setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
                     ::close(c);
                     return;
                 }
@@ -464,6 +487,8 @@ namespace
         int _trickle_chunk = 0;
         int _chunked_chunks = 0;
         bool _close_mid = false;
+        bool _reset_mid = false;
+        int _drop_second_ms = 0;
         bool _close_after_first = false;
         std::string _late;
         int _late_ms = 0;
@@ -2296,6 +2321,105 @@ TEST_P(ProxyBackend, RoundTripAndKeepAlive)
     EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
+// Reading continues while a request is in flight, and nothing bounded what a client
+// could pipeline behind it: one slow upstream let a client grow the buffer until OOM.
+TEST_P(ProxyBackend, BytesPipelinedBehindARequestInFlightAreBounded)
+{
+    _backend.set_stall(1); // read the request, never reply
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    const std::string junk(1 << 20, 'x');
+    bool refused = false;
+    for (int i = 0; i < 40 && !refused; ++i) refused = !c.send(junk);
+    EXPECT_TRUE(refused || c.wait_closed(3000)) << "40 MiB pipelined without the gateway closing";
+    c.close();
+    Client d; // and the worker still serves others
+    ASSERT_TRUE(d.connect(_proxy_port));
+    shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+}
+
+// Out of file descriptors, accept() fails while the connection stays queued: the
+// level-triggered listener (epoll) or the immediate multishot re-arm (io_uring) then
+// spun the worker at 100% CPU. It must back off, and resume once descriptors return.
+TEST_P(ProxyBackend, RunningOutOfDescriptorsDoesNotSpinTheWorker)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    rlimit old{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);
+    int open_fds = 0;
+    for (int fd = 0; fd < 4096; ++fd) open_fds += ::fcntl(fd, F_GETFD) != -1;
+    rlimit tight = old;
+    tight.rlim_cur = static_cast<rlim_t>(open_fds + 8);
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &tight), 0);
+    std::vector<int> held; // client sockets, until socket() itself runs out
+    const auto dial = [&]
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(_proxy_port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        (void)::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        held.push_back(fd);
+        return true;
+    };
+    for (int i = 0; i < 64 && dial(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // The table may have filled exactly as the gateway accepted the last one: free one
+    // descriptor and dial with it, so a connection is certainly left pending.
+    ASSERT_FALSE(held.empty());
+    ::close(held.back());
+    held.pop_back();
+    ASSERT_TRUE(dial());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    rusage r0{}, r1{};
+    ::getrusage(RUSAGE_SELF, &r0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ::getrusage(RUSAGE_SELF, &r1);
+    const auto us = [](const rusage& r)
+    { return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1'000'000L + r.ru_utime.tv_usec + r.ru_stime.tv_usec; };
+    const long cpu_us = us(r1) - us(r0);
+    for (int fd : held) ::close(fd);
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old), 0);
+    EXPECT_LT(cpu_us, 250'000) << "the worker spun for " << cpu_us << " us of 500 ms";
+
+    Client c; // descriptors are back: the listener must accept again
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_EQ(c.recv_status(3000), 200);
+    c.close();
+    shutdown(); // the worker writes stats unsynchronised, so read them only after the join
+    // io_uring's multishot accept may stay armed through EMFILE instead of ending, and
+    // then no error reaches the gateway; epoll always sees it.
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+    {
+        EXPECT_GE(_gw->stats().accept_backoffs, 1u);
+    }
+}
+
+// The stale-connection retry exists for a provider that closed an idle pooled
+// connection before our request reached it, which shows within a round trip. It also
+// fired when the provider read the request, worked on it, then dropped the
+// connection: the resend ran the request twice, and both runs are billed.
+TEST_P(ProxyBackend, APooledRequestTheProviderAlreadyHeldIsNotResent)
+{
+    _backend.set_drop_second_after_ms(1500);
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(c.recv_status(), 200);
+    ASSERT_TRUE(c.send(make_request())); // rides the pooled connection
+    EXPECT_EQ(c.recv_status(4000), 502);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 2) << "the request was sent to the provider twice";
+    EXPECT_EQ(_gw->stats().upstream_retries, 0u);
+}
+
 TEST_P(ProxyBackend, MultipleClients)
 {
     start(0, true, UpstreamDialect::OpenAI, GetParam());
@@ -3422,6 +3546,40 @@ TEST_P(ProxyStream, TheConnectDeadlineEndsAtTheWire)
     c.close();
     shutdown();
     EXPECT_EQ(_gw->stats().connect_timeouts, 0u);
+}
+
+// A provider that resets while its reads are paused for a slow client left a dead fd
+// registered with an empty interest mask; epoll still reports EPOLLHUP for it, so the
+// worker woke on every wait until the client drained: 100% CPU.
+TEST_P(ProxyStream, AnUpstreamResetWhilePausedDoesNotSpinTheWorker)
+{
+    const std::string filler(400, 'x');
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    for (int i = 0; i < 4000; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    _backend.set_reset_mid_response(true);
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    std::this_thread::sleep_for(std::chrono::milliseconds(800)); // paused, then reset
+    rusage r0{}, r1{};
+    ::getrusage(RUSAGE_SELF, &r0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ::getrusage(RUSAGE_SELF, &r1);
+    const auto us = [](const rusage& r)
+    { return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1'000'000L + r.ru_utime.tv_usec + r.ru_stime.tv_usec; };
+    EXPECT_LT(us(r1) - us(r0), 250'000) << "the worker spun on a reset upstream";
+    (void)c.recv_all(3000); // the client still gets what was buffered, then the close
+    c.close();
+    shutdown();
 }
 
 // ── Backpressure: a slow client must pause upstream reads (epoll) ─────────
@@ -4921,6 +5079,30 @@ TEST_P(ProxyRoute, AFailedVenueIsRetriedOnTheNextOne)
     EXPECT_EQ(pol.last_failed.load(), 0) << "the policy was told the wrong venue failed";
     EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
     EXPECT_EQ(good.seen(), 1);
+    good.stop();
+}
+
+// A failover whose connect fails at once (here ENETUNREACH) used to put the request
+// back into the client buffer a second time, so the leftover copy ran as a new
+// request, failed over the same way and left another: one request, served forever.
+TEST_P(ProxyRoute, AFailoverWhoseConnectFailsAtOnceServesTheRequestOnce)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead_sock;
+    FailoverPolicy pol(0, {1, 2});
+    start({{"127.0.0.1", dead_sock.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"255.255.255.255", 9, false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    EXPECT_TRUE(c.recv_some(500).empty()) << "a response arrived for a request never sent";
+    c.close();
+    shutdown();
+    EXPECT_EQ(good.seen(), 1) << "the healthy venue ran the one request more than once";
     good.stop();
 }
 

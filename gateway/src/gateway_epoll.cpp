@@ -49,24 +49,49 @@ namespace llmbridge
         ::epoll_ctl(_epfd, EPOLL_CTL_ADD, c->fd, &ev);
     }
 
+    void Gateway::ep_pause_accept() noexcept
+    {
+        epoll_event ev{};
+        ev.data.ptr = _listen_conn;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _listen_fd, &ev);
+        _accept_resume_ns = now_ns() + kAcceptBackoffNs;
+        ++_stats.accept_backoffs;
+        LB_WARN("CAP out of file descriptors; accepting paused for 100 ms, total=",
+                _stats.accept_backoffs);
+    }
+
+    void Gateway::ep_resume_accept() noexcept
+    {
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.ptr = _listen_conn;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, _listen_fd, &ev);
+        _accept_resume_ns = 0;
+    }
+
+    // The one writer of a connection's interest mask, from both flags: arming a write
+    // used to set EPOLLIN too, silently undoing a backpressure pause.
+    void Gateway::ep_sync_interest(Connection* c) noexcept
+    {
+        epoll_event ev{};
+        ev.events = (c->read_paused ? 0u : static_cast<uint32_t>(EPOLLIN)) |
+                    (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
+        ev.data.ptr = c;
+        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+    }
+
     void Gateway::ep_arm_write(Connection* c) noexcept
     {
         if (c->write_armed) return;
-        epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->write_armed = true;
+        ep_sync_interest(c);
     }
 
     void Gateway::ep_disarm_write(Connection* c) noexcept
     {
         if (!c->write_armed) return;
-        epoll_event ev{};
-        ev.events = EPOLLIN;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->write_armed = false;
+        ep_sync_interest(c);
     }
 
     // Backpressure: pause/resume reading a connection. Used to stop pulling
@@ -76,11 +101,8 @@ namespace llmbridge
     void Gateway::ep_pause_read(Connection* c) noexcept
     {
         if (c->read_paused) return;
-        epoll_event ev{};
-        ev.events = c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u;
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = true;
+        ep_sync_interest(c);
         ++_stats.stream_pauses; // observability: proves backpressure actually engaged
         // Both guards above are edge-triggered (`read_paused` early-returns), so this
         // is one line per episode, not per event. WARN like every other cap: at the
@@ -94,11 +116,8 @@ namespace llmbridge
     void Gateway::ep_resume_read(Connection* c) noexcept
     {
         if (!c->read_paused) return;
-        epoll_event ev{};
-        ev.events = static_cast<uint32_t>(EPOLLIN) | (c->write_armed ? static_cast<uint32_t>(EPOLLOUT) : 0u);
-        ev.data.ptr = c;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, c->fd, &ev);
         c->read_paused = false;
+        ep_sync_interest(c);
         // Same level as the pause: a log that opens an episode and never closes it
         // reads as still stuck.
         LB_WARN("CAP backpressure cleared, resuming upstream reads ", *c);
@@ -251,6 +270,7 @@ namespace llmbridge
             Connection* u = pool.back();
             pool.pop_back();
             u->from_pool = true; // reused -> a pre-response failure is retry-eligible
+            u->ts_pool_taken = now_ns();
             u->retried = false;  // fresh request: one retry available again
             ++_stats.upstream_reused;
             return u;
@@ -291,6 +311,7 @@ namespace llmbridge
         // dropped it idle without processing. Resend the request once on a fresh
         // connection instead of failing the client. (Same rule as the io_uring path.)
         if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // may have run
         Connection* client = u->peer;
         if (!client) return false;
         // The same venue: a retry that lands elsewhere is a silent reroute, and the
@@ -473,6 +494,9 @@ namespace llmbridge
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
                 if (errno == EINTR) continue;
+                // The pending connection stays queued, so a level-triggered listener
+                // would report it again at once: back off instead of spinning.
+                if (errno == EMFILE || errno == ENFILE) ep_pause_accept();
                 return;
             }
             net::set_nonblocking(fd);
@@ -521,6 +545,14 @@ namespace llmbridge
             else ep_close_client(c);
             return;
         }
+        // Reading continues while a request is in flight, so this is the only bound on
+        // what a client can pipeline behind it.
+        if (c->rbuf.size() > kMaxClientBuffered)
+        {
+            LB_WARN("CAP client buffered ", c->rbuf.size(), " bytes on ", *c, "; closing");
+            ep_abort_pair(c);
+            return;
+        }
         // One request in flight at a time per client.
         if (c->peer != nullptr || !c->wbuf.empty()) return;
         if (c->rbuf.empty()) return;
@@ -543,8 +575,9 @@ namespace llmbridge
                 c->rbuf.reserve(m.total_len);
                 // No body byte yet: the client is waiting on us, not the network.
                 if (c->rbuf.size() <= m.header_len &&
-                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)))
-                    send_interim_continue(c, /*uring=*/false);
+                    expects_continue(std::string_view(c->rbuf.data(), m.header_len)) &&
+                    !send_interim_continue(c, /*uring=*/false))
+                    ep_close_client(c);
             }
             return;
         }
@@ -697,6 +730,9 @@ namespace llmbridge
         if (!u)
         {
             secure_clear(_rebuild); // a credential must not wait in the scratch for the next request
+            // A failover attempt runs on a copy put back in rbuf; failover_req keeps the
+            // original, so drop the copy or the next failover inserts a second one.
+            if (!c->failover_req.empty()) c->rbuf.erase(0, c->msg.total_len);
             if (!ep_upstream_failed(c, 502, "no upstream (connect failed)"))
                 ep_error_respond(c, 502, "no upstream (connect failed)");
             return;
@@ -1171,6 +1207,11 @@ namespace llmbridge
         {
             stream_truncate(client);
         }
+        // Either way the stream has ended, so the upstream is done: close it now. Kept
+        // while reads were paused, its dead fd raised EPOLLHUP on every wait.
+        client->peer = nullptr;
+        u->peer = nullptr;
+        ep_close_upstream(u);
         ep_stream_flush(client);
     }
 
@@ -1270,6 +1311,7 @@ namespace llmbridge
                 }
             }
             sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
+            if (_accept_resume_ns && now_ns() >= _accept_resume_ns) ep_resume_accept();
             for (Connection* d : _doomed) { retire_wbuf(d); delete d; }
             _doomed.clear();
         }
