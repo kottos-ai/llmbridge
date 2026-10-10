@@ -10,9 +10,9 @@
 // misspelled setting fails open, silently, with no `ps` output to catch it, which
 // is the exact shape of the `--listen-tls`-on-a-non-TLS-build defect.
 
-#include "config.hpp"
+#include "options.hpp"
 
-#include "gateway/gateway.hpp"
+#include "provider/json.hpp"
 
 #include <gtest/gtest.h>
 
@@ -21,7 +21,7 @@
 #include <string>
 #include <utility>
 
-using llmbridge::app::ConfigFile;
+using llmbridge::app::Settings;
 using llmbridge::app::parse_config;
 
 TEST(Config, FullFileAppliesEveryGroup)
@@ -37,24 +37,20 @@ TEST(Config, FullFileAppliesEveryGroup)
                     "duration_s": 12, "warmup_s": 2, "log_level": "debug",
                     "prefault_mb": 16 }
     })";
-    ConfigFile c;
+    Settings c;
     std::string err;
     ASSERT_TRUE(parse_config(text, c, err)) << err;
 
-    EXPECT_TRUE(c.has_listen_port);
     EXPECT_EQ(c.listen_port, 8443);
-    EXPECT_TRUE(c.has_listen_tls);
     EXPECT_TRUE(c.listen_tls);
     EXPECT_EQ(c.tls_cert, "/c.pem");
     EXPECT_EQ(c.tls_key, "/k.pem");
-    ASSERT_EQ(c.upstreams.size(), 1u); // the object form is one entry
-    EXPECT_EQ(c.upstreams[0].url, "https://api.anthropic.com");
-    EXPECT_EQ(c.upstreams[0].dialect, "anthropic");
-    EXPECT_TRUE(c.has_upstream_s);
+    EXPECT_TRUE(c.more_upstreams.empty()); // the object form is one entry
+    EXPECT_EQ(c.upstream, "https://api.anthropic.com");
+    EXPECT_EQ(c.dialect, "anthropic");
     EXPECT_DOUBLE_EQ(c.upstream_s, 90);
     EXPECT_DOUBLE_EQ(c.client_idle_s, 259200);
     EXPECT_DOUBLE_EQ(c.pool_idle_s, 45);
-    EXPECT_TRUE(c.has_connect_s);
     EXPECT_DOUBLE_EQ(c.connect_s, 7);
     EXPECT_EQ(c.io, "uring");
     EXPECT_EQ(c.log_level, "debug");
@@ -66,38 +62,39 @@ TEST(Config, FullFileAppliesEveryGroup)
     ASSERT_EQ(c.strip_headers.size(), 2u);
     EXPECT_EQ(c.strip_headers[0], "authorization");
     EXPECT_EQ(c.strip_headers[1], "X-Internal"); // normalized by the Gateway, not here
-
 }
 
 // The values must survive the DOM they were parsed from. provider::json is
 // zero-copy, so every string in the parsed Value is a view into the input buffer;
-// if a ConfigFile field ever held a string_view instead of a string, this test
+// if a Settings field ever held a string_view instead of a string, this test
 // reads freed memory and ASan says so.
 TEST(Config, ValuesOutliveTheParsedBuffer)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     {
         std::string scratch = R"({"upstream":{"url":"https://example.invalid/v1"}})";
         ASSERT_TRUE(parse_config(scratch, c, err)) << err;
         scratch.assign(4096, 'x'); // clobber the buffer the DOM pointed into
     }
-    ASSERT_EQ(c.upstreams.size(), 1u);
-    EXPECT_EQ(c.upstreams[0].url, "https://example.invalid/v1");
+    EXPECT_EQ(c.upstream, "https://example.invalid/v1");
 }
 
 // An absent key must leave the caller's default alone, which is what makes
 // "file first, flags second" work at all.
 TEST(Config, AbsentKeysAreNotApplied)
 {
-    ConfigFile c;
+    Settings c;
+    c.workers = 7;
+    c.upstream = "10.0.0.1:1";
     std::string err;
     ASSERT_TRUE(parse_config(R"({"listen":{"port":9000}})", c, err)) << err;
-    EXPECT_TRUE(c.has_listen_port);
-    EXPECT_FALSE(c.has_listen_tls);
-    EXPECT_FALSE(c.has_workers);
+    EXPECT_EQ(c.listen_port, 9000);
+    EXPECT_FALSE(c.listen_tls);
+    EXPECT_EQ(c.workers, 7);
     EXPECT_TRUE(c.tls_cert.empty());
-    EXPECT_TRUE(c.upstreams.empty());
+    EXPECT_EQ(c.upstream, "10.0.0.1:1");
+    EXPECT_EQ(c.dialect, "openai");
 }
 
 // ── The upstream table ───────────────────────────────────────────────────────
@@ -113,22 +110,23 @@ TEST(Config, UpstreamArrayBecomesATableInOrder)
                     { "url": "127.0.0.1:9002", "dialect": "openai" },
                     { "url": "https://api.anthropic.com", "dialect": "anthropic" } ]
     })";
-    ConfigFile c;
+    Settings c;
     std::string err;
     ASSERT_TRUE(parse_config(text, c, err)) << err;
-    ASSERT_EQ(c.upstreams.size(), 3u);
-    EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
-    EXPECT_EQ(c.upstreams[1].url, "127.0.0.1:9002");
-    EXPECT_EQ(c.upstreams[2].url, "https://api.anthropic.com");
+    ASSERT_EQ(c.more_upstreams.size(), 2u);
+    EXPECT_EQ(c.upstream, "127.0.0.1:9001");
+    EXPECT_EQ(c.more_upstreams[0].url, "127.0.0.1:9002");
+    EXPECT_EQ(c.more_upstreams[1].url, "https://api.anthropic.com");
     // Order is the contract: a policy selects by index, so a table that reorders
     // silently sends requests to the wrong venue.
-    EXPECT_EQ(c.upstreams[1].dialect, "openai");
-    EXPECT_EQ(c.upstreams[2].dialect, "anthropic");
+    EXPECT_EQ(c.dialect, "anthropic");
+    EXPECT_EQ(c.more_upstreams[0].dialect, "openai");
+    EXPECT_EQ(c.more_upstreams[1].dialect, "anthropic");
 }
 
 TEST(Config, EachEntryValidatesLikeTheObjectForm)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     // A misspelling inside an array entry must fail exactly as it does in an object.
     EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"x:1","dialec":"openai"}]})", c, err));
@@ -142,7 +140,7 @@ class ConfigReject : public ::testing::TestWithParam<std::pair<const char*, cons
 
 TEST_P(ConfigReject, IsRefusedAndNamesTheProblem)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     EXPECT_FALSE(parse_config(GetParam().first, c, err)) << "accepted: " << GetParam().first;
     EXPECT_NE(err.find(GetParam().second), std::string::npos)
@@ -195,7 +193,7 @@ INSTANTIATE_TEST_SUITE_P(
 // would have no way to annotate the file.
 TEST(Config, UnderscoreKeysAreCommentsEverywhere)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     const std::string text = R"({
       "_why": "top level",
@@ -217,18 +215,18 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     ss << in.rdbuf();
     const std::string text = ss.str();
 
-    ConfigFile c;
+    Settings c;
     std::string err;
     ASSERT_TRUE(parse_config(text, c, err)) << "the shipped example does not parse: " << err;
 
-    // Mirrors the initialisers at the top of app/main.cpp.
+    // Mirrors the initialisers of Settings, which mirror the Gateway constants.
     EXPECT_EQ(c.listen_port, 8088);
     EXPECT_FALSE(c.listen_tls);
     EXPECT_TRUE(c.tls_cert.empty()) << "a certificate with tls:false is refused at startup";
     EXPECT_TRUE(c.tls_key.empty());
-    ASSERT_EQ(c.upstreams.size(), 1u);
-    EXPECT_EQ(c.upstreams[0].url, "127.0.0.1:9001");
-    EXPECT_EQ(c.upstreams[0].dialect, "openai");
+    EXPECT_TRUE(c.more_upstreams.empty());
+    EXPECT_EQ(c.upstream, "127.0.0.1:9001");
+    EXPECT_EQ(c.dialect, "openai");
     EXPECT_DOUBLE_EQ(c.upstream_s,
                      static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9);
     EXPECT_DOUBLE_EQ(c.client_idle_s,
@@ -245,12 +243,20 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
     EXPECT_DOUBLE_EQ(c.warmup_s, 0);
     EXPECT_DOUBLE_EQ(c.prefault_mb, 0);
 
-    // Every settable key must appear, or the example silently stops documenting one.
-    EXPECT_TRUE(c.has_listen_port && c.has_listen_tls && c.has_upstream_s &&
-                c.has_client_idle_s && c.has_pool_idle_s && c.has_connect_s && c.has_workers &&
-                c.has_timing_headers && c.has_duration_s && c.has_warmup_s &&
-                c.has_prefault_mb)
-        << "the example is missing a key it is supposed to document";
+    // Every key in the option table must appear, set or as its `_` comment (cert and
+    // key cannot be set while tls is false), or the example stops documenting one.
+    bool ok = false;
+    const auto root = llmbridge::provider::json::parse(text, ok);
+    ASSERT_TRUE(ok);
+    for (const llmbridge::app::Option& o : llmbridge::app::options())
+    {
+        const std::string_view group = o.key.substr(0, o.key.find('.'));
+        const std::string name(o.key.substr(o.key.find('.') + 1));
+        const auto* g = root.find(group);
+        ASSERT_NE(g, nullptr) << group;
+        EXPECT_TRUE(g->find(name) != nullptr || g->find("_" + name) != nullptr)
+            << "the example does not document " << o.key;
+    }
 }
 
 // ── The venue dialect: its name, its old name, and its old value ─────────────
@@ -263,12 +269,12 @@ TEST(Config, ShippedExampleMatchesTheRealDefaults)
 // the old model alive.
 TEST(Config, DialectIsTheName)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     ASSERT_TRUE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "anthropic"}})",
                              c, err))
         << err;
-    EXPECT_EQ(c.upstreams[0].dialect, "anthropic");
+    EXPECT_EQ(c.dialect, "anthropic");
 }
 
 TEST(Config, TheOldKeyIsRefusedByName)
@@ -276,7 +282,7 @@ TEST(Config, TheOldKeyIsRefusedByName)
     // Not accepted as an alias. The word said the field decided an action when it
     // names what the venue speaks, so a config still using it holds the old model,
     // and an alias would let that survive with nobody told.
-    ConfigFile c;
+    Settings c;
     std::string err;
     EXPECT_FALSE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "translate": "anthropic"}})",
                               c, err));
@@ -285,7 +291,7 @@ TEST(Config, TheOldKeyIsRefusedByName)
 
 TEST(Config, TheOldValueIsRefusedByName)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     EXPECT_FALSE(parse_config(R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "none"}})",
                               c, err));
@@ -296,8 +302,94 @@ TEST(Config, TheOldValueIsRefusedByName)
 
 TEST(Config, AnUnknownDialectIsRefused)
 {
-    ConfigFile c;
+    Settings c;
     std::string err;
     EXPECT_FALSE(parse_config(
         R"({"upstream": {"url": "127.0.0.1:9001", "dialect": "anthropc"}})", c, err));
+}
+
+// ── Fixes from the option table ──────────────────────────────────────────────
+
+// strip_headers is gateway-wide. The array form used to accept it per entry and drop
+// it, so a header the operator meant to strip was still forwarded.
+TEST(Config, ArrayFormStripHeadersIsHonoured)
+{
+    Settings c;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"upstream":[{"url":"127.0.0.1:1","strip_headers":["authorization"]},
+                                             {"url":"127.0.0.1:2"}]})",
+                             c, err))
+        << err;
+    ASSERT_EQ(c.strip_headers.size(), 1u);
+    EXPECT_EQ(c.strip_headers[0], "authorization");
+}
+
+TEST(Config, ArrayEntriesThatSetStripHeadersMustAgree)
+{
+    Settings c;
+    std::string err;
+    EXPECT_TRUE(parse_config(R"({"upstream":[{"url":"a:1","strip_headers":["x-a"]},
+                                             {"url":"b:2","strip_headers":["x-a"]}]})",
+                             c, err))
+        << err;
+    EXPECT_FALSE(parse_config(R"({"upstream":[{"url":"a:1","strip_headers":["x-a"]},
+                                              {"url":"b:2","strip_headers":["x-b"]}]})",
+                              c, err));
+    EXPECT_NE(err.find("gateway-wide"), std::string::npos) << err;
+}
+
+// The flag accepted these two and the file did not, so a table with a Bedrock or an
+// Azure venue past the first could not be written at all.
+TEST(Config, BedrockAndAzureAreDialects)
+{
+    Settings c;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"upstream":[{"url":"a:1","dialect":"bedrock"},
+                                             {"url":"b:2","dialect":"azure"}]})",
+                             c, err))
+        << err;
+    EXPECT_EQ(c.dialect, "bedrock");
+    ASSERT_EQ(c.more_upstreams.size(), 1u);
+    EXPECT_EQ(c.more_upstreams[0].dialect, "azure");
+}
+
+// A fraction used to be truncated: port 8088.9 served 8088 and workers 1.7 ran one.
+TEST(Config, IntegersRefuseAFraction)
+{
+    Settings c;
+    std::string err;
+    EXPECT_FALSE(parse_config(R"({"listen":{"port":8088.9}})", c, err));
+    EXPECT_NE(err.find("must be an integer"), std::string::npos) << err;
+    EXPECT_FALSE(parse_config(R"({"runtime":{"workers":1.7}})", c, err));
+    EXPECT_NE(err.find("must be an integer"), std::string::npos) << err;
+}
+
+// Half a second is half a second; main used to cast it to 0, which runs forever.
+TEST(Config, DurationKeepsItsFraction)
+{
+    Settings c;
+    std::string err;
+    ASSERT_TRUE(parse_config(R"({"runtime":{"duration_s":0.5}})", c, err)) << err;
+    EXPECT_DOUBLE_EQ(c.duration_s, 0.5);
+}
+
+// Every row's kind must match the field it writes, or its first use throws.
+TEST(Config, EveryOptionAcceptsAValueOfItsKind)
+{
+    using llmbridge::app::Kind;
+    for (const llmbridge::app::Option& o : llmbridge::app::options())
+    {
+        const std::string group(o.key.substr(0, o.key.find('.')));
+        const std::string name(o.key.substr(o.key.find('.') + 1));
+        const std::string value = o.kind == Kind::Bool     ? "true"
+                                  : o.kind == Kind::Int    ? "1"
+                                  : o.kind == Kind::Number ? "1.5"
+                                  : o.kind == Kind::Choice ? "\"" + std::string(o.choices[0]) + "\""
+                                  : o.kind == Kind::List   ? "[\"x\"]"
+                                                           : "\"v\"";
+        Settings c;
+        std::string err;
+        EXPECT_TRUE(parse_config("{\"" + group + "\":{\"" + name + "\":" + value + "}}", c, err))
+            << o.key << ": " << err;
+    }
 }

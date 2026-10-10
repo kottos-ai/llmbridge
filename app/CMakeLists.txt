@@ -1,14 +1,14 @@
 # app: the runnable llmbridge gateway daemon. The gateway logic
 # lives in the `gateway` library module; this is just the CLI/signal shell.
 
-add_executable(llmbridge main.cpp config.cpp)
-target_link_libraries(llmbridge PRIVATE gateway provider)
-target_include_directories(llmbridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The option table (flags, config file, --help) as a library, so it is tested
+# without running main().
+add_library(llmbridge_options STATIC options.cpp)
+target_link_libraries(llmbridge_options PUBLIC gateway provider)
+target_include_directories(llmbridge_options PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# The config parser as a library too, so it can be tested without running main().
-add_library(llmbridge_config STATIC config.cpp)
-target_link_libraries(llmbridge_config PUBLIC provider)
-target_include_directories(llmbridge_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(llmbridge main.cpp)
+target_link_libraries(llmbridge PRIVATE llmbridge_options gateway provider)
 
 # Install the daemon (so `cmake --install` puts `llmbridge` on path). Top-level only.
 if (PROJECT_IS_TOP_LEVEL)
@@ -50,6 +50,13 @@ if (LLMBRIDGE_BUILD_TESTS)
             "unknown argument"
             --listen 0 --upstream 127.0.0.1:9 --lisen 8080)
 
+    # --duration took atoi, so 0.5 became 0 and ran until killed; the timeout fails it.
+    add_test(NAME CliDurationTakesAFraction
+            COMMAND llmbridge --listen 0 --upstream 127.0.0.1:9 --duration 0.5)
+    set_tests_properties(CliDurationTakesAFraction PROPERTIES TIMEOUT 20)
+    llmbridge_cli_refuses(CliRefusesBadPort "out of range"
+            --listen 70000 --upstream 127.0.0.1:9)
+
     llmbridge_cli_refuses(CliRefusesCertWithoutListenTls
             "certificate/key was given without enabling the"
             --listen 0 --upstream 127.0.0.1:9 --tls-cert /nonexistent --tls-key /nonexistent)
@@ -68,9 +75,9 @@ endif ()
 
 if (LLMBRIDGE_BUILD_TESTS)
     include(GoogleTest)
-    add_executable(app_config_test tests/config_test.cpp)
-    target_link_libraries(app_config_test PRIVATE llmbridge_config gateway GTest::gtest_main)
-    target_compile_definitions(app_config_test PRIVATE
+    add_executable(app_options_test tests/config_test.cpp tests/cli_test.cpp)
+    target_link_libraries(app_options_test PRIVATE llmbridge_options GTest::gtest_main)
+    target_compile_definitions(app_options_test PRIVATE
             LLMBRIDGE_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/llmbridge.example.json")
-    gtest_discover_tests(app_config_test)
+    gtest_discover_tests(app_options_test)
 endif ()

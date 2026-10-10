@@ -5,37 +5,27 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// llmbridge gateway daemon.
-//
-//   llmbridge [--listen PORT] [--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]]
-//          [--duration SECONDS]
-//          [--warmup SECONDS] [--translate none|anthropic|gemini|cohere|bedrock|azure]
-//          [--upstream-timeout SECONDS] [--connect-timeout SECONDS]
-//          [--io auto|epoll|uring]
-//
-// One self-contained event-loop class (llmbridge::Gateway) does everything:
-// accept clients, frame requests, optionally translate the provider dialect,
-// forward over a keep-alive upstream pool, translate the response back, reply.
-// Defaults: listen :8088, upstream 127.0.0.1:9001. With --duration the daemon
-// self-stops after N seconds and dumps the added-latency profile (for scripted
-// benchmark runs); otherwise it runs until SIGINT/SIGTERM.
+// llmbridge gateway daemon: flags and an optional --config file (app/options.hpp, --help),
+// N shared-nothing gateway workers, and the added-latency profile printed on exit.
+// Defaults: listen :8088, upstream 127.0.0.1:9001. With --duration the daemon self-stops
+// after that many seconds (for scripted benchmark runs); otherwise it runs until
+// SIGINT/SIGTERM.
 
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
-#include <stdexcept>
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <memory>
 #include <source_location>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
-#include "config.hpp"
+#include "options.hpp"
 #include "gateway/gateway.hpp"
 #include "net/log.hpp"
 #include "net/upstream.hpp"
@@ -65,8 +55,8 @@ namespace
         return 2;
     }
 
-    /// A venue dialect by name, or OpenAI for "openai" and its old spelling "none".
-    /// Callers validate first: an unknown string must be refused, never defaulted.
+    /// A venue dialect by name. The option table has already refused any other word,
+    /// so the OpenAI fallthrough is reached by "openai" only.
     llmbridge::UpstreamDialect dialect_from(const std::string& s)
     {
         return s == "anthropic" ? llmbridge::UpstreamDialect::Anthropic
@@ -77,7 +67,8 @@ namespace
                                 : llmbridge::UpstreamDialect::OpenAI;
     }
 
-    std::vector<std::unique_ptr<llmbridge::Gateway>>* g_gateways = nullptr;
+    using Gateways = std::vector<std::unique_ptr<llmbridge::Gateway>>;
+    Gateways* g_gateways = nullptr;
     void on_signal(int) noexcept
     {
         if (g_gateways)
@@ -102,193 +93,34 @@ namespace
 // bound. Each of those deserves to be legible on the first read.
 static int run(int argc, char** argv)
 {
-    uint16_t listen_port = 8088;
-    std::string upstream_arg = "127.0.0.1:9001";
-    int duration = 0;
-    double warmup = 0;
-    // Seconds of upstream silence before a request/stream is aborted (0 = off).
-    double up_timeout = static_cast<double>(llmbridge::Gateway::kDefaultUpstreamIdleNs) / 1e9;
-    double client_idle = static_cast<double>(llmbridge::Gateway::kDefaultClientIdleNs) / 1e9;
-    double pool_idle = static_cast<double>(llmbridge::Gateway::kDefaultPoolIdleNs) / 1e9;
-    double connect_timeout = static_cast<double>(llmbridge::Gateway::kDefaultConnectNs) / 1e9;
-    double prefault_mb = 0;
-    std::string log_level = "info";
-    int workers = 1;
-    bool timing_headers = false;
-    // Inbound TLS. One listener, one mode: --listen-tls makes the single listener
-    // TLS-only, so "am I exposed in the clear?" is answerable from the command
-    // line. There is deliberately no second plaintext port.
-    bool listen_tls = false;
-    std::string tls_cert, tls_key;
-    llmbridge::UpstreamDialect dialect = llmbridge::UpstreamDialect::OpenAI;
-    llmbridge::IoBackend io = llmbridge::IoBackend::Auto;
-
-    // --config is applied first and flags overwrite it, so the CLI always wins and a
-    // one-off override needs no file edit. bench/*.sh drives this daemon with eight
-    // flags and must keep working, so the file is additive, never a replacement.
-    // --config is applied first and flags overwrite it, so the CLI always wins and a
-    // one-off override needs no file edit. Precedence is not positional: a flag wins
-    // whether it sits before or after --config. bench/*.sh drives this daemon with
-    // eight flags and must keep working, so the file is additive, never a replacement.
-    //
-    // Argument validation runs before any I/O, so `--config a --config b` reports the
-    // duplicate instead of whichever file happened to be unreadable first.
-    const char* config_path = nullptr;
-    for (int i = 1; i < argc; ++i)
+    llmbridge::app::Settings cfg;
+    std::string err;
+    switch (llmbridge::app::parse_cli(std::span<char* const>(argv + 1, argv + argc), cfg, err))
     {
-        if (std::string_view(argv[i]) != "--config") continue;
-        if (i + 1 >= argc)
-        {
-            return refuse("--config needs a path");
-        }
-        // Refuse a second --config instead of quietly using the first. Silently
-        // discarding the operator's later file is the same fail-open shape the parser
-        // refuses for unknown keys, and it is invisible from the outside.
-        if (config_path)
-        {
-            return refuse("--config given twice (" + std::string(config_path) + " and " +
-                          argv[i + 1] + "); pass it once");
-        }
-        config_path = argv[i + 1];
+    case llmbridge::app::Cli::Help:
+        std::fputs(llmbridge::app::help_text(argv[0]).c_str(), stdout);
+        return 0;
+    case llmbridge::app::Cli::Refused:
+        // Fail closed and name the setting: a half-applied config is how an operator
+        // ends up believing a setting took effect when it did not.
+        return refuse(err);
+    case llmbridge::app::Cli::Run:
+        break;
     }
+    const uint16_t listen_port = static_cast<uint16_t>(cfg.listen_port);
+    const bool listen_tls = cfg.listen_tls;
+    const std::string& tls_cert = cfg.tls_cert;
+    const std::string& tls_key = cfg.tls_key;
+    const std::string& upstream_arg = cfg.upstream;
+    const int workers = cfg.workers;
 
-    // Config-only, with no flag equivalent: a list does not fit a flag without
-    // inventing a separator, which is the argument that put --config in first.
-    std::vector<std::string> strip_headers;
-    // Venues past the first, from a config file only.
-    std::vector<llmbridge::app::ConfigFile::UpstreamEntry> extra_upstreams;
-
-    if (config_path)
-    {
-        llmbridge::app::ConfigFile cfg;
-        std::string cfg_err;
-        if (!llmbridge::app::load_config(config_path, cfg, cfg_err))
-        {
-            // Fail closed and name the key. A config that half-applies is how an
-            // operator ends up believing a setting took effect when it did not.
-            return refuse(cfg_err);
-        }
-        if (cfg.has_listen_port) listen_port = cfg.listen_port;
-        if (cfg.has_listen_tls) listen_tls = cfg.listen_tls;
-        if (!cfg.tls_cert.empty()) tls_cert = cfg.tls_cert;
-        if (!cfg.tls_key.empty()) tls_key = cfg.tls_key;
-        strip_headers = cfg.strip_headers;
-        // Entry 0 feeds the flags, so --upstream and --translate keep overriding a
-        // one-upstream file exactly as before. Entries beyond the first can only come
-        // from a file, since a list has no flag spelling.
-        if (!cfg.upstreams.empty())
-        {
-            if (!cfg.upstreams[0].url.empty()) upstream_arg = cfg.upstreams[0].url;
-            if (!cfg.upstreams[0].dialect.empty()) dialect = dialect_from(cfg.upstreams[0].dialect);
-            extra_upstreams.assign(cfg.upstreams.begin() + 1, cfg.upstreams.end());
-        }
-        if (cfg.has_upstream_s) up_timeout = cfg.upstream_s;
-        if (cfg.has_client_idle_s) client_idle = cfg.client_idle_s;
-        if (cfg.has_pool_idle_s) pool_idle = cfg.pool_idle_s;
-        if (cfg.has_connect_s) connect_timeout = cfg.connect_s;
-        if (cfg.has_prefault_mb) prefault_mb = cfg.prefault_mb;
-        if (!cfg.io.empty())
-            io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
-                 : cfg.io == "uring" ? llmbridge::IoBackend::Uring
-                                     : llmbridge::IoBackend::Auto;
-        if (!cfg.log_level.empty()) log_level = cfg.log_level;
-        if (cfg.has_workers) workers = cfg.workers;
-        if (cfg.has_timing_headers) timing_headers = cfg.timing_headers;
-        if (cfg.has_duration_s) duration = static_cast<int>(cfg.duration_s);
-        if (cfg.has_warmup_s) warmup = cfg.warmup_s;
-    }
-
-    for (int i = 1; i < argc; ++i)
-    {
-        const std::string_view a = argv[i];
-        auto nextarg = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
-        if (a == "--config") { (void)nextarg(); continue; } // already applied above
-        if (a == "--listen")
-        {
-            if (const char* v = nextarg()) listen_port = static_cast<uint16_t>(std::atoi(v));
-        }
-        else if (a == "--upstream")
-        {
-            if (const char* v = nextarg()) upstream_arg = v;
-        }
-        else if (a == "--duration") { if (const char* v = nextarg()) duration = std::atoi(v); }
-        else if (a == "--warmup")   { if (const char* v = nextarg()) warmup = std::atof(v); }
-        else if (a == "--upstream-timeout") { if (const char* v = nextarg()) up_timeout = std::atof(v); }
-        else if (a == "--client-idle")      { if (const char* v = nextarg()) client_idle = std::atof(v); }
-        else if (a == "--pool-idle")        { if (const char* v = nextarg()) pool_idle = std::atof(v); }
-        else if (a == "--connect-timeout")  { if (const char* v = nextarg()) connect_timeout = std::atof(v); }
-        else if (a == "--prefault-mb")      { if (const char* v = nextarg()) prefault_mb = std::atof(v); }
-        else if (a == "--log-level")        { if (const char* v = nextarg()) log_level = v; }
-        else if (a == "--workers")  { if (const char* v = nextarg()) workers = std::atoi(v); }
-        else if (a == "--timing-headers") timing_headers = true;
-        else if (a == "--listen-tls") listen_tls = true;
-        else if (a == "--tls-cert") { if (const char* v = nextarg()) tls_cert = v; }
-        else if (a == "--tls-key")  { if (const char* v = nextarg()) tls_key = v; }
-        else if (a == "--translate")
-            return refuse("--translate is now --upstream-dialect, and names what the "
-                          "venue speaks instead of an action we may not perform");
-        else if (a == "--upstream-dialect")
-        {
-            const char* v = nextarg();
-            if (v == nullptr) return refuse(std::string(a) + " needs a dialect");
-            const std::string mode(v);
-            // Validated, never defaulted: an unknown value used to become an
-            // OpenAI venue silently, so a typo turned an Anthropic upstream into a
-            // mistranslated request carrying a live credential.
-            if (mode == "none")
-                return refuse("upstream dialect 'none' is now 'openai': it names an "
-                              "OpenAI-compatible venue, never an absence");
-            if (mode != "openai" && mode != "anthropic" && mode != "gemini" &&
-                mode != "cohere" && mode != "bedrock" && mode != "azure")
-                return refuse("unknown upstream dialect '" + mode +
-                              "'; use openai|anthropic|gemini|cohere|bedrock|azure");
-            dialect = dialect_from(mode);
-        }
-        else if (a == "--io")
-        {
-            if (const char* v = nextarg())
-            {
-                std::string mode(v);
-                if (mode == "epoll") io = llmbridge::IoBackend::Epoll;
-                else if (mode == "uring") io = llmbridge::IoBackend::Uring;
-                else io = llmbridge::IoBackend::Auto;
-            }
-        }
-        else if (a == "--help" || a == "-h")
-        {
-            std::printf("usage: %s [--listen PORT] "
-                        "[--upstream IP:PORT|HOST:PORT|http(s)://HOST[:PORT]] "
-                        "[--duration SECONDS] [--warmup SECONDS] "
-                        "[--upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure] "
-                        "[--upstream-timeout SECONDS] [--client-idle SECONDS] [--pool-idle SECONDS] "
-                        "[--connect-timeout SECONDS] "
-                        "[--prefault-mb MB] "
-                        "[--log-level trace|debug|info|warn|error|off] "
-                        "[--listen-tls --tls-cert PATH --tls-key PATH] "
-                        "[--io auto|epoll|uring] [--workers N] [--timing-headers] [--config FILE]\n", argv[0]);
-            return 0;
-        }
-        else
-        {
-            std::string m = "unknown argument '" + std::string(a) + "'";
-            if (const size_t eq = a.find('='); eq != std::string_view::npos)
-                m += "; flags take a separate value, so write '" + std::string(a.substr(0, eq)) +
-                     " " + std::string(a.substr(eq + 1)) + "'";
-            return refuse(m + ". Run --help for the accepted flags.");
-        }
-    }
     llmbridge::net::log::register_thread("main", 0);
     {
         llmbridge::net::log::Level lv{};
-        if (!llmbridge::net::log::level_from_name(log_level, lv))
-        {
-            return refuse("unknown --log-level '" + log_level +
-                          "'; expected one of trace debug info warn error off");
-        }
+        if (!llmbridge::net::log::level_from_name(cfg.log_level, lv))
+            return refuse("unknown log level '" + cfg.log_level + "'");
         llmbridge::net::log::set_level(lv);
     }
-
-    if (workers < 1) workers = 1;
 
     if (listen_tls && (tls_cert.empty() || tls_key.empty()))
     {
@@ -366,12 +198,12 @@ static int run(int argc, char** argv)
                             .port = upstream_port,
                             .tls = up.tls,
                             .sni_host = up.host,
-                            .dialect = dialect,
+                            .dialect = dialect_from(cfg.dialect),
                             .base_path = up.path,
                             .query = up.query,
                             .ips = ips,
                             .host = up.host});
-    for (const auto& e : extra_upstreams)
+    for (const auto& e : cfg.more_upstreams)
     {
         const llmbridge::net::UpstreamSpec s2 = llmbridge::net::parse_upstream(e.url);
         if (!s2.ok())
@@ -406,9 +238,12 @@ static int run(int argc, char** argv)
     // N shared-nothing workers, each its own event loop binding the same port with
     // SO_REUSEPORT: the kernel load-balances connections across them. No locks on
     // the hot path; per-worker upstream pools and stats, merged at the end.
-    const int64_t warmup_ns = static_cast<int64_t>(warmup * 1e9);
-    const int64_t up_timeout_ns = static_cast<int64_t>(up_timeout * 1e9);
-    std::vector<std::unique_ptr<llmbridge::Gateway>> gateways;
+    const int64_t warmup_ns = static_cast<int64_t>(cfg.warmup_s * 1e9);
+    const int64_t up_timeout_ns = static_cast<int64_t>(cfg.upstream_s * 1e9);
+    const llmbridge::IoBackend io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
+                                    : cfg.io == "uring" ? llmbridge::IoBackend::Uring
+                                                        : llmbridge::IoBackend::Auto;
+    Gateways gateways;
     for (int i = 0; i < workers; ++i)
     {
         llmbridge::TlsConfig tls;
@@ -419,13 +254,13 @@ static int run(int argc, char** argv)
         tls.cert_file = tls_cert;
         tls.key_file = tls_key;
         auto gw = std::make_unique<llmbridge::Gateway>(
-            listen_port, upstream_table, warmup_ns, io, up_timeout_ns, tls, timing_headers,
-            nullptr, strip_headers);
+            listen_port, upstream_table, warmup_ns, io, up_timeout_ns, tls, cfg.timing_headers,
+            nullptr, cfg.strip_headers);
         // Before run(): the loop thread reads it, so setting it later is a data race.
-        gw->set_client_idle_ns(static_cast<int64_t>(client_idle * 1e9));
-        gw->set_pool_idle_ns(static_cast<int64_t>(pool_idle * 1e9));
-        gw->set_connect_ns(static_cast<int64_t>(connect_timeout * 1e9));
-        gw->set_prefault_bytes(static_cast<size_t>(prefault_mb * (1 << 20)));
+        gw->set_client_idle_ns(static_cast<int64_t>(cfg.client_idle_s * 1e9));
+        gw->set_pool_idle_ns(static_cast<int64_t>(cfg.pool_idle_s * 1e9));
+        gw->set_connect_ns(static_cast<int64_t>(cfg.connect_s * 1e9));
+        gw->set_prefault_bytes(static_cast<size_t>(cfg.prefault_mb * (1 << 20)));
         gateways.push_back(std::move(gw));
     }
     g_gateways = &gateways;
@@ -435,10 +270,10 @@ static int run(int argc, char** argv)
     std::signal(SIGUSR1, on_dump_signal);
 
     std::thread timer;
-    if (duration > 0)
+    if (cfg.duration_s > 0)
     {
-        timer = std::thread([&gateways, duration] {
-            std::this_thread::sleep_for(std::chrono::seconds(duration));
+        timer = std::thread([&gateways, d = cfg.duration_s] {
+            std::this_thread::sleep_for(std::chrono::duration<double>(d));
             for (auto& g : gateways) g->request_stop();
         });
     }

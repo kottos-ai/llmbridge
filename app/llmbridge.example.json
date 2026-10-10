@@ -1,7 +1,7 @@
 {
   "_what": "Every value below is the BUILT-IN DEFAULT, so this file changes nothing if you pass it as-is. It is a reference for what exists and what it is set to, not a deployment you should copy unedited.",
   "_optional": "Every key is optional. An absent key leaves the default alone, so a real config is usually three or four lines.",
-  "_precedence": "The file is read first and command-line flags overwrite it. Precedence is NOT positional: a flag wins whether it appears before or after --config. Passing --config twice is an error.",
+  "_precedence": "The file is read first and command-line flags overwrite it; --help names the key each flag sets. Precedence is NOT positional: a flag wins whether it appears before or after --config. Passing --config twice is an error.",
   "_strict": "Unknown keys are a startup ERROR, never ignored: a silently-skipped typo is how an operator ends up believing a setting took effect. Wrong types, bad enum values and out-of-range numbers are refused the same way. Keys beginning with _ are comments.",
   "_secrets": "Paths only. Never put a token or a provider API key in this file. Provider credentials travel per request, from the client.",
   "_pinned": "app/tests/config_test.cpp asserts these values equal the constants in the code, so this file cannot drift from the defaults it claims to document.",
@@ -17,14 +17,14 @@
     "_key": "Private key, PEM, and it must not be readable beyond its owner (chmod 600) or startup refuses it. Example: /etc/llmbridge/key.pem"
   },
 
-  "_upstream_table": "An OBJECT for one venue, as below, or an ARRAY of the same object for several. With an array, a policy installed by a consuming program selects the index per request; llmbridge itself always uses the first, because choosing needs measurements it does not collect. Order is the contract: the index a policy returns is a position in this list. strip_headers is gateway-wide and is read from the object form only.",
+  "_upstream_table": "An OBJECT for one venue, as below, or an ARRAY of the same object for several. With an array, a policy installed by a consuming program selects the index per request; llmbridge itself always uses the first, because choosing needs measurements it does not collect. Order is the contract: the index a policy returns is a position in this list. strip_headers is gateway-wide: in an array it applies to every venue whichever entry sets it, and entries that set it must list the same headers.",
   "_upstream_example": "\"upstream\": [ {\"url\": \"https://api.anthropic.com\", \"dialect\": \"anthropic\"}, {\"url\": \"https://api.together.xyz\", \"dialect\": \"openai\"} ]",
 
   "upstream": {
     "_url": "IP:PORT, HOST:PORT, or http(s)://HOST[:PORT]. https:// needs a TLS build and verifies both the chain and the hostname, with no way to disable it. A non-loopback plaintext upstream warns at startup, because a forwarded credential would cross the network in the clear.",
     "url": "127.0.0.1:9001",
 
-    "_dialect": "What this venue speaks: openai | anthropic | gemini | cohere. A client already speaking the venue's dialect is byte-forwarded, whichever it is. The old key name \"translate\" and the old value \"none\" still parse.",
+    "_dialect": "What this venue speaks: openai | anthropic | gemini | cohere | bedrock | azure. A client already speaking the venue's dialect is byte-forwarded, whichever it is. The old key name \"translate\" and the old value \"none\" are refused by name.",
     "dialect": "openai",
 
     "_strip_headers": "Header names removed from every request before it is forwarded, matched case-insensitively and exactly. Empty by default, which leaves passthrough a single memcpy. Use it when a client header must not reach a third-party provider: an internal routing header, or an identity token meant for THIS gateway and nobody else. Translating modes already rebuild from a whitelist; this also stops a stripped Authorization being promoted to the provider credential.",
@@ -52,7 +52,7 @@
     "_log_level": "trace | debug | info | warn | error | off. Lines BELOW the level compiled in at build time do not exist at all, so raising this at runtime cannot resurrect them: build with -DLLMBRIDGE_LOG_LEVEL=debug for the per-connection lines. Release compiles in info and above so the published latency numbers are measured on what ships.",
     "log_level": "info",
 
-    "_workers": "Shared-nothing event loops, one thread each, all binding the same port with SO_REUSEPORT. The kernel picks a worker per CONNECTION by hashing the 4-tuple, so a single keep-alive client stays on one worker for that connection's life; a client wanting to spread across workers opens several connections.",
+    "_workers": "1 to 4096 shared-nothing event loops, one thread each, all binding the same port with SO_REUSEPORT. The kernel picks a worker per CONNECTION by hashing the 4-tuple, so a single keep-alive client stays on one worker for that connection's life; a client wanting to spread across workers opens several connections.",
     "workers": 1,
 
     "_timing_headers": "Per-request x-llmbridge-* response headers splitting the request into disjoint spans. Metadata only, no prompt or completion text. Defined precisely in LATENCY.md.",
@@ -61,7 +61,7 @@
     "_prefault_mb": "Megabytes to reserve and write through in every request buffer before it carries a request: the gateway's two scratch strings at start, each upstream connection's send buffer when it opens. Without it the first request through each buffer faults in fresh pages as it is written, measured at 2.6 ms for a 10 MB agent context. Memory is this size times the number of pooled upstream connections, resident for the life of the process, so leave it at 0 for small requests and set it to the largest request body you expect (16 for Claude Code sessions) when they are large.",
     "prefault_mb": 0,
 
-    "_duration_s": "Self-stop after N seconds and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
+    "_duration_s": "Self-stop after N seconds (fractions allowed; SIGINT/SIGTERM still stop it at once) and print the added-latency profile, for scripted benchmark runs. 0 runs until SIGINT/SIGTERM.",
     "duration_s": 0,
 
     "_warmup_s": "Exclude the first N seconds from the histograms.",
