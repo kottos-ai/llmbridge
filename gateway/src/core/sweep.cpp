@@ -10,6 +10,7 @@
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
+#include "core/registry.hpp"
 #include "stream.hpp"
 
 #include <vector>
@@ -37,9 +38,9 @@ namespace llmbridge
         {
             _last_heartbeat_ns = now;
             size_t in_flight = 0;
-            for (const auto& [id, c] : _clients)
+            for (Connection* c : *_clients)
                 if (!c->doomed && (c->peer != nullptr || c->req.f.streaming)) ++in_flight;
-            LB_INFO("heartbeat clients=", _clients.size(), " in_flight=", in_flight,
+            LB_INFO("heartbeat clients=", _clients->size(), " in_flight=", in_flight,
                     " pooled_upstreams=", pooled_upstream_count(),
                     " requests=", _stats.requests);
         }
@@ -73,7 +74,7 @@ namespace llmbridge
         // it is a resource-exhaustion vector that costs an attacker one packet.
         {
             std::vector<Connection*> unfinished;
-            for (auto& [id, c] : _clients)
+            for (Connection* c : *_clients)
             {
                 if (c->doomed || c->ever_framed || c->ts_accepted == 0) continue;
                 if (now - c->ts_accepted > _client_setup_ns) unfinished.push_back(c);
@@ -99,7 +100,7 @@ namespace llmbridge
         if (_client_idle_ns > 0)
         {
             std::vector<Connection*> quiet;
-            for (auto& [id, c] : _clients)
+            for (Connection* c : *_clients)
             {
                 if (c->doomed || !c->ever_framed || c->ts_client_activity == 0) continue;
                 if (c->peer != nullptr || c->req.f.streaming) continue; // in flight
@@ -126,7 +127,7 @@ namespace llmbridge
         if (_connect_ns > 0)
         {
             std::vector<Connection*> stuck;
-            for (auto& [id, c] : _clients)
+            for (Connection* c : *_clients)
             {
                 if (c->doomed) continue;
                 const Connection* u = c->peer;
@@ -162,7 +163,7 @@ namespace llmbridge
 
         // Collect first: the teardown below erases from _clients.
         std::vector<Connection*> stale;
-        for (auto& [id, c] : _clients)
+        for (Connection* c : *_clients)
         {
             if (c->doomed) continue;
             const bool in_flight = c->peer != nullptr || c->req.f.streaming;

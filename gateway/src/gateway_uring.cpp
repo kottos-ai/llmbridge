@@ -12,6 +12,7 @@
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
+#include "core/registry.hpp"
 #include "net/secure.hpp"
 #include "net/socket_util.hpp"
 #include "request.hpp"
@@ -303,6 +304,7 @@ namespace llmbridge
             return nullptr;
         }
 #endif
+        _upconns->add(u);
         ++_stats.upstream_conns_opened;
         LB_DEBUG("upstream open ", *u, " to ", up.ip, " pool=", pooled_upstream_count()); // see ep_ twin
         return u;
@@ -355,6 +357,7 @@ namespace llmbridge
             return false;
         }
 #endif
+        _upconns->add(uf);
         ++_stats.upstream_conns_opened;
 
         // WARN, not DEBUG: it is not a cap, it is a recovered failure. A pooled
@@ -380,22 +383,25 @@ namespace llmbridge
         if (c->doomed) return;
         // Every close unpairs: the other leg never keeps a pointer to a freed object.
         Connection* other = unpair(c);
-        if (c->is_client && c->id)
+        if (c->is_client)
         {
-            _clients.erase(c->id);
-            LB_DEBUG("close ", *c, " clients=", _clients.size());
+            _clients->remove(c);
+            LB_DEBUG("close ", *c, " clients=", _clients->size());
         }
-        if (!c->is_client) _pool->remove(*c);
-        // This backend closes both kinds in one function where epoll has two, so
-        // the upstream branch lives here. After the erase, as in the ep_ twin.
-        if (!c->is_client)
+        else
+        {
+            // This backend closes both kinds in one function where epoll has two, so
+            // the upstream branch lives here. After the erase, as in the ep_ twin.
+            _pool->remove(*c);
+            _upconns->remove(c);
             LB_DEBUG("upstream close ", *c, " pool=", pooled_upstream_count());
+        }
         // Force any in-flight op on this fd to complete so its inflight count drains
         // (the fd is closed at free time). shutdown alone does not end an armed
         // multishot recv, so also cancel everything on the fd.
         if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); ur_submit_cancel(c->fd); }
         c->doomed = true;
-        _doomed.push_back(c);
+        _doomed->add(c);
         // An upstream mid-response is of no use to anyone else.
         if (other && c->is_client) ur_close(other);
         ur_maybe_free(c);
@@ -432,8 +438,7 @@ namespace llmbridge
     {
         if (!c->doomed || c->inflight > 0) return; // a completion still references it
         if (c->fd >= 0) { ::close(c->fd); c->fd = -1; }
-        for (auto it = _doomed.begin(); it != _doomed.end(); ++it)
-            if (*it == c) { _doomed.erase(it); break; }
+        _doomed->remove(c);
         retire_wbuf(c);
         delete c;
     }
@@ -518,8 +523,8 @@ namespace llmbridge
             return;
         }
 #endif
-        _clients[c->id] = c;
-        LB_DEBUG("accept ", *c, " clients=", _clients.size());
+        _clients->add(c);
+        LB_DEBUG("accept ", *c, " clients=", _clients->size());
         ur_arm_recv(c); // multishot recv stays armed for the connection's life
     }
 
@@ -1265,18 +1270,13 @@ namespace llmbridge
 
         // Graceful drain: stop taking new work, force every live fd's in-flight ops
         // to complete, and reap until nothing is outstanding, so no kernel op
-        // writes into a buffer we're about to free. Acquired upstreams are reachable
-        // only via client->peer, so shut those down too.
+        // writes into a buffer we're about to free.
         _draining = true;
         auto stop_conn = [this](Connection* c) {
             if (c->fd >= 0) { ::shutdown(c->fd, SHUT_RDWR); ur_submit_cancel(c->fd); }
         };
-        for (auto& [id, c] : _clients)
-        {
-            stop_conn(c);
-            if (c->peer) stop_conn(c->peer); // acquired upstreams reachable only via peer
-        }
-        _pool->for_each(stop_conn);
+        for (Connection* c : *_clients) stop_conn(c);
+        for (Connection* u : *_upconns) stop_conn(u); // pooled and in flight alike
         // doomed conns were already shut down + cancelled by ur_close().
 
         while (_uring_inflight > 0)
@@ -1286,13 +1286,8 @@ namespace llmbridge
             reap();
         }
 
-        // Free acquired (in-flight) upstreams now drained but tracked only via peer;
-        // the rest (_clients, the pool, _doomed, listen_conn) are freed by
-        // ~Gateway.
-        for (auto& [id, c] : _clients)
-            if (Connection* u = unpair(c)) { if (u->fd >= 0) ::close(u->fd); delete u; }
+        return 0; // ~Gateway frees what the registries still hold
 
-        return 0;
     }
 } // namespace llmbridge
 #endif // LLMBRIDGE_HAVE_URING

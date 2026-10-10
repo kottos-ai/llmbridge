@@ -358,6 +358,11 @@ credentials, so the rules are worth stating exactly.
                                           doomed && inflight == 0
 ```
 
+Every `Connection` is in exactly one `Registry` (`gateway/src/core/registry.hpp`):
+`_clients`, `_upconns` (live upstreams, pooled ones too) or `_doomed`. Each member
+holds its own index, so a close moves it in O(1), and the destructor and the
+io_uring drain walk the registries instead of following `peer` to find upstreams.
+
 `inflight` counts submitted-but-uncompleted SQEs for one connection:
 
 - **incremented** by the three `ur_submit_*` functions, each at its tail

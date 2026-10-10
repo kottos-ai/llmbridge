@@ -44,6 +44,8 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        /// Index in the Registry that holds it: live clients, live upstreams or doomed.
+        uint32_t slot = UINT32_MAX;
 
         /// Upstream table index, -1 for none: an upstream's own venue (for its pool), or the
         /// venue serving a client's request in flight (for the response's dialect).
