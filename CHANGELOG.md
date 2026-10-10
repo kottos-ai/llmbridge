@@ -8,6 +8,66 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.79.0]. 2026-10-10
+
+One option table for the flags, the config file and `--help`. Each fix has a
+regression test that fails without it.
+
+### Fixed
+
+- **Flags are validated like config keys** (P16). They used `atoi`/`atof`, so
+  `--listen 70000` served port 4464, a negative `--upstream-timeout` switched the
+  upstream idle sweep off, `--io urnig` became `auto`, `--workers` had no cap, and a
+  flag missing its value was ignored. Each is now refused at startup, naming the flag.
+- **`--duration` and `runtime.duration_s` keep a fraction.** `0.5` was truncated to 0,
+  which ran until killed.
+- **`listen.port` and `runtime.workers` refuse a fraction** (P16): `8088.9` served 8088
+  and `1.7` ran one worker.
+- **`upstream.strip_headers` in an `upstream` array is honoured** (P4). It was accepted
+  in an array entry and ignored, so the header the operator meant to strip was still
+  forwarded. The list stays gateway-wide: it applies to every venue, and entries that
+  set it must list the same headers.
+- **The config file accepts the `bedrock` and `azure` dialects** (P14), which the flag
+  already did, so a venue table can hold them.
+- **SIGINT or SIGTERM ends a `--duration` run at once** (P15); it used to wait out the
+  deadline. The signal handlers' gateway pointer is cleared before the gateways are
+  destroyed.
+
+### Changed
+
+- **Breaking: bad flag values are refused instead of coerced.** A value outside its
+  range (`--listen` 0..65535, `--workers` 1..4096, timeouts, `--warmup` and `--duration`
+  0..31536000 s, `--prefault-mb` 0..4096), a number with trailing text, an unknown
+  `--io`, or a flag whose value is missing or is another `--flag` stops startup.
+  `--workers 0` used to run one worker.
+- **Breaking: `--help` is one line per flag**, with its range or choices and the config
+  key it sets, generated from the table; file-only keys are listed after the flags.
+  `--help` now wins even next to an unknown flag.
+- A worker whose event loop returns now stops the others instead of leaving them
+  serving its share of the port. No test: nothing outside `gateway/` can make a loop
+  return early.
+- Dialect, range and choice refusals share one wording between the flag and the key
+  (`--io must be one of: auto epoll uring (got "urnig")`).
+- `app/config.hpp` and `app/config.cpp` are replaced by `app/options.hpp` and
+  `app/options.cpp` (`Settings`, `Option`, `parse_cli`, `parse_config`, `help_text`);
+  the internal CMake target `llmbridge_config` is now `llmbridge_options`.
+- `bench/run_stream_cpu.sh` and `bench/run_stream_headtohead.sh` pass
+  `--upstream-dialect`; the retired `--translate` they used stopped startup.
+
+### Tests
+
+- `app_options_test` replaces `app_config_test`: the config cases ported, plus
+  `Config.ArrayFormStripHeadersIsHonoured`, `Config.ArrayEntriesThatSetStripHeadersMustAgree`,
+  `Config.BedrockAndAzureAreDialects`, `Config.IntegersRefuseAFraction`,
+  `Config.DurationKeepsItsFraction` and `Config.EveryOptionAcceptsAValueOfItsKind`;
+  `P16/CliReject.*` (one case per P16 example), `Cli.TheBenchFlagsStillParse`,
+  `Cli.AFlagBeatsTheFileWhereverItSits` and the `--help` golden
+  `Cli.HelpWinsAndIsGolden`.
+- CLI tests `CliDurationTakesAFraction`, `CliSigintEndsADurationRun` and
+  `CliRefusesBadPort`.
+- `fuzz_config` fuzzes the config parser in CI.
+
+
 ## [0.78.0]. 2026-10-10
 
 ### Changed

@@ -300,7 +300,7 @@ made long enough that none finishes inside the window:
 
 ```sh
 build-linux/bin/faststream --port 9601 --tokens 1000 --token-interval-us 100000 --prefill-us 100000 &
-build-linux/bin/llmbridge --listen 8088 --upstream 127.0.0.1:9601 --translate anthropic --workers 1 --io uring &
+build-linux/bin/llmbridge --listen 8088 --upstream 127.0.0.1:9601 --upstream-dialect anthropic --workers 1 --io uring &
 for i in 1 2 3 4; do build-linux/bin/streamgen --port 8088 --streams 1024 --duration 30 --warmup 5 & done
 ```
 
@@ -426,7 +426,7 @@ exactly how an ephemeral-port collision was misread as "the new build crashes".
 
 ```
 --listen PORT           --upstream IP:PORT | HOST:PORT | http://HOST[:PORT]
---io auto|epoll|uring   --translate none|anthropic|gemini|cohere
+--io auto|epoll|uring   --upstream-dialect NAME (see --help)
 --workers N             --upstream-timeout SECONDS
 --duration SECONDS      --warmup SECONDS
 ```

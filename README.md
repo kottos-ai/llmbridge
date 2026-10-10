@@ -202,7 +202,7 @@ llmbridge --listen 8088 --upstream 127.0.0.1:9001 --upstream-dialect anthropic
 #          --upstream also takes HOST:PORT or http(s)://HOST[:PORT][/BASE]
 #                                (resolved at startup; /BASE for providers serving
 #                                 an OpenAI-compatible API below the root)
-#                                                  --upstream-dialect openai|anthropic|gemini|cohere
+#                    --upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure
 #          --upstream-timeout 120   # seconds of upstream silence before aborting (0 = off)
 ```
 
@@ -272,6 +272,11 @@ properties worth knowing:
   is how you end up believing a value took effect when it did not, and a file has no
   command line to inspect. Wrong types and out-of-range values are refused the same
   way, each naming the key.
+- **One table, one set of rules.** Every flag and its key are one row in
+  [`app/options.hpp`](app/options.hpp), so both are parsed and bounded the same way: a
+  port past 65535, a negative timeout, a fractional worker count, an unknown `--io` or a
+  flag missing its value is refused at startup, naming it. `--help` lists every flag
+  with the key it sets.
 - **Paths, never secrets.** `cert` and `key` are filenames. Do not put provider API
   keys in it; those travel per request, from the client.
 

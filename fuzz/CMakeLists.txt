@@ -49,6 +49,14 @@ target_link_libraries(fuzz_http_diff PRIVATE net) # http.hpp against fuzz/http_l
 target_link_libraries(fuzz_sse PRIVATE provider)  # provider/sse.hpp + compiled sse.cpp
 target_link_libraries(fuzz_scan PRIVATE provider) # provider/openai.hpp scans
 
+# The `--config` file parser. options.cpp is compiled in, not linked from the app's
+# library, so libFuzzer sees its coverage.
+add_executable(fuzz_config fuzz_config.cpp ${PROJECT_SOURCE_DIR}/app/options.cpp)
+target_compile_options(fuzz_config PRIVATE -g -O1 -UNDEBUG -fsanitize=fuzzer,address,undefined)
+target_link_options(fuzz_config PRIVATE -fsanitize=fuzzer,address,undefined)
+target_include_directories(fuzz_config PRIVATE ${PROJECT_SOURCE_DIR}/app)
+target_link_libraries(fuzz_config PRIVATE gateway provider)
+
 # The inbound TLS handshake: the first surface an unauthenticated remote peer
 # reaches. Only in a TLS build, because there is no server Session without one.
 if (LLMBRIDGE_TLS)

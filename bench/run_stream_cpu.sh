@@ -58,9 +58,9 @@ start_all(){
   $BIN/faststream --port $MOCK --tokens 60 --token-interval-us "$interval_us" --prefill-us "$interval_us" \
       >/tmp/cpu_prov.log 2>&1 & local FP=$!
   sleep 1.5
-  $BIN/llmbridge --listen $GW_E --upstream 127.0.0.1:$MOCK --translate anthropic --workers 1 --io epoll \
+  $BIN/llmbridge --listen $GW_E --upstream 127.0.0.1:$MOCK --upstream-dialect anthropic --workers 1 --io epoll \
       >/tmp/cpu_ge.log 2>&1 & local GE=$!
-  $BIN/llmbridge --listen $GW_U --upstream 127.0.0.1:$MOCK --translate anthropic --workers 1 --io uring \
+  $BIN/llmbridge --listen $GW_U --upstream 127.0.0.1:$MOCK --upstream-dialect anthropic --workers 1 --io uring \
       >/tmp/cpu_gu.log 2>&1 & local GU=$!
   PIDS=($FP $GE $GU); EPOLL_PID=$GE; URING_PID=$GU
   sleep 2

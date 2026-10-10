@@ -619,9 +619,17 @@ flags cannot express that without inventing a mini-language with none of the too
 and worse errors. The shape is grouped (`listen`, `upstream`, `timeouts`, `runtime`) so
 `upstream` can become an array without disturbing the rest.
 
+**One table.** Each setting is one `Option` row in `app/options.hpp`: flag, key, kind,
+bounds and choices. `parse_cli`, `parse_config` and `--help` all read it, so the two
+inputs cannot drift into two validation rules, which is how the flags came to wrap a
+port past 65535 and take a negative timeout the file refused. A key with no row is
+refused, which is also what keeps a per-venue `strip_headers` from being accepted and
+ignored: the list is gateway-wide, so in an `upstream` array it applies to every venue,
+and entries that set it must agree.
+
 Parsed with `provider/json.hpp`, the same hand-rolled parser the translator uses, so
 the file adds **no dependency**. That parser is a zero-copy DOM over `string_view`, so
-`ConfigFile` copies every value out and owns `std::string`; a field holding a view
+`Settings` copies every value out and owns `std::string`; a field holding a view
 would be a use-after-free the moment the buffer went away, and a test clobbers the
 input buffer before reading the values back to keep that honest.
 
