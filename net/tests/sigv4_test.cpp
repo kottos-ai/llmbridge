@@ -143,6 +143,32 @@ TEST(SigV4, QueryParametersAreSortedByEncodedName)
     EXPECT_EQ(sigv4::canonical_query(""), "");
 }
 
+// Canonical values are trimmed and inner whitespace collapsed, never lower-cased: AWS
+// signs the Host it receives, so a capitalised venue host used to fail every request.
+TEST(SigV4, HeaderValuesKeepTheirCaseAndCollapseSpaces)
+{
+    sigv4::Request r;
+    r.method = "POST";
+    r.path = "/model/m/invoke";
+    r.host = "Bedrock-Runtime.us-east-1.amazonaws.com";
+    r.content_type = "  application/json;   charset=UTF-8 ";
+    r.region = "us-east-1";
+    r.service = "bedrock";
+    r.amz_date = "20260101T000000Z";
+    const std::string c = sigv4::canonical_request(r, "hash", "");
+    EXPECT_NE(c.find("\nhost:Bedrock-Runtime.us-east-1.amazonaws.com\n"), std::string::npos) << c;
+    EXPECT_NE(c.find("\ncontent-type:application/json; charset=UTF-8\n"), std::string::npos) << c;
+}
+
+// The wire query is already encoded once; encoding it again signed %3A as %253A.
+TEST(SigV4, QueryValuesAreDecodedBeforeTheyAreEncoded)
+{
+    EXPECT_EQ(sigv4::canonical_query("api-version=2024%3A01"), "api-version=2024%3A01");
+    EXPECT_EQ(sigv4::canonical_query("a=x:y"), "a=x%3Ay");
+    EXPECT_EQ(sigv4::canonical_query("a=%7e"), "a=~");
+    EXPECT_EQ(sigv4::canonical_query("a=100%"), "a=100%25") << "a malformed escape is kept";
+}
+
 TEST(SigV4, SessionTokenJoinsTheSignedHeaders)
 {
     // Temporary credentials are what most real deployments use, and the token is part
