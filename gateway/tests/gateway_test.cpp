@@ -10023,3 +10023,41 @@ TEST_P(ProxyRoute, AFramingErrorAfterASuccessIsARequestOfItsOwn)
     EXPECT_FALSE(recs[1].r.from_pool);
     EXPECT_EQ(recs[1].model, "") << "the previous request's model";
 }
+
+// G5: t2 and t3 were stamped only when still 0, so a keep-alive client's second
+// request on a fresh upstream kept the first one's: connect-us went negative and
+// upwrite-us counted the time between the two requests.
+class ProxyRequestReset : public ProxyIT,
+                          public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyRequestReset, ASecondRequestOnAColdUpstreamGetsItsOwnStamps)
+{
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                          "Connection: close\r\nContent-Length: 2\r\n\r\n{}");
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 2; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request())) << i;
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200) << i;
+    }
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    for (size_t i = 0; i < recs.size(); ++i)
+    {
+        const llmbridge::RequestRecord& r = recs[i].r;
+        EXPECT_FALSE(r.from_pool) << i;
+        EXPECT_GE(r.ts_wire_ready, r.ts_req_built) << i << ": t2 is the previous request's";
+        EXPECT_GE(r.ts_up_sent, r.ts_wire_ready) << i;
+        EXPECT_GE(r.ts_up_recvd, r.ts_up_sent) << i;
+    }
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyRequestReset,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));

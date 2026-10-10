@@ -879,7 +879,9 @@ namespace llmbridge
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
         c->req.f.ts_up_activity = c->req.f.ts_req_built; // idle-timeout baseline for this request
-        if (u->connected) c->req.f.ts_wire_ready = c->req.f.ts_req_built; // pooled: no handshake
+        // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
+        c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
+        c->req.f.ts_up_sent = 0;
         c->req.f.upstream_pooled = u->connected;
         c->req.f.upstream_ip = u->up_addr.sin_addr.s_addr;
 
@@ -912,7 +914,7 @@ namespace llmbridge
         if (!upstream_is_tls(u))
         {
             u->wire_ready = true;
-            if (u->peer && u->peer->req.f.ts_wire_ready == 0) u->peer->req.f.ts_wire_ready = now_ns();
+            if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
         }
         if (!ur_arm_recv(u)) return; // arm the multishot recv for this upstream's life; may free u
 #ifdef LLMBRIDGE_HAVE_TLS
