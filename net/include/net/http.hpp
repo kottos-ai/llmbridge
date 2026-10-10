@@ -445,20 +445,9 @@ namespace llmbridge::net::http
                             if (_line.size() >= 2 && _line[_line.size() - 2] == '\r' && _line.back() == '\n')
                             {
                                 size_t sz = 0;
-                                bool any = false;
-                                for (char h : _line)
-                                {
-                                    int d;
-                                    if (h >= '0' && h <= '9') d = h - '0';
-                                    else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
-                                    else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
-                                    else break; // ';' extension or '\r'
-                                    sz = sz * 16 + static_cast<size_t>(d);
-                                    any = true;
-                                    if (sz > kMaxBodyLen) return fail(); // hostile chunk size
-                                }
+                                const bool ok = size_line(std::string_view(_line).substr(0, _line.size() - 2), sz);
                                 _line.clear();
-                                if (!any) return fail();
+                                if (!ok) return fail();
                                 _remaining = sz;
                                 _st = (sz == 0) ? St::Trailer : St::Data;
                                 break;
@@ -513,6 +502,28 @@ namespace llmbridge::net::http
     private:
         enum class St { Size, Data, DataCRLF, Trailer, Done, Error };
         bool fail() noexcept { _st = St::Error; return false; }
+
+        // RFC 9112 §7.1: 1*HEXDIG, optional whitespace, then a chunk extension or
+        // nothing. `line` excludes its CRLF and may hold no other CR or LF.
+        static bool size_line(std::string_view line, size_t& sz) noexcept
+        {
+            size_t i = 0;
+            for (; i < line.size(); ++i)
+            {
+                const char h = line[i];
+                int d;
+                if (h >= '0' && h <= '9') d = h - '0';
+                else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+                else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+                else break;
+                sz = sz * 16 + static_cast<size_t>(d);
+                if (sz > kMaxBodyLen) return false; // hostile chunk size
+            }
+            if (i == 0) return false;
+            while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+            if (i < line.size() && line[i] != ';') return false;
+            return line.find_first_of("\r\n", i) == std::string_view::npos;
+        }
 
         St _st = St::Size;
         size_t _remaining = 0; // bytes left in the current chunk's data
