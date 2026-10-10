@@ -178,7 +178,7 @@ Two consequences of that table worth reading off it:
   If you add a fifth send path, it must stamp t3 or the request silently reports
   a zero upstream write.
 
-`gateway.hpp` and `gateway.cpp` use this same t0–t6 labelling in their comments,
+`gateway.hpp` and the gateway sources use this same t0–t6 labelling in their comments,
 so `connect-us` reads one way whichever file you trust.
 
 Two intervals are the gateway's compute; one is connection setup; one is the

@@ -26,7 +26,10 @@ provider/   dialect translation (OpenAI ⇄ Anthropic / Gemini / Cohere)   (no I
   ├─ json.hpp        hand-rolled, scoped JSON parser + escaping builder
   └─ translate.hpp   string→string translation functions, one .cpp per venue
 gateway/    the event-loop proxy that ties net + provider together
-  ├─ gateway.cpp        Gateway: construction, the shared methods, run()
+  ├─ engine.cpp         Gateway: construction, teardown, run(), warm buffers
+  ├─ resolve.cpp        next address after a failed connect, re-resolution thread
+  ├─ core/              the shared methods, by concern: transport (TLS), sink,
+  │                     sweep, stream, upstream, client; conn.hpp is Connection
   ├─ gateway_epoll.cpp  every ep_ method and run_epoll()
   ├─ gateway_uring.cpp  every ur_ method and run_uring()
   └─ request, response, scan, stream, loop   the helpers, by concern (src/ only)
@@ -52,8 +55,8 @@ Namespaces mirror the directory, with no exceptions:
 | *(none)* | genuinely shared by both loops (`sweep_idle`, the `tls_*` pump helpers) |
 
 The prefix is also the file: `ep_` methods are defined in `gateway_epoll.cpp`, `ur_`
-methods in `gateway_uring.cpp`, and unprefixed ones in `gateway.cpp`, so a fix that
-lands on one side shows in the diff as a file that its twin did not touch.
+methods in `gateway_uring.cpp`, and unprefixed ones in `engine.cpp` and `core/`, so a
+fix that lands on one side shows in the diff as a file that its twin did not touch.
 
 Two rules make this worth the verbosity:
 

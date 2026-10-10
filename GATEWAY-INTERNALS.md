@@ -295,6 +295,17 @@ So `stream_ended && close_after_resp` is the truncated case. That pairing is the
 difference between a client believing it received the whole answer and knowing
 it did not, so read it, never infer it.
 
+`stream_truncate()` makes the three mutations together (`stream_ended`,
+`close_after_resp`, `++errors`) because five call sites once wrote them by hand,
+which is how a sixth ends up setting two of the three. The `stream_ended` latch is
+load-bearing: `{ep,ur}_stream_flush` finalize only when it is set, and without it
+they resume reading from an upstream that will never speak again, holding the client
+until the idle sweep. `CorruptStreamFromAProviderThatHoldsTheConnectionStillClosesTheClient`
+is the test that fails without it. The `TRUNCATED` warning is logged there too, in
+the one shared place: the abort paths bypass the finalize, and a truncated stream is
+the one outcome a client cannot tell from a clean finish, so if it is not recorded
+on our side nobody can answer "did my stream complete?" afterwards.
+
 ### 6c. The one place the backends deliberately differ
 
 Under a slow client, **epoll** pauses upstream `EPOLLIN` and applies
@@ -526,6 +537,26 @@ every site and read as a safety net while changing nothing.
 They are no-op-safe building blocks shared by both backends. Since inbound TLS
 landed they run on client connections too, and `u` means upstream everywhere else
 in the file. Direction is read from `c->is_client`, never assumed.
+
+### 10d. Two TLS checks that look removable
+
+`tls_invariant_ok()` refuses a write on a connection the configuration says must be
+encrypted but that has no Session: on the client leg those bytes would answer a peer
+that dialled TLS, on the upstream leg the next thing sent is the provider credential.
+It cannot fire today, and a mutation sweep confirms no test can tell it from `return
+true`. It stays because what makes it unreachable is six call sites that each close
+the connection when `tls_attach_*` fails, an invariant re-established by hand, two of
+them added the week inbound TLS landed. A guard whose precondition is one structural
+fact is noise and gets deleted; the test is how many places must stay right for it to
+stay unreachable.
+
+`tls_feed()` logs `Session::last_error()` on a failed handshake. Before it did, wrong
+CA, wrong hostname and a protocol mismatch all looked like a closed socket. A failure
+on the client leg during the handshake is almost always an internet scanner speaking
+junk at the listener, so it is logged at DEBUG, where an info-floor build stays quiet,
+and counted in `client_tls_handshake_failures`: the line is noise, the rate is a
+diagnostic, and a customer who cannot handshake shows up as a step in it. An upstream
+handshake failure or a mid-session failure on either leg stays WARN.
 
 ## 11. Where each rule is enforced
 
