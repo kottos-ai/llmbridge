@@ -8,6 +8,49 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.81.0]. 2026-10-10
+
+### Fixed
+
+- **A failed request write after a stream began ends the stream**. A provider
+  that answered early and reset while our request was still going out had its write
+  failure taken for one before any response: the gateway wrote a 502 into the open
+  stream, on both backends, and a pooled upstream would have re-sent the request
+  behind a reply in progress. An error once a reply has begun, or with bytes still
+  owed to the client, now closes the client.
+- **A TLS `100 Continue` flushed in pieces no longer completes a request on epoll**.
+  The write event that drained it found nothing owed, counted a reply, reset the
+  message and closed a connection still waiting for its body.
+- **A stale-connection retry never moves a buffer a send is reading**. The retry
+  takes the request with `OutBuf::take()`, which copies while an io_uring send is in
+  flight.
+
+### Changed
+
+- **Behaviour change: retry and failover only before any response byte.** A request
+  is `Dispatched` until the first response byte, and only then may it be re-sent, on a
+  fresh connection or another venue. A response cut short after it began used to be
+  eligible for failover; it now gets the 502, because the venue may have acted on it.
+- **`OutBuf` replaces `wbuf`, `woff`, `wpending` and `send_inflight`**
+  (`gateway/src/core/outbuf.hpp`), and TLS ciphertext is an `OutBuf` too. Only an io_uring
+  send pins one; output staged meanwhile waits behind the pin, so an io_uring stream no
+  longer moves its pending output into a fresh buffer on every flush. The reply
+  builders append to the connection's buffer, keeping its capacity (GP1).
+- **Request phases** (`ReqState::phase`: `Idle`, `Dispatched`, `Responding`,
+  `Streaming`, `Replying`) gate finishing, retry and failover, in place of reading the
+  buffers; `client_interim_inflight` is gone. GATEWAY-INTERNALS.md 3c.
+- io_uring's 8 MiB stream cap counts bytes not yet sent, where it counted the whole
+  buffer being sent plus the pending one.
+- `Gateway::set_epoll_write_cap_for_test(size_t)`, a seam that splits every epoll write.
+
+### Tests
+
+- `ProxyEarlyResponse.AWriteFailureAfterTheStreamBeganAbortsIt`, both backends, fails
+  on both against 0.80.0; `GatewayTls.APartialInterimFlushFinishesNoRequest`, both
+  backends, fails on epoll against 0.80.0 with the seam added; `OutBuf` unit tests
+  (`gateway/tests/outbuf_test.cpp`), the pinned `take()` among them.
+
+
 ## [0.80.0]. 2026-10-10
 
 ### Fixed
