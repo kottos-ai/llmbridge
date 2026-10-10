@@ -145,7 +145,14 @@ namespace llmbridge::app
     {
         bool ok = false;
         const json::Value root = json::parse(text, ok);
-        if (!ok) return fail(err, "config: not valid JSON");
+        if (!ok)
+        {
+            // Keys::Any tells a repeated key, which parse() refuses, from bad JSON.
+            bool any = false;
+            (void)json::parse(text, any, json::Keys::Any);
+            return fail(err, any ? "config: a key appears twice in one object"
+                                 : "config: not valid JSON");
+        }
         if (!root.is_object()) return fail(err, "config: top level must be an object");
         if (!only(root, "(top level)", {"listen", "upstream", "timeouts", "runtime"}, err))
             return false;

@@ -8,6 +8,72 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.69.0]. 2026-10-09
+
+### Changed
+
+- **Breaking: `json::parse` is stricter** (installed header `provider/json.hpp`). It
+  now refuses, with `ok=false`:
+    - anything but whitespace after the root value (`{}x`, `{} {}`, `1 2`);
+    - an object that repeats a key, at any depth, compared after unescaping
+      (`{"model":"a","m\u006fdel":"b"}`); pass `json::Keys::Any` as a third argument for
+      the old first-wins reading;
+    - a document of more than `json::kMaxNodes` (2^20) values.
+      Every translator, `rewrite_model`/`apply_overrides` and the gateway's error
+      classifier get this through the default, so a request with a repeated key is
+      refused with 400 instead of translated on its first copy.
+- **Breaking: the config file refuses a repeated key**, `_` comment keys included:
+  "config: a key appears twice in one object". Give each comment its own name.
+- **`json::parse` reuses its arena.** A dropped document parks its emptied arena in a
+  per-thread slot for the next parse, so a parse no longer allocates the arena and its
+  block list. Allocation ceilings (`gateway_alloc_test`) lowered to match:
+
+  | Path | Before | After |
+    |---|---|---|
+  | Passthrough request | 3 | 3 |
+  | Translated request (OpenAI to Anthropic) | 16 | 12 |
+  | Translated stream, 20 deltas | 59 | 7 |
+  | Each further stream delta | 2.05 | 0.05 (measured 0.00, 0.01 on io_uring) |
+
+  `bench/protocol_micro` p50, GCC Release, median of 7 interleaved runs against
+  master: `anthropic_to_openai_response` 1301 to 1313 ns (+0.9%),
+  `AnthropicToOpenAiSse::feed` 355 to 342 ns (-3.7%), `openai_to_anthropic_request`
+  (130 KB) 172.6 to 174.4 us (+1.0%). `parse_response_head`, which this change does
+  not touch, moved +0.9%: that is the layout noise floor.
+- **One string escaper.** `append_escaped_string` was a byte-at-a-time copy of
+  `append_escaped`; it is now a forwarding alias, kept for source compatibility, and
+  the translators call `append_escaped` directly. Output is byte-identical.
+
+### Fixed
+
+- **A body of tiny values no longer costs ~1 GB and pins half of it.** A 16 MiB
+  `{"pad":[0,0,0,...]}` parsed 8 M nodes (~1 GB peak, a ~2 s loop stall), and the
+  per-thread scratch stacks kept ~512 MB per worker afterwards. The node cap stops it
+  at 2^20 values, and scratch capacity past 4 MiB is freed after each parse. DESIGN.md
+  "Parsing & framing" has the sizing.
+- **Tool-call `arguments` with leading whitespace are translated.** The hand-written
+  trailing-bytes check in the Anthropic translator compared the object's span with
+  the string's length, so `" {\"a\":1}"` was refused as an injection. The parser now
+  refuses trailing bytes itself and the check is gone.
+
+### Tests
+
+- `JsonDocument`, `JsonKeys`, `JsonBounds` (node cap exact at 2^20, the 16 MiB flood
+  refused, scratch released past 4 MiB and kept below it), an escaper oracle over all
+  256 bytes and 5,000 random strings, a parked-arena test,
+  `ToolReqInjection.WhitespaceAroundArgumentsIsStillOneObject`,
+  `StrictKeys.ARepeatedKeyAnywhereRefusesTheRequest` and three config cases.
+- `fuzz_json` asserts that `Keys::Unique` only ever refuses more than `Keys::Any`,
+  that a strict-parsed body never draws `DuplicateKey` from the top-level walker, and
+  that `append_escaped` of any bytes parses back and unescapes to those bytes.
+
+### Known gaps
+
+- `gateway/src/request.cpp` (`translate_failure`) still carries its own
+  `parsed.sv.size() != args.size()` check on tool arguments, which names arguments
+  with leading whitespace as the reason when a request fails for another reason.
+  Left for the gateway lane; the parser makes the check redundant.
+
 ## [0.68.0]. 2026-10-09
 
 Safety fixes in the event loops. Each fix is its own commit with a

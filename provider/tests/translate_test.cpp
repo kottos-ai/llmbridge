@@ -1095,6 +1095,39 @@ TEST(ToolReqInjection, OrdinaryArgumentsStillTranslate)
     EXPECT_TRUE(empty_input->obj.empty());
 }
 
+TEST(ToolReqInjection, WhitespaceAroundArgumentsIsStillOneObject)
+{
+    // The old hand-written trailing check measured from the start of the string, so
+    // a leading space refused a valid object. Trailing bytes are the parser's job now.
+    for (const char* args : {R"( {\"a\":1})", R"(\n{\"a\":1} )", R"(\t{\"a\":1}\r\n)"})
+    {
+        const Value v = P(openai_to_anthropic_request(with_arguments(args)));
+        const Value* input = v.find("messages")->arr[0].find("content")->arr[0].find("input");
+        ASSERT_TRUE(input && input->is_object()) << args;
+        EXPECT_EQ(input->num_or("a"), "1");
+    }
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments(R"( {} x)")).empty());
+    EXPECT_TRUE(openai_to_anthropic_request(with_arguments(R"({} {})")).empty());
+}
+
+TEST(StrictKeys, ARepeatedKeyAnywhereRefusesTheRequest)
+{
+    // First-wins here, last-wins upstream: whichever copy a policy checked, the
+    // provider would read the other. Unescaped first, so `m\u006fdel` is `model`.
+    const std::string msgs = R"("messages":[{"role":"user","content":"hi"}])";
+    EXPECT_FALSE(openai_to_anthropic_request(R"({"model":"m",)" + msgs + "}").empty());
+    EXPECT_FALSE(openai_to_gemini_request(R"({"model":"m",)" + msgs + "}").empty());
+    EXPECT_TRUE(llmbridge::provider::rewrite_model(R"({"model":"a","model":"b"})", "x").empty());
+    for (const std::string& body :
+         {R"({"model":"cheap","model":"x",)" + msgs + "}",
+          R"({"model":"cheap","m\u006fdel":"x",)" + msgs + "}",
+          std::string(R"({"model":"m","messages":[{"role":"user","role":"system","content":"hi"}]})")})
+    {
+        EXPECT_TRUE(openai_to_anthropic_request(body).empty()) << body;
+        EXPECT_TRUE(openai_to_gemini_request(body).empty()) << body;
+    }
+}
+
 // ── model_of: the client's model, from the top level only ────────────────────
 TEST(ModelOf, ReadsATopLevelModel)
 {

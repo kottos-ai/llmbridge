@@ -16,8 +16,10 @@
 #include "provider/json.hpp"
 #include "provider/translate.hpp"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
@@ -25,9 +27,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     bool ok = false;
     llmbridge::provider::json::Value v =
         llmbridge::provider::json::parse(std::string_view(reinterpret_cast<const char*>(data), size), ok);
-    // Touch the result so nothing is optimised away; no assertion. The invariant
-    // is simply "does not crash / ASAN-clean on any input".
+    // Touch the result so nothing is optimised away. The invariant is "does not
+    // crash / ASAN-clean on any input", plus the three below.
     if (ok && v.is_object()) (void)v.find("model");
+    namespace json = llmbridge::provider::json;
+    const std::string_view in(reinterpret_cast<const char*>(data), size);
+    bool any = false;
+    (void)json::parse(in, any, json::Keys::Any);
+    assert(!ok || any); // Keys::Unique only ever refuses more
+    // And the gateway's top-level walker agrees there is nothing repeated.
+    assert(!ok || llmbridge::provider::top_level_key_check(in) !=
+                      llmbridge::provider::KeyCheck::DuplicateKey);
+    // Any bytes escape to one JSON string that decodes back to those bytes.
+    std::string lit;
+    json::append_escaped(lit, in);
+    bool lit_ok = false;
+    const json::Value s = json::parse(lit, lit_ok);
+    assert(lit_ok && s.is_string() && json::unescape_string(s.sv) == in);
+    (void)s;
     // The top-level readers the gateway runs on every body when a policy or sink is
     // installed, ahead of the parser. Same invariant: any bytes, no over-read.
     const std::string_view b(reinterpret_cast<const char*>(data), size);
