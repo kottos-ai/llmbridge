@@ -192,6 +192,9 @@ namespace llmbridge
         /// before run(). A fixed value turns off send-buffer autotuning, which on
         /// loopback can absorb a whole multi-MB stream and so never back up a write.
         void set_client_sndbuf_for_test(int bytes) noexcept { _client_sndbuf = bytes; }
+        /// Epoll only: at most `bytes` per socket write pass, then the write behaves as
+        /// EAGAIN, so a test can force a partial flush at any size; call before run().
+        void set_epoll_write_cap_for_test(size_t bytes) noexcept { _ep_write_cap = bytes; }
         /// Test seam: prefault the scratch buffers now, without run(), and report how
         /// many of `_rebuild`'s pages the kernel has resident (mincore), so a test
         /// can prove the touch mapped them and a reserve alone would not have.
@@ -493,6 +496,7 @@ namespace llmbridge
 #endif
         unsigned _uring_buf_count = 0;     // 0 = kUrBufCount default (test hook only)
         int _client_sndbuf = 0;            // 0 = kernel default (test hook only)
+        size_t _ep_write_cap = 0;          // 0 = none (test hook only)
         int64_t _last_sweep_ns = 0;
         int64_t _heartbeat_ns = kDefaultHeartbeatNs;
         /// 0 until the first sweep emits, which it does immediately, so an operator

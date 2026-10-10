@@ -296,10 +296,10 @@ namespace llmbridge
         // idle keep-alive connection without processing the request. (Industry
         // convention: retry an idempotent-or-idle-reused request that failed before
         // any response; don't retry once a partial response has been seen.)
-        if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (!u->from_pool || u->retried) return false;
         if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // see the epoll mirror
         Connection* client = u->peer;
-        if (!client) return false;
+        if (!client || !client->req.can_redispatch()) return false; // a response byte arrived
         const Upstream& up = upstream_of(u);
         const int fd = net::make_client_socket();
         if (fd < 0) return false;
@@ -401,11 +401,15 @@ namespace llmbridge
                                                               : std::string{};
         LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
                 peer.empty() ? "" : " peer=", peer);
-        // A send in flight is reading `out`: whatever the client was sent, it now gets
-        // a close.
-        if (client->send_inflight()) { ur_abort_pair(client); return; }
+        // A reply already begun cannot be followed by a second one: close instead.
+        if (client->req.f.phase >= Phase::Streaming || !client->out.idle())
+        {
+            ur_abort_pair(client);
+            return;
+        }
         if (Connection* u = unpair(client)) ur_close(u);
         append_error(client->out.stage(), code, detail);
+        client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // ur_finish_client closes once the reply flushes
         ++_stats.errors;
         ur_client_send(client);
@@ -563,6 +567,7 @@ namespace llmbridge
                 c->rbuf.append(_bufring.data(bid), static_cast<size_t>(res));
             }
             _bufring.recycle(bid);
+            if (!c->is_client) note_response_bytes(c);
         }
         // Kernel ended the multishot (pool pressure): re-arm. A failed arm may free c.
         if (!armed && !ur_arm_recv(c)) return;
@@ -654,7 +659,7 @@ namespace llmbridge
     {
         // Forward the next framed request only when the client is idle. No request
         // in flight and no reply still draining to it.
-        if (c->peer != nullptr || !c->out.bytes().empty() || c->rbuf.empty()) return;
+        if (c->req.f.phase != Phase::Idle || c->rbuf.empty()) return;
         // Same memo as the epoll twin; see the note there.
         if (c->client_frame_want && c->rbuf.size() < c->client_frame_want) return;
         net::http::Message m;
@@ -794,6 +799,7 @@ namespace llmbridge
             { ur_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
+        c->req.f.phase = Phase::Dispatched; // see the epoll mirror
         Connection* u = ur_acquire_upstream(c->upstream_slot);
         if (!u)
         {
@@ -888,6 +894,7 @@ namespace llmbridge
             {
                 append_http_status(client->out.stage(), h.status, reason_for(h.status),
                                    provider::upstream_error_to_openai(body, "upstream_error"));
+                client->req.f.phase = Phase::Replying;
                 unpair(u);
                 u->rbuf.erase(0, total_len);
                 ur_release_upstream(u, h.keep_alive, true);
@@ -943,6 +950,7 @@ namespace llmbridge
         // upstream is about to close on us. Drop it instead of reusing a corpse.
         const bool keep_alive =
             h.keep_alive && (client->req.f.translate_body || client->msg.keep_alive);
+        client->req.f.phase = Phase::Replying;
         unpair(u);
         u->rbuf.erase(0, total_len); // see the epoll mirror
         ur_release_upstream(u, keep_alive, true);
@@ -986,7 +994,7 @@ namespace llmbridge
             // the same completion point the plaintext path reaches below.
             if (!tls_out_flushed(c)) return;
             if (c->req.f.streaming) ur_stream_flush(c);
-            else if (!c->out.bytes().empty()) ur_finish_client(c); // an interim finishes nothing
+            else ur_finish_client(c);
             return;
         }
 #endif
@@ -1004,6 +1012,9 @@ namespace llmbridge
 
     void Gateway::ur_finish_client(Connection* c) noexcept
     {
+        // Only a staged reply finishes; an interim 100 Continue's completion is no
+        // request (see the epoll mirror).
+        if (c->req.f.phase != Phase::Replying) return;
         if (_sink) sink_emit(c, status_of(c->out.bytes()), /*streamed=*/false);
         LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
                  " bytes=", c->out.bytes().size(), " tokens_in=", c->req.f.tok.in,
@@ -1040,6 +1051,7 @@ namespace llmbridge
         }
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
+        c->req.f.phase = Phase::Idle;
         if (close_now) { ur_close(c); return; }
         // The client's multishot recv is still armed; a pipelined next request may
         // already sit in rbuf. Forward it, else the armed recv delivers more.
@@ -1081,6 +1093,7 @@ namespace llmbridge
         }
         else
             client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        client->req.f.phase = Phase::Streaming;
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         ur_stream_pump(u);
     }
@@ -1156,6 +1169,7 @@ namespace llmbridge
         // Keep the connection when the framing gave the body an end marker.
         if (!stream_client_reusable(client)) { ur_close(client); return; }
         client->req.f.streaming = false; // over; begin() resets the rest at the next framing
+        client->req.f.phase = Phase::Idle;
         client->out.clear();
         client->msg = net::http::Message{};
         // The client's multishot recv stays armed.

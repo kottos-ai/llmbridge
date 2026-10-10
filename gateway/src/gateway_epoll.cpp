@@ -168,14 +168,17 @@ namespace llmbridge
             return true;
         }
 #endif
+        size_t budget = _ep_write_cap ? _ep_write_cap : SIZE_MAX;
         while (!c->out.wire().empty())
         {
+            if (budget == 0) return true; // the test seam's EAGAIN
             const std::string_view w = c->out.wire();
-            const ssize_t n = ::write(c->fd, w.data(), w.size());
+            const ssize_t n = ::write(c->fd, w.data(), std::min(w.size(), budget));
             if (n > 0)
             {
                 c->out.sent(static_cast<size_t>(n));
                 c->sent_bytes += static_cast<uint64_t>(n);
+                budget -= static_cast<size_t>(n);
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
@@ -194,17 +197,19 @@ namespace llmbridge
     {
         *done = false;
         tls_pump_out(u);
+        size_t budget = _ep_write_cap ? _ep_write_cap : SIZE_MAX;
         while (!u->tls_out.wire().empty())
         {
             const std::string_view w = u->tls_out.wire();
-            const ssize_t n = ::write(u->fd, w.data(), w.size());
+            const ssize_t n = budget ? ::write(u->fd, w.data(), std::min(w.size(), budget)) : -1;
             if (n > 0)
             {
                 u->tls_out.sent(static_cast<size_t>(n));
                 u->sent_bytes += static_cast<uint64_t>(n);
+                budget -= static_cast<size_t>(n);
                 continue;
             }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (budget == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
             {
                 ep_arm_write(u);
                 return true;
@@ -319,10 +324,10 @@ namespace llmbridge
         // and failed before sending any response. The provider almost certainly
         // dropped it idle without processing. Resend the request once on a fresh
         // connection instead of failing the client. (Same rule as the io_uring path.)
-        if (!u->from_pool || u->retried || !u->rbuf.empty()) return false;
+        if (!u->from_pool || u->retried) return false;
         if (now_ns() - u->ts_pool_taken > kStaleRetryWindowNs) return false; // may have run
         Connection* client = u->peer;
-        if (!client) return false;
+        if (!client || !client->req.can_redispatch()) return false; // a response byte arrived
         // The same venue: a retry that lands elsewhere is a silent reroute, and the
         // request was translated for this dialect and carries its credential.
         const Upstream& up = upstream_of(u);
@@ -430,9 +435,16 @@ namespace llmbridge
                                                               : std::string{};
         LB_WARN(ReqId{client->req.f.req_seq}, " reply ", code, " ", why, " on ", *client,
                 peer.empty() ? "" : " peer=", peer);
+        // A reply already begun cannot be followed by a second one: close instead.
+        if (client->req.f.phase >= Phase::Streaming || !client->out.idle())
+        {
+            ep_abort_pair(client);
+            return;
+        }
         // We're replying to the client ourselves, so drop any in-flight upstream.
         if (Connection* u = unpair(client)) ep_close_upstream(u);
         append_error(client->out.stage(), code, detail);
+        client->req.f.phase = Phase::Replying;
         client->close_after_resp = true; // ep_finish_client closes once it flushes
         ++_stats.errors;
         ep_respond(client);
@@ -492,7 +504,7 @@ namespace llmbridge
         if (!ok)
         {
             // EOF/error: mid-request close is a real abort; idle close is normal.
-            const bool in_flight = c->peer != nullptr || !c->out.bytes().empty();
+            const bool in_flight = c->req.f.phase != Phase::Idle;
             if (in_flight) ep_abort_pair(c);
             else ep_close_client(c);
             return;
@@ -506,7 +518,7 @@ namespace llmbridge
             return;
         }
         // One request in flight at a time per client.
-        if (c->peer != nullptr || !c->out.bytes().empty()) return;
+        if (c->req.f.phase != Phase::Idle) return;
         if (c->rbuf.empty()) return;
 
         // Stamp just before framing so the (completing) HTTP parse is counted in
@@ -675,6 +687,7 @@ namespace llmbridge
             { ep_error_respond(c, 400, "request target not origin-form"); return; }
         }
 
+        c->req.f.phase = Phase::Dispatched; // from here until a response byte, failover may redo it
         Connection* u = ep_acquire_upstream(c->upstream_slot);
         if (!u)
         {
@@ -817,6 +830,7 @@ namespace llmbridge
             u->tls ? ep_tls_drain_read(u) :
 #endif
                      ep_drain_read(u);
+        note_response_bytes(u);
         if (!read_ok)
         {
             u->peer_eof = true; // never pooled now, whatever finishes the exchange
@@ -917,6 +931,7 @@ namespace llmbridge
             {
                 append_http_status(client->out.stage(), h.status, reason_for(h.status),
                                    provider::upstream_error_to_openai(body, "upstream_error"));
+                client->req.f.phase = Phase::Replying;
                 unpair(u);
                 u->rbuf.erase(0, total_len);
                 ep_release_upstream(u, h.keep_alive, true);
@@ -969,6 +984,7 @@ namespace llmbridge
             // recorded a request that cost zero tokens at a real price.
             client->req.f.tok = scan_usage(body_buf);
         }
+        client->req.f.phase = Phase::Replying;
 
         // Response fully read -> upstream is free. Pool it only if it will stay
         // open (response keep-alive, and for passthrough the client didn't ask to
@@ -1003,9 +1019,11 @@ namespace llmbridge
 
     void Gateway::ep_finish_client(Connection* c) noexcept
     {
-        if (c->client_interim_inflight)
+        // Only a staged reply finishes. A drained interim 100 Continue, or a write event
+        // with nothing owed, is no request: counting one wiped the real one's state.
+        if (c->req.f.phase != Phase::Replying)
         {
-            c->client_interim_inflight = false; // the 100 Continue left; nothing finished
+            ep_disarm_write(c);
             return;
         }
         // Error replies (close_after_resp) are counted in _stats.errors, not the
@@ -1042,6 +1060,7 @@ namespace llmbridge
         LB_DEBUG(ReqId{c->req.f.req_seq}, " status=", status_of(c->out.bytes()),
                  " bytes=", c->out.bytes().size(), " keep_alive=", c->msg.keep_alive, " on ", *c);
         c->out.clear();
+        c->req.f.phase = Phase::Idle;
         const bool close_now = c->close_after_resp || !c->msg.keep_alive;
         c->msg = net::http::Message{};
         if (close_now) { ep_close_client(c); return; }
@@ -1082,6 +1101,7 @@ namespace llmbridge
         }
         else
             client->out.stage().append(client->req.f.stream_chunked_out ? kSseHeadChunked : kSseHead);
+        client->req.f.phase = Phase::Streaming;
 
         u->rbuf.erase(0, h.header_len); // consume the head; the rest is body
         ep_stream_pump(u);                 // translate any initial body + flush headers
@@ -1176,6 +1196,7 @@ namespace llmbridge
         // Keep the connection when the framing gave the body an end marker.
         if (!stream_client_reusable(client)) { ep_close_client(client); return; }
         client->req.f.streaming = false; // over; begin() resets the rest at the next framing
+        client->req.f.phase = Phase::Idle;
         client->out.clear();
         client->msg = net::http::Message{};
         ep_on_client_readable(client); // a pipelined next request is already in rbuf

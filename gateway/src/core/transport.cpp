@@ -232,12 +232,11 @@ namespace llmbridge
             const auto* p = reinterpret_cast<const uint8_t*>(kContinue.data());
             if (c->tls->write_plaintext({p, kContinue.size()}) != kContinue.size()) return true;
 #ifdef LLMBRIDGE_HAVE_URING
-            if (uring) { ur_tls_flush(c); return true; } // completion sees an empty `out`: nothing finishes
+            if (uring) { ur_tls_flush(c); return true; } // its completion finishes nothing: Idle
 #endif
             (void)uring;
             bool done = false;
-            if (!ep_tls_flush(c, &done)) return true;
-            if (!done) c->client_interim_inflight = true; // the writable event drains it
+            (void)ep_tls_flush(c, &done); // a partial flush finishes on writable, but nothing finishes: Idle
             return true;
         }
 #else

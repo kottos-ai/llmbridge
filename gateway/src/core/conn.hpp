@@ -83,8 +83,6 @@ namespace llmbridge
         /// Total length of the request being buffered, learned from its headers on
         /// the first partial read, or 0 when none is in progress.
         size_t client_frame_want = 0;
-        /// An interim `100 Continue`'s ciphertext has not fully left the socket.
-        bool client_interim_inflight = false;
 
         Connection* peer = nullptr; // the other leg of the request in flight; pair()/unpair() only
         net::http::Message msg{};
@@ -153,6 +151,13 @@ namespace llmbridge
         if (p) p->peer = nullptr;
         c->peer = nullptr;
         return p;
+    }
+
+    /// A response byte reached `u`'s rbuf: the venue may have acted, so no retry now.
+    inline void note_response_bytes(Connection* u) noexcept
+    {
+        if (u->peer && !u->rbuf.empty() && u->peer->req.f.phase == Phase::Dispatched)
+            u->peer->req.f.phase = Phase::Responding;
     }
 
     /// Renders `ClientConnection#42(fd=17,cid=2)` for `LB_INFO("closed ", *c)`. Never prints

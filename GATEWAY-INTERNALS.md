@@ -83,7 +83,7 @@ neither half loses its capacity.
 The front keeps what was sent until it is staged over, cleared or taken. That is
 what keeps an upstream request available for a resend when a pooled connection
 turns out to be dead: `ep_retry_upstream` / `ur_retry_upstream` `take()` it, and
-resend only when the connection came from the pool and no response byte has arrived.
+resend only while the request is `Dispatched` (3c).
 
 ## 3. Request lifecycle, common to both backends
 
@@ -133,6 +133,22 @@ the scalars and leaves the string buffers' bytes alone. Strings the request keep
 are `FixedStr` copies, never views: the policy's `model` and `service_tier` are
 copied at the decision (a longer one is refused with a 500, never cut), and a
 failover takes `Retry`'s.
+
+### 3c. Phases
+
+`ReqState::phase` says where a request stands, and the gates read it, not the buffers:
+
+| phase | entered | what it allows |
+|---|---|---|
+| `Idle` | at framing (`begin()`), and when a reply finishes | a new request may be framed |
+| `Dispatched` | `*_forward`, before the upstream is acquired | retry on a fresh connection, failover to another venue |
+| `Responding` | the first response byte in the upstream's `rbuf` | neither: the venue may have acted on the request |
+| `Streaming` | the SSE head is staged | the stream finishes when it ends |
+| `Replying` | a whole reply is staged | the reply finishes once it is on the wire |
+
+A write event with no reply staged, such as a drained interim `100 Continue`, finishes
+nothing. An error once a reply has begun, or with bytes still owed to the client,
+closes the client instead of staging a second reply into the first.
 
 ## 4. The epoll backend
 
@@ -432,7 +448,8 @@ separately.
 **Stale-connection retry.** A pooled connection that fails before any response
 byte arrives is retry-eligible (`from_pool && !retried`): the request is resent
 on a fresh connection, and the client never sees the blip. The write path keeps
-`out`'s front for exactly this reason, so the request survives to be resent (2b).
+`out`'s front for exactly this reason, so the request survives to be resent (2b);
+the gate is the phase (3c), so a request whose response has begun is never resent.
 
 
 ### 8b. Sizing `kMaxIdleUpstreams`, and why it is 8192

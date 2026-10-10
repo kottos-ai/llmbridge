@@ -42,6 +42,17 @@ namespace llmbridge
         [[nodiscard]] bool empty() const noexcept { return n == 0; }
     };
 
+    /// Where a request stands. Retry and failover are legal only while Dispatched, before
+    /// any response byte; a reply finishes only from Replying, a stream from Streaming.
+    enum class Phase : uint8_t
+    {
+        Idle,       ///< nothing in flight
+        Dispatched, ///< being sent upstream, no response byte yet
+        Responding, ///< response bytes arrived
+        Streaming,  ///< the SSE head is staged for the client
+        Replying,   ///< a whole reply is staged for the client
+    };
+
     /// Everything a request owns that is trivially copyable. Never assigned field by
     /// field to reset it: begin() constructs a fresh one in place.
     struct ReqState
@@ -93,6 +104,7 @@ namespace llmbridge
         bool stream_ended = false;
         bool stream_keep_alive = false; ///< the upstream may be pooled at the end
         bool sse_translating = false;
+        Phase phase = Phase::Idle;
         uint8_t quota_exhausted = 0;
         uint16_t retry_after_s = 0;
         uint8_t served_tier_tries = 0; ///< reads searched, so a venue without it is given up on
@@ -132,5 +144,6 @@ namespace llmbridge
             stream_usage.reset();
             sse_scratch.clear();
         }
+        [[nodiscard]] bool can_redispatch() const noexcept { return f.phase == Phase::Dispatched; }
     };
 } // namespace llmbridge
