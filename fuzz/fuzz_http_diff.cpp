@@ -5,8 +5,11 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// Differential target: the header walker in net/http.hpp must frame every input
-// exactly as the v0.70.0 framer frozen in http_legacy.hpp does. Kept for one release.
+// Differential target: net/http.hpp against the v0.70.0 framer frozen in
+// http_legacy.hpp. The framer may refuse more than the old one did, never less, and
+// whatever both accept frames the same way. The deliberate differences: keep-alive
+// (version default and Connection tokens) and bodyless responses (1xx, 204, 304),
+// which end at the head. Kept for one release.
 
 #include "http_legacy.hpp"
 #include "net/http.hpp"
@@ -28,8 +31,7 @@ namespace
 
     bool same(const now::ResponseHead& a, const old::ResponseHead& b)
     {
-        return a.header_len == b.header_len && a.status == b.status &&
-               a.keep_alive == b.keep_alive && a.chunked == b.chunked &&
+        return a.header_len == b.header_len && a.status == b.status && a.chunked == b.chunked &&
                a.event_stream == b.event_stream && a.has_content_length == b.has_content_length &&
                a.encoded == b.encoded && a.content_length == b.content_length &&
                static_cast<int>(a.quota_exhausted) == static_cast<int>(b.quota_exhausted) &&
@@ -40,31 +42,35 @@ namespace
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     const std::string_view in(reinterpret_cast<const char*>(data), size);
+    constexpr auto kError = now::FrameStatus::Error;
 
     now::Message m1;
     old::Message m2;
     const auto r1 = now::parse_request(in, m1);
     const auto r2 = old::parse_request(in, m2);
-    assert(same(r1, r2));
-    if (r1 != now::FrameStatus::Error)
+    assert(r1 == kError || same(r1, r2));
+    if (r1 != kError)
         assert(m1.header_len == m2.header_len && m1.body_len == m2.body_len &&
-               m1.total_len == m2.total_len && m1.keep_alive == m2.keep_alive &&
-               m1.encoded == m2.encoded && m1.http_1_1 == m2.http_1_1);
+               m1.total_len == m2.total_len && m1.encoded == m2.encoded && m1.http_1_1 == m2.http_1_1);
 
     now::ResponseHead h1;
     old::ResponseHead h2;
     const auto s1 = now::parse_response_head(in, h1);
     const auto s2 = old::parse_response_head(in, h2);
-    assert(same(s1, s2));
-    if (s1 == now::FrameStatus::Complete) assert(same(h1, h2));
+    // A bodyless status is not held to the body cap the old framer applied to it.
+    assert(s1 == kError || same(s1, s2) || (h1.body == now::Body::None && s2 == old::FrameStatus::Error));
+    if (s1 == now::FrameStatus::Complete && s2 == old::FrameStatus::Complete) assert(same(h1, h2));
 
     now::ResponseDecoder d1;
     old::ResponseDecoder d2;
     const auto p1 = now::parse_response(in, d1);
     const auto p2 = old::parse_response(in, d2);
-    assert(same(p1.status, p2.status));
-    if (p1.complete())
-        assert(same(p1.head, p2.head) && p1.body == p2.body && p1.total_len == p2.total_len);
+    if (p1.status == now::FrameStatus::NeedMore) assert(same(p1.status, p2.status));
+    else if (p1.complete() && p1.head.body == now::Body::None)
+        assert(p1.total_len == p1.head.header_len && p1.body.empty());
+    else if (p1.complete())
+        assert(p2.complete() && same(p1.head, p2.head) && p1.body == p2.body &&
+               p1.total_len == p2.total_len);
 
     // Names from the input itself, so the fuzzer can steer them onto real lines.
     const size_t colon = in.find(':');
