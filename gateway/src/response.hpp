@@ -15,6 +15,8 @@
 #include <string>
 #include <string_view>
 
+#include "provider/openai.hpp"
+
 namespace llmbridge::detail
 {
     // Client-facing SSE response head. The stream is close-delimited: the body
@@ -38,7 +40,7 @@ namespace llmbridge::detail
                                int64_t connect_us, int64_t upwrite_us,
                                int64_t upstream_us, const char* upstream_key, uint64_t seq,
                                int64_t client_upload_us);
-    void append_usage_headers(std::string& out, std::string_view translated_body);
+    void append_usage_headers(std::string& out, const provider::openai::Usage& u);
     std::string build_error(int code, const char* detail = nullptr);
 
     /// The 400 for a body whose top-level keys we could read differently from the

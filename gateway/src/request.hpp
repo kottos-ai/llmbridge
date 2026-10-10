@@ -78,8 +78,8 @@ namespace llmbridge::detail
     TranslationPlan resolve_dialect(const Connection* c, const Upstream& venue) noexcept;
     const char* translate_failure(std::string_view body) noexcept;
     const char* dialect_name(UpstreamDialect m) noexcept;
-    std::string build_http(std::string_view start_line, std::string_view body,
-                           std::string_view extra = {});
+    void build_http(std::string& out, std::string_view start_line, std::string_view body,
+                    std::string_view extra); // into `out`, capacity kept
     /// Into `into`, capacity kept, like request_without.
     void build_http_request(std::string_view start_line, std::string_view body,
                             std::string_view host, std::string_view extra, std::string& into);
@@ -104,7 +104,8 @@ namespace llmbridge::detail
     /// header scan (`scan_auth_headers`) that replaced size find_header() walks.
     bool auth_headers_for(UpstreamDialect mode, std::string_view client_headers,
                           const std::vector<std::string>& strip, std::string& out);
-    std::string xlate_resp(UpstreamDialect mode, std::string_view body);
+    bool xlate_resp(UpstreamDialect mode, std::string_view body, std::string& out,
+                    provider::openai::Usage& u);
     std::string host_header_for(const Upstream& u);
     std::string aws_region_for(const Upstream& u);
     std::string peer_of(int fd) noexcept;

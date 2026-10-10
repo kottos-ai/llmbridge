@@ -194,17 +194,9 @@ namespace llmbridge
         /// Client conns: the sequencer value for the request in flight, assigned once
         /// at framing and read by the log lines and the x-llmbridge-seq header.
         uint64_t req_seq = 0;
-        /// Provider-reported token counts for the request in flight, -1 when not
-        /// reported. Non-streaming: scanned out of the translated body. Streaming:
-        /// read off the SSE translator at finalize. Metadata, never content.
-        long long tok_in = -1;
-        long long tok_out = -1;
-        long long tok_cached = -1; // non-streaming: prompt_tokens_details.cached_tokens
-        long long tok_cache_write = -1; // usage.cache_creation_input_tokens, when stated
-        long long tok_cw_5m = -1, tok_cw_1h = -1; // usage.cache_creation, when stated
-        /// The details blocks, non-streaming; see BodyUsage. -1 = not stated.
-        long long tok_reasoning = -1, tok_audio_in = -1, tok_audio_out = -1;
-        long long tok_accepted_pred = -1, tok_rejected_pred = -1, tok_tool_prompt = -1;
+        /// Provider-reported token counts for a non-streamed reply, -1 when not stated:
+        /// what the translator wrote, or a scan of a byte-forwarded body.
+        provider::openai::Usage tok;
         bool write_armed = false;     // epoll backend only: EPOLLOUT currently registered
         bool connected = false;       // upstream-only: non-blocking connect done
         bool wire_ready = false;
@@ -327,6 +319,8 @@ namespace llmbridge
         provider::openai::StreamUsage stream_usage;
         /// Scratch for one streaming step's decoded bytes, reused across chunks.
         std::string sse_scratch{};
+        /// A translated reply body, before it is framed into `wbuf`; capacity kept.
+        std::string xlate_scratch{};
         /// The stream is framed to the client with chunked transfer-encoding instead
         /// of being close-delimited. False for an HTTP/1.0 caller and for one that
         /// asked to close.

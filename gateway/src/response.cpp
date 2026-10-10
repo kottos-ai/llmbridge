@@ -131,9 +131,8 @@ namespace llmbridge::detail
     // end-of-stream facts. They are not invented for streams. A streaming client
     // that wants them sets `stream_options.include_usage` and reads the provider's
     // own counts from the final chunk.
-    void append_usage_headers(std::string& out, std::string_view translated_body)
+    void append_usage_headers(std::string& out, const BodyUsage& u)
     {
-        const BodyUsage u = scan_usage(translated_body);
         if (u.in >= 0)
         {
             out.append("x-llmbridge-tokens-in: ");

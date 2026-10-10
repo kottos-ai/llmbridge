@@ -7101,7 +7101,7 @@ TEST_P(ProxyForwardStream, AByteForwardedStreamReportsTheCacheWriteToo)
 //
 // The non-streaming counters are assigned only where a response body is scanned, so a
 // request that fails before that (here, the provider answering 500, which is relayed
-// without translating) left tok_in/tok_out/tok_cached holding the previous request's
+// without translating) left the token counts holding the previous request's
 // numbers. The streaming twins of these fields were reset for exactly this reason and
 // the non-streaming ones were never added to that block. A token count is a bill.
 class ProxyUsage : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};

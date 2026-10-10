@@ -973,30 +973,7 @@ namespace llmbridge
                 ep_respond(client);
                 return;
             }
-            std::string tbody = xlate_resp(client->effective_dialect, body);
-            // Scanned unconditionally, not only when --timing-headers is on: the
-            // response header is one surface for these numbers and the log is
-            // another, and a number that appears in one but not the other is the
-            // kind of inconsistency this file has been bitten by before.
-            {
-                const BodyUsage bu = scan_usage(tbody);
-                client->tok_in = bu.in;
-                client->tok_out = bu.out;
-                client->tok_cached = bu.cached;
-                // The cache-creation counts are read from the provider's own body, never the
-                // translated one. OpenAI defines no field for them.
-                const BodyUsage up = scan_usage(body);
-                client->tok_cache_write = up.cache_write;
-                client->tok_cw_5m = up.cache_write_5m;
-                client->tok_cw_1h = up.cache_write_1h;
-                client->tok_reasoning = up.reasoning;
-                client->tok_audio_in = up.audio_in;
-                client->tok_audio_out = up.audio_out;
-                client->tok_accepted_pred = up.accepted_prediction;
-                client->tok_rejected_pred = up.rejected_prediction;
-                client->tok_tool_prompt = up.tool_prompt;
-            }
-            if (tbody.empty())
+            if (!xlate_resp(client->effective_dialect, body, client->xlate_scratch, client->tok))
             {
                 client->peer = nullptr;
                 ep_release_upstream(u); // framing was valid; the upstream conn is reusable
@@ -1015,9 +992,9 @@ namespace llmbridge
                                       sp.connect_ns / 1000, sp.upwrite_ns / 1000,
                                       sp.upstream_ns / 1000, "x-llmbridge-upstream-us",
                                       client->req_seq, client->client_upload_ns / 1000);
-                append_usage_headers(timing, tbody);
+                append_usage_headers(timing, client->tok);
             }
-            client->wbuf = build_http("HTTP/1.1 200 OK", tbody, timing);
+            build_http(client->wbuf, "HTTP/1.1 200 OK", client->xlate_scratch, timing);
         }
         else
         {
@@ -1039,19 +1016,7 @@ namespace llmbridge
             // The counts, from the venue's own body. Only the translated branch above
             // scanned, so a byte-forward reported nothing: a sink saw -1 and a tape
             // recorded a request that cost zero tokens at a real price.
-            const BodyUsage bu = scan_usage(body_buf);
-            client->tok_in = bu.in;
-            client->tok_out = bu.out;
-            client->tok_cached = bu.cached;
-            client->tok_cache_write = bu.cache_write;
-            client->tok_cw_5m = bu.cache_write_5m;
-            client->tok_cw_1h = bu.cache_write_1h;
-            client->tok_reasoning = bu.reasoning;
-            client->tok_audio_in = bu.audio_in;
-            client->tok_audio_out = bu.audio_out;
-            client->tok_accepted_pred = bu.accepted_prediction;
-            client->tok_rejected_pred = bu.rejected_prediction;
-            client->tok_tool_prompt = bu.tool_prompt;
+            client->tok = scan_usage(body_buf);
         }
         client->woff = 0;
 
