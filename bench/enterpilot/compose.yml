@@ -9,10 +9,10 @@ services:
     depends_on: [mock]
     ports:
       - "${LLMBRIDGE_HOST_PORT:-8092}:8080"
-    # Space separated, one argv element per list item. The parser is exact match on
-    # the flag and silently ignores anything it does not recognise, so "--listen=8080"
-    # runs on the default port against the default upstream and the benchmark measures
-    # a gateway pointed somewhere else. Verified 2026-09-02.
+    # Space separated, one argv element per list item. The parser matches the flag
+    # exactly and refuses anything it does not recognise, so "--listen=8080" stops the
+    # container at startup. (Before v0.51.0 it was ignored, and the benchmark measured a
+    # gateway pointed somewhere else.)
     command:
       - "--listen"
       - "8080"
