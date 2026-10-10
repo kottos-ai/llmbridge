@@ -2385,19 +2385,19 @@ TEST_P(ProxyBackend, RunningOutOfDescriptorsDoesNotSpinTheWorker)
     for (int fd : held) ::close(fd);
     ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old), 0);
     EXPECT_LT(cpu_us, 250'000) << "the worker spun for " << cpu_us << " us of 500 ms";
-    // io_uring's multishot accept may stay armed through EMFILE instead of ending, and
-    // then no error reaches the gateway; epoll always sees it.
-    if (GetParam() == llmbridge::IoBackend::Epoll)
-    {
-        EXPECT_GE(_gw->stats().accept_backoffs, 1u);
-    }
 
     Client c; // descriptors are back: the listener must accept again
     ASSERT_TRUE(c.connect(_proxy_port));
     ASSERT_TRUE(c.send(make_request()));
     EXPECT_EQ(c.recv_status(3000), 200);
     c.close();
-    shutdown();
+    shutdown(); // the worker writes stats unsynchronised, so read them only after the join
+    // io_uring's multishot accept may stay armed through EMFILE instead of ending, and
+    // then no error reaches the gateway; epoll always sees it.
+    if (GetParam() == llmbridge::IoBackend::Epoll)
+    {
+        EXPECT_GE(_gw->stats().accept_backoffs, 1u);
+    }
 }
 
 // The stale-connection retry exists for a provider that closed an idle pooled
