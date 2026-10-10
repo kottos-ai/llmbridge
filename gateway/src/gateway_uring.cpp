@@ -674,13 +674,13 @@ namespace llmbridge
                 !c->peer->translate_body)
             {
                 net::http::ResponseHead h;
-                const auto hs = net::http::parse_response_head(c->rbuf, h);
+                const auto hs = net::http::parse_response_head(c->rbuf, h, sent_head(*c->peer));
                 if (hs == net::http::FrameStatus::NeedMore) return; // wait for the full head
                 if (hs == net::http::FrameStatus::Error)
                 { ur_error_respond(c->peer, 502, "upstream response head framing"); return; }
                 // Only a 200 is a real stream; a provider error is relayed with its
                 // own status by ur_on_response below (never laundered into a 200).
-                if (h.event_stream && h.status == 200)
+                if (h.event_stream && h.status == 200 && h.body != net::http::Body::None)
                 {
                     c->peer->ts_up_recvd = now_ns(); // t4: head complete, see the epoll mirror
                     note_quota(c->peer, h);
@@ -692,7 +692,7 @@ namespace llmbridge
 
             // parse_response, not parse: providers return non-streaming bodies
             // chunked over HTTP/1.1 and parse_request() rejects that by design (http.hpp).
-            const auto r = net::http::parse_response(c->rbuf, c->rdec);
+            const auto r = net::http::parse_response(c->rbuf, c->rdec, sent_head(*c->peer));
             if (r.failed()) { ur_error_respond(c->peer, 502, "upstream response framing"); return; }
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->ts_up_recvd = now_ns();
@@ -729,6 +729,7 @@ namespace llmbridge
         }
         c->client_frame_want = 0;
         if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400, "request framing"); return; }
+        if (!net::http::request_line_ok(c->rbuf)) { ur_error_respond(c, 400, "request line"); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
         c->client_upload_ns = span_since(c->ts_first_byte, c->ts_req_recvd);
@@ -1013,7 +1014,7 @@ namespace llmbridge
             // rate-limit error, with Retry-After dropped. The client cannot back off
             // from a 200. Content-Length responses were relayed verbatim and were
             // never affected, which is why it survived: only chunkedness triggers it.
-            if (h.chunked)
+            if (h.body == net::http::Body::Chunked)
                 client->wbuf = build_http_status(h.status ? h.status : 200,
                                                  reason_for(h.status ? h.status : 200),
                                                  body_buf);

@@ -258,9 +258,20 @@ continuously fuzzed:
     - a line with no colon, or an empty name.
   - **Content-Length is `1*DIGIT`** after trimming OWS. `std::from_chars` alone reads
     `0x1b` as 0 and `27abc` as 27; the first framed a 27-byte body as empty.
-  - **The status line must start `HTTP/1.x SP`**, so bytes left in front of a reply
-    (`JUNKHTTP/1.1 200 OK`) are refused, not absorbed. `{ep,ur}_release_upstream`
-    also clears the buffer; this is the second lock.
+  - **The request line is `method SP target SP HTTP/1.x`** (RFC 9112 §3): single
+    spaces, a token method, a target with no whitespace or control byte, and 1.0 or
+    1.1, checked by the gateway with `request_line_ok` (not by `parse_request`, which
+    tools also use to frame responses). Reading only the version after the last space
+    forwarded lines an upstream could split another way.
+  - **The status line is `HTTP/1.x SP 3DIGIT`**, then SP and a reason phrase or the
+    end of the line; the reason phrase is optional because servers omit it. Bytes left
+    in front of a reply (`JUNKHTTP/1.1 200 OK`) are refused, not absorbed, and
+    `{ep,ur}_release_upstream` also clears the buffer: this is the second lock. A
+    status of `2000` or `200x` no longer reads as 200.
+  - **Keep-alive.** `Connection` is a comma-separated token list on both legs: any
+    `close` token closes, and `keep-alive` keeps an HTTP/1.0 message open, which
+    otherwise closes. An HTTP/1.0 upstream reply that said nothing used to be pooled,
+    and every reuse became a stale-connection retry.
   - **Quota and `Retry-After`.** A rate-limit family counts as exhausted only when its
     remaining value is a well-formed 0, since naming the wrong quota sends an
     operator to raise a limit that was not the one refusing. `Retry-After` is read in
@@ -283,9 +294,18 @@ continuously fuzzed:
   - a 1xx: framing `100 Continue` as the reply orphans the real response on a pooled
     connection, where it becomes the next client's bytes (`request_without` also
     drops `Expect`);
-  - neither framing header on anything but 204 or 304: read-until-close cannot be
+  - neither framing header on a response that has a body: read-until-close cannot be
     pooled. A streamed response is diverted on its head before this, so
     close-delimited SSE is unaffected.
+
+  `ResponseHead::body` names how the body ends (RFC 9112 §6.3): `None` for a reply
+  to HEAD and for 1xx, 204 and 304 whatever their headers say, then `Chunked`,
+  `Length`, or `UntilClose`. A 304 with its resource's Content-Length, or a HEAD
+  reply with its GET's, waited for bytes that never come until the idle timeout.
+  Byte-forward relays any method, so the gateway passes `sent_head` to the framer;
+  a translated request is always a POST. A chunk size line is `1*HEXDIG`, optional
+  whitespace, then a chunk extension (accepted, ignored) or CRLF; `0x10` read as the
+  last chunk and swallowed the data as trailers.
 
   A Content-Length body is a view into the receive buffer; a chunked body is decoded
   into the per-connection `ResponseDecoder`, which is fed only the bytes that arrived
@@ -298,7 +318,9 @@ continuously fuzzed:
   invariants are asserted on every input (e.g. `total_len == header_len + body_len`,
   `body_len ≤ kMaxBodyLen`). `fuzz_http_diff` runs every input through the framer and
   through `fuzz/http_legacy.hpp`, a frozen copy of the v0.70.0 framer from before the
-  header walker, and asserts identical results. It is kept for one release.
+  header walker. The framer may refuse more than the old one, never less, and what
+  both accept frames the same, except the deliberate changes above: keep-alive, and
+  bodyless responses ending at the head. It is kept for one release.
 
 ## Translation model
 

@@ -15,9 +15,9 @@
 //   - Error     : non-numeric / signed / empty Content-Length, oversize header,
 //                 Transfer-Encoding, conflicting duplicate CL, over-cap body.
 //   - Pipeline  : concatenated messages -> first is framed, total_len = first.
-//   - Lenient   : documented parser quirks (identical dup CL collapses, "closed"
-//                 prefix-matching "close"). Note: "trailing garbage after CL is
-//                 accepted" used to live here as a quirk. It was a smuggling
+//   - Lenient   : documented parser quirks (identical dup CL collapses). Note:
+//                 "trailing garbage after CL is accepted" used to live here as a
+//                 quirk. It was a smuggling
 //                 primitive, not a quirk; see the HttpDesync suite, which now
 //                 asserts the rejection.
 //   - HttpDesync: framing-desync regressions from the 2026-08-03 security sweep.
@@ -395,6 +395,31 @@ TEST(HttpDesync, ResponseWithoutAnHttpVersionStatusLineIsRejected)
     EXPECT_EQ(h.status, 503);
 }
 
+// N8: the status code is exactly three digits followed by SP or the end of the line.
+// "2000" and "200x" read as 200, and a missing code left status 0 on a Complete head.
+TEST(HttpDesync, StatusCodeIsExactlyThreeDigits)
+{
+    using llmbridge::net::http::FrameStatus;
+    using llmbridge::net::http::parse_response_head;
+    for (const char* line : {"HTTP/1.1 2000 OK", "HTTP/1.1 200x", "HTTP/1.1 20 OK", "HTTP/1.1  200 OK",
+                             "HTTP/1.1 \t200 OK", "HTTP/1.1 OK", "HTTP/1.1 ", "HTTP/1.1 2O0 OK"})
+    {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(parse_response_head(std::string(line) + "\r\nContent-Length: 0\r\n\r\n", h),
+                  FrameStatus::Error) << line;
+    }
+    for (const char* line : {"HTTP/1.1 200 OK", "HTTP/1.1 200", "HTTP/1.1 200 ", "HTTP/1.1 429 Too Many"})
+    {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(parse_response_head(std::string(line) + "\r\nContent-Length: 0\r\n\r\n", h),
+                  FrameStatus::Complete) << line;
+        EXPECT_EQ(h.status, line[9] == '4' ? 429 : 200) << line;
+    }
+    llmbridge::net::http::ResponseHead h;
+    EXPECT_EQ(parse_response_head("HTTP/1.1 204\r\n\r\n", h), FrameStatus::Complete);
+    EXPECT_EQ(h.status, 204);
+}
+
 TEST(HttpQuirk, TrailingSpaceAfterClNumberIsAccepted)
 {
     Message m;
@@ -451,12 +476,69 @@ TEST(HttpVersion, ParsedFromTheRequestLineAndDrivesTheKeepAliveDefault)
     EXPECT_TRUE(m10k.keep_alive) << "an explicit keep-alive overrides the 1.0 default";
 }
 
-TEST(HttpQuirk, ConnectionClosedPrefixMatchesClose)
+TEST(HttpDesync, RequestLineSyntaxIsChecked)
 {
+    using llmbridge::net::http::request_line_ok;
+    for (const char* rl : {"GET / HTTP/1.1 x", "GET  / HTTP/1.1", "GET /  HTTP/1.1", "GET\t/ HTTP/1.1",
+                           "GET / HTTP/2.0", "GET / HTTP/1.2", "GET /", "GET", "", " GET / HTTP/1.1",
+                           "G(T / HTTP/1.1", "GET /a\x01 HTTP/1.1", "GET /a\x7f HTTP/1.1",
+                           "GET / http/1.1", "HTTP/1.1 200 OK"})
+        EXPECT_FALSE(request_line_ok(std::string(rl) + "\r\nHost: x\r\n\r\n")) << rl;
+    EXPECT_FALSE(request_line_ok("GET / HTTP/1.1"));
+    for (const char* rl : {"GET / HTTP/1.1", "PATCH /v1/x?a=b HTTP/1.0", "OPTIONS * HTTP/1.1",
+                           "M-SEARCH http://h/p HTTP/1.1"})
+        EXPECT_TRUE(request_line_ok(std::string(rl) + "\r\nHost: x\r\n\r\n")) << rl;
+}
+
+// N2: Connection is a token list. Reading only a leading "close" kept
+// `keep-alive, close` open and read `closed` as close.
+TEST(HttpConnection, RequestConnectionIsATokenList)
+{
+    const auto ka = [](const std::string& conn) {
+        Message m;
+        EXPECT_EQ(parse_request(build("POST", {"Connection: " + conn, "Content-Length: 1"}, "x"), m),
+                  FrameStatus::Complete);
+        return m.keep_alive;
+    };
+    EXPECT_FALSE(ka("keep-alive, close"));
+    EXPECT_FALSE(ka("Upgrade,CLOSE"));
+    EXPECT_FALSE(ka("close"));
+    EXPECT_TRUE(ka("closed"));
+    EXPECT_TRUE(ka("keep-alive"));
+
     Message m;
-    ASSERT_EQ(parse_request(build("POST", {"Connection: closed", "Content-Length: 1"}, "x"), m),
+    ASSERT_EQ(parse_request("GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n", m),
               FrameStatus::Complete);
-    EXPECT_FALSE(m.keep_alive);
+    EXPECT_FALSE(m.keep_alive) << "close in any Connection field wins";
+}
+
+// N2: an HTTP/1.0 response closes unless it says keep-alive. Pooling one sent the
+// next request into a connection the server was closing, and every reuse became a
+// stale-connection retry.
+TEST(HttpConnection, ResponseKeepAliveFollowsTheVersionAndTheTokenList)
+{
+    const auto ka = [](std::string_view head) {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(llmbridge::net::http::parse_response_head(head, h), FrameStatus::Complete) << head;
+        return h.keep_alive;
+    };
+    EXPECT_FALSE(ka("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_FALSE(ka("HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_FALSE(ka("HTTP/1.1 200 OK\r\nConnection: te, Close\r\nContent-Length: 0\r\n\r\n"));
+    EXPECT_TRUE(ka("HTTP/1.1 200 OK\r\nConnection: closed\r\nContent-Length: 0\r\n\r\n"));
+}
+
+TEST(HttpConnection, HasTokenMatchesWholeTokensOnly)
+{
+    using llmbridge::net::http::has_token;
+    EXPECT_TRUE(has_token("close", "close"));
+    EXPECT_TRUE(has_token(" a ,\tClose\t, b", "close"));
+    EXPECT_FALSE(has_token("closed", "close"));
+    EXPECT_FALSE(has_token("un close", "close"));
+    EXPECT_FALSE(has_token("", "close"));
+    EXPECT_FALSE(has_token(",,", "close"));
 }
 TEST(HttpQuirk, IdempotentReparseGivesSameResult)
 {
@@ -718,6 +800,64 @@ TEST(ResponseFraming, BodylessStatusesStillFrameWithNoLength)
               llmbridge::net::http::FrameStatus::Complete);
 }
 
+// N8: 204 and 304 end at the head whatever Content-Length or Transfer-Encoding say.
+// A 304 carrying the resource's Content-Length waited for 1234 bytes that never come,
+// and the client got a 504 after the upstream idle timeout.
+TEST(ResponseFraming, BodylessStatusesEndAtTheHeadWhateverTheirHeadersSay)
+{
+    for (const std::string head : {"HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\n\r\n",
+                                   "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
+                                   "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"})
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const std::string wire = head + "HTTP/1.1 200 OK\r\n";
+        const auto r = llmbridge::net::http::parse_response(wire, st);
+        ASSERT_EQ(r.status, llmbridge::net::http::FrameStatus::Complete) << head;
+        EXPECT_EQ(r.head.body, llmbridge::net::http::Body::None);
+        EXPECT_EQ(r.total_len, head.size()) << "the next response is not this one's body";
+        EXPECT_TRUE(r.body.empty());
+    }
+}
+
+// A response to HEAD has no body, whatever its framing headers describe.
+TEST(ResponseFraming, AResponseToHeadEndsAtTheHead)
+{
+    Message m;
+    ASSERT_EQ(parse_request("HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n", m), FrameStatus::Complete);
+    EXPECT_TRUE(m.head);
+    ASSERT_EQ(parse_request("HEADER /v1/models HTTP/1.1\r\nHost: x\r\n\r\n", m), FrameStatus::Complete);
+    EXPECT_FALSE(m.head);
+
+    for (const std::string head : {"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n",
+                                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"})
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const auto r = llmbridge::net::http::parse_response(head, st, /*head_request=*/true);
+        ASSERT_EQ(r.status, FrameStatus::Complete) << head;
+        EXPECT_EQ(r.total_len, head.size());
+        llmbridge::net::http::ResponseDecoder st2;
+        EXPECT_EQ(llmbridge::net::http::parse_response(head, st2).status, FrameStatus::NeedMore)
+            << "the same head after a GET still waits for its body";
+    }
+}
+
+TEST(ResponseFraming, BodyKindNamesTheFraming)
+{
+    using llmbridge::net::http::Body;
+    const auto body_of = [](std::string_view head) {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(llmbridge::net::http::parse_response_head(head, h),
+                  llmbridge::net::http::FrameStatus::Complete) << head;
+        return h.body;
+    };
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"), Body::Length);
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), Body::Chunked);
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"), Body::UntilClose);
+    EXPECT_EQ(body_of("HTTP/1.1 101 Switching Protocols\r\n\r\n"), Body::None);
+    EXPECT_EQ(body_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 99999999\r\n\r\n"), Body::None)
+        << "a bodyless status is not held to the body cap";
+}
+
 TEST(ResponseFraming, AFramedResponseIsUnaffected)
 {
     EXPECT_EQ(frame_of("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),
@@ -830,4 +970,121 @@ TEST(WalkHeaders, StopsWhenTheCallerRefuses)
             return false;
         }));
     EXPECT_EQ(calls, 1);
+}
+
+// ── provider heads ───────────────────────────────────────────────────────────
+//
+// Smoke test for the strict framer: responses shaped like the venues' own (their
+// header sets, casing, chunking), plus the legal forms a strict reading could trip
+// on: a status line with no reason phrase, chunk extensions, an HTTP/1.0 reply.
+namespace
+{
+    struct ProviderReply
+    {
+        const char* name;
+        std::string wire;
+        int status;
+        llmbridge::net::http::Body body;
+        bool keep_alive;
+        std::string_view payload;
+    };
+
+    constexpr std::string_view kJson = R"({"id":"x","usage":{"input_tokens":3}})";
+
+    std::vector<ProviderReply> provider_replies()
+    {
+        using llmbridge::net::http::Body;
+        const std::string len = std::to_string(kJson.size());
+        const auto hex = [](size_t n) {
+            char b[16];
+            std::snprintf(b, sizeof b, "%zx", n);
+            return std::string(b);
+        };
+        const std::string chunked = hex(kJson.size()) + "\r\n" + std::string(kJson) + "\r\n0\r\n\r\n";
+        return {
+            {"anthropic", "HTTP/1.1 200 OK\r\nDate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                          "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+                          "Connection: keep-alive\r\nanthropic-ratelimit-requests-remaining: 3999\r\n"
+                          "request-id: req_011CTEST\r\nanthropic-organization-id: 0000\r\n"
+                          "via: 1.1 google\r\nCF-RAY: 8c01-IAD\r\nServer: cloudflare\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"anthropic_stream", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+                                 "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n"
+                                 "Cache-Control: no-cache\r\nrequest-id: req_011CTEST\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"openai", "HTTP/1.1 200 OK\r\ndate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                       "content-type: application/json\r\ntransfer-encoding: chunked\r\n"
+                       "connection: keep-alive\r\nopenai-processing-ms: 412\r\n"
+                       "x-ratelimit-remaining-requests: 9999\r\nx-ratelimit-remaining-tokens: 199000\r\n"
+                       "x-request-id: req_abc\r\nalt-svc: h3=\":443\"; ma=86400\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"gemini", "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n"
+                       "Vary: Origin\r\nVary: X-Origin\r\nVary: Referer\r\n"
+                       "Transfer-Encoding: chunked\r\nServer: scaffolding on HTTPServer2\r\n"
+                       "X-XSS-Protection: 0\r\nServer-Timing: gfet4t7; dur=812\r\n\r\n" + chunked,
+             200, Body::Chunked, true, kJson},
+            {"bedrock", "HTTP/1.1 200 OK\r\nDate: Thu, 09 Oct 2026 12:00:00 GMT\r\n"
+                        "Content-Type: application/json\r\nContent-Length: " + len + "\r\n"
+                        "Connection: keep-alive\r\nx-amzn-RequestId: 6f1c\r\n"
+                        "X-Amzn-Bedrock-Invocation-Latency: 812\r\n\r\n" + std::string(kJson),
+             200, Body::Length, true, kJson},
+            {"no_reason_phrase", "HTTP/1.1 200\r\nContent-Type: application/json\r\nContent-Length: " +
+                                 len + "\r\n\r\n" + std::string(kJson),
+             200, Body::Length, true, kJson},
+            {"chunk_extensions", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                 "10;name=value\r\n" + std::string(kJson.substr(0, 16)) + "\r\n" +
+                                 hex(kJson.size() - 16) + " ;q=\"a b\"\r\n" +
+                                 std::string(kJson.substr(16)) + "\r\n0;last\r\nx-trailer: 1\r\n\r\n",
+             200, Body::Chunked, true, kJson},
+            {"rate_limited", "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                             "retry-after: 20\r\nx-ratelimit-remaining-requests: 0\r\n"
+                             "Content-Length: " + len + "\r\n\r\n" + std::string(kJson),
+             429, Body::Length, true, kJson},
+            {"http_1_0_proxy", "HTTP/1.0 200 OK\r\nContent-Length: " + len + "\r\n\r\n" + std::string(kJson),
+             200, Body::Length, false, kJson},
+            {"not_modified", "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 1234\r\n\r\n",
+             304, Body::None, true, ""},
+        };
+    }
+} // namespace
+
+TEST(ProviderHeads, EveryShapeFramesWholeAndByteByByte)
+{
+    for (const ProviderReply& p : provider_replies())
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const auto r = llmbridge::net::http::parse_response(p.wire, st);
+        ASSERT_EQ(r.status, FrameStatus::Complete) << p.name;
+        EXPECT_EQ(r.head.status, p.status) << p.name;
+        EXPECT_EQ(r.head.body, p.body) << p.name;
+        EXPECT_EQ(r.head.keep_alive, p.keep_alive) << p.name;
+        EXPECT_EQ(r.body, p.payload) << p.name;
+        EXPECT_EQ(r.total_len, p.wire.size()) << p.name;
+
+        llmbridge::net::http::ResponseDecoder inc;
+        std::string buf;
+        FrameStatus last = FrameStatus::NeedMore;
+        for (const char c : p.wire)
+        {
+            ASSERT_EQ(last, FrameStatus::NeedMore) << p.name << ": framed before its last byte";
+            buf += c;
+            last = llmbridge::net::http::parse_response(buf, inc).status;
+        }
+        EXPECT_EQ(last, FrameStatus::Complete) << p.name;
+    }
+}
+
+TEST(ProviderHeads, RateLimitHeadsNameTheQuota)
+{
+    for (const ProviderReply& p : provider_replies())
+    {
+        llmbridge::net::http::ResponseHead h;
+        ASSERT_EQ(llmbridge::net::http::parse_response_head(p.wire, h), FrameStatus::Complete) << p.name;
+        const bool limited = std::string_view(p.name) == "rate_limited";
+        EXPECT_EQ(h.retry_after_s, limited ? 20 : 0) << p.name;
+        EXPECT_EQ(h.quota_exhausted, limited ? llmbridge::net::http::ResponseHead::Quota::Requests
+                                             : llmbridge::net::http::ResponseHead::Quota::None)
+            << p.name;
+        EXPECT_EQ(h.event_stream, std::string_view(p.name) == "anthropic_stream") << p.name;
+    }
 }

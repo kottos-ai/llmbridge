@@ -582,6 +582,7 @@ namespace llmbridge
         }
         c->client_frame_want = 0;
         if (st == net::http::FrameStatus::Error) { ep_error_respond(c, 400, "request framing"); return; }
+        if (!net::http::request_line_ok(c->rbuf)) { ep_error_respond(c, 400, "request line"); return; }
 
         c->msg = m;
         c->ts_req_recvd = t0;
@@ -906,14 +907,14 @@ namespace llmbridge
             !client->translate_body)
         {
             net::http::ResponseHead h;
-            const auto hs = net::http::parse_response_head(u->rbuf, h);
+            const auto hs = net::http::parse_response_head(u->rbuf, h, sent_head(*client));
             if (hs == net::http::FrameStatus::NeedMore) return;
             if (hs == net::http::FrameStatus::Error) { ep_error_respond(client, 502, "upstream response head framing"); return; }
             // Only a 200 carries a real event stream. A provider error (429 rate
             // limit, 529 overloaded, 400 context length, 401 auth) must reach the
             // client with its status (relayed below once the body is framed)
             // never laundered into a 200 stream.
-            if (h.event_stream && h.status == 200)
+            if (h.event_stream && h.status == 200 && h.body != net::http::Body::None)
             {
                 // t4 for a stream: the provider's response head is now complete.
                 // Not the first token, and not the first data chunk. A provider
@@ -940,7 +941,7 @@ namespace llmbridge
         // chunked over HTTP/1.1, which parse_request() rejects by design (see http.hpp).
         // `r.body` aliases rbuf (Content-Length) or _resp_scratch (chunked); it is
         // dead before rbuf is erased or the upstream released, below.
-        const auto r = net::http::parse_response(u->rbuf, u->rdec);
+        const auto r = net::http::parse_response(u->rbuf, u->rdec, sent_head(*client));
         if (r.failed()) { ep_error_respond(client, 502, "upstream response framing"); return; }
         if (!r.complete()) return;
         const net::http::ResponseHead& h = r.head;
@@ -1030,7 +1031,7 @@ namespace llmbridge
             // rate-limit error, with Retry-After dropped. The client cannot back off
             // from a 200. Content-Length responses were relayed verbatim and were
             // never affected, which is why it survived: only chunkedness triggers it.
-            if (h.chunked)
+            if (h.body == net::http::Body::Chunked)
                 client->wbuf = build_http_status(h.status ? h.status : 200,
                                                  reason_for(h.status ? h.status : 200),
                                                  body_buf);

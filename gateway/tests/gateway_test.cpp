@@ -1575,6 +1575,61 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
         << "no upstream was reused, so the residue path was never exercised";
 }
 
+// N8: a 304 ends at its head whatever Content-Length says. Framed by that length, the
+// reply waited for 1234 bytes that never come, and the client got a 504 after the
+// upstream idle timeout with both connections held the whole time.
+TEST_P(ProxyAuth, BodylessStatusIsRelayedWithoutWaitingForItsContentLength)
+{
+    _backend.set_response("HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\nETag: \"v1\"\r\n\r\n");
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"));
+    const std::string got = c.recv_until("\r\n\r\n", 3000);
+    EXPECT_EQ(Client::status_of(got), 304) << got;
+}
+
+// A reply to HEAD carries the GET's Content-Length and no body. Byte-forward relays
+// any method, so this waited for the idle timeout too, and then failed over.
+TEST_P(ProxyAuth, HeadResponseEndsAtItsHeadAndTheConnectionIsReused)
+{
+    _backend.set_responses({"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            "Content-Length: 1234\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"});
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("HEAD /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"));
+    const std::string head = c.recv_until("\r\n\r\n", 3000);
+    EXPECT_EQ(Client::status_of(head), 200) << head;
+    EXPECT_NE(head.find("Content-Length: 1234"), std::string::npos) << head;
+
+    ASSERT_TRUE(c.send("GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"));
+    const std::string next = c.recv_response(3000);
+    EXPECT_EQ(Client::status_of(next), 200) << next;
+    EXPECT_TRUE(next.size() >= 2 && next.compare(next.size() - 2, 2, "ok") == 0) << next;
+    c.close();
+    shutdown();
+    EXPECT_GT(_gw->stats().upstream_reused, 0u);
+}
+
+// The request line is method SP target SP HTTP/1.x. Only the version was read, from
+// after the last space, so a line an upstream could split another way went out.
+TEST_P(ProxyAuth, MalformedRequestLineIsRefusedAndNeverForwarded)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    for (const char* rl : {"GET /v1/models HTTP/1.1 x", "GET  /v1/models HTTP/1.1",
+                           "GET /v1/models HTTP/2.0", "G(T /v1/models HTTP/1.1"})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(std::string(rl) + "\r\nHost: x\r\n\r\n"));
+        EXPECT_EQ(c.recv_status(), 400) << rl;
+    }
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
 TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
 {
     // The classic smuggling shape from the other direction: the client declares N

@@ -212,3 +212,31 @@ TEST(Chunked, AbsurdSizeLineIsError)
     EXPECT_FALSE(d.feed(std::string(100, 'a') + "\r\n", out)); // > 64-char size line
     EXPECT_TRUE(d.failed());
 }
+
+// N7: the size line is 1*HEXDIG, optional whitespace, then a chunk extension or
+// CRLF. The digit loop stopped at the first non-hex byte and nothing checked what
+// followed, so "0x10" read as the last chunk and swallowed the 16 data bytes as
+// trailers, and "5zz" or "5\rX" read as 5.
+TEST(Chunked, SizeLineIsStrictHex)
+{
+    for (const char* bad : {"0x10\r\n0123456789abcdef\r\n0\r\n\r\n", "5zz\r\nhello\r\n0\r\n\r\n",
+                            "5\rX\r\nhello\r\n0\r\n\r\n", "5\nX\r\nhello\r\n0\r\n\r\n",
+                            "5 x\r\nhello\r\n0\r\n\r\n", "5;a\rb\r\nhello\r\n0\r\n\r\n",
+                            "-5\r\nhello\r\n0\r\n\r\n", " 5\r\nhello\r\n0\r\n\r\n"})
+    {
+        bool ok = true, done = false;
+        decode_whole(bad, ok, done);
+        EXPECT_FALSE(ok) << bad;
+        decode_bytewise(bad, ok, done);
+        EXPECT_FALSE(ok) << bad;
+    }
+    for (const char* good : {"5\r\nhello\r\n0\r\n\r\n", "5 \r\nhello\r\n0\r\n\r\n",
+                             "5\t;ext\r\nhello\r\n0;last\r\n\r\n", "005;a=\"b c\"\r\nhello\r\n0\r\n\r\n"})
+    {
+        bool ok = false, done = false;
+        EXPECT_EQ(decode_whole(good, ok, done), "hello") << good;
+        EXPECT_TRUE(ok && done) << good;
+        EXPECT_EQ(decode_bytewise(good, ok, done), "hello") << good;
+        EXPECT_TRUE(ok && done) << good;
+    }
+}

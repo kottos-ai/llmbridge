@@ -57,6 +57,13 @@ namespace llmbridge::detail
         return (a - '0') * 100 + (b - '0') * 10 + (c - '0');
     }
 
+    /// The venue was sent HEAD, so its response has no body. Only a byte-forward keeps
+    /// the client's method; a translated request is always a POST.
+    [[nodiscard]] inline bool sent_head(const Connection& c) noexcept
+    {
+        return c.msg.head && !c.translate_body;
+    }
+
     [[nodiscard]] inline int64_t span_since(int64_t start, int64_t end) noexcept
     {
         return (start > 0 && end >= start) ? end - start : 0;
