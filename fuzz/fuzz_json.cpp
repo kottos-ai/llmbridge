@@ -60,6 +60,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         assert(f.stream == (st && st->type == json::Value::Type::Bool && st->boolean));
         (void)f;
     }
+    // Every request translator writes one JSON object or refuses: never a body the
+    // provider would have to reject as malformed, whatever the client sent.
+    if (ok && v.is_object())
+    {
+        namespace p = llmbridge::provider;
+        std::string model;
+        const std::string outs[] = {p::openai_to_anthropic_request(in),
+                                    p::openai_to_bedrock_request(in, model),
+                                    p::openai_to_gemini_request(in), p::openai_to_cohere_request(in)};
+        for (const std::string& o : outs)
+        {
+            bool o_ok = o.empty();
+            if (!o.empty()) assert(json::parse(o, o_ok).is_object() && o_ok);
+            (void)o_ok;
+        }
+    }
     // The top-level readers the gateway runs on every body when a policy or sink is
     // installed, ahead of the parser. Same invariant: any bytes, no over-read.
     const std::string_view b(reinterpret_cast<const char*>(data), size);
