@@ -48,6 +48,16 @@ namespace llmbridge
         if (!ep_upstream_failed(client, code, why)) ep_error_respond(client, code, why);
     }
 
+    // Plaintext not yet on the wire, a send in flight, or ciphertext not yet written.
+    static bool owes_client(const Connection* c) noexcept
+    {
+        if (c->send_inflight || !c->wpending.empty() || c->woff < c->wbuf.size()) return true;
+#ifdef LLMBRIDGE_HAVE_TLS
+        if (c->tls_out_off < c->tls_out.size()) return true;
+#endif
+        return false;
+    }
+
     // At most ~20 times a second, on the loop's periodic tick, so an idle gateway costs
     // one walk of its clients per tick. A client yet to be answered gets a real 504; a
     // live stream (headers already sent) is cut without a terminal [DONE], so the
@@ -141,12 +151,16 @@ namespace llmbridge
             fail_request(c, 502, "upstream connect timeout");
             return;
         }
-        if (_upstream_idle_ns <= 0 || c->req.f.ts_up_activity == 0 ||
-            now - c->req.f.ts_up_activity <= _upstream_idle_ns)
+        if (_upstream_idle_ns <= 0 || c->req.f.ts_progress == 0 ||
+            now - c->req.f.ts_progress <= _upstream_idle_ns)
             return;
-        ++_stats.upstream_timeouts;
-        LB_WARN(ReqId{c->req.f.req_seq}, " TIMEOUT upstream silent ", *c,
-                " after_ns=", now - c->req.f.ts_up_activity, " limit_ns=", _upstream_idle_ns,
+        // Neither leg moved. With bytes still owed to the client it is the client that
+        // stopped reading, and a paused upstream is waiting on it.
+        const bool stalled = owes_client(c);
+        ++(stalled ? _stats.client_idle_timeouts : _stats.upstream_timeouts);
+        LB_WARN(ReqId{c->req.f.req_seq},
+                stalled ? " TIMEOUT client stalled " : " TIMEOUT upstream silent ", *c,
+                " after_ns=", now - c->req.f.ts_progress, " limit_ns=", _upstream_idle_ns,
                 " streaming=", c->req.f.streaming);
         if (!c->req.f.streaming) { fail_request(c, 504, "upstream idle timeout"); return; }
         stream_truncate(c); // the head is out; truncate honestly, with no [DONE]

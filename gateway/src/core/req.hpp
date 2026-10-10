@@ -65,9 +65,9 @@ namespace llmbridge
         int64_t ts_first_thinking = 0;
         int64_t ts_last_chunk = 0;
         int64_t max_chunk_gap_ns = 0;
-        /// Last upstream progress, request forwarded or bytes received; the idle
-        /// sweep measures against it.
-        int64_t ts_up_activity = 0;
+        /// Last progress on either leg: the request forwarded or sent, a response byte
+        /// read, or a byte the client took. The idle sweep measures against it.
+        int64_t ts_progress = 0;
         int64_t client_upload_ns = 0; ///< t0 minus the first byte: the client's network
         int64_t client_conn_setup_ns = 0;
         /// Non-streamed token counts, -1 when not stated.

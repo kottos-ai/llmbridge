@@ -3710,6 +3710,96 @@ TEST_P(ProxyStream, SlowClientEngagesBackpressureAndLosesNothing)
     }
 }
 
+// ── The idle deadline measures progress on either leg ──────────────────
+// It counted only upstream reads, so a stream paused for a slow client (epoll), or
+// one the provider had finished while the client still drained it (io_uring), aged
+// toward the deadline while bytes moved, was cut, and was logged as "upstream silent".
+namespace
+{
+    constexpr int kDeltas = 800;
+    // ~0.35 MB of Anthropic SSE in 16 KB chunks, keep-alive, so nothing ends it but the
+    // client taking every byte.
+    std::string g7_stream()
+    {
+        const std::string filler(400, 'x');
+        std::string ev =
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+        for (int i = 0; i < kDeltas; ++i)
+            ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+                  "{\"type\":\"text_delta\",\"text\":\"" + filler + "\"}}\n\n";
+        ev += "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+              "data: {\"type\":\"message_stop\"}\n\n";
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(ev, 16384);
+    }
+} // namespace
+
+TEST_P(ProxyStream, ADrainingSlowClientOutlivesTheIdleTimeout)
+{
+    _backend.set_response(g7_stream());
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/200'000'000LL);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    // At most 8 KB every 25 ms: the stream takes seconds, many idle windows, and no
+    // gap between reads comes near one. A paused epoll upstream waits on the drain.
+    std::string raw;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (raw.find("[DONE]") == std::string::npos && std::chrono::steady_clock::now() < deadline)
+    {
+        const std::string got = c.recv_some(2000);
+        if (got.empty()) break; // closed, or nothing for 2 s
+        raw += got;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    const Streamed s = parse_streamed(raw);
+    EXPECT_EQ(s.content.size(), 400u * kDeltas) << "a draining client was cut off";
+    EXPECT_TRUE(s.done);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u);
+    EXPECT_EQ(_gw->stats().errors, 0u);
+}
+
+// The other half: a client that stops reading is timed out, as the client's stall.
+TEST_P(ProxyStream, AClientThatStopsReadingIsTimedOutAsAClientStall)
+{
+    _backend.set_response(g7_stream());
+    _client_sndbuf = 4096;
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/200'000'000LL);
+
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // read nothing
+    const Streamed s = parse_streamed(c.recv_all(5000)); // what was buffered, then the close
+    EXPECT_FALSE(s.done) << "a timed-out stream must not end in [DONE]";
+    EXPECT_LT(s.content.size(), 400u * kDeltas);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 0u) << "the provider was not silent";
+}
+
+// And the deadline still fires for a provider that took the request and said nothing.
+TEST_P(ProxyStream, ASilentUpstreamStillGetsA504AtTheShortDeadline)
+{
+    _backend.set_stall(1);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/200'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    EXPECT_EQ(c.recv_status(3000), 504);
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_timeouts, 1u);
+    EXPECT_EQ(_gw->stats().client_idle_timeouts, 0u);
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyStream,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
                          [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
@@ -7855,7 +7945,7 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 200);
 }
 
-// L2: io_uring pooled an upstream that had already sent EOF after its final chunk
+// io_uring pooled an upstream that had already sent EOF after its final chunk
 // when the EOF arrived while the stream's last send to the client was still in flight.
 // Its recv was over, so the next request on it was never answered.
 TEST_P(ProxyPoolHygiene, AnUpstreamThatClosedAfterTheStreamIsNeverPooled)
@@ -10043,7 +10133,7 @@ TEST_P(ProxyRoute, EachRequestOnAKeepAliveConnectionRecordsItsOwnServedModelAndT
 // Each request starts from a state constructed fresh at framing, before any reply,
 // so nothing a request reports can belong to the one before it on the connection.
 
-// G9: a framing error used to reply before the sequencer ran, so its record carried
+// A framing error used to reply before the sequencer ran, so its record carried
 // the previous request's sequence number, stamps, venue and model.
 TEST_P(ProxyRoute, AFramingErrorAfterASuccessIsARequestOfItsOwn)
 {
@@ -10078,7 +10168,7 @@ TEST_P(ProxyRoute, AFramingErrorAfterASuccessIsARequestOfItsOwn)
     EXPECT_EQ(recs[1].model, "") << "the previous request's model";
 }
 
-// G5: t2 and t3 were stamped only when still 0, so a keep-alive client's second
+// t2 and t3 were stamped only when still 0, so a keep-alive client's second
 // request on a fresh upstream kept the first one's: connect-us went negative and
 // upwrite-us counted the time between the two requests.
 class ProxyRequestReset : public ProxyIT,
@@ -10156,7 +10246,7 @@ namespace
     };
 } // namespace
 
-// G3: the override was a view into the policy's buffer, read again by a failover in a
+// the override was a view into the policy's buffer, read again by a failover in a
 // later event; under ASan that was a use-after-free, and either way venue B was sent
 // venue A's model name. Now the failover sends Retry::model.
 TEST_P(ProxyRoute, AFailoverSendsTheRetryModelNotTheFailedVenuesOverride)
@@ -10219,7 +10309,7 @@ TEST_P(ProxyRoute, AnOverrideLongerThanTheGatewayKeepsIsA500)
     b.stop();
 }
 
-// G17: the bare IP:PORT form with only `ips` set took its Host header from the empty
+// the bare IP:PORT form with only `ips` set took its Host header from the empty
 // `ip`, before the constructor defaulted it, and sent `Host: :PORT`.
 TEST_P(ProxyRoute, AVenueGivenOnlyAnAddressListNamesItInTheHostHeader)
 {
@@ -10240,7 +10330,7 @@ TEST_P(ProxyRoute, AVenueGivenOnlyAnAddressListNamesItInTheHostHeader)
     b.stop();
 }
 
-// G1: the cap compared the number of venues with kMaxIdleUpstreams, so it never bound
+// the cap compared the number of venues with kMaxIdleUpstreams, so it never bound
 // the connections. Three venues, a cap of two: the third connection released closes.
 TEST_P(ProxyRoute, ThePoolCapCountsConnectionsNotVenues)
 {

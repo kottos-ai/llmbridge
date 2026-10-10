@@ -70,6 +70,8 @@ namespace llmbridge
 
         /// Bytes of wbuf on the socket, or fed to the Session: GATEWAY-INTERNALS.md 2b.
         size_t woff = 0;
+        /// Bytes the socket took over the connection's life, on either transport.
+        uint64_t sent_bytes = 0;
 
         /// Accept and first request byte on a client; socket creation and first
         /// response byte on an upstream.

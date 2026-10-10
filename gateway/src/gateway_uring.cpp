@@ -627,7 +627,7 @@ namespace llmbridge
             // Upstream bytes are the response to the in-flight request. Stray data on
             // an idle pooled upstream (no peer) means it's unusable, so drop it.
             if (!c->peer) { ur_close(c); return; }
-            c->peer->req.f.ts_up_activity = now_ns(); // upstream made progress
+            c->peer->req.f.ts_progress = now_ns(); // upstream made progress
 
             // Mid-stream: pump the newly-arrived body bytes and return.
             if (c->peer->req.f.streaming) { ur_stream_pump(c); return; }
@@ -847,7 +847,7 @@ namespace llmbridge
         c->ever_framed = true;        // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
-        c->req.f.ts_up_activity = c->req.f.ts_req_built; // idle-timeout baseline for this request
+        c->req.f.ts_progress = c->req.f.ts_req_built; // idle-timeout baseline for this request
         // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
         c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
         c->req.f.ts_up_sent = 0;
@@ -990,6 +990,11 @@ namespace llmbridge
         // calling ur_submit_send again. When each branch cleared its own, two of
         // the four forgot, and the flag meant different things on different paths.
         c->send_inflight = false;
+        c->sent_bytes += static_cast<uint64_t>(res);
+        // Bytes either peer took are progress: a client draining a stream the provider
+        // has finished is not an idle request. A finished reply needs no stamp.
+        if (c->is_client ? c->req.f.streaming : c->peer != nullptr)
+            (c->is_client ? c : c->peer)->req.f.ts_progress = now_ns();
 #ifdef LLMBRIDGE_HAVE_TLS
         if (c->tls)
         {
