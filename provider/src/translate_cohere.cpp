@@ -56,19 +56,20 @@ namespace llmbridge::provider
         bool ok = false;
         const json::Value v = json::parse(openai_body, ok);
         if (!ok || !v.is_object()) return {};
-        // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
+        // No `messages` array is not a chat request, and no model names nothing to run.
         const json::Value* msgs = v.find("messages");
-        if (!msgs || !msgs->is_array() || detail::declares_tools(v)) return {};
+        const std::string_view model = v.str_or("model");
+        if (!msgs || !msgs->is_array() || model.empty() || detail::declares_tools(v)) return {};
 
         std::string out;
         out.reserve(openai_body.size() + 256);
         out = "{\"model\":";
-        json::append_raw_string(out, v.str_or("model", "command-r-plus"));
+        json::append_raw_string(out, model);
         out += ",\"messages\":[";
         CohereTurns turns{out};
         if (!detail::walk_messages(*msgs, turns)) return {};
         out += ']';
-        if (std::string_view mt = v.num_or("max_tokens"); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
+        if (std::string_view mt = detail::max_tokens_of(v); !mt.empty()) { out += ",\"max_tokens\":"; out += mt; }
         if (std::string_view t = v.num_or("temperature"); !t.empty()) { out += ",\"temperature\":"; out += t; }
         if (std::string_view p = v.num_or("top_p"); !p.empty()) { out += ",\"p\":"; out += p; } // Cohere: top_p is "p"
         out += "}";

@@ -92,7 +92,7 @@ namespace llmbridge::provider
             out += key;
             out += value;
         };
-        put("\"maxOutputTokens\":", v.num_or("max_tokens"));
+        put("\"maxOutputTokens\":", detail::max_tokens_of(v));
         put("\"temperature\":", v.num_or("temperature"));
         put("\"topP\":", v.num_or("top_p"));
         if (out.size() == first) out.resize(at);

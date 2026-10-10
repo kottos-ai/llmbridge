@@ -55,4 +55,11 @@ namespace llmbridge::provider::detail
         const json::Value* t = body.find("tools");
         return t && t->type != json::Value::Type::Null && !(t->is_array() && t->arr.empty());
     }
+
+    /// `max_completion_tokens`, which replaced `max_tokens` in OpenAI's API, else `max_tokens`.
+    inline std::string_view max_tokens_of(const json::Value& body, std::string_view def = {})
+    {
+        const std::string_view n = body.num_or("max_completion_tokens");
+        return n.empty() ? body.num_or("max_tokens", def) : n;
+    }
 } // namespace llmbridge::provider::detail

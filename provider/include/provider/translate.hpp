@@ -62,7 +62,7 @@ namespace llmbridge::provider
     bool openai_to_anthropic_request(std::string_view openai_body, std::string& out,
                                      bool* wants_stream_usage = nullptr);
 
-    /// Bedrock's Messages body; `model_out` gets the id for `/model/{id}/invoke`, empty if none.
+    /// Bedrock's Messages body; `model_out` gets the id for `/model/{id}/invoke`. No model refuses.
     std::string openai_to_bedrock_request(std::string_view openai_body,
                                           std::string& model_out);
     bool openai_to_bedrock_request(std::string_view openai_body, std::string& model_out,

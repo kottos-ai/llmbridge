@@ -10,6 +10,8 @@
 
 #include "provider/translate.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -56,33 +58,35 @@ namespace llmbridge::provider
         // Anything malformed is dropped instead of guessed at: a half-translated
         // tool call would make the provider fail in a way the client cannot read.
 
-        // OpenAI tool_choice -> Anthropic tool_choice. Nothing for OpenAI's default,
-        // and "none" never gets here: append_tools omits the tools for it.
-        void append_tool_choice(std::string& out, const json::Value* tc)
+        // OpenAI tool_choice and parallel_tool_calls -> Anthropic's tool_choice, which
+        // carries both. "none" keeps the tools: a history holding tool_use blocks is
+        // refused by Anthropic when no tools are declared.
+        void append_tool_choice(std::string& out, const json::Value* tc, const json::Value* parallel)
         {
             std::string_view type, name;
             if (tc && tc->is_string())
-                type = tc->sv == "auto" ? "auto" : tc->sv == "required" ? "any" : "";
+                type = tc->sv == "auto" ? "auto" : tc->sv == "required" ? "any"
+                     : tc->sv == "none" ? "none" : "";
             else if (const json::Value* f = tc ? tc->find("function") : nullptr)
                 if (name = f->str_or("name"); !name.empty()) type = "tool";
-            if (type.empty()) return;
+            const bool serial = parallel && parallel->type == json::Value::Type::Bool &&
+                                !parallel->boolean && type != "none";
+            if (type.empty() && !serial) return; // the provider's default
             out += ",\"tool_choice\":{\"type\":\"";
-            out += type;
+            out += type.empty() ? "auto" : type;
             out += '"';
             if (!name.empty())
             {
                 out += ",\"name\":";
                 json::append_raw_string(out, name);
             }
+            if (serial) out += ",\"disable_parallel_tool_use\":true";
             out += '}';
         }
 
         // OpenAI tools[] -> Anthropic tools[], appended in place; nothing if none is usable.
         void append_tools(std::string& out, const json::Value& body)
         {
-            // tool_choice:"none" means "do not call tools", expressed by there being none.
-            const json::Value* tc = body.find("tool_choice");
-            if (tc && tc->is_string() && tc->sv == "none") return;
             const json::Value* tools = body.find("tools");
             if (!tools || !tools->is_array()) return;
             const size_t at = out.size();
@@ -126,7 +130,7 @@ namespace llmbridge::provider
             }
             if (out.size() == first) { out.resize(at); return; }
             out += ']';
-            append_tool_choice(out, tc);
+            append_tool_choice(out, body.find("tool_choice"), body.find("parallel_tool_calls"));
         }
 
         // arguments (a JSON *string*) -> input (a JSON *object*), decoded straight into
@@ -142,6 +146,91 @@ namespace llmbridge::provider
             bool ok = false;
             const json::Value input = json::parse(std::string_view(out).substr(at), ok);
             return ok && input.is_object();
+        }
+
+        // Whether a JSON number lies in [0, 1], read off its digits: no float parse, so
+        // no locale and no rounding at the boundary.
+        bool unit_interval(std::string_view n)
+        {
+            size_t i = (!n.empty() && n[0] == '-') ? 1 : 0;
+            const bool negative = i == 1;
+            long long pos = 0;   // power of ten of the first significant digit
+            char lead = 0;       // that digit; 0 while every digit so far is zero
+            bool tail = false;   // a non-zero digit after it
+            const size_t int_end = std::min(n.find_first_of(".eE", i), n.size());
+            long long place = static_cast<long long>(int_end - i) - 1; // of the digit at i
+            for (; i < n.size() && n[i] != 'e' && n[i] != 'E'; ++i)
+            {
+                if (n[i] == '.') continue;
+                if (n[i] != '0' && lead) tail = true;
+                if (n[i] != '0' && !lead) { lead = n[i]; pos = place; }
+                --place;
+            }
+            long long exp = 0;
+            bool exp_negative = false;
+            if (i < n.size()) // past the 'e'
+                for (++i; i < n.size(); ++i)
+                {
+                    if (n[i] == '-') exp_negative = true;
+                    else if (n[i] != '+' && exp < 100000) exp = exp * 10 + (n[i] - '0');
+                }
+            if (!lead) return true; // zero, however written
+            if (negative) return false;
+            pos += exp_negative ? -exp : exp;
+            return pos < 0 || (pos == 0 && lead == '1' && !tail);
+        }
+
+        // OpenAI request parameters with an Anthropic meaning, in the order emitted.
+        enum class Param : uint8_t { Unit, Number, Stops, True };
+        struct ParamRule
+        {
+            std::string_view from, to;
+            Param kind;
+        };
+        constexpr ParamRule kParams[] = {
+            {"temperature", "temperature", Param::Unit}, // OpenAI allows up to 2
+            {"top_p", "top_p", Param::Number},
+            {"stop", "stop_sequences", Param::Stops},    // a string or several
+            {"stream", "stream", Param::True},
+        };
+
+        // False refuses the request: a value Anthropic has no equivalent for.
+        bool append_params(std::string& out, const json::Value& body)
+        {
+            using T = json::Value::Type;
+            for (const ParamRule& r : kParams)
+            {
+                const json::Value* p = body.find(r.from);
+                if (!p || p->type == T::Null) continue;
+                if (r.kind == Param::True && (p->type != T::Bool || !p->boolean)) continue;
+                if (r.kind <= Param::Number && p->type != T::Number) continue;
+                if (r.kind == Param::Unit && !unit_interval(p->sv)) return false;
+                if (r.kind == Param::Stops && !p->is_string() && !p->is_array()) return false;
+                if (r.kind == Param::Stops && p->is_array() && p->arr.empty()) continue;
+                out += ",\"";
+                out += r.to;
+                out += "\":";
+                if (r.kind == Param::True) out += "true";
+                else if (r.kind != Param::Stops) out += p->sv;
+                else if (p->is_string())
+                {
+                    out += '[';
+                    json::append_raw_string(out, p->sv);
+                    out += ']';
+                }
+                else
+                {
+                    out += '[';
+                    for (const auto& s : p->arr)
+                    {
+                        if (!s.is_string()) return false;
+                        if (&s != &p->arr[0]) out += ',';
+                        json::append_raw_string(out, s.sv);
+                    }
+                    out += ']';
+                }
+            }
+            return true;
         }
 
         // Every system and developer message, hoisted to the top-level `system` and
@@ -289,7 +378,8 @@ namespace llmbridge::provider
         /// Anthropic wants it in a header.
         ///
         /// Written front to back into `out`, which keeps its capacity across agent
-        /// turns. A message the walk refuses refuses the request whole.
+        /// turns. A request with no model, a parameter append_params refuses, or a
+        /// message the walk refuses is refused whole.
         bool messages_request(std::string_view openai_body, bool bedrock, std::string* model_out,
                               bool* wants_stream_usage, std::string& out)
         {
@@ -305,10 +395,11 @@ namespace llmbridge::provider
                 *wants_stream_usage = iu && iu->type == json::Value::Type::Bool && iu->boolean;
             }
 
-            // A body carrying no `messages` array is not a chat request. Refuse instead of guessing.
+            // A body carrying no `messages` array is not a chat request, and one with no
+            // model names nothing to run. Refuse instead of guessing either.
             const json::Value* msgs = v.find("messages");
-            const std::string_view model = v.str_or("model", "claude-3-5-sonnet-latest");
-            if (!msgs || !msgs->is_array()) return false;
+            const std::string_view model = v.str_or("model");
+            if (!msgs || !msgs->is_array() || model.empty()) return false;
             {
                 const size_t need = openai_body.size() + 65536;
                 if (out.capacity() < need) out.reserve(need + need / 8);
@@ -326,22 +417,8 @@ namespace llmbridge::provider
             }
             // Anthropic requires max_tokens; default if the OpenAI request omitted it.
             out += ",\"max_tokens\":";
-            out += v.num_or("max_tokens", "1024");
-            ok = append_system(out, *msgs);
-            if (const std::string_view t = v.num_or("temperature"); !t.empty())
-            {
-                out += ",\"temperature\":";
-                out += t;
-            }
-            if (const std::string_view p = v.num_or("top_p"); !p.empty())
-            {
-                out += ",\"top_p\":";
-                out += p;
-            }
-            // Anthropic uses the same `stream` flag, so an OpenAI `stream:true` request
-            // becomes an Anthropic SSE response.
-            if (const json::Value* s = v.find("stream"); s && s->type == json::Value::Type::Bool && s->boolean)
-                out += ",\"stream\":true";
+            out += detail::max_tokens_of(v, "1024");
+            ok = append_system(out, *msgs) && append_params(out, v);
             append_tools(out, v);
             out += ",\"messages\":[";
             AnthropicTurns turns{out};

@@ -658,9 +658,10 @@ TEST(ToolReq, ToolChoiceMapping)
     EXPECT_NE(choice(R"("required")").find(R"("tool_choice":{"type":"any"})"), std::string::npos);
     EXPECT_NE(choice(R"({"type":"function","function":{"name":"f"}})")
                   .find(R"("tool_choice":{"type":"tool","name":"f"})"), std::string::npos);
-    // "none" means do not call tools; Anthropic expresses that by having none.
+    // "none" keeps the tools, so a history holding tool_use blocks stays valid (P11).
     const std::string none = choice(R"("none")");
-    EXPECT_EQ(none.find("\"tools\""), std::string::npos) << none;
+    EXPECT_NE(none.find("\"tools\""), std::string::npos) << none;
+    EXPECT_NE(none.find(R"("tool_choice":{"type":"none"})"), std::string::npos) << none;
     // Absent tool_choice: tools present, no choice emitted (provider default).
     const std::string absent = choice("");
     EXPECT_NE(absent.find("\"tools\""), std::string::npos);
@@ -1810,7 +1811,7 @@ TEST(TranslateEnvelope, TranslatorsReturnTheCountsTheyWrote)
     EXPECT_TRUE(out.empty());
 }
 
-// ── The message walk ────────────────────────────────────────────────────────
+// ── The message walk and the Anthropic parameter table ──────────────────────
 
 namespace
 {
@@ -1908,6 +1909,104 @@ TEST(MessageWalk, DeveloperRoleIsSystem)
     const Value c = P(openai_to_cohere_request(body));
     EXPECT_EQ(c.find("messages")->arr[0].str_or("role"), "system");
     EXPECT_EQ(c.find("messages")->arr[0].str_or("content"), "be brief");
+}
+
+// P10: max_completion_tokens replaced max_tokens, and wins when both are sent.
+TEST(AnthropicParams, MaxCompletionTokensTakesPrecedence)
+{
+    EXPECT_EQ(P(anth(R"({"model":"m","max_tokens":10,"max_completion_tokens":4000,"messages":[]})"))
+                  .num_or("max_tokens"), "4000");
+    EXPECT_EQ(P(anth(R"({"model":"m","max_completion_tokens":4000,"messages":[]})")).num_or("max_tokens"),
+              "4000");
+    EXPECT_EQ(P(anth(R"({"model":"m","max_tokens":10,"max_completion_tokens":null,"messages":[]})"))
+                  .num_or("max_tokens"), "10");
+    const std::string both = R"({"model":"m","max_tokens":10,"max_completion_tokens":4000,"messages":[]})";
+    EXPECT_EQ(P(openai_to_gemini_request(both)).find("generationConfig")->num_or("maxOutputTokens"), "4000");
+    EXPECT_EQ(P(openai_to_cohere_request(both)).num_or("max_tokens"), "4000");
+}
+
+// P10: `stop` becomes `stop_sequences`, which is always an array.
+TEST(AnthropicParams, StopBecomesStopSequences)
+{
+    const auto stops = [](std::string_view stop) {
+        return anth(std::string(R"({"model":"m","messages":[],"stop":)") + std::string(stop) + "}");
+    };
+    EXPECT_NE(stops(R"("END")").find(R"("stop_sequences":["END"])"), std::string::npos);
+    EXPECT_NE(stops(R"([ "a", "b\"c" ])").find(R"("stop_sequences":["a","b\"c"])"), std::string::npos);
+    for (const char* none : {"null", "[]"})
+    {
+        EXPECT_FALSE(stops(none).empty()) << none;
+        EXPECT_EQ(stops(none).find("stop"), std::string::npos) << none;
+    }
+    EXPECT_TRUE(stops("7").empty());
+    EXPECT_TRUE(stops(R"(["a",1])").empty());
+}
+
+// P10: Anthropic's temperature range is 0 to 1, where OpenAI's reaches 2.
+TEST(AnthropicParams, TemperatureAboveOneIsRefused)
+{
+    const auto temp = [](std::string_view t) {
+        return anth(std::string(R"({"model":"m","messages":[],"temperature":)") + std::string(t) + "}");
+    };
+    for (const char* t : {"0", "-0", "0.0", "0.7", "1", "1.0", "1.000", "1e0", "10e-1", "100E-2",
+                          "0.1e+1", "0e5", "5e-1", "0.000001e6", "0.0000000001"})
+        EXPECT_NE(temp(t).find(std::string("\"temperature\":") + t), std::string::npos) << t;
+    for (const char* t : {"1.0001", "1.5", "2", "10", "1e1", "1e+0001", "0.15e1", "0.0000011e6",
+                          "1.00000000000000000001", "-0.5", "-1", "9e-0"})
+        EXPECT_TRUE(temp(t).empty()) << t;
+}
+
+// P10: parallel_tool_calls:false is disable_parallel_tool_use, inside tool_choice.
+TEST(AnthropicParams, ParallelToolCallsFalseDisablesParallelUse)
+{
+    const auto with = [](std::string_view extra) {
+        return anth(std::string(R"({"model":"m","messages":[],)"
+                                R"("tools":[{"type":"function","function":{"name":"f"}}])") +
+                    std::string(extra) + "}");
+    };
+    EXPECT_NE(with(R"(,"parallel_tool_calls":false)")
+                  .find(R"("tool_choice":{"type":"auto","disable_parallel_tool_use":true})"), std::string::npos);
+    EXPECT_NE(with(R"(,"parallel_tool_calls":false,"tool_choice":"required")")
+                  .find(R"("tool_choice":{"type":"any","disable_parallel_tool_use":true})"), std::string::npos);
+    EXPECT_NE(with(R"(,"parallel_tool_calls":false,"tool_choice":{"type":"function","function":{"name":"f"}})")
+                  .find(R"("tool_choice":{"type":"tool","name":"f","disable_parallel_tool_use":true})"),
+              std::string::npos);
+    // Anthropic's "none" takes no such field, and true is the default.
+    EXPECT_NE(with(R"(,"parallel_tool_calls":false,"tool_choice":"none")")
+                  .find(R"("tool_choice":{"type":"none"})"), std::string::npos);
+    EXPECT_EQ(with(R"(,"parallel_tool_calls":true)").find("tool_choice"), std::string::npos);
+    EXPECT_EQ(anth(R"({"model":"m","messages":[],"parallel_tool_calls":false})").find("tool_choice"), std::string::npos);
+}
+
+// P11: tool_choice "none" keeps the tools that a tool_use history needs.
+TEST(AnthropicParams, ToolChoiceNoneKeepsToolsForAToolHistory)
+{
+    const Value v = P(anth(R"({"model":"m","tool_choice":"none",
+      "tools":[{"type":"function","function":{"name":"f"}}],"messages":[
+      {"role":"assistant","content":null,"tool_calls":[
+        {"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},
+      {"role":"tool","tool_call_id":"c","content":"r"}]})"));
+    ASSERT_NE(v.find("tools"), nullptr);
+    EXPECT_EQ(v.find("tools")->arr[0].str_or("name"), "f");
+    ASSERT_NE(v.find("tool_choice"), nullptr);
+    EXPECT_EQ(v.find("tool_choice")->str_or("type"), "none");
+}
+
+// P10: no default model. The old one was a retired alias, and on Bedrock it named a
+// path that does not exist instead of letting the gateway refuse.
+TEST(AnthropicParams, NoModelIsRefusedNotDefaulted)
+{
+    for (const char* body : {R"({"messages":[]})", R"({"model":7,"messages":[]})",
+                             R"({"model":"","messages":[]})", R"({"model":null,"messages":[]})"})
+    {
+        EXPECT_TRUE(anth(body).empty()) << body;
+        std::string model, out;
+        EXPECT_FALSE(llmbridge::provider::openai_to_bedrock_request(body, model, out)) << body;
+        EXPECT_TRUE(out.empty()) << body;
+        EXPECT_TRUE(openai_to_cohere_request(body).empty()) << body;
+    }
+    // Gemini names its model in the path, never in the body.
+    EXPECT_FALSE(openai_to_gemini_request(R"({"messages":[]})").empty());
 }
 
 // PP1: arguments are decoded into the output and parsed there, escapes and all.
