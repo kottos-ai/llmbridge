@@ -9041,6 +9041,42 @@ TEST_P(ProxyHeartbeat, TheHeartbeatReportsConnectionsAtInfo)
         EXPECT_NE(sink.text.find(field), std::string::npos) << field << " in:\n" << sink.text;
 }
 
+// The counts, not only the fields: the sweep counts them in the same walk that closes
+// what timed out, and must report what it held when the tick began.
+TEST_P(ProxyHeartbeat, TheHeartbeatCountsAnIdleClientAndItsPooledUpstream)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    _heartbeat_ns = 1'000'000;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // several ticks, still connected
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+    EXPECT_NE(sink.text.find("heartbeat clients=1 in_flight=0 pooled_upstreams=1 requests=1"),
+              std::string::npos) << sink.text;
+}
+
+TEST_P(ProxyHeartbeat, TheHeartbeatCountsARequestInFlight)
+{
+    HeartbeatSink sink;
+    llmbridge::net::log::set_sink(&sink);
+    _heartbeat_ns = 1'000'000;
+    _backend.set_stall(1); // read the request, never reply
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    shutdown();
+    llmbridge::net::log::set_sink(nullptr);
+    EXPECT_NE(sink.text.find("heartbeat clients=1 in_flight=1 pooled_upstreams=0 requests=0"),
+              std::string::npos) << sink.text;
+}
+
 // 0 is off. An operator who does not want the line must be able to silence it without
 // patching the binary, and a test that never checks the off switch leaves it unproven.
 TEST_P(ProxyHeartbeat, AZeroIntervalSilencesTheHeartbeat)

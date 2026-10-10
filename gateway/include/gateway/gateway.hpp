@@ -284,10 +284,13 @@ namespace llmbridge
             return false;
         }
 
-        /// Abort any request whose upstream has been silent longer than
-        /// _upstream_idle_ns, on the loop's existing periodic tick. `uring` selects
-        /// the matching teardown primitives.
-        void sweep_idle(bool uring) noexcept;
+        /// Heartbeat, pool reaping and every timeout, in one walk of the clients.
+        void sweep_idle() noexcept;
+        void sweep_client(Connection* c, int64_t now, bool busy) noexcept;
+        /// The sweep's teardowns, on whichever backend runs.
+        void close_conn(Connection* c) noexcept;
+        void abort_request(Connection* client) noexcept;
+        void fail_request(Connection* client, int code, const char* why) noexcept; // failover, else reply
 
         /// `slot` indexes the upstream table; the pool it draws from is that venue's.
         Connection* ep_acquire_upstream(int slot) noexcept;

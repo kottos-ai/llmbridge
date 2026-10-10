@@ -450,7 +450,7 @@ namespace llmbridge
         {
             if (!_draining && !_stop)
             {
-                sweep_idle(/*uring=*/true);
+                sweep_idle();
                 if (_accept_resume_ns && now_ns() >= _accept_resume_ns)
                 {
                     _accept_resume_ns = 0;

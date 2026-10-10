@@ -1210,7 +1210,7 @@ namespace llmbridge
                     if (readable && !c->doomed) ep_on_upstream_readable(c);
                 }
             }
-            sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
+            sweep_idle(); // heartbeat, pool reaping and every timeout
             if (_accept_resume_ns && now_ns() >= _accept_resume_ns) ep_resume_accept();
             _doomed->clear([this](Connection* d) {
                 retire_wbuf(d);
