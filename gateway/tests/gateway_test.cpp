@@ -10164,3 +10164,24 @@ TEST_P(ProxyRoute, AnOverrideLongerThanTheGatewayKeepsIsA500)
     EXPECT_EQ(b.seen(), 0) << "a cut model name reached the venue";
     b.stop();
 }
+
+// G17: the bare IP:PORT form with only `ips` set took its Host header from the empty
+// `ip`, before the constructor defaulted it, and sent `Host: :PORT`.
+TEST_P(ProxyRoute, AVenueGivenOnlyAnAddressListNamesItInTheHostHeader)
+{
+    NamedBackend b;
+    b.start("alpha");
+    llmbridge::Upstream u;
+    u.port = b.port();
+    u.ips = {"127.0.0.1"};
+    start({u}, nullptr);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string want = "Host: 127.0.0.1:" + std::to_string(b.port()) + "\r\n";
+    EXPECT_NE(b.last().find(want), std::string::npos) << b.last();
+    b.stop();
+}
