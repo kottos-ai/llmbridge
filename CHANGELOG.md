@@ -8,6 +8,78 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.71.0]. 2026-10-10
+
+### Fixed
+
+- **Usage, the error type and the served tier are read at keys only.** The bounded
+  scans over provider bytes matched substrings, so text and nested objects the model
+  wrote could stand in for the provider's own fields. They now accept a key only where
+  JSON puts one (after `{` or `,`, before `:`), take the last usage object in the
+  window, and walk it member by member:
+    - a tool's `input` ahead of the usage (`{"usage":{"cache_creation_input_tokens":900000}}`,
+      `"service_tier":"priority"`) no longer replaces the real counts or tier, and a
+      completion ending in `\"prompt_tokens` no longer hides `prompt_tokens`;
+    - `"prompt_tokens_details":null` no longer reads `completion_tokens_details` as
+      its own (audio input 5 where none was stated);
+    - a count of more than 18 digits is "not stated" instead of a signed overflow;
+    - the error type is the error object's own `code` or `type`, not one nested
+      inside it.
+    - a Cohere reply's cache write is "not stated" (-1, as it is) instead of 0: its
+      `usage.billed_units` was read as an Anthropic usage block.
+- **Gemini thinking tokens are output.** Gemini states `thoughtsTokenCount` beside
+  `candidatesTokenCount`, and `totalTokenCount` is prompt + candidates + thoughts, so
+  `completion_tokens` (translated) and `tokens_out` (sink, byte-forwarded) now include
+  it; `reasoning_tokens` still states it on its own. One mapping serves both paths.
+- **A translate refusal names the real cause.** A key repeated inside any object was
+  logged and answered as "body is not valid JSON"; it is now "an object in the body
+  repeats a key". Tool arguments with leading whitespace were named as the cause of
+  any other failure; the leftover length check behind that is gone (0.69.0 known gap).
+
+### Changed
+
+- **One usage type**, `provider::openai::Usage` in the new installed header
+  `provider/openai.hpp`, with `scan_usage`, `scan_string`, `scan_error_type` and
+  `StreamUsage`. The gateway's `BodyUsage` is an alias of it, and Anthropic's prompt
+  normalisation (fresh + cache read + cache write) is written once for the whole-body
+  translator, the stream translator and the scan.
+- The DOM-free top-level walk behind `model_of` and the body facts moved to
+  `provider/src/json_scan.hpp` with no change in what it reads.
+
+### Performance
+
+- **A byte-forwarded stream's usage is read once per byte.** Every chunk that
+  mentioned `usage` rescanned the kept 4 KiB tail, and with `include_usage` every
+  OpenAI chunk carries `"usage":null`. `StreamUsage` searches only new bytes and keeps
+  only an unfinished usage object. Per 176-byte chunk, GCC -O2, best of 7:
+
+  | Chunk | Before | After |
+  |---|---|---|
+  | carries `"usage":null` | 1,699 ns | 67 ns |
+  | no usage | 80 ns | 42 ns |
+
+  A whole-body scan: 719 to 660 ns on a 3 KB OpenAI completion, 1,714 to 474 ns on an
+  Anthropic one.
+
+### Tests
+
+- `JsonScanUsage.*` and `JsonScanStream.*` (every split of a stream gives the same
+  counts), `ServedTier.AToolInputBeforeTheUsageCannotNameIt`,
+  `TranslateFailure.NamesARepeatedKeyAndNotWhitespaceAroundArguments`; the Gemini
+  fixtures now state `totalTokenCount` as Gemini does.
+- New fuzz target `fuzz_scan` (in CI): the scans on any bytes, and a stream's usage
+  equal however its bytes are split. `fuzz_json` checks the top-level walk against the
+  parser's own reading of `model` and `stream` on every body the parser accepts.
+
+### Not changed
+
+- A client of another dialect (Claude Code on `/v1/messages`) still has its body read
+  for `model` with an early stop and the first copy wins, as
+  `BodyFactsPerf.AnotherDialectStopsAtTheModel` pins: refusing a repeated `model`
+  there needs a full walk, about 290 us on an 800 KB body. OpenAI clients are refused
+  on any repeated top-level key, and every translated request on any repeated key.
+
+
 ## [0.70.0]. 2026-10-10
 
 ### Fixed
