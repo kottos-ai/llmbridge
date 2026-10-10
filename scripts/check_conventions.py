@@ -40,15 +40,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Gateway is defined across three files: the shared methods, then one per backend.
-# They are read as one text, since a crossing is a call from a method in one file to
-# a method in another, and the reachability walk needs every method in view.
-GATEWAY_FILES = [ROOT / "gateway" / "src" / f
-                 for f in ("gateway.cpp", "gateway_epoll.cpp", "gateway_uring.cpp")]
+# Gateway is defined across every .cpp under gateway/src: the shared methods by
+# concern, then one file per backend. They are read as one text, since a crossing is
+# a call from a method in one file to a method in another, and the reachability walk
+# needs every method in view. A glob, so a new file cannot be left out of the check.
+GATEWAY_FILES = sorted((ROOT / "gateway" / "src").rglob("*.cpp"))
 
 
 def gateway_text():
-    """(text, locate): the three files' comment-stripped text joined, and a function
+    """(text, locate): the files' comment-stripped text joined, and a function
     mapping a line in it back to `file:line`."""
     parts, starts, at = [], [], 0
     for f in GATEWAY_FILES:
@@ -350,9 +350,9 @@ def main():
     hdr = strip_comments((ROOT / "gateway" / "include" / "gateway" / "gateway.hpp")
                          .read_text(encoding="utf-8"))
     consts = set(const_re.findall(hdr)) | set(const_re.findall(gtext))
-    # The helpers beside gateway.cpp hold constants too, and a kEp*/kUr* placed
+    # The helpers under gateway/src hold constants too, and a kEp*/kUr* placed
     # there is still read from a Gateway method, which is where the evidence is.
-    for helper in sorted((ROOT / "gateway" / "src").glob("*.hpp")):
+    for helper in sorted((ROOT / "gateway" / "src").rglob("*.hpp")):
         consts |= set(const_re.findall(strip_comments(helper.read_text(encoding="utf-8"))))
     consts = {c for c in consts if re.fullmatch(r"k[A-Z]\w*", c)}
     n_checked = 0
@@ -370,12 +370,12 @@ def main():
         want = "ep" if name.startswith("kEp") else "ur" if name.startswith("kUr") else None
         if want and used - {want}:
             failures.append(
-                f"gateway.cpp: BACKEND: constant `{name}` claims {want} but is used from "
+                f"gateway/src: BACKEND: constant `{name}` claims {want} but is used from "
                 f"{sorted(used - {want})}; rename it or stop crossing")
         elif not want and len(used) == 1:
             b = used.pop()
             failures.append(
-                f"gateway.cpp: BACKEND: constant `{name}` is used only from {b}_ methods; "
+                f"gateway/src: BACKEND: constant `{name}` is used only from {b}_ methods; "
                 f"name it k{b.capitalize()}{name[1:]} so the side is readable")
     if n_checked < 15:
         print(f"error: backend-prefix check inspected only {n_checked} constants; "
