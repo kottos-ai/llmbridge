@@ -8,6 +8,57 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.78.0]. 2026-10-10
+
+### Changed
+
+- **Behaviour change: Gemini and Cohere refuse tool calling instead of dropping it.** A
+  request carrying `tools`, an assistant `tool_calls` turn or a `tool` result is
+  answered 400. Before, the tools were dropped, the call became an empty turn, and the
+  result became an anonymous user turn (Gemini) or a `tool` message without the
+  `tool_call_id` Cohere requires. Every request translator now reads `messages` through
+  one walk, and a construct the dialect has no hook for is refused.
+- **Behaviour change: a missing or unknown message role is refused** by every request
+  translator. Anthropic forwarded it verbatim, Gemini made it a user turn, and Cohere
+  forwarded it.
+- **Behaviour change: there is no default model.** Anthropic and Bedrock refuse a request
+  whose `model` is absent, empty or not a string, where they sent the retired
+  `claude-3-5-sonnet-latest` (on Bedrock, as a path no model has). Cohere refuses it
+  too, where it sent `command-r-plus`.
+- **Behaviour change: an Anthropic `temperature` outside 0 to 1 is refused.** OpenAI
+  accepts up to 2; Anthropic answers 400.
+- **Behaviour change: `tool_choice: "none"` keeps the tools on Anthropic** and sends
+  `{"type":"none"}`. The tools used to be dropped, and Anthropic refuses a history
+  holding `tool_use` blocks when no tools are declared.
+- `developer` messages are system messages in every dialect (Anthropic forwarded the
+  role, Gemini made it a user turn, Cohere forwarded it).
+- `max_completion_tokens` wins over `max_tokens` (Anthropic, Gemini and Cohere); it was
+  ignored, and Anthropic fell back to 1024.
+- Anthropic: `stop` becomes `stop_sequences` (a string or an array of strings; anything
+  else is refused), and `parallel_tool_calls: false` becomes
+  `"disable_parallel_tool_use": true` inside `tool_choice` (`{"type":"auto"}` when the
+  request named no choice). Both were dropped.
+- Empty text is skipped where the provider refuses it: a Gemini message or system prompt
+  with no text is left out, and Anthropic's block form (content carrying a
+  `cache_control`) leaves out empty text blocks.
+
+### Added
+
+- `json::unescape_append` (installed header `provider/json.hpp`): `unescape_string`
+  onto the end of an existing string.
+- `fuzz_json` asserts every request translator writes one JSON object or refuses, with
+  an agent-turn seed. `bench/protocol_micro` gains a tool-carrying agent request.
+
+### Performance
+
+- The Anthropic request is written front to back into the kept buffer: no prefix string
+  inserted at the end, tool schemas appended in place (copied once instead of three
+  times), and each history tool call's arguments decoded straight into the output and
+  parsed there, with no temporary. Translated requests make 2 allocations, from 3
+  (`alloc_test` ceilings lowered); a 130 KB tool-carrying agent request translates about
+  30% faster. Gemini and Cohere bodies are built in one buffer.
+
+
 ## [0.77.0]. 2026-10-10
 
 ### Fixed
