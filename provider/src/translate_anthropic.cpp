@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include "content.hpp"
+#include "json_scan.hpp"
 #include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
 #include "provider/json.hpp"
 
@@ -431,17 +432,16 @@ namespace llmbridge::provider
         const std::string_view sr = v.str_or("stop_reason", "end_turn");
         const char* finish = detail::anthropic_finish_reason(sr);
 
-        long long in_tok = 0, out_tok = 0, cached_tok = 0;
-        if (const json::Value* u = v.find("usage"))
+        openai::Usage u;
+        if (const json::Value* m = v.find("usage"))
         {
-            // prompt_tokens is the whole prompt (OpenAI's convention): fresh input plus
-            // the cache read and write legs Anthropic reports separately. cached is the
-            // read subset. Matches scan_usage and the streaming translator.
-            out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
-            cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
-            in_tok = detail::to_ll(u->num_or("input_tokens", "0")) + cached_tok +
-                     detail::to_ll(u->num_or("cache_creation_input_tokens", "0"));
+            const auto n = [m](std::string_view k) { return json_scan::count(m->num_or(k)); };
+            u = detail::anthropic_usage(n("input_tokens"), n("output_tokens"),
+                                        n("cache_read_input_tokens"),
+                                        n("cache_creation_input_tokens"), -1, -1);
         }
+        const long long in_tok = u.in > 0 ? u.in : 0, out_tok = u.out > 0 ? u.out : 0;
+        const long long cached_tok = u.cached > 0 ? u.cached : 0;
 
         std::string out = "{\"id\":";
         json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));

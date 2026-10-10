@@ -1,0 +1,7 @@
+{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"usageMetadata":{"promptTokenCount":1}}}}]}}],
+  "usageMetadata": {
+    "promptTokenCount": 8,
+    "candidatesTokenCount": 3,
+    "thoughtsTokenCount": 2
+  }
+}

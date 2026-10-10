@@ -14,10 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstring>
 #include <string>
 #include <string_view>
 
+#include "json_scan.hpp"
 #include "openai_common.hpp" // detail::append_sanitized
 #include "provider/json.hpp"
 
@@ -25,119 +25,7 @@ namespace llmbridge::provider
 {
     namespace
     {
-        // The quote closing a string whose contents start at `i`, or npos. memchr
-        // finds each candidate quote; it is closing when the backslashes right
-        // before it are even in number, since each pair is one escaped backslash.
-        size_t string_close(std::string_view b, size_t i) noexcept
-        {
-            const char* const base = b.data();
-            for (size_t from = i; from < b.size();)
-            {
-                const void* q = std::memchr(base + from, '"', b.size() - from);
-                if (!q) break;
-                const auto at = static_cast<size_t>(static_cast<const char*>(q) - base);
-                size_t k = at;
-                while (k > i && base[k - 1] == '\\') --k;
-                if (((at - k) & 1) == 0) return at;
-                from = at + 1;
-            }
-            return std::string_view::npos;
-        }
-
-        // Past one JSON value, without building it. npos on malformed input, which
-        // the caller reads as "no model": a body we cannot walk is one whose
-        // top-level keys we do not know.
-        size_t skip_value(std::string_view b, size_t i) noexcept
-        {
-            constexpr size_t kBad = std::string_view::npos;
-            if (i >= b.size()) return kBad;
-            if (b[i] == '"')
-            {
-                const size_t close = string_close(b, i + 1);
-                return close == kBad ? kBad : close + 1;
-            }
-            if (b[i] == '{' || b[i] == '[')
-            {
-                // Byte by byte only between strings, which are short in a request
-                // body; string contents, nearly all of its bytes, go to memchr.
-                int depth = 0;
-                while (i < b.size())
-                {
-                    const char c = b[i];
-                    if (c == '"')
-                    {
-                        const size_t close = string_close(b, i + 1);
-                        if (close == kBad) return kBad;
-                        i = close + 1;
-                        continue;
-                    }
-                    if (c == '{' || c == '[') ++depth;
-                    else if ((c == '}' || c == ']') && --depth == 0) return i + 1;
-                    ++i;
-                }
-                return kBad;
-            }
-            while (i < b.size() && b[i] != ',' && b[i] != '}') ++i; // number, bool, null
-            return i;
-        }
-
-        size_t skip_ws(std::string_view b, size_t i) noexcept
-        {
-            while (i < b.size() && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r'))
-                ++i;
-            return i;
-        }
-    } // namespace
-
-    namespace
-    {
-        /// Calls `f(key, value)` for each member of the object `body`, key raw and
-        /// unquoted, value with trailing whitespace trimmed, until `f` returns false.
-        /// False when `body` is not an object or stops parsing before its end.
-        template <class F>
-        bool for_each_member(std::string_view body, F&& f) noexcept
-        {
-            size_t i = skip_ws(body, 0);
-            if (i >= body.size() || body[i] != '{') return false;
-            i = skip_ws(body, i + 1);
-            if (i < body.size() && body[i] == '}') return true;
-            while (true)
-            {
-                if (i >= body.size() || body[i] != '"') return false;
-                const size_t kb = ++i;
-                i = string_close(body, kb);
-                if (i == std::string_view::npos) return false;
-                const std::string_view k = body.substr(kb, i - kb);
-                i = skip_ws(body, i + 1);
-                if (i >= body.size() || body[i] != ':') return false;
-                i = skip_ws(body, i + 1);
-                const size_t vb = i;
-                i = skip_value(body, i);
-                if (i == std::string_view::npos) return false;
-                // A bare literal runs to the next ',' or '}', so the whitespace
-                // before it is not part of the value: `"stream": true\n}` is true.
-                size_t ve = i;
-                while (ve > vb && (body[ve - 1] == ' ' || body[ve - 1] == '\t' ||
-                                   body[ve - 1] == '\n' || body[ve - 1] == '\r'))
-                    --ve;
-                if (!f(k, body.substr(vb, ve - vb))) return true;
-                i = skip_ws(body, i);
-                if (i < body.size() && body[i] == '}') return true;
-                if (i >= body.size() || body[i] != ',') return false;
-                i = skip_ws(body, i + 1);
-            }
-        }
-
-        std::string_view top_level_value(std::string_view body, std::string_view key) noexcept
-        {
-            std::string_view out;
-            (void)for_each_member(body, [&](std::string_view k, std::string_view v) {
-                if (k != key) return true;
-                out = v;
-                return false;
-            });
-            return out;
-        }
+        using json_scan::for_each_member;
 
         // Keys of one object: none escaped, none repeated, at most kMaxKeys of them.
         // Fed one key at a time, so the single pass can tally while it reads values.
@@ -177,17 +65,6 @@ namespace llmbridge::provider
             });
             return t.result();
         }
-
-        // The model as model_of reports it, from the raw value of the `model` key.
-        std::string_view model_from(std::string_view v) noexcept
-        {
-            // A string, and one we can compare byte for byte against a configured
-            // name. An escape means it was never one of those, and unescaping here
-            // would need an allocation on a path that has none.
-            if (v.size() < 2 || v.front() != '"' || v.back() != '"') return {};
-            const std::string_view inner = v.substr(1, v.size() - 2);
-            return inner.find('\\') == std::string_view::npos ? inner : std::string_view{};
-        }
     } // namespace
 
     TopLevelFacts top_level_facts(std::string_view body) noexcept
@@ -204,9 +81,9 @@ namespace llmbridge::provider
             return true;
         });
         TopLevelFacts f;
-        f.model = model_from(model);
+        f.model = json_scan::plain_string(model);
         f.stream = stream == "true";
-        f.include_usage = top_level_value(options, "include_usage") == "true";
+        f.include_usage = json_scan::first_member(options, "include_usage") == "true";
         f.keys = t.result();
         // stream_options is read one level down, so its keys carry the same risk.
         if (f.keys == KeyCheck::Ok) f.keys = check_keys(options);
@@ -217,8 +94,9 @@ namespace llmbridge::provider
     {
         // Anthropic's first stream event names the model one level down, inside the
         // message it starts; every other reply names it at the top level.
-        if (top_level_value(json, "type") == "\"message_start\"")
-            return model_from(top_level_value(top_level_value(json, "message"), "model"));
+        if (json_scan::first_member(json, "type") == "\"message_start\"")
+            return json_scan::plain_string(
+                json_scan::first_member(json_scan::first_member(json, "message"), "model"));
         return model_of(json);
     }
 
@@ -243,7 +121,7 @@ namespace llmbridge::provider
     // bytes before it and nothing after.
     std::string_view model_of(std::string_view body) noexcept
     {
-        return model_from(top_level_value(body, "model"));
+        return json_scan::plain_string(json_scan::first_member(body, "model"));
     }
 
     bool wants_stream(std::string_view body) noexcept

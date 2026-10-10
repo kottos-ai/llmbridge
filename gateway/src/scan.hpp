@@ -7,58 +7,24 @@
 
 #pragma once
 
-// Bounded substring scans over provider bytes: usage counts, an error type, one JSON
-// string. Inline because they run per chunk on a stream and per request on the
-// tail of a body, and nothing in the build inlines across translation units.
+// Substring search over provider bytes, for the stream markers. The JSON-aware scans
+// (usage, error type, one string) are provider::openai's, key-anchored.
 
 #include <cstddef>
 #include <cstring>
 #include <string_view>
 
+#include "provider/openai.hpp"
+
 namespace llmbridge::detail
 {
-    // Pull `prompt_tokens` / `completion_tokens` out of a translated OpenAI body.
-    //
-    // Bounded on purpose: `usage` is the last object in the response we build, so
-    // this searches only the tail instead of scanning a body that may be many KB
-    // of completion text. On no match the headers are simply omitted. The
-    // existing rule everywhere in this file is to omit instead of report a
-    // number we did not measure.
-    struct BodyUsage
-    {
-        long long in = -1, out = -1, cached = -1, cache_write = -1;
-        // The write split by entry lifetime. Priced differently (1.25x the input
-        // rate at Anthropic's five minutes, 2x at one hour).
-        long long cache_write_5m = -1, cache_write_1h = -1;
-        /// The rest of what a venue says about its tokens, -1 when it says nothing.
-        /// OpenAI: completion_tokens_details.reasoning_tokens, inside `out`;
-        /// Gemini's thoughtsTokenCount is the same fact.
-        long long reasoning = -1;
-        /// OpenAI: prompt_tokens_details.audio_tokens and
-        /// completion_tokens_details.audio_tokens, priced at their own rates.
-        long long audio_in = -1, audio_out = -1;
-        /// OpenAI predicted outputs: completion_tokens_details.accepted_ and
-        /// rejected_prediction_tokens; the rejected ones are billed and not shown.
-        long long accepted_prediction = -1, rejected_prediction = -1;
-        /// Gemini's toolUsePromptTokenCount: prompt tokens a server tool added.
-        long long tool_prompt = -1;
-    };
+    using BodyUsage = provider::openai::Usage;
+    using provider::openai::scan_error_type;
+    using provider::openai::scan_string;
+    using provider::openai::scan_usage;
 
-    /// Bytes of a response worth searching for a usage block.
-    ///
-    /// Sized by what must fit, not by feel. A full OpenAI usage chunk carries
-    /// prompt/completion/total plus `prompt_tokens_details` and
-    /// `completion_tokens_details`, and on a stream it is followed by
-    /// `data: [DONE]`, so the block can sit ~600 bytes from the end. 2 KiB clears
-    /// that with room for fields providers keep adding, and is still a bounded
-    /// tail, never a full-body scan.
-    constexpr size_t kUsageWindow = 2048;
-
-    /// The string value of `key` at or after `from`, empty when the key is absent,
-    /// its value is null or a number, or the string runs past the end of `head`.
-    /// Substring search for the JSON scanners below, backed by memmem.
     [[nodiscard]] inline size_t find_fast(std::string_view hay, std::string_view needle,
-                                   size_t from = 0) noexcept
+                                          size_t from = 0) noexcept
     {
         if (from > hay.size()) return std::string_view::npos;
         if (needle.empty()) return from;
@@ -67,172 +33,4 @@ namespace llmbridge::detail
         return p ? static_cast<size_t>(static_cast<const char*>(p) - hay.data())
                  : std::string_view::npos;
     }
-
-    /// Last occurrence, as repeated forward finds. Hits are rare in this use (a
-    /// usage key appears once or twice), so the loop runs once or twice.
-    [[nodiscard]] inline size_t rfind_fast(std::string_view hay, std::string_view needle) noexcept
-    {
-        size_t last = std::string_view::npos;
-        for (size_t at = find_fast(hay, needle); at != std::string_view::npos;
-             at = find_fast(hay, needle, at + 1))
-            last = at;
-        return last;
-    }
-
-    inline std::string_view json_string_at(std::string_view head, std::string_view key,
-                                    size_t from = 0) noexcept
-    {
-        const size_t k = find_fast(head, key, from);
-        if (k == std::string_view::npos) return {};
-        size_t i = k + key.size();
-        while (i < head.size() && (head[i] == ':' || head[i] == ' ')) ++i;
-        if (i >= head.size() || head[i] != '"') return {};
-        const size_t b = ++i;
-        while (i < head.size() && head[i] != '"' && head[i] != '\\') ++i;
-        return i < head.size() && head[i] == '"' ? head.substr(b, i - b)
-                                                 : std::string_view{};
-    }
-
-    /// Bytes of an error body worth searching. A provider states the type near
-    /// the front, and the field that can be long is `message`.
-    constexpr size_t kErrorWindow = 512;
-
-    /// What the venue called this failure, taken from its own error body.
-    inline std::string_view scan_error_type(std::string_view body) noexcept
-    {
-        const std::string_view head =
-            body.size() > kErrorWindow ? body.substr(0, kErrorWindow) : body;
-        const size_t e = find_fast(head, "\"error\"");
-        if (e == std::string_view::npos) return {};
-        const std::string_view code = json_string_at(head, "\"code\"", e);
-        return code.empty() ? json_string_at(head, "\"type\"", e) : code;
-    }
-
-    /// `window` 0 = search all of `body`, for a caller that already bounded it.
-    /// Passing a second, smaller window there is how the retained bytes and the
-    /// searched bytes drift apart and the counts come back -1.
-    inline BodyUsage scan_usage(std::string_view body, size_t window = kUsageWindow) noexcept
-    {
-        BodyUsage u;
-        const std::string_view tail =
-            (window && body.size() > window) ? body.substr(body.size() - window) : body;
-        // `last` matters for one field only, and it is not a preference: an
-        // Anthropic stream states `output_tokens` twice, a placeholder 1 in
-        // message_start and the real total in message_delta. Taking the first
-        // match reports every answer as one token long.
-        const auto num_at = [&tail](std::string_view key, bool last) -> long long {
-            const size_t k = last ? rfind_fast(tail, key) : find_fast(tail, key);
-            if (k == std::string_view::npos) return -1;
-            size_t i = k + key.size();
-            while (i < tail.size() && (tail[i] == ':' || tail[i] == ' ')) ++i;
-            long long v = 0;
-            bool any = false;
-            for (; i < tail.size() && tail[i] >= '0' && tail[i] <= '9'; ++i)
-            {
-                v = v * 10 + (tail[i] - '0');
-                any = true;
-            }
-            return any ? v : -1;
-        };
-        const auto num_after = [&num_at](std::string_view key) { return num_at(key, false); };
-        u.in = num_after("\"prompt_tokens\"");
-        u.out = num_after("\"completion_tokens\"");
-        u.cached = num_after("\"cached_tokens\"");
-        // Verified against a live gpt-5.6-luna response: the write is
-        // reported at usage.prompt_tokens_details.cache_write_tokens and is a subset of
-        // prompt_tokens, as cached_tokens already is.
-        const long long oai_write = num_after("\"cache_write_tokens\"");
-        if (oai_write > 0) u.cache_write = oai_write;
-        if (u.in >= 0 || u.out >= 0) // OpenAI shape
-        {
-            constexpr size_t kDetailsWindow = 700;
-            const std::string_view end =
-                tail.size() > kDetailsWindow ? tail.substr(tail.size() - kDetailsWindow) : tail;
-            if (find_fast(end, "_details\"") == std::string_view::npos) return u;
-            const auto block_at = [&end](std::string_view block_key) -> std::string_view {
-                const size_t at = find_fast(end, block_key);
-                if (at == std::string_view::npos) return {};
-                const size_t close = end.find('}', at);
-                return end.substr(at, close == std::string_view::npos ? std::string_view::npos
-                                                                      : close - at);
-            };
-            const auto num_in = [](std::string_view block, std::string_view key) -> long long {
-                const size_t k = find_fast(block, key);
-                if (k == std::string_view::npos) return -1;
-                size_t i = k + key.size();
-                while (i < block.size() && (block[i] == ':' || block[i] == ' ')) ++i;
-                long long v = 0;
-                bool any = false;
-                for (; i < block.size() && block[i] >= '0' && block[i] <= '9'; ++i)
-                {
-                    v = v * 10 + (block[i] - '0');
-                    any = true;
-                }
-                return any ? v : -1;
-            };
-            const std::string_view pd = block_at("\"prompt_tokens_details\"");
-            const std::string_view cd = block_at("\"completion_tokens_details\"");
-            u.audio_in = num_in(pd, "\"audio_tokens\"");
-            u.audio_out = num_in(cd, "\"audio_tokens\"");
-            u.reasoning = num_in(cd, "\"reasoning_tokens\"");
-            u.accepted_prediction = num_in(cd, "\"accepted_prediction_tokens\"");
-            u.rejected_prediction = num_in(cd, "\"rejected_prediction_tokens\"");
-            return u;
-        }
-
-        // Anthropic names the same three things differently, and a byte-forwarded
-        // stream is exactly where nothing translates them for us. Claude Code
-        // speaks this dialect, so without these its every request records zero
-        // tokens and therefore zero cost.
-        const long long fresh = num_after("\"input_tokens\"");
-        u.out = num_at("\"output_tokens\"", /*last=*/true);
-        if (fresh < 0)
-        {
-            // Neither shape. Gemini's own body names its counts differently, and only
-            // reaches here untranslated, so this is the one place to read them.
-            if (find_fast(tail, "\"candidatesTokenCount\"") != std::string_view::npos)
-            {
-                u.in = num_after("\"promptTokenCount\"");
-                u.out = num_after("\"candidatesTokenCount\"");
-                const long long gc = num_after("\"cachedContentTokenCount\"");
-                if (gc >= 0) u.cached = gc;
-                u.reasoning = num_after("\"thoughtsTokenCount\"");
-                u.tool_prompt = num_after("\"toolUsePromptTokenCount\"");
-            }
-            return u;
-        }
-        // Normalize to the OpenAI convention so `in` and `cached` mean the same thing
-        // whatever the venue. OpenAI's `prompt_tokens` is the entire prompt with
-        // `cached_tokens` a subset of it; Anthropic's `input_tokens` is the fresh
-        // part only, with cache reads and the cache-creation write reported
-        // separately. Add them back: `in` is the whole prompt, `cached` is the
-        // discounted read subset of it, so `in - cached` is the full-rate part on
-        // both. The creation write is part of `in` too and is reported separately in
-        // `cache_write`, because it is billed above the input rate and a caller that
-        // cannot see it prices a first turn low.
-        const long long read = num_after("\"cache_read_input_tokens\"");
-        const long long write = num_after("\"cache_creation_input_tokens\"");
-        // An OpenAI Responses-API body reaches here too: it names its totals
-        // `input_tokens`/`output_tokens`, so the branch above does not claim it, but it
-        // carries neither Anthropic cache field and puts `cached_tokens` under
-        // `input_tokens_details`.
-        if (read < 0 && write < 0 && (u.cached >= 0 || u.cache_write > 0))
-        {
-            if (u.cached < 0) u.cached = 0;
-            u.in = fresh;
-            return u;
-        }
-        u.cached = read > 0 ? read : 0;
-        u.cache_write = write > 0 ? write : 0;
-        const long long w5 = num_after("\"ephemeral_5m_input_tokens\"");
-        const long long w1 = num_after("\"ephemeral_1h_input_tokens\"");
-        if (w5 >= 0 || w1 >= 0)
-        {
-            u.cache_write_5m = w5 > 0 ? w5 : 0;
-            u.cache_write_1h = w1 > 0 ? w1 : 0;
-        }
-        u.in = fresh + u.cached + u.cache_write;
-        return u;
-    }
-
 } // namespace llmbridge::detail

@@ -66,6 +66,22 @@ TEST(ServedTier, FindsItInTheTailOfANonStreamedBody)
     EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "priority");
 }
 
+TEST(ServedTier, AToolInputBeforeTheUsageCannotNameIt)
+{
+    // Raw JSON the model wrote, ahead of the reply's own usage block.
+    Connection c;
+    note_served_tier(&c,
+                     R"({"content":[{"type":"tool_use","input":{"service_tier":"priority"}}],)"
+                     R"("usage":{"input_tokens":5,"service_tier":"standard"}})",
+                     /*tail=*/true);
+    EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "standard");
+    Connection q;
+    note_served_tier(&q, R"({"choices":[{"delta":{"content":"\"service_tier\":\"x\""}}],)"
+                         R"("service_tier":"flex"})",
+                     /*tail=*/false);
+    EXPECT_EQ(std::string(q.served_tier, q.served_tier_len), "flex");
+}
+
 TEST(ServedTier, OnceFoundIsNeverOverwritten)
 {
     Connection c;

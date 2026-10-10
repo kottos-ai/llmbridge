@@ -25,6 +25,7 @@
 #include "net/http.hpp"
 #include "net/log.hpp"
 #include "net/tls.hpp" // self-guarded by LLMBRIDGE_HAVE_TLS
+#include "provider/openai.hpp"
 #include "provider/sse.hpp"
 
 namespace llmbridge
@@ -320,23 +321,14 @@ namespace llmbridge
 
         /// The Anthropic-to-OpenAI SSE translator, null when the stream needs none.
         std::unique_ptr<provider::AnthropicToOpenAiSse> sse_xlate;
-        /// Tail of a byte-forwarded stream, for the final usage chunk. Bounded; see
-        /// stream_note_usage.
-        std::string stream_tail{};
+        /// Usage a byte-forwarded stream states, read as it arrives.
+        provider::openai::StreamUsage stream_usage;
         /// Scratch for one streaming step's decoded bytes, reused across chunks.
         std::string sse_scratch{};
         /// The stream is framed to the client with chunked transfer-encoding instead
         /// of being close-delimited. False for an HTTP/1.0 caller and for one that
         /// asked to close.
         bool stream_chunked_out = false;
-        /// Usage accumulated as a byte-forwarded stream runs. -1 = not reported, which
-        /// must never be rendered as a number. Fields and not a tail scan, because
-        /// Anthropic states input and cache tokens in its first event.
-        long long usage_in = -1, usage_out = -1, usage_cached = -1;
-        long long usage_cache_write = -1; // cache_creation_input_tokens, first-wins
-        long long usage_cw_5m = -1, usage_cw_1h = -1; // usage.cache_creation, first-wins
-        long long usage_reasoning = -1, usage_audio_in = -1, usage_audio_out = -1;
-        long long usage_accepted_pred = -1, usage_rejected_pred = -1, usage_tool_prompt = -1;
         net::http::ChunkDecoder chunkdec;                          // decodes the upstream chunked body
         /// io_uring streaming only: translated output accumulates here while a client
         /// send SQE is in flight, so `wbuf` is never reallocated under the kernel.

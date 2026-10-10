@@ -13,7 +13,8 @@
 #include <string_view>
 
 #include "content.hpp"
-#include "openai_common.hpp" // detail::created_now / to_ll
+#include "json_scan.hpp"
+#include "openai_common.hpp" // detail::created_now / gemini_usage
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -108,17 +109,17 @@ namespace llmbridge::provider
                    : "stop";
         }
 
-        long long in_tok = 0, out_tok = 0, total = 0, cached = 0, thoughts = -1;
-        if (const json::Value* u = v.find("usageMetadata"))
+        openai::Usage u;
+        long long total = -1;
+        if (const json::Value* m = v.find("usageMetadata"))
         {
-            in_tok = detail::to_ll(u->num_or("promptTokenCount", "0"));
-            out_tok = detail::to_ll(u->num_or("candidatesTokenCount", "0"));
-            total = detail::to_ll(u->num_or("totalTokenCount", "0"));
-            cached = detail::to_ll(u->num_or("cachedContentTokenCount", "0"));
-            if (u->find("thoughtsTokenCount"))
-                thoughts = detail::to_ll(u->num_or("thoughtsTokenCount", "0"));
+            const auto n = [m](std::string_view k) { return json_scan::count(m->num_or(k)); };
+            u = detail::gemini_usage(n("promptTokenCount"), n("candidatesTokenCount"),
+                                     n("thoughtsTokenCount"), n("cachedContentTokenCount"), -1);
+            total = n("totalTokenCount");
         }
-        if (total == 0) total = in_tok + out_tok;
+        const long long in_tok = u.in > 0 ? u.in : 0, out_tok = u.out > 0 ? u.out : 0;
+        if (total <= 0) total = in_tok + out_tok;
 
         std::string out = "{\"id\":\"chatcmpl-llmbridge\",\"object\":\"chat.completion\",\"created\":"
                           + detail::created_now() + ",\"model\":";
@@ -131,14 +132,11 @@ namespace llmbridge::provider
         out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
                ",\"completion_tokens\":" + std::to_string(out_tok) +
                ",\"total_tokens\":" + std::to_string(total);
-        // Gemini's cache read and thinking count, in the shape an OpenAI client reads
-        // and the gateway's scanner records. Thinking is inside candidatesTokenCount
-        // the way reasoning is inside completion_tokens.
-        if (cached > 0)
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(cached) + "}";
-        if (thoughts >= 0)
+        if (u.cached > 0)
+            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(u.cached) + "}";
+        if (u.reasoning >= 0)
             out += ",\"completion_tokens_details\":{\"reasoning_tokens\":" +
-                   std::to_string(thoughts) + "}";
+                   std::to_string(u.reasoning) + "}";
         out += "}}";
         return out;
     }

@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}
+
+data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":null,"completion_tokens_details":{"reasoning_tokens":1}},"service_tier":"default"}
+
+data: [DONE]
+

@@ -114,7 +114,7 @@ namespace llmbridge::detail
         const std::string_view head =
             bytes.size() <= w ? bytes
                               : (tail ? bytes.substr(bytes.size() - w) : bytes.substr(0, w));
-        const std::string_view t = json_string_at(head, "\"service_tier\"");
+        const std::string_view t = scan_string(head, "\"service_tier\"", tail);
         const size_t n = t.size() < sizeof c->served_tier ? t.size()
                                                           : sizeof c->served_tier;
         c->served_tier_len = static_cast<uint8_t>(n);
@@ -150,90 +150,16 @@ namespace llmbridge::detail
         }
     }
 
-    /// Keep the tail of a byte-forwarded stream, so the final usage chunk can be
-    /// read at the end.
-    ///
-    /// The anthropic stream translator counts tokens as it parses, so that path
-    /// needs none of this. A byte-forwarded stream is never parsed, so without the
-    /// tail a streamed passthrough request records no tokens at all, which is the
-    /// shape most of a voice workload takes.
-    ///
-    /// Not "translated streams" as a category: `Connection::sse_xlate` is typed
-    /// `AnthropicToOpenAiSse` and is the only SSE translator that exists. Gemini
-    /// and Cohere have none and do not stream here at all. Whoever adds one owns
-    /// its token accounting; stream_tokens() below is where that decision lands.
-    ///
-    /// Bounded and only kept when the client asked for usage: with no
-    /// `stream_options.include_usage` the provider sends no usage chunk, so the
-    /// copy would buy nothing.
-    inline void stream_note_usage(Connection* client, std::string_view bytes) noexcept
+    /// Usage a byte-forwarded stream states, read as it arrives: Anthropic states its
+    /// input and cache counts in the first event and OpenAI its totals in the last.
+    inline void stream_note_usage(Connection* client, std::string_view bytes)
     {
-        client->stream_tail.append(bytes);
-
-        // Scanned as it arrives, not once at the end, because Anthropic reports
-        // input and cache tokens in `message_start`, at the very beginning of the
-        // stream. A tail window holds the last 2 KiB, so on any stream longer
-        // than that the input count had already scrolled out by the time anyone
-        // looked. OpenAI puts everything in one chunk before [DONE], which is why
-        // the tail was enough until this dialect arrived.
-        //
-        // The `wants_usage` gate went with it: that flag reads
-        // `stream_options.include_usage`, an OpenAI option Anthropic does not
-        // have and Claude Code never sends, so gating on it meant no counts at
-        // all for the dialect this exists to measure.
-        //
-        // Gated instead on a cheap search of the arriving bytes, so the hot path
-        // pays one substring scan per chunk. `_tokens` catches a usage block
-        // split across two reads: the half carrying the numbers triggers a
-        // rescan of the tail, which by then holds both halves.
-        //
-        // The scan runs before the window is trimmed, and that ordering is the
-        // whole fix. Trimming first discards whatever arrived earlier in the same
-        // read, and a mock or a fast provider delivers an entire stream in one
-        // read: message_start had already been cut away when the scan ran, so
-        // input and cache came back as "not reported" while output was found.
-        if (find_fast(bytes, "usage") != std::string_view::npos ||
-            find_fast(bytes, "_tokens") != std::string_view::npos)
-        {
-            const BodyUsage u = scan_usage(client->stream_tail, 0);
-        // Input and cache are first-wins: stated once, in message_start, and a
-        // later chunk mentioning them again is not a new fact. Output is
-        // last-wins: message_start carries a placeholder 1 and message_delta
-        // carries the real total.
-            if (client->usage_in < 0 && u.in >= 0) client->usage_in = u.in;
-            if (client->usage_cached < 0 && u.cached >= 0) client->usage_cached = u.cached;
-            if (client->usage_cache_write < 0 && u.cache_write >= 0)
-                client->usage_cache_write = u.cache_write;
-            if (client->usage_cw_5m < 0 && u.cache_write_5m >= 0)
-                client->usage_cw_5m = u.cache_write_5m;
-            if (client->usage_cw_1h < 0 && u.cache_write_1h >= 0)
-                client->usage_cw_1h = u.cache_write_1h;
-            if (u.out >= 0) client->usage_out = u.out;
-            // The details ride the final usage chunk, so last-wins like output.
-            if (u.reasoning >= 0) client->usage_reasoning = u.reasoning;
-            if (u.audio_in >= 0) client->usage_audio_in = u.audio_in;
-            if (u.audio_out >= 0) client->usage_audio_out = u.audio_out;
-            if (u.accepted_prediction >= 0) client->usage_accepted_pred = u.accepted_prediction;
-            if (u.rejected_prediction >= 0) client->usage_rejected_pred = u.rejected_prediction;
-            if (u.tool_prompt >= 0) client->usage_tool_prompt = u.tool_prompt;
-        }
-        // Trimmed last, so the buffer stays bounded across reads while every read
-        // is searched whole.
-        if (client->stream_tail.size() > 2 * kUsageWindow)
-            client->stream_tail.erase(0, client->stream_tail.size() - kUsageWindow);
+        client->stream_usage.feed(bytes);
     }
 
-    /// A finished stream's token counts, from whichever of the two paths carried
-    /// it: the Anthropic translator, or the tail of a byte-forwarded stream.
-    ///
-    /// One function because the sink and the debug log both want them, and a
-    /// number that appears in one but not the other is a bug this file has been
-    /// bitten by before. -1 means not reported, never zero.
-    ///
-    /// Two paths because there are two, not because "translated" is a category. A
-    /// third dialect that learns to stream must add its own branch here; falling
-    /// through to the tail scan would search a non-OpenAI stream for an OpenAI
-    /// usage block and quietly report nothing.
+    /// A finished stream's token counts, from the Anthropic translator or from what a
+    /// byte-forwarded stream stated; one function so the sink and the log agree. A
+    /// dialect that learns to stream adds its own branch here.
     inline BodyUsage stream_tokens(const Connection* c) noexcept
     {
         if (c->sse_xlate)
@@ -242,12 +168,7 @@ namespace llmbridge::detail
                     static_cast<long long>(c->sse_xlate->cache_write_tokens()),
                     static_cast<long long>(c->sse_xlate->cache_write_5m_tokens()),
                     static_cast<long long>(c->sse_xlate->cache_write_1h_tokens())};
-        // Accumulated by stream_note_usage as the stream ran. Reading the tail
-        // here instead would miss anything stated before the last 2 KiB.
-        return {c->usage_in, c->usage_out, c->usage_cached, c->usage_cache_write,
-                c->usage_cw_5m, c->usage_cw_1h, c->usage_reasoning, c->usage_audio_in,
-                c->usage_audio_out, c->usage_accepted_pred, c->usage_rejected_pred,
-                c->usage_tool_prompt};
+        return c->stream_usage.usage();
     }
 
     // Did this stream end, or did it just stop? The two are not the same, and one

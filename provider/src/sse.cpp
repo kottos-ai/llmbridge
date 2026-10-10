@@ -8,6 +8,7 @@
 #include <charconv>
 #include "provider/sse.hpp"
 
+#include "json_scan.hpp"
 #include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
 #include "provider/json.hpp"
 
@@ -179,24 +180,24 @@ namespace llmbridge::provider
                 _model = sanitized(m->str_or("model"));
                 if (const json::Value* u = m->find("usage"))
                 {
-                    // prompt_tokens is OpenAI's whole-prompt count, so add back the cache
-                    // read and write legs Anthropic reports separately from input_tokens;
-                    // cached_tokens stays the read subset. Matches scan_usage so a
-                    // translated stream and a byte-forwarded one agree.
-                    const long long fresh = detail::to_ll(u->num_or("input_tokens", "0"));
-                    _out_tok = detail::to_ll(u->num_or("output_tokens", "0"));
-                    _cached_tok = detail::to_ll(u->num_or("cache_read_input_tokens", "0"));
-                    _cache_write_tok =
-                        detail::to_ll(u->num_or("cache_creation_input_tokens", "0"));
-                    // The write is priced by the entry's lifetime, so the total cannot
-                    // be costed on its own. Absent breakdown stays -1, which is not the
-                    // same fact as a breakdown of zero.
-                    if (const json::Value* cc = u->find("cache_creation"))
+                    const auto n = [](const json::Value* o, std::string_view k) {
+                        return o ? json_scan::count(o->num_or(k)) : -1;
+                    };
+                    const json::Value* cc = u->find("cache_creation");
+                    const openai::Usage t = detail::anthropic_usage(
+                        n(u, "input_tokens"), n(u, "output_tokens"),
+                        n(u, "cache_read_input_tokens"), n(u, "cache_creation_input_tokens"), n(cc, "ephemeral_5m_input_tokens"),
+                        n(cc, "ephemeral_1h_input_tokens"));
+                    _in_tok = t.in;
+                    _out_tok = t.out > 0 ? t.out : 0;
+                    _cached_tok = t.cached;
+                    _cache_write_tok = t.cache_write;
+                    // An absent breakdown stays -1: not the same fact as one of zero.
+                    if (cc)
                     {
-                        _cw_5m = detail::to_ll(cc->num_or("ephemeral_5m_input_tokens", "0"));
-                        _cw_1h = detail::to_ll(cc->num_or("ephemeral_1h_input_tokens", "0"));
+                        _cw_5m = t.cache_write_5m > 0 ? t.cache_write_5m : 0;
+                        _cw_1h = t.cache_write_1h > 0 ? t.cache_write_1h : 0;
                     }
-                    _in_tok = fresh + _cached_tok + _cache_write_tok;
                 }
             }
             ensure_created();
