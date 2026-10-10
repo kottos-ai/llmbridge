@@ -17,6 +17,7 @@
 // arrays, strings, numbers, bools, null, and the common escape sequences. Not a
 // general-purpose JSON library; it is fast and correct for the shapes we move.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,6 +31,17 @@ namespace llmbridge::provider::json
 {
     class Value;
     struct Member;
+
+    /// Object keys parse() accepts. Unique, the default, refuses an object that
+    /// names a key twice, compared after unescaping, since readers disagree on
+    /// which copy wins (find() takes the first, most upstream parsers the last).
+    enum class Keys : uint8_t { Unique, Any };
+
+    /// Values in one document past which parse() refuses it. See DESIGN.md.
+    inline constexpr size_t kMaxNodes = size_t{1} << 20;
+
+    inline Value parse(std::string_view text, bool& ok, Keys keys = Keys::Unique);
+    inline std::string unescape_string(std::string_view raw);
 
     namespace detail
     {
@@ -83,16 +95,24 @@ namespace llmbridge::provider::json
         {
         public:
             // `hint` is the document's byte count.
-            explicit Arena(size_t hint = 0) noexcept
-            {
-                if (hint) _next = hint < 4096 ? 4096 : (hint > (size_t{1} << 20) ? (size_t{1} << 20) : hint);
-            }
+            explicit Arena(size_t hint = 0) noexcept { start(hint); }
             Arena(const Arena&) = delete;
             Arena& operator=(const Arena&) = delete;
 
-            ~Arena()
+            ~Arena() { clear(); }
+
+            void start(size_t hint) noexcept
+            {
+                _next = hint < 4096 ? 4096 : (hint > (size_t{1} << 20) ? (size_t{1} << 20) : hint);
+            }
+
+            // Every block back to the pool; the block list keeps its capacity.
+            void clear()
             {
                 for (auto& [block, size] : _blocks) block_pool().give(std::move(block), size);
+                _blocks.clear();
+                _cur = nullptr;
+                _left = 0;
             }
 
             // Raw space for `n` T, uninitialized: the caller constructs into it. Sizes
@@ -129,6 +149,15 @@ namespace llmbridge::provider::json
             size_t _left = 0;
             size_t _next = 4096;
         };
+
+        // One emptied arena kept per thread, so a parse costs no allocation for the
+        // arena or its block list. Parked with no blocks, so its destruction at
+        // thread exit never reaches a block_pool() that may already be gone.
+        inline std::unique_ptr<Arena>& spare_arena() noexcept
+        {
+            thread_local std::unique_ptr<Arena> a;
+            return a;
+        }
     } // namespace detail
 
     // A run of nodes owned by the document's arena. Read-only by construction: the
@@ -198,7 +227,7 @@ namespace llmbridge::provider::json
         [[nodiscard]] std::string_view num_or(std::string_view key, std::string_view def = "") const;
 
     private:
-        friend Value parse(std::string_view, bool&);
+        friend Value parse(std::string_view, bool&, Keys);
         // Set on the root only, and only by parse(). Every node below it points into
         // this arena, so the root outliving them is the whole contract of the DOM.
         detail::Arena* _arena = nullptr;
@@ -213,7 +242,27 @@ namespace llmbridge::provider::json
         Value value;
     };
 
-    inline Value::~Value() { delete _arena; }
+    namespace detail
+    {
+        inline Arena* take_arena(size_t hint)
+        {
+            if (Arena* a = spare_arena().release()) { a->start(hint); return a; }
+            return new Arena(hint);
+        }
+
+        inline void drop_arena(Arena* a)
+        {
+            a->clear();
+            std::unique_ptr<Arena>& spare = spare_arena();
+            if (spare) delete a;
+            else spare.reset(a);
+        }
+    } // namespace detail
+
+    inline Value::~Value()
+    {
+        if (_arena) detail::drop_arena(_arena); // only a root owns one
+    }
 
     inline Value::Value(Value&& o) noexcept
         : type(o.type), boolean(o.boolean), sv(o.sv), arr(o.arr), obj(o.obj), _arena(o._arena)
@@ -225,7 +274,7 @@ namespace llmbridge::provider::json
     {
         if (this != &o)
         {
-            delete _arena;
+            if (_arena) detail::drop_arena(_arena);
             type = o.type; boolean = o.boolean; sv = o.sv; arr = o.arr; obj = o.obj;
             _arena = o._arena;
             o._arena = nullptr;
@@ -270,8 +319,12 @@ namespace llmbridge::provider::json
         {
             std::vector<Value> values;
             std::vector<Member> members;
+            std::vector<std::string_view> keys;
             bool busy = false;
         };
+
+        // Scratch capacity kept past a parse, BlockPool's kMaxHeld for the same reason.
+        inline constexpr size_t kScratchKeep = size_t{4} << 20;
 
         inline Scratch& scratch() noexcept
         {
@@ -285,8 +338,12 @@ namespace llmbridge::provider::json
             Arena& a;
             std::vector<Value>& vstack;
             std::vector<Member>& mstack;
+            std::vector<std::string_view>& kbuf;
+            Keys keys = Keys::Unique;
             size_t i = 0;
+            size_t nodes = 0; // bounded by kMaxNodes
             bool ok = true;
+            size_t escapes = 0; // strings so far that held a backslash, keys or values
             int depth = 0; // current object/array nesting; bounded by kMaxDepth
 
             // Children are parsed onto these stacks and copied into the arena in one
@@ -300,6 +357,61 @@ namespace llmbridge::provider::json
                 for (size_t k = 0; k < n; ++k) new (p + k) Value(std::move(vstack[mark + k]));
                 vstack.resize(mark);
                 return Span<Value>(p, static_cast<uint32_t>(n));
+            }
+
+            // One of 64 bits per key, from its length and end bytes. A repeat always
+            // lands on a bit already set and a fresh key rarely does, so the exact
+            // check runs on few objects. Done at the close, over keys already in
+            // cache, because state kept live across the recursion cost more.
+            [[nodiscard]] bool keys_fresh(size_t mark, bool escaped)
+            {
+                const Member* m = mstack.data() + mark;
+                const size_t n = mstack.size() - mark;
+                if (n < 2) return true;
+                if (escaped) return keys_unique(mark);
+                uint64_t seen = 0;
+                for (size_t k = 0; k < n; ++k)
+                {
+                    const std::string_view key = m[k].key;
+                    size_t h = key.size() * 7;
+                    if (!key.empty())
+                        h += static_cast<unsigned char>(key.front()) * 3u +
+                             static_cast<unsigned char>(key.back());
+                    const uint64_t bit = uint64_t{1} << (h & 63);
+                    if (seen & bit) return keys_unique(mark);
+                    seen |= bit;
+                }
+                return true;
+            }
+
+            // Exact: unescaped only when a key carries a backslash, which a real
+            // client almost never sends; pairwise while small, sorted past that.
+            [[gnu::noinline]] bool keys_unique(size_t mark)
+            {
+                const Member* m = mstack.data() + mark;
+                const size_t n = mstack.size() - mark;
+                bool escaped = false;
+                for (size_t k = 0; k < n; ++k)
+                    escaped = escaped || m[k].key.find('\\') != std::string_view::npos;
+                if (escaped)
+                {
+                    std::vector<std::string> u;
+                    u.reserve(n);
+                    for (size_t k = 0; k < n; ++k) u.push_back(unescape_string(m[k].key));
+                    std::sort(u.begin(), u.end());
+                    return std::adjacent_find(u.begin(), u.end()) == u.end();
+                }
+                if (n <= 16)
+                {
+                    for (size_t a = 1; a < n; ++a)
+                        for (size_t b = 0; b < a; ++b)
+                            if (m[a].key == m[b].key) return false;
+                    return true;
+                }
+                kbuf.clear();
+                for (size_t k = 0; k < n; ++k) kbuf.push_back(m[k].key);
+                std::sort(kbuf.begin(), kbuf.end());
+                return std::adjacent_find(kbuf.begin(), kbuf.end()) == kbuf.end();
             }
 
             Span<Member> commit_members(size_t mark)
@@ -356,6 +468,7 @@ namespace llmbridge::provider::json
                     if (c < 0x20) break; // raw control character. RFC 8259 §7 forbids it
                     if (c == '\\')
                     {
+                        ++escapes;
                         if (i + 1 >= s.size()) break;
                         const char e = s[i + 1];
                         if (!is_escape_char(e)) break; // e.g. "\q", which would re-emit invalid
@@ -379,6 +492,7 @@ namespace llmbridge::provider::json
 
             Value parse_value()
             {
+                if (++nodes > kMaxNodes) { ok = false; return {}; }
                 ws();
                 if (i >= s.size()) { ok = false; return {}; }
                 char c = s[i];
@@ -484,6 +598,7 @@ namespace llmbridge::provider::json
                 ws();
                 if (i < s.size() && s[i] == '}') { ++i; return v; }
                 const size_t mark = mstack.size();
+                const size_t escapes_before = escapes;
                 while (i < s.size())
                 {
                     ws();
@@ -495,7 +610,14 @@ namespace llmbridge::provider::json
                     mstack.push_back(Member{key, parse_value()});
                     ws();
                     if (i < s.size() && s[i] == ',') { ++i; continue; }
-                    if (i < s.size() && s[i] == '}') { ++i; v.obj = commit_members(mark); return v; }
+                    if (i < s.size() && s[i] == '}')
+                    {
+                        ++i;
+                        if (keys == Keys::Unique && !keys_fresh(mark, escapes != escapes_before))
+                            ok = false;
+                        v.obj = commit_members(mark);
+                        return v;
+                    }
                     ok = false; v.obj = commit_members(mark); return v;
                 }
                 ok = false; v.obj = commit_members(mark); return v;
@@ -503,28 +625,41 @@ namespace llmbridge::provider::json
         };
     } // namespace detail
 
-    // Parse a JSON document. On failure, sets ok=false and returns whatever was
-    // parsed so far (callers should check ok).
-    inline Value parse(std::string_view text, bool& ok)
+    /// Parse one JSON document: a single value with nothing but whitespace after
+    /// it. Also refused: more than kMaxNodes values, nesting past kMaxDepth, and
+    /// under Keys::Unique a repeated key. On failure, sets ok=false and returns
+    /// whatever was parsed so far (callers should check ok).
+    inline Value parse(std::string_view text, bool& ok, Keys keys)
     {
         // The arena is handed to the root even when the parse fails, because a failed
         // parse still returns whatever it built and those nodes live in here.
-        auto* arena = new detail::Arena(text.size());
+        detail::Arena* arena = detail::take_arena(text.size());
         detail::Scratch& sc = detail::scratch();
         const bool reentrant = sc.busy;
         std::vector<Value> own_values;
         std::vector<Member> own_members;
+        std::vector<std::string_view> own_keys;
         sc.busy = true;
         detail::Parser p{text, *arena,
                          reentrant ? own_values : sc.values,
-                         reentrant ? own_members : sc.members};
+                         reentrant ? own_members : sc.members,
+                         reentrant ? own_keys : sc.keys, keys};
         Value v = p.parse_value();
-        ok = p.ok;
+        p.ws();
+        ok = p.ok && p.i == text.size();
         if (!reentrant)
         {
-            // Emptied, not shrunk: the capacity is the point of keeping them.
+            // Emptied, and shrunk only past kScratchKeep: the capacity is the point
+            // of keeping them, but not the capacity one hostile document asked for.
             sc.values.clear();
             sc.members.clear();
+            sc.keys.clear();
+            if (sc.values.capacity() * sizeof(Value) > detail::kScratchKeep)
+                std::vector<Value>().swap(sc.values);
+            if (sc.members.capacity() * sizeof(Member) > detail::kScratchKeep)
+                std::vector<Member>().swap(sc.members);
+            if (sc.keys.capacity() * sizeof(std::string_view) > detail::kScratchKeep)
+                std::vector<std::string_view>().swap(sc.keys);
             sc.busy = false;
         }
         v._arena = arena;

@@ -559,6 +559,125 @@ TEST(JsonArena, AFailedInnerObjectDoesNotDonateItsMembersToItsParent)
     }
 }
 
+// ── One document, nothing after it ───────────────────────────────────────────
+
+TEST(JsonDocument, AnythingButWhitespaceAfterTheRootIsRefused)
+{
+    for (const char* doc : {"{}x", "{} {}", "1 2", R"("a"b)", "[]]", "{}}", "null,", "{}\x01"})
+    {
+        bool ok = true;
+        (void)parse(std::string_view(doc), ok);
+        EXPECT_FALSE(ok) << doc;
+    }
+    for (const char* doc : {" {} ", "\t\r\n[1]\n", "0 ", "\"s\"\r\n"})
+    {
+        bool ok = false;
+        (void)parse(std::string_view(doc), ok);
+        EXPECT_TRUE(ok) << doc;
+    }
+}
+
+// ── Keys::Unique: one copy of each key, compared unescaped ───────────────────
+
+TEST(JsonKeys, ARepeatedKeyIsRefusedAtAnyDepth)
+{
+    using llmbridge::provider::json::Keys;
+    for (const char* doc : {R"({"model":"cheap","model":"x"})",
+                            R"({"model":"cheap","m\u006fdel":"x"})",
+                            R"({"\u0061":1,"a":2})",
+                            R"({"a\/b":1,"a/b":2})",
+                            R"({"x":{"a":1,"b":2,"a":3}})",
+                            R"([{"ok":1},{"k":1,"k":1}])"})
+    {
+        bool ok = true;
+        (void)parse(std::string_view(doc), ok);
+        EXPECT_FALSE(ok) << doc;
+        (void)parse(std::string_view(doc), ok, Keys::Any);
+        EXPECT_TRUE(ok) << "Keys::Any keeps the old reading: " << doc;
+    }
+    for (const char* doc : {R"({"a":1,"b":2})", R"([{"a":1},{"a":2}])", R"({"a":{"a":{"a":1}}})",
+                            R"({"a\"":1,"a":2})", R"({"\u00e9":1,"e":2})"})
+    {
+        bool ok = false;
+        (void)parse(std::string_view(doc), ok);
+        EXPECT_TRUE(ok) << doc;
+    }
+}
+
+TEST(JsonKeys, WideObjectsTakeTheSortedPath)
+{
+    // Past 16 keys the exact check sorts instead of comparing pairs; both must agree.
+    for (const size_t n : {size_t{15}, size_t{17}, size_t{300}})
+    {
+        std::string doc = "{";
+        for (size_t k = 0; k < n; ++k) doc += (k ? ",\"k" : "\"k") + std::to_string(k) + "\":0";
+        bool ok = false;
+        (void)parse(doc + "}", ok);
+        EXPECT_TRUE(ok) << n;
+        (void)parse(doc + ",\"k" + std::to_string(n / 2) + "\":1}", ok);
+        EXPECT_FALSE(ok) << n;
+    }
+}
+
+// ── Bounded memory on hostile input ──────────────────────────────────────────
+
+namespace
+{
+    // `n` copies of ",0", by doubling: a byte-at-a-time loop costs seconds under ASan.
+    std::string zeros(size_t n)
+    {
+        std::string s = ",0";
+        while (s.size() < 2 * n) s += s;
+        s.resize(2 * n);
+        return s;
+    }
+} // namespace
+
+TEST(JsonBounds, NodeCapIsExactAndRefusesTheTinyValueFlood)
+{
+    using llmbridge::provider::json::kMaxNodes;
+    // A root array of kMaxNodes - 1 zeros is exactly kMaxNodes values.
+    const std::string doc = "[0" + zeros(kMaxNodes - 2);
+    bool ok = false;
+    {
+        const std::string exact = doc + "]";
+        const Value v = parse(exact, ok);
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(v.arr.size(), kMaxNodes - 1);
+    }
+    (void)parse(doc + ",0]", ok);
+    EXPECT_FALSE(ok);
+
+    // The audit's body: 16 MiB, nearly all of it one-byte values.
+    const std::string body = R"({"model":"m","messages":[{"role":"user","content":"hi"}],"pad":[0)" +
+                             zeros(size_t{8} << 20) + "]}";
+    (void)parse(body, ok);
+    EXPECT_FALSE(ok);
+}
+
+TEST(JsonBounds, ScratchCapacityPastTheBudgetIsReleased)
+{
+    using llmbridge::provider::json::detail::kScratchKeep;
+    auto& sc = llmbridge::provider::json::detail::scratch();
+    // Small documents keep their capacity: that is what the scratch is for.
+    std::string small = "[0";
+    for (int k = 0; k < 1000; ++k) small += ",0";
+    small += "]";
+    bool ok = false;
+    (void)parse(small, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_GE(sc.values.capacity(), 1000u);
+    // A wide one, legal, pushes all three stacks far past the budget, then gives it back.
+    std::string wide = "{\"a\":[0" + zeros(300000) + "],\"o\":{";
+    for (int k = 0; k < 300000; ++k) wide += (k ? ",\"k" : "\"k") + std::to_string(k) + "\":0";
+    wide += "}}";
+    (void)parse(wide, ok);
+    ASSERT_TRUE(ok);
+    EXPECT_LE(sc.values.capacity() * sizeof(Value), kScratchKeep);
+    EXPECT_LE(sc.members.capacity() * sizeof(llmbridge::provider::json::Member), kScratchKeep);
+    EXPECT_LE(sc.keys.capacity() * sizeof(std::string_view), kScratchKeep);
+}
+
 // ── One escaper ──────────────────────────────────────────────────────────────
 
 namespace
@@ -628,4 +747,28 @@ TEST(JsonBuilder, EscaperMatchesTheReferenceOnEveryByteAndRandomStrings)
                                  : static_cast<char>(rng() % 256);
         check(raw);
     }
+}
+
+TEST(JsonArena, ADroppedDocumentParksItsArenaForTheNextParse)
+{
+    auto& spare = llmbridge::provider::json::detail::spare_arena();
+    spare.reset();
+    bool ok = false;
+    const llmbridge::provider::json::detail::Arena* first = nullptr;
+    {
+        const Value v = parse(std::string_view(R"({"a":[1,2,3]})"), ok);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(spare, nullptr);
+        {
+            const Value w = parse(std::string_view("[1]"), ok); // a second live document
+            ASSERT_TRUE(ok);
+        }
+        first = spare.get();
+        EXPECT_NE(first, nullptr) << "w's arena is parked";
+    }
+    EXPECT_EQ(spare.get(), first) << "one is kept; v's is freed, not leaked";
+    const Value again = parse(std::string_view(R"({"b":true})"), ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(spare, nullptr) << "the parked arena was taken";
+    EXPECT_TRUE(again.find("b")->boolean);
 }

@@ -299,24 +299,14 @@ namespace llmbridge::provider
                         //
                         // rewrite_model refuses the same class three functions down;
                         // this is the same rule applied to the same kind of input.
+                        // parse() refuses anything after the one value, so `{}}]...`
+                        // fails here, while whitespace around it is still JSON.
                         const std::string args = json::unescape_string(fn->str_or("arguments"));
                         if (!args.empty())
                         {
                             bool arg_ok = false;
                             const json::Value parsed = json::parse(args, arg_ok);
                             if (!arg_ok || !parsed.is_object()) { out.clear(); return false; }
-                            // And nothing after it. The parser stops at the end of
-                            // the first value, so `{}}]},{...}` parses as a valid
-                            // empty object with the payload trailing behind it, and
-                            // checking only "is it an object" accepts exactly the
-                            // injection this refuses. `sv` spans the object's own
-                            // braces, so comparing it against the input is what
-                            // makes the whole string have to be that object.
-                            size_t end = args.size();
-                            while (end > 0 && (args[end - 1] == ' ' || args[end - 1] == '\t' ||
-                                               args[end - 1] == '\n' || args[end - 1] == '\r'))
-                                --end;
-                            if (parsed.sv.size() != end) { out.clear(); return false; }
                         }
                         messages += ",\"input\":";
                         messages += args.empty() ? "{}" : args;

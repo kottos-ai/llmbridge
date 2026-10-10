@@ -184,6 +184,10 @@ INSTANTIATE_TEST_SUITE_P(
         // structure
         std::make_pair("[]", "top level must be an object"),
         std::make_pair("{", "not valid JSON"),
+        std::make_pair(R"({"listen":{"port":1}} x)", "not valid JSON"),
+        // First-wins would apply one copy silently; the other is a typo or a merge.
+        std::make_pair(R"({"listen":{"port":1,"port":2}})", "appears twice"),
+        std::make_pair(R"({"_c":"a","_c":"b"})", "appears twice"),
         // paths must not carry escapes the zero-copy DOM would hand over undecoded
         std::make_pair(R"({"listen":{"cert":"/a\\b.pem"}})", "backslash")));
 

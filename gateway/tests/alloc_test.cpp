@@ -299,12 +299,13 @@ namespace
         double passthrough, translated, stream_20, per_delta;
     };
 
-    // Measured 2026-10-09 on master 6507161 (GCC 13 Release and ASan Debug agree).
+    // Measured 2026-10-09 at v0.69.0 (GCC 13 Release and ASan Debug agree), after
+    // json::parse began reusing its arena: 16 -> 12, 59 -> 7, 2 -> 0 per delta.
     // Lower these when a change removes allocations; never raise them without a
-    // reason in the commit message. io_uring's per-delta figure is 2.01, not 2: its
+    // reason in the commit message. io_uring's per-delta figure is 0.01, not 0: its
     // 4 KiB receive buffers split the stream at different points.
-    constexpr Ceiling kEpoll{3, 16, 59, 2.05};
-    constexpr Ceiling kUring{3, 16, 59, 2.05};
+    constexpr Ceiling kEpoll{3, 12, 7, 0.05};
+    constexpr Ceiling kUring{3, 12, 7, 0.05};
 
     class AllocCeiling : public ::testing::TestWithParam<IoBackend>
     {

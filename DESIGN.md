@@ -214,6 +214,33 @@ continuously fuzzed:
 
 - **JSON parser** (`provider/json.hpp`): recursion is depth-limited (`kMaxDepth`), so
   a `[[[[...` nesting bomb fails cleanly (`ok=false`) instead of overflowing the stack.
+  Since v0.69.0 it also refuses, or stops paying for:
+  - **Anything after the root value but whitespace.** `{}}]},{...}` used to parse as
+    `{}`, so every caller splicing a parsed value had to re-check the tail by hand.
+  - **A repeated key, at any depth** (`Keys::Unique`, the default). `find()` is
+    first-wins and most upstream parsers are last-wins, so `{"model":"cheap",
+    "model":"x"}` passed a policy on one copy and reached the provider with the other.
+    Keys are compared unescaped, so `"m\u006fdel"` repeats `model`. Cost: at each
+    object's close, one pass sets a bit per key (from its length and end bytes) in a
+    64-bit word; only an object whose bits collide, or whose subtree held a backslash,
+    runs the exact check (pairwise to 16 keys, sorted past that, unescaped only if a
+    key has a backslash). Tracking that state per key during the descent measured
+    slower: it stays live across the recursion. `Keys::Any` keeps the old reading for
+    a caller that needs it; the config loader uses it only to word its error.
+  - **More than `kMaxNodes` (2^20) values.** A 16 MiB body of `0,0,0,...` is 8 M
+    values; at 64 B a `Value` (80 B a `Member`) that was ~1 GB peak per parse and a
+    two-second loop stall. Real bodies run 27 B per value at their densest (an
+    agent-tool-heavy summary; chat history runs 150+), so a full 16 MiB (`kMaxBodyLen`)
+    legitimate body is ~620 K values: 2^20 leaves 1.7x headroom and bounds the worst
+    parse near 64 MB of nodes.
+  - **An allocation per parse.** A dropped document's arena, emptied of blocks, is
+    parked in one per-thread slot and taken by the next parse, so a parse no longer
+    allocates the arena and its block list. Allocations per translated request went
+    16 to 12, per 20-delta stream 59 to 7, per further delta 2 to 0
+    (`gateway_alloc_test`).
+  - **Keeping hostile scratch.** The per-thread scratch stacks are emptied after each
+    parse and freed outright when one exceeds 4 MiB (`kScratchKeep`, the same budget as
+    `BlockPool`), so one wide document no longer pins its peak for the thread's life.
 - **HTTP framer** (`net/http.hpp`): header size is capped (`kMaxHeaderLen`), body size
   is capped (`kMaxBodyLen`, blocking a `Content-Length: 9999999999` memory-exhaustion
   trickle), and framing is smuggling-safe. **Content-Length only**; a `Transfer-Encoding`
