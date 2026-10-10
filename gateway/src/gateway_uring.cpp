@@ -729,6 +729,7 @@ namespace llmbridge
         }
         c->client_frame_want = 0;
         if (st == net::http::FrameStatus::Error) { ur_error_respond(c, 400, "request framing"); return; }
+        if (!net::http::request_line_ok(c->rbuf)) { ur_error_respond(c, 400, "request line"); return; }
         c->msg = m;
         c->ts_req_recvd = now_ns();
         c->client_upload_ns = span_since(c->ts_first_byte, c->ts_req_recvd);

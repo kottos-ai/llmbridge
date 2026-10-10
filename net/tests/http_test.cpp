@@ -476,6 +476,20 @@ TEST(HttpVersion, ParsedFromTheRequestLineAndDrivesTheKeepAliveDefault)
     EXPECT_TRUE(m10k.keep_alive) << "an explicit keep-alive overrides the 1.0 default";
 }
 
+TEST(HttpDesync, RequestLineSyntaxIsChecked)
+{
+    using llmbridge::net::http::request_line_ok;
+    for (const char* rl : {"GET / HTTP/1.1 x", "GET  / HTTP/1.1", "GET /  HTTP/1.1", "GET\t/ HTTP/1.1",
+                           "GET / HTTP/2.0", "GET / HTTP/1.2", "GET /", "GET", "", " GET / HTTP/1.1",
+                           "G(T / HTTP/1.1", "GET /a\x01 HTTP/1.1", "GET /a\x7f HTTP/1.1",
+                           "GET / http/1.1", "HTTP/1.1 200 OK"})
+        EXPECT_FALSE(request_line_ok(std::string(rl) + "\r\nHost: x\r\n\r\n")) << rl;
+    EXPECT_FALSE(request_line_ok("GET / HTTP/1.1"));
+    for (const char* rl : {"GET / HTTP/1.1", "PATCH /v1/x?a=b HTTP/1.0", "OPTIONS * HTTP/1.1",
+                           "M-SEARCH http://h/p HTTP/1.1"})
+        EXPECT_TRUE(request_line_ok(std::string(rl) + "\r\nHost: x\r\n\r\n")) << rl;
+}
+
 // N2: Connection is a token list. Reading only a leading "close" kept
 // `keep-alive, close` open and read `closed` as close.
 TEST(HttpConnection, RequestConnectionIsATokenList)

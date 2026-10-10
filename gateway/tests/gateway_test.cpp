@@ -1613,6 +1613,23 @@ TEST_P(ProxyAuth, HeadResponseEndsAtItsHeadAndTheConnectionIsReused)
     EXPECT_GT(_gw->stats().upstream_reused, 0u);
 }
 
+// The request line is method SP target SP HTTP/1.x. Only the version was read, from
+// after the last space, so a line an upstream could split another way went out.
+TEST_P(ProxyAuth, MalformedRequestLineIsRefusedAndNeverForwarded)
+{
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    for (const char* rl : {"GET /v1/models HTTP/1.1 x", "GET  /v1/models HTTP/1.1",
+                           "GET /v1/models HTTP/2.0", "G(T /v1/models HTTP/1.1"})
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(std::string(rl) + "\r\nHost: x\r\n\r\n"));
+        EXPECT_EQ(c.recv_status(), 400) << rl;
+    }
+    shutdown();
+    EXPECT_EQ(_backend.requests_seen(), 0);
+}
+
 TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
 {
     // The classic smuggling shape from the other direction: the client declares N

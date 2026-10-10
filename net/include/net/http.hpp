@@ -245,6 +245,28 @@ namespace llmbridge::net::http
         return {};
     }
 
+    /// Whether the message in `buf` starts with `method SP target SP HTTP/1.x CRLF`
+    /// (RFC 9112 §3): single spaces, a token method, a target with no whitespace or
+    /// control byte, and HTTP/1.0 or 1.1. Not part of parse_request, which tools also
+    /// use to frame responses.
+    inline bool request_line_ok(std::string_view buf) noexcept
+    {
+        const size_t eol = buf.find("\r\n");
+        if (eol == std::string_view::npos) return false;
+        const std::string_view rl = buf.substr(0, eol);
+        const size_t sp1 = rl.find(' '), sp2 = rl.rfind(' ');
+        if (sp1 == 0 || sp1 == std::string_view::npos || sp2 <= sp1 + 1) return false;
+        const std::string_view ver = rl.substr(sp2 + 1);
+        if (ver != "HTTP/1.1" && ver != "HTTP/1.0") return false;
+        for (const char c : rl.substr(0, sp1))
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  std::string_view("!#$%&'*+-.^_`|~").find(c) != std::string_view::npos))
+                return false;
+        for (const char c : rl.substr(sp1 + 1, sp2 - sp1 - 1))
+            if (static_cast<unsigned char>(c) <= ' ' || c == 0x7f) return false;
+        return true;
+    }
+
     // Header section cap: bounds slow-loris buffer growth.
     inline constexpr size_t kMaxHeaderLen = 32 * 1024;
 
