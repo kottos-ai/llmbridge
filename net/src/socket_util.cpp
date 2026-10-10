@@ -45,7 +45,7 @@ namespace llmbridge::net
 
     int make_listener(uint16_t port, int backlog) noexcept
     {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) return -1;
         int one = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -65,17 +65,13 @@ namespace llmbridge::net
             ::close(fd);
             return -1;
         }
-        set_nonblocking(fd);
         return fd;
     }
 
     int start_connect(const char* ip, uint16_t port) noexcept
     {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        const int fd = make_client_socket();
         if (fd < 0) return -1;
-        set_nonblocking(fd);
-        set_nodelay(fd);
-        set_nosigpipe(fd);
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -102,11 +98,12 @@ namespace llmbridge::net
         return err;
     }
 
+    // Non-blocking and close-on-exec from creation: no window where a fork+exec in an
+    // embedding process inherits it, and two fcntl calls fewer per connection.
     int make_client_socket() noexcept
     {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) return -1;
-        set_nonblocking(fd);
         set_nodelay(fd);
         set_nosigpipe(fd);
         return fd;
