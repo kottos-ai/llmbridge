@@ -93,6 +93,15 @@ namespace llmbridge
                                             "giving up");
             return {};
         }
+        // The new venue's overrides, never the failed one's: its model name is wrong for
+        // another venue. Copied now, since the views die once on_failure has returned.
+        if (!client->req.f.model_override.set(r.model) ||
+            !client->req.f.tier_override.set(r.service_tier))
+        {
+            LB_WARN(ReqId{client->req.f.req_seq}, " failover override longer than the gateway "
+                                                  "holds; giving up");
+            return {};
+        }
         return r;
     }
 

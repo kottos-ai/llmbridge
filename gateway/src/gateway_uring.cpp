@@ -770,8 +770,11 @@ namespace llmbridge
                         static_cast<int64_t>(d.upstream_index), " of ",
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
             // Copied: see the epoll mirror.
-            c->req.f.model_override.set(d.model);
-            c->req.f.tier_override.set(d.service_tier);
+            if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
+            {
+                ur_error_respond(c, 500, "policy override longer than the gateway holds");
+                return;
+            }
         }
         ur_forward(c); // resolves the translation for the chosen venue; see ur_forward
     }

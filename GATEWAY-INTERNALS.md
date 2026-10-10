@@ -127,7 +127,9 @@ framing, as soon as the parser answers, and before any reply, a 400 included, so
 nothing a request reports can belong to the one before it on the connection. It
 constructs a fresh `ReqState` in place rather than assigning one, which writes only
 the scalars and leaves the string buffers' bytes alone. Strings the request keeps
-are `FixedStr` copies, never views.
+are `FixedStr` copies, never views: the policy's `model` and `service_tier` are
+copied at the decision (a longer one is refused with a 500, never cut), and a
+failover takes `Retry`'s.
 
 ## 4. The epoll backend
 

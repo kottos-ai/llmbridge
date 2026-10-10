@@ -631,9 +631,13 @@ namespace llmbridge
                         static_cast<int64_t>(d.upstream_index), " of ",
                         static_cast<int64_t>(_upstreams.size()), "; using 0");
             // Copied: the policy's views die when this returns, and a failover runs
-            // from a later event.
-            c->req.f.model_override.set(d.model);
-            c->req.f.tier_override.set(d.service_tier);
+            // from a later event. Refused rather than cut, which would route to
+            // whatever model the prefix names.
+            if (!c->req.f.model_override.set(d.model) || !c->req.f.tier_override.set(d.service_tier))
+            {
+                ep_error_respond(c, 500, "policy override longer than the gateway holds");
+                return;
+            }
         }
         ep_forward(c); // resolves the translation for the chosen venue; see ep_forward
     }

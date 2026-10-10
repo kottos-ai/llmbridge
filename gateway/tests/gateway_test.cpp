@@ -10061,3 +10061,106 @@ TEST_P(ProxyRequestReset, ASecondRequestOnAColdUpstreamGetsItsOwnStamps)
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRequestReset,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring));
+
+namespace
+{
+    /// Keeps the model it routes with in a buffer it rewrites, as a policy formatting
+    /// names per request may, and fails over with a model of its own or none.
+    class RewritingPolicy final : public llmbridge::Policy
+    {
+      public:
+        explicit RewritingPolicy(std::string retry_model) : _retry(std::move(retry_model)) {}
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            _buf = "venue-a-model-" + std::string(40, 'a'); // on the heap, past SSO
+            return {.allow = true, .upstream_index = 0, .model = _buf};
+        }
+        llmbridge::Retry on_failure(const llmbridge::FailureFacts& f) noexcept override
+        {
+            _buf.assign(400, 'z'); // reallocates: a view kept from decide() now dangles
+            _buf.shrink_to_fit();
+            if (f.attempt > 0) return {};
+            return {.retry = true, .upstream_index = 1, .model = _retry};
+        }
+
+      private:
+        std::string _buf;
+        std::string _retry;
+    };
+
+    /// Routes with a model name longer than the gateway keeps.
+    class LongModelPolicy final : public llmbridge::Policy
+    {
+      public:
+        llmbridge::Decision decide(const llmbridge::RequestFacts&) noexcept override
+        {
+            return {.allow = true, .upstream_index = 0, .model = _long};
+        }
+
+      private:
+        std::string _long = std::string(256, 'm');
+    };
+} // namespace
+
+// G3: the override was a view into the policy's buffer, read again by a failover in a
+// later event; under ASan that was a use-after-free, and either way venue B was sent
+// venue A's model name. Now the failover sends Retry::model.
+TEST_P(ProxyRoute, AFailoverSendsTheRetryModelNotTheFailedVenuesOverride)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    RewritingPolicy pol("venue-b-model");
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model","messages":[]})")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string got = good.last();
+    EXPECT_NE(got.find(R"("model":"venue-b-model")"), std::string::npos) << got;
+    EXPECT_EQ(got.find("venue-a-model"), std::string::npos) << got;
+    EXPECT_EQ(got.find("zzz"), std::string::npos) << got;
+    good.stop();
+}
+
+// And a failover naming no model sends the client's own, not the failed venue's.
+TEST_P(ProxyRoute, AFailoverWithoutAModelSendsTheClientsOwn)
+{
+    NamedBackend good;
+    good.start("bravo");
+    const DeadPort dead;
+    RewritingPolicy pol("");
+    start({{"127.0.0.1", dead.port(), false, "", UpstreamDialect::OpenAI, ""},
+           {"127.0.0.1", good.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model","messages":[]})")));
+    EXPECT_NE(c.recv_response().find("bravo"), std::string::npos);
+    c.close();
+    shutdown();
+    const std::string got = good.last();
+    EXPECT_NE(got.find(R"("model":"client-model")"), std::string::npos) << got;
+    EXPECT_EQ(got.find("venue-a-model"), std::string::npos) << got;
+    good.stop();
+}
+
+// An override is copied whole or not at all: a cut name would route to whatever
+// model its prefix happens to name.
+TEST_P(ProxyRoute, AnOverrideLongerThanTheGatewayKeepsIsA500)
+{
+    NamedBackend b;
+    b.start("alpha");
+    LongModelPolicy pol;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"client-model"})")));
+    EXPECT_EQ(c.recv_status(), 500);
+    c.close();
+    shutdown();
+    EXPECT_EQ(b.seen(), 0) << "a cut model name reached the venue";
+    b.stop();
+}
