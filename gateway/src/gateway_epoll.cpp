@@ -1030,7 +1030,7 @@ namespace llmbridge
             // rate-limit error, with Retry-After dropped. The client cannot back off
             // from a 200. Content-Length responses were relayed verbatim and were
             // never affected, which is why it survived: only chunkedness triggers it.
-            if (h.chunked)
+            if (h.body == net::http::Body::Chunked)
                 client->wbuf = build_http_status(h.status ? h.status : 200,
                                                  reason_for(h.status ? h.status : 200),
                                                  body_buf);

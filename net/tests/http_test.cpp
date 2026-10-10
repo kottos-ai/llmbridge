@@ -786,6 +786,42 @@ TEST(ResponseFraming, BodylessStatusesStillFrameWithNoLength)
               llmbridge::net::http::FrameStatus::Complete);
 }
 
+// N8: 204 and 304 end at the head whatever Content-Length or Transfer-Encoding say.
+// A 304 carrying the resource's Content-Length waited for 1234 bytes that never come,
+// and the client got a 504 after the upstream idle timeout.
+TEST(ResponseFraming, BodylessStatusesEndAtTheHeadWhateverTheirHeadersSay)
+{
+    for (const std::string head : {"HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\n\r\n",
+                                   "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
+                                   "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"})
+    {
+        llmbridge::net::http::ResponseDecoder st;
+        const std::string wire = head + "HTTP/1.1 200 OK\r\n";
+        const auto r = llmbridge::net::http::parse_response(wire, st);
+        ASSERT_EQ(r.status, llmbridge::net::http::FrameStatus::Complete) << head;
+        EXPECT_EQ(r.head.body, llmbridge::net::http::Body::None);
+        EXPECT_EQ(r.total_len, head.size()) << "the next response is not this one's body";
+        EXPECT_TRUE(r.body.empty());
+    }
+}
+
+TEST(ResponseFraming, BodyKindNamesTheFraming)
+{
+    using llmbridge::net::http::Body;
+    const auto body_of = [](std::string_view head) {
+        llmbridge::net::http::ResponseHead h;
+        EXPECT_EQ(llmbridge::net::http::parse_response_head(head, h),
+                  llmbridge::net::http::FrameStatus::Complete) << head;
+        return h.body;
+    };
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"), Body::Length);
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"), Body::Chunked);
+    EXPECT_EQ(body_of("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"), Body::UntilClose);
+    EXPECT_EQ(body_of("HTTP/1.1 101 Switching Protocols\r\n\r\n"), Body::None);
+    EXPECT_EQ(body_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 99999999\r\n\r\n"), Body::None)
+        << "a bodyless status is not held to the body cap";
+}
+
 TEST(ResponseFraming, AFramedResponseIsUnaffected)
 {
     EXPECT_EQ(frame_of("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),

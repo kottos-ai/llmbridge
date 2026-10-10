@@ -1575,6 +1575,20 @@ TEST_P(ProxyAuth, UpstreamBodyLongerThanContentLengthDoesNotPoisonTheNextRequest
         << "no upstream was reused, so the residue path was never exercised";
 }
 
+// N8: a 304 ends at its head whatever Content-Length says. Framed by that length, the
+// reply waited for 1234 bytes that never come, and the client got a 504 after the
+// upstream idle timeout with both connections held the whole time.
+TEST_P(ProxyAuth, BodylessStatusIsRelayedWithoutWaitingForItsContentLength)
+{
+    _backend.set_response("HTTP/1.1 304 Not Modified\r\nContent-Length: 1234\r\nETag: \"v1\"\r\n\r\n");
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send("GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n"));
+    const std::string got = c.recv_until("\r\n\r\n", 3000);
+    EXPECT_EQ(Client::status_of(got), 304) << got;
+}
+
 TEST_P(ProxyAuth, ClientBodyLongerThanContentLengthDoesNotSmuggleASecondRequest)
 {
     // The classic smuggling shape from the other direction: the client declares N

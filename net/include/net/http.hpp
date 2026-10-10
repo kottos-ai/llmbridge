@@ -307,10 +307,15 @@ namespace llmbridge::net::http
         return FrameStatus::Complete;
     }
 
+    /// How a response body ends (RFC 9112 §6.3): not at all, after Content-Length
+    /// bytes, at the last chunk, or when the server closes.
+    enum class Body : uint8_t { None, Length, Chunked, UntilClose };
+
     struct ResponseHead
     {
         size_t header_len = 0;         // bytes up to and including CRLFCRLF
         int status = 0;                // e.g. 200
+        Body body = Body::None;
         bool keep_alive = true;
         bool chunked = false;          // Transfer-Encoding: chunked
         bool event_stream = false;     // Content-Type: text/event-stream
@@ -403,7 +408,12 @@ namespace llmbridge::net::http
         if (close || keep) out.keep_alive = !close;
         // Both framings present (RFC 9112 §6.3): refuse instead of picking one.
         if (out.chunked && out.has_content_length) return FrameStatus::Error;
-        if (out.has_content_length && out.content_length > kMaxBodyLen) return FrameStatus::Error;
+        // 1xx, 204 and 304 end at the head whatever their headers say.
+        if (out.status < 200 || out.status == 204 || out.status == 304) out.body = Body::None;
+        else if (out.chunked) out.body = Body::Chunked;
+        else if (out.has_content_length) out.body = Body::Length;
+        else out.body = Body::UntilClose;
+        if (out.body == Body::Length && out.content_length > kMaxBodyLen) return FrameStatus::Error;
         return FrameStatus::Complete;
     }
 
@@ -545,27 +555,20 @@ namespace llmbridge::net::http
         if (hs == FrameStatus::NeedMore) return r; // status stays NeedMore
         if (hs == FrameStatus::Error) { r.status = FrameStatus::Error; return r; }
 
-        if (r.head.chunked && r.head.has_content_length) { r.status = FrameStatus::Error; return r; }
-
         // An interim 1xx is not the answer, and framing one as it orphans the real
-        // response on a pooled connection.
-        if (r.head.status < 200) { r.status = FrameStatus::Error; return r; }
-
-        // No framing header means read-until-close (RFC 9112 §6.3 rule 8), which a
-        // pooled connection cannot do; 204 and 304 carry no body by definition.
-        if (!r.head.chunked && !r.head.has_content_length &&
-            r.head.status != 204 && r.head.status != 304)
+        // response on a pooled connection. Read-until-close cannot be pooled.
+        if (r.head.status < 200 || r.head.body == Body::UntilClose)
         {
             r.status = FrameStatus::Error;
             return r;
         }
 
-        if (!r.head.chunked)
+        if (r.head.body != Body::Chunked)
         {
-            if (r.head.content_length > kMaxBodyLen) { r.status = FrameStatus::Error; return r; }
-            const size_t need = r.head.header_len + r.head.content_length;
+            const size_t len = r.head.body == Body::Length ? r.head.content_length : 0;
+            const size_t need = r.head.header_len + len;
             if (buf.size() < need) return r; // NeedMore
-            r.body = buf.substr(r.head.header_len, r.head.content_length); // no copy
+            r.body = buf.substr(r.head.header_len, len); // no copy
             r.total_len = need;
             r.status = FrameStatus::Complete;
             return r;
