@@ -335,6 +335,17 @@ return a `std::string` (empty on parse failure, no exceptions). Coverage is the 
 chat path: model, system prompt, multi-turn messages, `max_tokens`/`temperature`/`top_p`;
 and on the response, content / finish-reason / usage.
 
+Every request translator reads `messages` through one walk (`provider/src/messages.hpp`)
+that calls the dialect's hook for each message: system (and `developer`), user and
+assistant turns, assistant `tool_calls`, and `tool` results. A dialect without a hook
+for a construct refuses the request instead of dropping it, so Gemini and Cohere refuse
+tools, tool calls and tool results, and every dialect refuses an unknown role. Anthropic's
+parameters are a table (`temperature` limited to Anthropic's 0 to 1, `top_p`, `stop` to
+`stop_sequences`, `stream`); `max_completion_tokens` wins over `max_tokens`; `tool_choice:
+"none"` becomes `{"type":"none"}` and keeps the tools, because a history holding
+`tool_use` blocks is refused without them; and `parallel_tool_calls: false` becomes
+`disable_parallel_tool_use` inside `tool_choice`. There is no default model.
+
 Coverage per target: Anthropic Messages (system extraction, content blocks,
 `stop_reason`), Gemini `generateContent` (`contents`/`parts`, role `model`,
 `generationConfig`) and Cohere Chat v2 (`messages`, `top_p` to `p`). OpenAI-compatible
@@ -364,8 +375,8 @@ fields faster than we adopt them. Only the value span moves.
 
 **Bedrock** differs from Anthropic direct in two required ways: no `model` field,
 because Bedrock takes the id in the path (`/model/{id}/invoke`), and `anthropic_version`
-inside the JSON, where Anthropic wants a header. `model_out` is empty only when the body
-named no model, in which case there is no path to build and the request is refused.
+inside the JSON, where Anthropic wants a header. A body that names no model has no path
+to build, so the translator refuses it.
 
 **Upstream errors** become the OpenAI envelope: Anthropic's
 `{"type":"error","error":{"type":"overloaded_error","message":"..."}}` is sent as

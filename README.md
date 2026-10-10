@@ -29,7 +29,8 @@
 - **Per-request timing headers** (`--timing-headers`), what the gateway cost vs what the provider cost
 - An Anthropic-speaking client reaching an Anthropic upstream **byte-forwards**, which is how an Anthropic SDK or Claude Code runs through it unchanged
 - Not yet shipped, and **refused with a message that says so** instead of ignored:
-  vision, audio and file content parts; streaming for Gemini and Cohere; Bedrock
+  vision, audio and file content parts; tool calling for Gemini and Cohere (a request
+  carrying tools, tool calls or tool results); streaming for Gemini and Cohere; Bedrock
   streaming; and the Anthropic-to-OpenAI *translator*, for a client speaking Anthropic
   to an OpenAI-dialect upstream (distinct from the byte-forward above)
 
@@ -347,9 +348,13 @@ Today. **chat completions**, via `--upstream-dialect` or the `provider::` API:
 | Cohere Chat v2 | ✅ | ✅ |
 | OpenAI-compatible (Groq / Together / Fireworks / ...) | passthrough | passthrough |
 
-Per-dialect coverage is the common chat path: model, system prompt, user/assistant
-turns, `max_tokens` / `temperature` / `top_p`; and on the response, content /
-finish-reason / usage.
+Per-dialect coverage is the common chat path: model, system prompt (`system` and
+`developer` messages), user/assistant turns, `max_tokens` / `max_completion_tokens`
+(which wins when both are set) / `temperature` / `top_p`; and on the response, content /
+finish-reason / usage. Anthropic also takes `stop` (as `stop_sequences`) and
+`parallel_tool_calls: false` (as `disable_parallel_tool_use`). A request with no
+`model`, an unknown message role, or a value the provider has no equivalent for (an
+Anthropic `temperature` above 1) is refused with a 400 rather than guessed at.
 
 **Streaming (SSE)** is supported for OpenAI ⇄ Anthropic: send `"stream": true` and the
 gateway translates the Anthropic event stream into OpenAI `chat.completion.chunk`s
