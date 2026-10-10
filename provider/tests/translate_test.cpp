@@ -447,7 +447,7 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
 {
     std::string in = R"({"candidates":[{"content":{"role":"model","parts":[
         {"text":"hello "},{"text":"world"}]},"finishReason":"STOP"}],
-        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11,
+        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":13,
         "cachedContentTokenCount":5,"thoughtsTokenCount":2},
         "modelVersion":"gemini-2.0"})";
     Value out = P(gemini_to_openai_response(in));
@@ -459,9 +459,9 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
     EXPECT_EQ(ch->arr[0].str_or("finish_reason"), "stop");
     const Value* u = out.find("usage");
     EXPECT_EQ(u->num_or("prompt_tokens"), "8");
-    EXPECT_EQ(u->num_or("completion_tokens"), "3");
-    EXPECT_EQ(u->num_or("total_tokens"), "11");
-    // Gemini's cache read and thinking count, in the OpenAI shape the scanner reads.
+    // Gemini states thinking beside candidatesTokenCount and bills it as output.
+    EXPECT_EQ(u->num_or("completion_tokens"), "5");
+    EXPECT_EQ(u->num_or("total_tokens"), "13");
     EXPECT_EQ(u->find("prompt_tokens_details")->num_or("cached_tokens"), "5");
     EXPECT_EQ(u->find("completion_tokens_details")->num_or("reasoning_tokens"), "2");
 }
@@ -1633,6 +1633,16 @@ TEST(JsonScanUsage, ReadsEachVenuesShape)
     EXPECT_EQ(a.out, 9);
     EXPECT_EQ(oai::scan_usage(R"({"usage":null})").in, -1);
     EXPECT_EQ(oai::scan_usage("").out, -1);
+}
+
+TEST(JsonScanUsage, GeminiThinkingIsOutput)
+{
+    const oai::Usage g = oai::scan_usage(
+        R"({"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,)"
+        R"("thoughtsTokenCount":2,"totalTokenCount":13}})");
+    EXPECT_EQ(g.in, 8);
+    EXPECT_EQ(g.out, 5) << "stated beside candidatesTokenCount, billed as output";
+    EXPECT_EQ(g.reasoning, 2);
 }
 
 TEST(JsonScanUsage, ANullDetailsBlockIsNotTheNextOne)

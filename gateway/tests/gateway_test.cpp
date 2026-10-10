@@ -6775,7 +6775,7 @@ TEST_P(ProxyForwardStream, GeminisOwnCountsLandOnTheSameFields)
     _backend.set_response(http_ok(
         "{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},"
         "\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":40,"
-        "\"candidatesTokenCount\":9,\"totalTokenCount\":49,\"cachedContentTokenCount\":32,"
+        "\"candidatesTokenCount\":9,\"totalTokenCount\":59,\"cachedContentTokenCount\":32,"
         "\"thoughtsTokenCount\":4,\"toolUsePromptTokenCount\":6},\"modelVersion\":\"gemini-3\"}"));
     start(0, true, UpstreamDialect::Gemini, GetParam());
     Client c;
@@ -6788,7 +6788,7 @@ TEST_P(ProxyForwardStream, GeminisOwnCountsLandOnTheSameFields)
     ASSERT_EQ(recs.size(), 1u);
     const llmbridge::RequestRecord& r = recs[0].r;
     EXPECT_EQ(r.tokens_in, 40);
-    EXPECT_EQ(r.tokens_out, 9);
+    EXPECT_EQ(r.tokens_out, 13) << "thinking is billed as output, stated beside candidates";
     EXPECT_EQ(r.cached_tokens, 32);
     EXPECT_EQ(r.reasoning_tokens, 4);
     EXPECT_EQ(r.tool_prompt_tokens, 6);

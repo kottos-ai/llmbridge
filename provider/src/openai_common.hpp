@@ -83,13 +83,15 @@ namespace llmbridge::provider::detail
         return u;
     }
 
-    // Gemini's thinking count, read as the reasoning part of its output.
+    // Gemini states thinking beside candidatesTokenCount, not inside it, and bills it
+    // as output, so completion_tokens is their sum and reasoning the thinking part.
     inline openai::Usage gemini_usage(long long prompt, long long candidates, long long thoughts,
                                       long long cached, long long tool_prompt) noexcept
     {
         openai::Usage u;
         u.in = prompt;
         u.out = candidates;
+        if (thoughts >= 0) u.out = (candidates > 0 ? candidates : 0) + thoughts;
         u.cached = cached;
         u.reasoning = thoughts;
         u.tool_prompt = tool_prompt;
