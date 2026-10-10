@@ -71,7 +71,8 @@ namespace llmbridge::provider
         // terminal event is read. False, permanently, on an `error` event or a cap.
         bool feed(std::string_view bytes, std::string& out);
 
-        // Upstream EOF: a terminal finish chunk and [DONE], unless message_stop already sent them.
+        // Upstream EOF: [DONE] once a stop_reason said the message is whole; false, writing
+        // nothing, for a stream cut before that.
         bool finish(std::string& out);
 
         /// Provider-reported token counts so far; final only once the stream ends.

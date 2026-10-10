@@ -460,25 +460,17 @@ namespace llmbridge::provider
         return !_failed;
     }
 
+    // Upstream EOF. Anthropic states the end in-band, so EOF before message_delta's
+    // stop_reason is a cut stream however the transport closed (FIN, RST, no
+    // close_notify); a fabricated finish and [DONE] would call a partial answer whole.
     bool AnthropicToOpenAiSse::finish(std::string& out)
     {
-        if (_failed) return false; // don't fabricate a clean [DONE] on a capped stream
-        // Order matters: _done first. A stream that already emitted [DONE] is over,
-        // and reporting failure for it makes the gateway count an error and close
-        // abruptly on a response that completed correctly. (An earlier revision of
-        // this function checked _tool_open first and did exactly that whenever the
-        // upstream sent message_stop without a preceding message_delta.)
+        if (_failed || !(_done || _finish)) return false;
         if (_done) return true;
-        // A tool call still open at EOF means its arguments were cut MID-JSON. The
-        // client would concatenate them into something unparseable inside a stream
-        // that looked complete: the "corrupt framing fabricated a clean ending"
-        // failure 0.3.0 fixed for text, which streamed tool calls reintroduced.
-        // Same signal: no [DONE], and the gateway counts it as an error.
-        if (_tool_open) return false;
         if (!_finish_emitted)
         {
             emit_head(out);
-            emit_tail(out, _finish ? _finish : default_finish());
+            emit_tail(out, _finish);
             _finish_emitted = true;
         }
         emit_done(out);

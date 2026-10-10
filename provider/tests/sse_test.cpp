@@ -186,22 +186,34 @@ TEST(Sse, MaxTokensMapsToLength)
     EXPECT_EQ(fin.find("choices")->arr[0].str_or("finish_reason"), "length");
 }
 
-TEST(Sse, EofWithoutMessageStopStillTerminates)
+TEST(Sse, EofBeforeAStopReasonIsACutStream)
 {
-    // Upstream drops after a delta with no message_stop: finish() must still emit
-    // a finish chunk + [DONE] so the client stream is well-formed.
+    // Upstream drops after a delta: finish() must not dress the partial answer up as
+    // a whole one with a finish chunk and [DONE].
     AnthropicToOpenAiSse t;
     std::string out;
     t.feed("data: {\"type\":\"content_block_delta\",\"index\":0,"
            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
            out);
-    t.finish(out);
+    const size_t before = out.size();
+    EXPECT_FALSE(t.finish(out));
+    EXPECT_EQ(out.size(), before) << out;
+    EXPECT_EQ(out.find("[DONE]"), std::string::npos);
+}
+
+TEST(Sse, EofAfterTheStopReasonEndsCleanly)
+{
+    // message_delta's stop_reason states the message is whole; only message_stop is lost.
+    std::string in(kAnthropicText);
+    in.erase(in.find("event: message_stop"));
+    AnthropicToOpenAiSse t;
+    std::string out;
+    ASSERT_TRUE(t.feed(in, out));
+    EXPECT_TRUE(t.finish(out));
     const auto payloads = data_payloads(out);
     EXPECT_EQ(payloads.back(), "[DONE]");
-    // role+content chunk, finish chunk, [DONE]
-    ASSERT_GE(payloads.size(), 3u);
-    Value fin = P(payloads[payloads.size() - 2]);
-    EXPECT_EQ(fin.find("choices")->arr[0].str_or("finish_reason"), "stop");
+    EXPECT_EQ(P(payloads[payloads.size() - 2]).find("choices")->arr[0].str_or("finish_reason"),
+              "stop");
 }
 
 // ── Coverage: robustness, framing, mapping, caps ────────────────────────────

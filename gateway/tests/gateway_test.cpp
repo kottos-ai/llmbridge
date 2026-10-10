@@ -3345,9 +3345,9 @@ TEST_P(ProxyStream, NonChunkedCloseDelimitedUpstream)
     shutdown();
 }
 
-// Upstream truncates mid-stream (no message_stop, connection just drops): the
-// client still gets a well-formed terminal chunk + [DONE] so its SSE parser ends.
-TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
+// Upstream drops a close-delimited stream before the stop reason: the client gets
+// what arrived and a failed stream, never a fabricated finish_reason and [DONE].
+TEST_P(ProxyStream, TruncatedUpstreamFailsTheClientStream)
 {
     const std::string ev = anthropic_sse_events();
     const std::string cut = ev.substr(0, ev.find("event: message_delta")); // drop the tail
@@ -3360,9 +3360,33 @@ TEST_P(ProxyStream, TruncatedUpstreamStillTerminatesClientStream)
     ASSERT_TRUE(c.send(openai_stream_request("hi")));
     const Streamed s = parse_streamed(c.recv_stream());
     EXPECT_EQ(s.content, "Hello, world"); // everything received is delivered
-    EXPECT_TRUE(s.done);                  // finish() at EOF closes the stream cleanly
+    EXPECT_FALSE(s.done) << "a cut stream ended with a fabricated [DONE]";
+    EXPECT_TRUE(s.finish.empty()) << s.finish;
     c.close();
     shutdown();
+    EXPECT_GE(_gw->stats().errors, 1u);
+    EXPECT_EQ(_gw->stats().requests, 0u);
+}
+
+// Cut after message_delta: the stop reason says the answer is whole.
+TEST_P(ProxyStream, UpstreamClosingAfterTheStopReasonEndsCleanly)
+{
+    const std::string ev = anthropic_sse_events();
+    const std::string cut = ev.substr(0, ev.find("event: message_stop"));
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Connection: close\r\n\r\n" + cut);
+    _backend.set_close_after_first(true);
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    const Streamed s = parse_streamed(c.recv_stream());
+    EXPECT_EQ(s.content, "Hello, world");
+    EXPECT_TRUE(s.done);
+    EXPECT_EQ(s.finish, "stop");
+    c.close();
+    shutdown();
+    EXPECT_EQ(_gw->stats().errors, 0u);
 }
 
 // Anthropic reports a failure after the head as an `error` event, then ends the

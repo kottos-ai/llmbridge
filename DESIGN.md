@@ -749,6 +749,8 @@ strictly at the socket edge. Three things fall out of this for free:
 - **Not done, stated:** no OCSP/CRL revocation checking (usual for non-browser
   clients); a provider EOF without `close_notify` is treated as normal end-of-stream
   (providers rarely send it; strict truncation detection would break real streams).
+  A translated Anthropic stream that ends before its `stop_reason` still fails: the
+  end is stated in-band, so no finish chunk or `[DONE]` is fabricated.
 
 ### Tests
 
