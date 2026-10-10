@@ -778,3 +778,56 @@ TEST(HttpRequestEncoding, CaseInsensitive)
               llmbridge::net::http::FrameStatus::Complete);
     EXPECT_TRUE(m.encoded);
 }
+
+// ── walk_headers ─────────────────────────────────────────────────────────────
+
+TEST(WalkHeaders, ClassifiesEachLineAndSkipsTheStartLine)
+{
+    using llmbridge::net::http::Field;
+    using llmbridge::net::http::HeaderLine;
+    std::vector<std::pair<Field, std::string>> seen;
+    const bool ok = llmbridge::net::http::walk_headers(
+        "HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 5\r\nx-ratelimit-remaining-tokens:0\r\nVia: a",
+        [&](const HeaderLine& h) {
+            seen.emplace_back(h.field, std::string(h.name) + "=" + std::string(h.value));
+            return true;
+        });
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0], std::make_pair(Field::ContentLength, std::string("CONTENT-LENGTH= 5")));
+    EXPECT_EQ(seen[1], std::make_pair(Field::TokensRemaining,
+                                      std::string("x-ratelimit-remaining-tokens=0")));
+    EXPECT_EQ(seen[2], std::make_pair(Field::Other, std::string("Via= a")));
+}
+
+// The line-ending check is folded into the walk: a bare CR or LF anywhere, start line
+// included, refuses the head.
+TEST(WalkHeaders, RefusesWhatAnotherParserCouldSplitDifferently)
+{
+    const auto walk = [](std::string_view head) {
+        return llmbridge::net::http::walk_headers(
+            head, [](const llmbridge::net::http::HeaderLine&) { return true; });
+    };
+    EXPECT_TRUE(walk("GET / HTTP/1.1"));
+    EXPECT_TRUE(walk("GET / HTTP/1.1\r\nA: 1"));
+    EXPECT_FALSE(walk("GET /\r HTTP/1.1\r\nA: 1"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\nA: 1"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\nA: 1\rB: 2"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\nA: 1\r"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\n A: 1"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\nA : 1"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\n: 1"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\nno colon"));
+    EXPECT_FALSE(walk("GET / HTTP/1.1\r\nA: 1\r\n"));
+}
+
+TEST(WalkHeaders, StopsWhenTheCallerRefuses)
+{
+    int calls = 0;
+    EXPECT_FALSE(llmbridge::net::http::walk_headers(
+        "GET / HTTP/1.1\r\nA: 1\r\nB: 2", [&](const llmbridge::net::http::HeaderLine&) {
+            ++calls;
+            return false;
+        }));
+    EXPECT_EQ(calls, 1);
+}

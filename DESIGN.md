@@ -246,10 +246,59 @@ continuously fuzzed:
   trickle), and framing is smuggling-safe. **Content-Length only**; a `Transfer-Encoding`
   header and a *conflicting* duplicate `Content-Length` are both **rejected** (RFC 9112
   §6), which matters because upstream connections are pooled across clients.
+  - **One header walk.** `walk_headers` splits the head once, checks each line's
+    ending as it goes, and hands every line to the caller already classified as a
+    `Field`, so `parse_request` and `parse_response_head` share one strict reader.
+    It refuses a head that another parser could split differently, because on a
+    pooled upstream a framing disagreement hands one client another client's bytes:
+    - a bare CR or bare LF anywhere, start line included (`X-A: 1\rContent-Length: 27`
+      hid a length from us that a lenient upstream honoured);
+    - obs-fold, a line starting with SP or HTAB (RFC 9112 §5.2);
+    - whitespace before the colon (`Content-Length : 27`, RFC 9112 §5.1);
+    - a line with no colon, or an empty name.
+  - **Content-Length is `1*DIGIT`** after trimming OWS. `std::from_chars` alone reads
+    `0x1b` as 0 and `27abc` as 27; the first framed a 27-byte body as empty.
+  - **The status line must start `HTTP/1.x SP`**, so bytes left in front of a reply
+    (`JUNKHTTP/1.1 200 OK`) are refused, not absorbed. `{ep,ur}_release_upstream`
+    also clears the buffer; this is the second lock.
+  - **Quota and `Retry-After`.** A rate-limit family counts as exhausted only when its
+    remaining value is a well-formed 0, since naming the wrong quota sends an
+    operator to raise a limit that was not the one refusing. `Retry-After` is read in
+    seconds only; the HTTP-date form reads as absent.
+  - **`find_header`** is the lenient lookup for code outside the framer. The name
+    matches exactly, in any case, with or without its colon, so `x-tenant` never
+    answers from an `x-tenant-spoof:` line (the bare-prefix version did, waiting for
+    its first authorisation caller). First match wins, as the gateway rebuilds the
+    upstream request from an allowlist, so a duplicate never travels. It stops at a
+    blank line, so a credential written into the body is never found. It splits on
+    CRLF only, so a bare CR survives inside a value: anything re-emitted must pass
+    `header_value_safe` first.
+- **Response framing** (`parse_response`). The request path frames by Content-Length
+  only, because there the bytes are the client's and a TE/CL disagreement with the
+  upstream is the classic desync. On the response path we are the client of a
+  configured provider, and chunked is normal: Anthropic sends non-streamed
+  completions chunked over HTTP/1.1 (invisible over h2, so a curl probe will not
+  show it). So the response framer accepts both, and refuses:
+  - both framings at once (RFC 9112 §6.3), whichever is right;
+  - a 1xx: framing `100 Continue` as the reply orphans the real response on a pooled
+    connection, where it becomes the next client's bytes (`request_without` also
+    drops `Expect`);
+  - neither framing header on anything but 204 or 304: read-until-close cannot be
+    pooled. A streamed response is diverted on its head before this, so
+    close-delimited SSE is unaffected.
+
+  A Content-Length body is a view into the receive buffer; a chunked body is decoded
+  into the per-connection `ResponseDecoder`, which is fed only the bytes that arrived
+  since the last call. Re-decoding from byte zero on every read cost O(reads × body):
+  8 MB in 64 KiB reads took 79 ms of single-threaded loop time (1 MB 1.6 ms, 2 MB
+  4.3 ms, 4 MB 13.9 ms), head-of-line blocking every other client on that worker. A
+  typical 1 KB reply arrives in one read and never noticed.
 - **Fuzzing** (`fuzz/`): libFuzzer targets for `json::parse` and `http::parse` under
   ASan + UBSan. Build with `-DLLMBRIDGE_BUILD_FUZZERS=ON` (Clang). Structural
   invariants are asserted on every input (e.g. `total_len == header_len + body_len`,
-  `body_len ≤ kMaxBodyLen`).
+  `body_len ≤ kMaxBodyLen`). `fuzz_http_diff` runs every input through the framer and
+  through `fuzz/http_legacy.hpp`, a frozen copy of the v0.70.0 framer from before the
+  header walker, and asserts identical results. It is kept for one release.
 
 ## Translation model
 
