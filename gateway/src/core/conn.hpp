@@ -7,8 +7,7 @@
 
 #pragma once
 
-// What a Gateway holds per socket and per venue: the dialect and TLS configuration,
-// the upstream table entry, and Connection, the per-fd state both event loops share.
+// Connection, the per-fd state both event loops share, and its log rendering.
 // Which buffer holds what, who may free a connection on each backend, and how the
 // two TLS legs fit: GATEWAY-INTERNALS.md.
 
@@ -19,9 +18,9 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "gateway/sink.hpp"
+#include "gateway/venue.hpp"
 #include "net/http.hpp"
 #include "net/log.hpp"
 #include "net/tls.hpp" // self-guarded by LLMBRIDGE_HAVE_TLS
@@ -30,116 +29,6 @@
 
 namespace llmbridge
 {
-    /// What a refused request is told, in one place. The tests read these, so the
-    /// wording lives here and editing it cannot break a test that is still right.
-    namespace refuse
-    {
-        inline constexpr const char* kImage =
-            "request translate: image content is not supported";
-        inline constexpr const char* kAudio =
-            "request translate: audio content is not supported";
-        inline constexpr const char* kFile =
-            "request translate: file content is not supported";
-        inline constexpr const char* kPart =
-            "request translate: unsupported content part; only \"text\" parts are carried";
-        inline constexpr const char* kToolArgs =
-            "request translate: tool_calls[].function.arguments must be a JSON object "
-            "and nothing else";
-        inline constexpr const char* kCredential =
-            "a credential header holds bytes that cannot be forwarded "
-            "(control characters are refused)";
-        inline constexpr const char* kBedrockCredential =
-            "a Bedrock venue is signed with the caller's AWS access key pair, sent as "
-            "Bearer ACCESS_KEY_ID:SECRET or ACCESS_KEY_ID:SECRET:SESSION_TOKEN; the bearer "
-            "sent is not one (a Bedrock API key is not accepted here)";
-        inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
-        inline constexpr const char* kRepeatedKey =
-            "request translate: an object in the body repeats a key";
-        inline constexpr const char* kNotObject =
-            "request translate: body is not a JSON object";
-        inline constexpr const char* kNoModel = "request translate: no \"model\" field";
-        inline constexpr const char* kNoMessages = "request translate: no \"messages\" field";
-        inline constexpr const char* kShape = "request translate: unsupported request shape";
-    } // namespace refuse
-
-    /// What a venue speaks. OpenAI byte-forwards; the rest translate on the way out
-    /// and back.
-    enum class UpstreamDialect
-    {
-        OpenAI,
-        Anthropic,
-        Gemini,
-        Cohere,
-        /// Bedrock's Messages endpoint: Anthropic's body, the model in the path, SigV4
-        /// in place of a header swap. Needs a TLS build for the signing, so selecting
-        /// it without one fails at startup instead of sending unsigned bytes.
-        Bedrock,
-        /// Azure OpenAI: OpenAI's body, the deployment in the path, api-version in the query,
-        /// the key in `api-key`. Not a byte-forward: that would merge two queries.
-        Azure,
-    };
-
-    /// TLS on either leg, declared without ifdefs. `rbuf` and `wbuf` always hold plaintext;
-    /// ciphertext lives in `tls_out` and the Session.
-    struct TlsConfig
-    {
-        /// Outbound, gateway to provider: we are the TLS client and verify them.
-        bool upstream_tls = false;
-        std::string sni_host; // DNS name for SNI + certificate hostname verification
-        std::string ca_file;  // empty = system trust store (tests pass their own CA)
-
-        /// Inbound, client to gateway: we are the TLS server. One listener, one mode:
-        /// set, the single listener is TLS-only and there is no plaintext port, so
-        /// "am I exposed in the clear?" is answered by the command line.
-        bool client_tls = false;
-        std::string cert_file; // PEM chain, leaf first (Let's Encrypt fullchain.pem)
-        std::string key_file;  // PEM key, mode 600 or startup refuses it
-    };
-
-    /// One place a request can be sent. The gateway holds an ordered table and a policy
-    /// picks the index per request; llmbridge never chooses. The dialect lives here
-    /// because it is what makes cross-venue routing possible.
-    struct Upstream
-    {
-        /// The address in use. Resolved by the caller at startup; the gateway moves
-        /// to the next entry of `ips` after a failed connect and, when `host` is set,
-        /// re-resolves it off the loop and installs the fresh list.
-        std::string ip{};
-        uint16_t port = 0;
-        bool tls = false;     ///< originate TLS to this venue
-        std::string sni_host{}; ///< DNS name for SNI, hostname verification and the
-                              ///< Host header. Empty for the bare IP:PORT form.
-        UpstreamDialect dialect = UpstreamDialect::OpenAI;
-        /// Prefixed to this venue's request target, for providers serving below the
-        /// root. Empty, or "/..." with no trailing slash; net::parse_upstream enforces
-        /// that, and a request whose own target is not origin-form is refused.
-        std::string base_path{};
-
-        std::string host_hdr{}; ///< derived at construction; see host_header_for()
-
-        /// Query for this venue, without the '?'. Only a mode that builds its own
-        /// target may carry one; a byte-forwarding venue would have to merge it with
-        /// the client's, and the constructor refuses that.
-        std::string query{};
-
-        /// AWS region for SigV4, derived from the hostname at construction. Empty when
-        /// the name carries none, which makes a Bedrock venue refuse every request
-        /// instead of signing with a guess.
-        std::string aws_region{};
-
-
-        std::vector<std::string> ips{};
-        std::string host{};
-    };
-
-    /// Event-loop backend. Auto is io_uring when the kernel has it, else epoll.
-    enum class IoBackend
-    {
-        Auto,
-        Epoll,
-        Uring,
-    };
-
     /// Per-fd state, client or upstream (`is_client`); buffer names are the gateway's view:
     ///   c->rbuf request in   u->wbuf request out
     ///   u->rbuf response in  c->wbuf response out

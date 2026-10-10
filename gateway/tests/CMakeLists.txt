@@ -9,6 +9,8 @@ target_link_libraries(gateway_stats_test PRIVATE gateway GTest::gtest_main)
 
 add_executable(gateway_test gateway_test.cpp)
 target_link_libraries(gateway_test PRIVATE gateway GTest::gtest_main)
+# Connection::s_live, the leak counter, lives in src/core/conn.hpp.
+target_include_directories(gateway_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 add_executable(gateway_dialect_test dialect_test.cpp)
 target_link_libraries(gateway_dialect_test PRIVATE gateway GTest::gtest_main)

@@ -10,7 +10,7 @@
 // Gateway: the whole llmbridge proxy in one class. A single-threaded, non-blocking
 // event loop (epoll or io_uring): accept, frame, optionally translate the provider
 // dialect, forward over a keep-alive upstream pool, read back, translate, reply.
-// The per-socket state is in connection.hpp; how it all fits, GATEWAY-INTERNALS.md.
+// The per-socket state is in src/core/conn.hpp; how it all fits, GATEWAY-INTERNALS.md.
 //
 // Per-request added latency is the headline metric, and LATENCY.md is normative for
 // every number below; change a stamp and that document changes with it.
@@ -44,10 +44,12 @@
 #include <utility>
 #include <vector>
 
-#include "gateway/connection.hpp"
 #include "gateway/metrics.hpp"
 #include "gateway/policy.hpp"
+#include "gateway/refusals.hpp"
 #include "gateway/sink.hpp"
+#include "gateway/stats.hpp"
+#include "gateway/venue.hpp"
 #include "net/http.hpp"
 #include "net/tls.hpp"   // self-guarded by LLMBRIDGE_HAVE_TLS
 #include "net/uring.hpp" // self-guarded by LLMBRIDGE_HAVE_URING
@@ -59,61 +61,7 @@ namespace llmbridge
     /// The field promises identity of "the leading bytes" and not this number.
     inline constexpr size_t kPrefixHashBytes = 4096;
 
-    struct Stats
-    {
-        /// The t0-t6 stamps grouped three ways (LATENCY.md section 4). `connect` is
-        /// kept out of req_path and overhead because a cold TCP+TLS handshake is
-        /// 50 ms and would otherwise sit inside a metric sized for microseconds.
-        Histogram overhead;  // req_path + resp_path: everything the gateway does
-        Histogram req_path;  // framing/translate/auth plus the write() to the upstream
-        /// TCP + TLS handshake only, on its own range: the default (20 ns over 2.62 ms)
-        /// put every cold handshake in overflow, and widening the bucket instead would
-        /// charge a pooled conn one bucket width of invented cost. 1 us over 262 ms.
-        Histogram connect{1'000, 262'144};
-        /// Inbound handshake, accept to client handshake done. Ours, unlike `connect`:
-        /// it exists only because the gateway is in the path. Empty unless --listen-tls.
-        Histogram accept_tls{1'000'000, 32'768};
-        Histogram resp_path; // upstream-recv -> client-sent
-        /// Time to first token, streamed requests only: t0 to the first content chunk.
-        Histogram first_token{100'000, 262'144};
-        uint64_t requests = 0;
-        uint64_t errors = 0;
-        uint64_t upstream_conns_opened = 0;
-        uint64_t upstream_retries = 0;  // stale pooled connection -> resent on a fresh one
-        uint64_t upstream_reused = 0;   // requests served on a pooled keep-alive conn
-        uint64_t upstream_unsent = 0;   // response beat our request out; conn closed, not pooled
-        /// Peak unsent ciphertext staged for one connection: the part of tls_out not
-        /// yet written plus whatever is still in the write BIO. The measurement seam
-        /// for "can a client that never reads grow us without bound?"; counting
-        /// tls_out.size() instead grew with total bytes streamed, not the backlog.
-        uint64_t tls_buffered_peak = 0;
-        uint64_t upstream_timeouts = 0; // requests/streams aborted on upstream inactivity
-        uint64_t connect_timeouts = 0;  // fresh upstream connects abandoned at the deadline
-        uint64_t upstream_reresolved = 0; // venue address lists replaced after a connect failure
-        uint64_t client_idle_timeouts = 0;  // established clients dropped after going quiet
-        uint64_t client_setup_timeouts = 0; // clients dropped for never completing a
-                                            // first request (stall, or the wrong protocol)
-        /// Inbound handshakes that failed, mostly scanners speaking junk at 443. Their
-        /// log line sits at DEBUG so production stays readable; this keeps them
-        /// visible, and a step change when a customer connects is their TLS problem.
-        uint64_t client_tls_handshake_failures = 0;
-        uint64_t stream_pauses = 0;     // epoll: upstream reads paused for client backpressure
-        uint64_t uring_enobufs = 0;     // io_uring: provided-buffer pool momentarily empty
-        uint64_t accept_backoffs = 0;   // listener paused: out of file descriptors
-        /// Requests an installed Policy refused; a subset of `errors`, not a sibling.
-        /// Denials climbing while `errors - denials` stays flat is a brute-force
-        /// attempt, not an outage.
-        uint64_t policy_denied = 0;
-        /// Re-dispatched to another venue after a failure; 0 unless a policy opts in.
-        /// `upstream_retries` is the same venue on a fresh connection.
-        uint64_t upstream_failovers = 0;
-        /// Requests whose scratch buffer had to grow to hold them, so the pages it
-        /// wrote were fresh and faulted in.
-        uint64_t cold_builds = 0;
-        uint64_t warm_reuses = 0; // new upstream connections given a retired buffer
-        /// Requests whose ciphertext buffer had to grow.
-        uint64_t tls_out_grows = 0;
-    };
+    struct Connection; // src/core/conn.hpp
 
     class Gateway
     {
@@ -326,12 +274,8 @@ namespace llmbridge
         /// level-triggered epoll re-notifies, so stopping early costs one wakeup.
         static constexpr size_t kEpMaxReadPerEvent = 1 << 20; // 1 MiB
 
-        /// The venue a connection is bound to; see Connection::upstream_slot.
-        [[nodiscard]] const Upstream& upstream_of(const Connection* c) const noexcept
-        {
-            const size_t i = (c->upstream_slot >= 0) ? static_cast<size_t>(c->upstream_slot) : 0;
-            return _upstreams[i < _upstreams.size() ? i : 0];
-        }
+        /// The venue a connection is bound to; defined in loop.hpp beside Connection.
+        [[nodiscard]] inline const Upstream& upstream_of(const Connection* c) const noexcept;
 
         /// One shared SSL_CTX covers every venue: it holds the trust store, while SNI
         /// and the verified hostname are per-connection.

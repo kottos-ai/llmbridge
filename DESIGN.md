@@ -436,7 +436,11 @@ the model in the path, Azure the deployment in the path and the api-version in t
 (Anthropic and OpenAI respectively), so they cannot reduce to a plain byte-forward on a
 same-dialect match. They stay on their existing OpenAI-client path until a non-OpenAI
 client path is built for them, and `resolve_translation` refuses a non-OpenAI client to
-either, so the SigV4 or the URL rewrite is never dropped.
+either, so the SigV4 or the URL rewrite is never dropped. Bedrock is Anthropic's body
+with the model in the path and SigV4 in place of a header swap, so it needs a TLS build
+for the signing: selecting it without one fails at startup instead of sending unsigned
+bytes. Azure is OpenAI's body with the deployment in the path, `api-version` in the
+query and the key in `api-key`; it is not a byte-forward, which would merge two queries.
 
 Sequencing: phase one is the resolution above, which makes a same-dialect caller
 byte-forward (this is what lets an Anthropic client reach an Anthropic venue) and refuses
