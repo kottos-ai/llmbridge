@@ -633,6 +633,7 @@ namespace llmbridge
                 if (h.event_stream && h.status == 200 && h.body != net::http::Body::None)
                 {
                     c->peer->req.f.ts_up_recvd = now_ns(); // t4: head complete, see the epoll mirror
+                    note_upstream_rtt(c->peer, c);
                     note_quota(c->peer, h);
                     note_venue_req_id(c->peer, std::string_view(c->rbuf.data(), h.header_len));
                     ur_begin_stream(c, h);
@@ -646,6 +647,7 @@ namespace llmbridge
             if (r.failed()) { ur_error_respond(c->peer, 502, "upstream response framing"); return; }
             if (!r.complete()) return; // armed recv delivers the rest
             c->peer->req.f.ts_up_recvd = now_ns();
+            note_upstream_rtt(c->peer, c);
             note_quota(c->peer, r.head);
             note_venue_req_id(c->peer, std::string_view(c->rbuf.data(), r.head.header_len));
             note_upstream_error(c->peer, r.head, r.body);

@@ -253,3 +253,35 @@ INSTANTIATE_TEST_SUITE_P(Cases, StartConnectBadIp,
                              for (char& ch : s) if (!std::isalnum((unsigned char)ch)) ch = '_';
                              return s.empty() ? std::string("empty") : s;
                          });
+
+// ── tcp_rtt ─────────────────────────────────────────────────────────────────
+// The handshake alone is a sample, so a connected socket reports both estimates.
+// Loopback, so the bound is loose: anything near a second is a unit error.
+TEST(SocketUtil, TcpRttReportsAConnectedSocket)
+{
+    const int lst = make_listener(0);
+    ASSERT_GE(lst, 0);
+    const int c = start_connect("127.0.0.1", port_of(lst));
+    ASSERT_GE(c, 0);
+    ASSERT_TRUE(wait_writable(c, 1000));
+    ASSERT_EQ(connect_result(c), 0);
+    const TcpRtt rtt = tcp_rtt(c);
+    EXPECT_GT(rtt.srtt_us, 0u);
+    EXPECT_GT(rtt.min_us, 0u);
+    EXPECT_LT(rtt.srtt_us, 1'000'000u);
+    EXPECT_LT(rtt.min_us, 1'000'000u);
+    ::close(c);
+    ::close(lst);
+}
+
+// No sample is zero, never the kernel's ~0U starting minimum or a stale struct.
+TEST(SocketUtil, TcpRttIsZeroWithoutAConnection)
+{
+    for (const int fd : {-1, tcp_socket(), static_cast<int>(::socket(AF_INET, SOCK_DGRAM, 0))})
+    {
+        const TcpRtt rtt = tcp_rtt(fd);
+        EXPECT_EQ(rtt.srtt_us, 0u) << fd;
+        EXPECT_EQ(rtt.min_us, 0u) << fd;
+        if (fd >= 0) ::close(fd);
+    }
+}

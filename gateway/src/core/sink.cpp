@@ -123,6 +123,8 @@ namespace llmbridge
         r.status = status;
         r.upstream_index = c->upstream_slot;
         r.upstream_ip = c->req.f.upstream_ip;
+        r.upstream_srtt_us = c->req.f.upstream_srtt_us;
+        r.upstream_min_rtt_us = c->req.f.upstream_min_rtt_us;
         r.attempts = c->req.f.failover_attempts;
         r.streamed = streamed;
         r.error_reply = !streamed && c->close_after_resp;

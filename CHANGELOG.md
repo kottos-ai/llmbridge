@@ -8,6 +8,35 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.81.1]. 2026-10-10
+
+The record of each request carries the kernel's round-trip time to the venue.
+
+### Added
+
+- **`RequestRecord::upstream_min_rtt_us` and `upstream_srtt_us`**: the kernel's
+  minimum and smoothed round-trip estimates for the venue's socket, read with
+  `TCP_INFO` when its response head arrives, on both backends, streamed or not, error
+  statuses included. 0 when no venue answered.
+- `net::tcp_rtt(fd)` and `net::TcpRtt`. In their own file, `net/src/tcp_rtt.cpp`,
+  because glibc's `struct tcp_info` has no `tcpi_min_rtt` and `<linux/tcp.h>` cannot be
+  included beside `<netinet/tcp.h>`.
+
+### Performance
+
+- One `getsockopt` per request, after t4 is stamped, so no timing span grows: 0.73 µs
+  at p50 and about 1 µs at p99 over 200,000 calls on a loopback socket.
+
+### Tests
+
+- `net_socket_util_test`: a connected socket reports both estimates; a closed fd, an
+  unconnected TCP socket and a UDP socket report zero, never the kernel's `~0U`
+  starting minimum.
+- `gateway_test`, both backends: a dialled request, a pooled one, a venue's 529 and a
+  stream carry the estimates; a request no venue answered carries none. Each call
+  site, the sink copy and the `~0U` mapping were removed in turn, and each removal
+  failed a test.
+
 ## [0.81.0]. 2026-10-10
 
 ### Fixed

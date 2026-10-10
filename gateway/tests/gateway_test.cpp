@@ -9335,6 +9335,25 @@ TEST_P(ProxyStream, TheRouteSetsTheServiceTierOnTheWire)
         << "the client named no tier, so there is no disagreement to report";
 }
 
+// A stream's head is where its RTT is read too, before the first token.
+TEST_P(ProxyStream, AStreamCarriesTheVenueRtt)
+{
+    _backend.set_response(sse_chunked_response(4096));
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    c.recv_stream();
+    c.close();
+    shutdown();
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_TRUE(sink.records()[0].r.streamed);
+    EXPECT_GT(sink.records()[0].r.upstream_min_rtt_us, 0u);
+    EXPECT_LT(sink.records()[0].r.upstream_min_rtt_us, 1'000'000u);
+}
+
 // The caller loses, and is not overridden in silence: what it asked for reaches the
 // record so the page it reads can say the route bought something else.
 TEST_P(ProxyStream, ACallersOwnTierIsOverriddenAndReported)
@@ -10247,6 +10266,83 @@ TEST_P(ProxyRequestReset, ASecondRequestOnAColdUpstreamGetsItsOwnStamps)
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyRequestReset,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring));
+
+// ── The kernel's RTT to the venue (net::tcp_rtt) ─────────────────────────────
+//
+// Read at the response head, so a reader can take one round trip off the first-token
+// wait and keep the venue's queue. Loopback, so only "set and plausible" is testable;
+// anything near a second is a unit error.
+class ProxyUpstreamRtt : public ProxyIT,
+                         public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+TEST_P(ProxyUpstreamRtt, ADialledAndAPooledRequestBothCarryIt)
+{
+    _backend.set_response(http_ok("{}"));
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    for (int i = 0; i < 2; ++i)
+    {
+        ASSERT_TRUE(c.send(make_request())) << i;
+        ASSERT_EQ(Client::status_of(c.recv_response()), 200) << i;
+    }
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_FALSE(recs[0].r.from_pool);
+    EXPECT_TRUE(recs[1].r.from_pool);
+    for (size_t i = 0; i < recs.size(); ++i)
+    {
+        EXPECT_GT(recs[i].r.upstream_min_rtt_us, 0u) << i;
+        EXPECT_GT(recs[i].r.upstream_srtt_us, 0u) << i;
+        EXPECT_LT(recs[i].r.upstream_min_rtt_us, 1'000'000u) << i;
+        EXPECT_LT(recs[i].r.upstream_srtt_us, 1'000'000u) << i;
+    }
+}
+
+// An error status is a head like any other: an overloaded venue's 529 is the row a
+// queue reading most needs.
+TEST_P(ProxyUpstreamRtt, AVenuesErrorCarriesIt)
+{
+    _backend.set_response("HTTP/1.1 529 Overloaded\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 2\r\n\r\n{}");
+    RecordingSink sink;
+    _sink = &sink;
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(make_request()));
+    ASSERT_EQ(Client::status_of(c.recv_response()), 529);
+    c.close();
+    shutdown();
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_GT(sink.records()[0].r.upstream_min_rtt_us, 0u);
+}
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyUpstreamRtt,
+                         ::testing::Values(llmbridge::IoBackend::Epoll,
+                                           llmbridge::IoBackend::Uring));
+
+// No venue answered, so there is no round trip to report.
+TEST_P(ProxyRoute, ARequestNoVenueAnsweredHasNoRtt)
+{
+    const DeadPort dead_sock;
+    RecordingSink sink;
+    start({{"127.0.0.1", dead_sock.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr,
+          &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request()));
+    EXPECT_EQ(c.recv_status(), 502);
+    c.close();
+    shutdown();
+    ASSERT_EQ(sink.records().size(), 1u);
+    EXPECT_EQ(sink.records()[0].r.upstream_srtt_us, 0u);
+    EXPECT_EQ(sink.records()[0].r.upstream_min_rtt_us, 0u);
+}
 
 namespace
 {

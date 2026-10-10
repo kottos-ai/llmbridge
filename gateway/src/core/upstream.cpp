@@ -11,6 +11,7 @@
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
+#include "net/socket_util.hpp" // tcp_rtt
 #include "scan.hpp"
 
 #include <cstring>
@@ -43,6 +44,15 @@ namespace llmbridge
             client->req.f.venue_req_id.set(v);
             return;
         }
+    }
+
+    void Gateway::note_upstream_rtt(Connection* client, const Connection* u) noexcept
+    {
+        // At the head, when the venue has acknowledged the whole request, and on the
+        // socket under TLS. One getsockopt, after t4 is stamped so it is not inside it.
+        const net::TcpRtt rtt = net::tcp_rtt(u->fd);
+        client->req.f.upstream_srtt_us = rtt.srtt_us;
+        client->req.f.upstream_min_rtt_us = rtt.min_us;
     }
 
     void Gateway::note_upstream_error(Connection* client, const net::http::ResponseHead& h,
