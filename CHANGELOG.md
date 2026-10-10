@@ -8,6 +8,27 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.72.0]. 2026-10-10
+
+### Changed
+
+- **One header walker.** `net::http::walk_headers` splits a head once, checks each
+  line's ending as it goes, and hands each line to the caller classified as a
+  `net::http::Field`. `parse_request` and `parse_response_head` are rebuilt on it;
+  `find_header` keeps its lenient contract and shares the name compare. No behaviour
+  change: `fuzz_http_diff` runs every input through the new framer and through a
+  frozen copy of the v0.70.0 one (`fuzz/http_legacy.hpp`, kept for one release) and
+  asserts identical results, and CI fuzzes it for 60 s.
+- The rationale comments in `net/http.hpp` moved to DESIGN.md "Parsing & framing".
+
+### Performance
+
+- **Head parsing is 2.6x faster.** The separate line-ending pass is gone and each
+  line is classified once instead of tested against every known name.
+  `bench/protocol_micro` `parse_response_head` on the 1 KB Anthropic head, p50 of 3
+  interleaved runs, GCC Release: 2.13 to 0.80 us.
+
+
 ## [0.71.0]. 2026-10-10
 
 ### Fixed
@@ -240,7 +261,7 @@ regression test that fails without it, except where noted.
 - **12 files comments are shortened**.
 - **Rationale moved into the docs instead of being deleted.** DESIGN.md gains
   "Upstream URLs", "Body edits and top-level readers", "Signing for Bedrock", the
-  memory-BIO call protocol, the comment-density rule and two smaller additions;
+  memory-BIO call protocol, and two smaller additions;
   GATEWAY-INTERNALS.md gains section 9b on how `secure_clear` erases.
 - `sse.hpp` no longer claims the stream translator is text-only: it has handled tool
   calls for several releases.

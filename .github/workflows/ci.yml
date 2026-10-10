@@ -195,6 +195,9 @@ jobs:
       - name: Fuzz the HTTP framer (60s, seeded)
         run: ./build-fuzz/bin/fuzz_http -max_total_time=60 -print_final_stats=1
              -artifact_prefix=fuzz-artifacts/ fuzz/corpus/http
+      - name: Fuzz the header walker against the v0.70.0 framer (60s, seeded)
+        run: ./build-fuzz/bin/fuzz_http_diff -max_total_time=60 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/http
       - name: Fuzz the inbound TLS handshake (60s, seeded)
         run: ./build-fuzz/bin/fuzz_tls_server -max_total_time=60 -print_final_stats=1
              -artifact_prefix=fuzz-artifacts/ fuzz/corpus/tls

@@ -5,21 +5,19 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-#pragma once
+// Frozen copy of net/http.hpp as of v0.70.0, the reference fuzz_http_diff compares
+// the header walker against. Kept for one release; do not edit.
 
-// HTTP/1.1 framing for the proxy hot path: index math over a caller-owned buffer.
-// Requests frame by Content-Length only; responses also accept chunked. What is
-// refused and why: DESIGN.md "Parsing & framing".
+#pragma once
 
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <string_view>
 
-namespace llmbridge::net::http
+namespace llmbridge::net::http_legacy
 {
     struct Message
     {
@@ -28,30 +26,14 @@ namespace llmbridge::net::http
         size_t total_len = 0;  // header_len + body_len: full message size
         bool keep_alive = true;
         bool encoded = false;  // Content-Encoding present and not identity
-        bool http_1_1 = true;  // false for 1.0, which has no chunked encoding
+        bool http_1_1 = true;
     };
 
-    // The framing tri-state, shared by every parse entry point in this header.
     enum class FrameStatus
     {
         NeedMore, // not fully buffered yet: feed more bytes and re-run
         Complete, // the thing this call frames is fully present
         Error     // malformed; refuse the message (see the fail-closed policy)
-    };
-
-    /// The header fields a framer acts on; every other name is Other.
-    enum class Field : uint8_t
-    {
-        Other, ContentLength, TransferEncoding, ContentEncoding, ContentType, Connection,
-        RetryAfter, RequestsRemaining, InputTokensRemaining, OutputTokensRemaining,
-        TokensRemaining
-    };
-
-    /// One header line. `value` is everything after the colon, untrimmed.
-    struct HeaderLine
-    {
-        Field field = Field::Other;
-        std::string_view name, value;
     };
 
     namespace detail
@@ -61,7 +43,6 @@ namespace llmbridge::net::http
             return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
         }
 
-        // Case-insensitive substring search; `needle` must be lower-case.
         inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept
         {
             if (needle.empty() || hay.size() < needle.size()) return needle.empty();
@@ -75,21 +56,11 @@ namespace llmbridge::net::http
             return false;
         }
 
-        // Case-insensitive prefix test; `name` must be lower-case. Not a header
-        // lookup: a name without its ':' prefix-matches longer names.
         inline bool line_is(std::string_view line, std::string_view name) noexcept
         {
             if (line.size() < name.size()) return false;
             for (size_t i = 0; i < name.size(); ++i)
                 if (lc(line[i]) != name[i]) return false;
-            return true;
-        }
-
-        inline bool same_ci(std::string_view a, std::string_view b) noexcept
-        {
-            if (a.size() != b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i)
-                if (lc(a[i]) != lc(b[i])) return false;
             return true;
         }
 
@@ -100,7 +71,6 @@ namespace llmbridge::net::http
             return v.substr(i);
         }
 
-        // RFC 9110 OWS (SP / HTAB) off both ends.
         inline std::string_view trim_ows(std::string_view v) noexcept
         {
             size_t b = 0, e = v.size();
@@ -109,7 +79,6 @@ namespace llmbridge::net::http
             return v.substr(b, e - b);
         }
 
-        // RFC 9112 §8.6: 1*DIGIT and nothing else, unlike a bare from_chars.
         inline bool parse_strict_length(std::string_view v, size_t& out) noexcept
         {
             v = trim_ows(v);
@@ -123,32 +92,22 @@ namespace llmbridge::net::http
             return true;
         }
 
-        // Only a well-formed 0 counts as an exhausted quota.
         inline bool is_zero_count(std::string_view v) noexcept
         {
             size_t n = 0;
             return parse_strict_length(v, n) && n == 0;
         }
 
-        // The end of the line starting at `from`: the CR of its CRLF, or the end of
-        // `s`. False when the line holds a bare CR or a bare LF.
-        inline bool line_end(std::string_view s, size_t from, size_t& eol) noexcept
+        inline bool block_line_endings_ok(std::string_view h) noexcept
         {
-            const char* b = s.data() + from;
-            size_t len = s.size() - from;
-            if (const void* lf = len ? std::memchr(b, '\n', len) : nullptr)
+            for (size_t i = 0; i < h.size(); ++i)
             {
-                len = static_cast<size_t>(static_cast<const char*>(lf) - b);
-                if (len == 0 || b[len - 1] != '\r') return false;
-                --len;
+                if (h[i] == '\r' && (i + 1 >= h.size() || h[i + 1] != '\n')) return false;
+                if (h[i] == '\n' && (i == 0 || h[i - 1] != '\r')) return false;
             }
-            if (len && std::memchr(b, '\r', len)) return false;
-            eol = from + len;
             return true;
         }
 
-        // A header line needs a colon after a non-empty name, no obs-fold and no
-        // whitespace before the colon (RFC 9112 §5.1, §5.2).
         inline bool line_ok(std::string_view line, size_t& colon) noexcept
         {
             if (line.empty()) return false;
@@ -157,61 +116,8 @@ namespace llmbridge::net::http
             if (colon == std::string_view::npos || colon == 0) return false;
             return !(line[colon - 1] == ' ' || line[colon - 1] == '\t');
         }
-
-        struct FieldName
-        {
-            std::string_view name;
-            Field field;
-        };
-        inline constexpr FieldName kFieldNames[] = {
-            {"connection", Field::Connection},
-            {"retry-after", Field::RetryAfter},
-            {"content-type", Field::ContentType},
-            {"content-length", Field::ContentLength},
-            {"content-encoding", Field::ContentEncoding},
-            {"transfer-encoding", Field::TransferEncoding},
-            {"x-ratelimit-remaining-tokens", Field::TokensRemaining},
-            {"x-ratelimit-remaining-requests", Field::RequestsRemaining},
-            {"anthropic-ratelimit-requests-remaining", Field::RequestsRemaining},
-            {"anthropic-ratelimit-input-tokens-remaining", Field::InputTokensRemaining},
-            {"anthropic-ratelimit-output-tokens-remaining", Field::OutputTokensRemaining},
-        };
-
-        inline Field classify(std::string_view name) noexcept
-        {
-            for (const FieldName& f : kFieldNames)
-                if (same_ci(name, f.name)) return f.field;
-            return Field::Other;
-        }
     } // namespace detail
 
-    /// Calls `on_line(const HeaderLine&) -> bool` for each header line of `head`, the
-    /// bytes before the terminating CRLFCRLF; the start line is checked, then skipped.
-    /// False when another parser could split the head differently (a bare CR or LF
-    /// anywhere, obs-fold, no colon, whitespace before the colon) or `on_line` refuses.
-    template <class OnLine>
-    bool walk_headers(std::string_view head, OnLine&& on_line) noexcept
-    {
-        size_t eol = 0;
-        if (!detail::line_end(head, 0, eol)) return false;
-        while (eol < head.size())
-        {
-            const size_t start = eol + 2;
-            if (!detail::line_end(head, start, eol)) return false;
-            const std::string_view line = head.substr(start, eol - start);
-            size_t colon = 0;
-            if (!detail::line_ok(line, colon)) return false;
-            const std::string_view name = line.substr(0, colon);
-            if (!on_line(HeaderLine{detail::classify(name), name, line.substr(colon + 1)}))
-                return false;
-        }
-        return true;
-    }
-
-    /// Value of header `name` (any case, trailing colon optional), left-trimmed;
-    /// empty when absent. First match wins, the search stops at a blank line, and a
-    /// start line may be included. Lenient on purpose: a bare CR stays inside the
-    /// value, so a caller re-emitting it must validate the charset first.
     inline std::string_view find_header(std::string_view headers, std::string_view name) noexcept
     {
         if (!name.empty() && name.back() == ':') name.remove_suffix(1);
@@ -223,73 +129,89 @@ namespace llmbridge::net::http
             if (eol == std::string_view::npos) eol = headers.size();
             const std::string_view line = headers.substr(start, eol - start);
             if (line.empty()) return {};
-            if (line.size() > name.size() && line[name.size()] == ':' &&
-                detail::same_ci(line.substr(0, name.size()), name))
-                return detail::ltrim(line.substr(name.size() + 1));
+            if (line.size() > name.size() && line[name.size()] == ':')
+            {
+                bool same = true;
+                for (size_t i = 0; i < name.size() && same; ++i)
+                    same = detail::lc(line[i]) == detail::lc(name[i]);
+                if (same) return detail::ltrim(line.substr(name.size() + 1));
+            }
             start = eol + 2;
         }
         return {};
     }
 
-    // Header section cap: bounds slow-loris buffer growth.
     inline constexpr size_t kMaxHeaderLen = 32 * 1024;
 
-    // Content-Length cap: bounds a `Content-Length: 9999999999` trickle.
     inline constexpr size_t kMaxBodyLen = 16 * 1024 * 1024;
 
-    // Idempotent: re-run as bytes arrive; NeedMore until the full message is buffered.
     inline FrameStatus parse_request(std::string_view buf, Message& out) noexcept
     {
         const size_t hdr_end = buf.find("\r\n\r\n");
         if (hdr_end == std::string_view::npos)
-            return buf.size() > kMaxHeaderLen ? FrameStatus::Error : FrameStatus::NeedMore;
+        {
+            if (buf.size() > kMaxHeaderLen) return FrameStatus::Error;
+            return FrameStatus::NeedMore;
+        }
         out.header_len = hdr_end + 4;
         if (out.header_len > kMaxHeaderLen) return FrameStatus::Error;
 
         out.body_len = 0;
         out.keep_alive = true;
-        const std::string_view head = buf.substr(0, hdr_end);
-        // "method SP target SP HTTP/1.x": the version follows the last space.
-        const std::string_view rl = head.substr(0, head.find("\r\n"));
-        const size_t sp = rl.rfind(' ');
-        const std::string_view ver = sp == std::string_view::npos ? std::string_view{}
-                                                                 : rl.substr(sp + 1);
-        out.http_1_1 = ver == "HTTP/1.1";
-        if (ver == "HTTP/1.0") out.keep_alive = false;
+        {
+            const size_t rl_end = buf.find("\r\n");
+            const std::string_view rl = buf.substr(0, rl_end == std::string_view::npos ? 0 : rl_end);
+            const size_t sp = rl.rfind(' ');
+            const std::string_view ver = sp == std::string_view::npos ? std::string_view{}
+                                                                     : rl.substr(sp + 1);
+            out.http_1_1 = ver == "HTTP/1.1";
+            if (ver == "HTTP/1.0") out.keep_alive = false;
+        }
+        bool have_cl = false; // to detect a conflicting duplicate Content-Length
+        std::string_view headers = buf.substr(0, hdr_end);
 
-        bool have_cl = false;
-        const bool ok = walk_headers(head, [&](const HeaderLine& h) noexcept {
-            switch (h.field)
+        if (!detail::block_line_endings_ok(headers)) return FrameStatus::Error;
+
+        size_t pos = headers.find("\r\n");
+        if (pos == std::string_view::npos) pos = headers.size(); // no headers
+        while (pos < headers.size())
+        {
+            size_t start = pos + 2;
+            size_t eol = headers.find("\r\n", start);
+            if (eol == std::string_view::npos) eol = headers.size();
+            std::string_view line = headers.substr(start, eol - start);
+
+            size_t colon = 0;
+            if (!detail::line_ok(line, colon)) return FrameStatus::Error;
+            const std::string_view value = line.substr(colon + 1);
+
+            if (detail::line_is(line, "content-length:"))
             {
-                case Field::ContentLength:
-                {
-                    size_t n = 0;
-                    if (!detail::parse_strict_length(h.value, n)) return false;
-                    if (have_cl && n != out.body_len) return false; // RFC 9112 §6.3
-                    out.body_len = n;
-                    have_cl = true;
-                    return true;
-                }
-                case Field::TransferEncoding:
-                    return false; // Content-Length framing only
-                case Field::ContentEncoding:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
-                    return true;
-                }
-                case Field::Connection:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
-                    else if (v.size() >= 10 && detail::line_is(v, "keep-alive")) out.keep_alive = true;
-                    return true;
-                }
-                default:
-                    return true;
+                size_t n = 0;
+                if (!detail::parse_strict_length(value, n)) return FrameStatus::Error;
+                if (have_cl && n != out.body_len) return FrameStatus::Error;
+                out.body_len = n;
+                have_cl = true;
             }
-        });
-        if (!ok || out.body_len > kMaxBodyLen) return FrameStatus::Error;
+            else if (detail::line_is(line, "transfer-encoding:"))
+            {
+                return FrameStatus::Error;
+            }
+            else if (detail::line_is(line, "content-encoding:"))
+            {
+                const std::string_view v = detail::ltrim(value);
+                out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
+            }
+            else if (detail::line_is(line, "connection:"))
+            {
+                std::string_view v = detail::ltrim(value);
+                if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
+                else if (v.size() >= 10 && detail::line_is(v, "keep-alive")) out.keep_alive = true;
+            }
+            pos = eol;
+        }
+
+        if (out.body_len > kMaxBodyLen) return FrameStatus::Error;
 
         out.total_len = out.header_len + out.body_len;
         if (buf.size() < out.total_len) return FrameStatus::NeedMore;
@@ -306,17 +228,12 @@ namespace llmbridge::net::http
         bool has_content_length = false;
         bool encoded = false;          // Content-Encoding present and not identity
         size_t content_length = 0;
-        /// The quota family whose remaining count is zero: Anthropic names it in the
-        /// header name, OpenAI in its suffix.
         enum class Quota : uint8_t { None = 0, Requests = 1, InputTokens = 2,
                                      OutputTokens = 3, Tokens = 4 };
         Quota quota_exhausted = Quota::None;
-        /// `Retry-After` in seconds, 0 when absent, saturated at 65535.
         uint16_t retry_after_s = 0;
     };
 
-    // Unlike parse_request, accepts chunked (SSE and most non-streamed replies) and
-    // reports the framing. NeedMore until the CRLFCRLF is buffered.
     inline FrameStatus parse_response_head(std::string_view buf, ResponseHead& out) noexcept
     {
         const size_t hdr_end = buf.find("\r\n\r\n");
@@ -325,83 +242,101 @@ namespace llmbridge::net::http
         out.header_len = hdr_end + 4;
         if (out.header_len > kMaxHeaderLen) return FrameStatus::Error;
 
-        const std::string_view head = buf.substr(0, hdr_end);
-        // "HTTP/1.x SP" first, so leading junk is never absorbed into the status line.
-        if (head.size() < 9 || head.compare(0, 7, "HTTP/1.") != 0 ||
-            (head[7] != '0' && head[7] != '1') || head[8] != ' ')
+        std::string_view headers = buf.substr(0, hdr_end);
+
+        if (headers.size() < 9 || headers.compare(0, 7, "HTTP/1.") != 0 ||
+            (headers[7] != '0' && headers[7] != '1') || headers[8] != ' ')
             return FrameStatus::Error;
 
-        const std::string_view rest = detail::ltrim(head.substr(9));
-        int code = 0;
-        size_t k = 0;
-        for (; k < rest.size() && k < 3 && rest[k] >= '0' && rest[k] <= '9'; ++k)
-            code = code * 10 + (rest[k] - '0');
-        if (k == 3) out.status = code;
+        size_t sp = headers.find(' ');
+        if (sp != std::string_view::npos)
+        {
+            std::string_view rest = detail::ltrim(headers.substr(sp + 1));
+            int code = 0;
+            size_t k = 0;
+            for (; k < rest.size() && k < 3 && rest[k] >= '0' && rest[k] <= '9'; ++k)
+                code = code * 10 + (rest[k] - '0');
+            if (k == 3) out.status = code;
+        }
 
-        using Quota = ResponseHead::Quota;
-        const auto quota = [&out](std::string_view v, Quota q) noexcept {
-            if (detail::is_zero_count(v)) out.quota_exhausted = q;
-            return true;
-        };
-        const bool ok = walk_headers(head, [&](const HeaderLine& h) noexcept {
-            switch (h.field)
+        if (!detail::block_line_endings_ok(headers)) return FrameStatus::Error;
+
+        size_t pos = headers.find("\r\n");
+        if (pos == std::string_view::npos) pos = headers.size();
+        while (pos < headers.size())
+        {
+            size_t start = pos + 2;
+            size_t eol = headers.find("\r\n", start);
+            if (eol == std::string_view::npos) eol = headers.size();
+            std::string_view line = headers.substr(start, eol - start);
+
+            size_t colon = 0;
+            if (!detail::line_ok(line, colon)) return FrameStatus::Error;
+            const std::string_view value = line.substr(colon + 1);
+
+            if (detail::line_is(line, "content-length:"))
             {
-                case Field::ContentLength:
-                {
-                    size_t n = 0;
-                    if (!detail::parse_strict_length(h.value, n)) return false;
-                    if (out.has_content_length && n != out.content_length) return false;
-                    out.content_length = n;
-                    out.has_content_length = true;
-                    return true;
-                }
-                case Field::RetryAfter:
-                {
-                    size_t n = 0; // seconds only; an HTTP-date reads as absent
-                    if (detail::parse_strict_length(h.value, n))
-                        out.retry_after_s = n > 65535 ? 65535 : static_cast<uint16_t>(n);
-                    return true;
-                }
-                case Field::RequestsRemaining: return quota(h.value, Quota::Requests);
-                case Field::InputTokensRemaining: return quota(h.value, Quota::InputTokens);
-                case Field::OutputTokensRemaining: return quota(h.value, Quota::OutputTokens);
-                case Field::TokensRemaining: return quota(h.value, Quota::Tokens);
-                case Field::TransferEncoding:
-                    if (detail::contains_ci(h.value, "chunked")) out.chunked = true;
-                    return true;
-                case Field::ContentEncoding:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
-                    return true;
-                }
-                case Field::ContentType:
-                    if (detail::contains_ci(h.value, "text/event-stream")) out.event_stream = true;
-                    return true;
-                case Field::Connection:
-                {
-                    const std::string_view v = detail::ltrim(h.value);
-                    if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
-                    return true;
-                }
-                default:
-                    return true;
+                size_t n = 0;
+                if (!detail::parse_strict_length(value, n)) return FrameStatus::Error;
+                if (out.has_content_length && n != out.content_length) return FrameStatus::Error;
+                out.content_length = n;
+                out.has_content_length = true;
             }
-        });
-        if (!ok) return FrameStatus::Error;
-        // Both framings present (RFC 9112 §6.3): refuse instead of picking one.
+            else if (detail::line_is(line, "retry-after:"))
+            {
+                size_t n = 0;
+                if (detail::parse_strict_length(value, n))
+                    out.retry_after_s = n > 65535 ? 65535 : static_cast<uint16_t>(n);
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-requests-remaining:") ||
+                     detail::line_is(line, "x-ratelimit-remaining-requests:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::Requests;
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-input-tokens-remaining:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::InputTokens;
+            }
+            else if (detail::line_is(line, "anthropic-ratelimit-output-tokens-remaining:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::OutputTokens;
+            }
+            else if (detail::line_is(line, "x-ratelimit-remaining-tokens:"))
+            {
+                if (detail::is_zero_count(value))
+                    out.quota_exhausted = ResponseHead::Quota::Tokens;
+            }
+            else if (detail::line_is(line, "transfer-encoding:"))
+            {
+                if (detail::contains_ci(value, "chunked")) out.chunked = true;
+            }
+            else if (detail::line_is(line, "content-encoding:"))
+            {
+                const std::string_view v = detail::ltrim(value);
+                out.encoded = !v.empty() && !detail::contains_ci(v, "identity");
+            }
+            else if (detail::line_is(line, "content-type:"))
+            {
+                if (detail::contains_ci(value, "text/event-stream")) out.event_stream = true;
+            }
+            else if (detail::line_is(line, "connection:"))
+            {
+                std::string_view v = detail::ltrim(value);
+                if (v.size() >= 5 && detail::line_is(v, "close")) out.keep_alive = false;
+            }
+            pos = eol;
+        }
         if (out.chunked && out.has_content_length) return FrameStatus::Error;
         if (out.has_content_length && out.content_length > kMaxBodyLen) return FrameStatus::Error;
         return FrameStatus::Complete;
     }
 
-    // Incremental chunked-transfer decoder, one per response: a size line or its data
-    // may split across reads. An absurd chunk size or size line is an error.
     class ChunkDecoder
     {
     public:
-        // Appends decoded bytes to `out`; false on a malformed stream. Bytes fed after
-        // done() are ignored.
         bool feed(std::string_view in, std::string& out) noexcept
         {
             size_t i = 0;
@@ -478,8 +413,6 @@ namespace llmbridge::net::http
 
         [[nodiscard]] bool done() const noexcept { return _st == St::Done; }
 
-        // Input bytes taken across all feeds, never past the terminating chunk: where
-        // a chunked message ends and any pipelined bytes begin.
         [[nodiscard]] size_t consumed() const noexcept { return _consumed; }
         [[nodiscard]] bool failed() const noexcept { return _st == St::Error; }
 
@@ -493,9 +426,6 @@ namespace llmbridge::net::http
         std::string _line;     // accumulates a size/CRLF/trailer line across reads
     };
 
-    // A complete upstream response, framed by Content-Length or chunked. On Complete,
-    // `body` aliases `buf` (Content-Length) or the decoder's buffer (chunked), and is
-    // valid until either changes.
     struct ParsedResponse
     {
         FrameStatus status = FrameStatus::NeedMore;
@@ -507,15 +437,12 @@ namespace llmbridge::net::http
         [[nodiscard]] bool failed() const noexcept { return status == FrameStatus::Error; }
     };
 
-    // Per-connection chunked decode state, fed only new bytes so a body arriving in
-    // many reads costs O(body), not O(reads * body).
     struct ResponseDecoder
     {
         ChunkDecoder dec;
         std::string body; // decoded payload, accumulated across feeds
         size_t fed = 0;   // post-header bytes already handed to `dec`
 
-        // Between responses on a pooled connection; keeps capacity.
         void reset() noexcept
         {
             dec = ChunkDecoder{};
@@ -524,7 +451,6 @@ namespace llmbridge::net::http
         }
     };
 
-    // Re-runnable like parse_request: NeedMore until the whole message is present.
     [[nodiscard]] inline ParsedResponse parse_response(std::string_view buf,
                                                        ResponseDecoder& st) noexcept
     {
@@ -535,12 +461,8 @@ namespace llmbridge::net::http
 
         if (r.head.chunked && r.head.has_content_length) { r.status = FrameStatus::Error; return r; }
 
-        // An interim 1xx is not the answer, and framing one as it orphans the real
-        // response on a pooled connection.
         if (r.head.status < 200) { r.status = FrameStatus::Error; return r; }
 
-        // No framing header means read-until-close (RFC 9112 §6.3 rule 8), which a
-        // pooled connection cannot do; 204 and 304 carry no body by definition.
         if (!r.head.chunked && !r.head.has_content_length &&
             r.head.status != 204 && r.head.status != 304)
         {
@@ -559,8 +481,6 @@ namespace llmbridge::net::http
             return r;
         }
 
-        // Feed only the bytes that arrived since the last call; `st` is reset between
-        // responses on a pooled connection.
         const std::string_view after = buf.substr(r.head.header_len);
         if (!st.dec.done() && st.fed < after.size())
         {
@@ -574,4 +494,4 @@ namespace llmbridge::net::http
         r.status = FrameStatus::Complete;
         return r;
     }
-} // namespace llmbridge::net::http
+} // namespace llmbridge::net::http_legacy
