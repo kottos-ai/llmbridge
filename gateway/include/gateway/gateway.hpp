@@ -40,7 +40,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -63,6 +62,7 @@ namespace llmbridge
 
     struct Connection;   // src/core/conn.hpp
     class UpstreamPool;  // src/core/pool.hpp
+    template <class T> class Registry; // src/core/registry.hpp
 
     class Gateway
     {
@@ -284,10 +284,13 @@ namespace llmbridge
             return false;
         }
 
-        /// Abort any request whose upstream has been silent longer than
-        /// _upstream_idle_ns, on the loop's existing periodic tick. `uring` selects
-        /// the matching teardown primitives.
-        void sweep_idle(bool uring) noexcept;
+        /// Heartbeat, pool reaping and every timeout, in one walk of the clients.
+        void sweep_idle() noexcept;
+        void sweep_client(Connection* c, int64_t now, bool busy) noexcept;
+        /// The sweep's teardowns, on whichever backend runs.
+        void close_conn(Connection* c) noexcept;
+        void abort_request(Connection* client) noexcept;
+        void fail_request(Connection* client, int code, const char* why) noexcept; // failover, else reply
 
         /// `slot` indexes the upstream table; the pool it draws from is that venue's.
         Connection* ep_acquire_upstream(int slot) noexcept;
@@ -502,10 +505,11 @@ namespace llmbridge
         Connection* _listen_conn = nullptr;
         int64_t _accept_resume_ns = 0; ///< listener paused until then; 0 when accepting
 
-        std::unordered_map<uint64_t, Connection*> _clients;
+        /// Every Connection is in exactly one: live clients, live upstreams (pooled
+        /// ones too), or closed and awaiting the free (GATEWAY-INTERNALS.md 7).
+        std::unique_ptr<Registry<Connection>> _clients, _upconns, _doomed;
         std::unique_ptr<UpstreamPool> _pool; ///< keep-alive upstreams, every venue
         uint64_t _next_client_id = 1;
-        std::vector<Connection*> _doomed; // closed mid-batch, freed after the batch
         /// The byte-forward rebuild's destination, swapped with the upstream's `wbuf`
         /// once the upstream is acquired, so the buffers rotate and keep their
         /// capacity instead of being allocated per request. See request_without.

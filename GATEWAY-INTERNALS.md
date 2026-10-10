@@ -328,6 +328,13 @@ back-pressure. **io_uring** instead bounds `wpending` with `kUrStreamBufCap` and
 drops the stream past the cap. Know which you are reasoning about before quoting
 streaming behaviour to a customer.
 
+Either way the idle deadline (`--upstream-timeout`) measures `ts_progress`, which both
+legs advance: a response byte read, a request byte sent, a byte the client took. A
+paused epoll upstream reads nothing while its client drains, and a finished io_uring
+stream reads nothing while its client catches up; neither is idle. When neither leg
+moves and bytes are still owed to the client, the sweep logs `client stalled` and counts
+`client_idle_timeouts`, not `upstream_timeouts`.
+
 `read_paused` is epoll's half and is owned entirely by `ep_pause_read` /
 `ep_resume_read`, the only writers, both guarding on the current value. io_uring
 never touches it, and the `ep_` prefix is what keeps that true.
@@ -357,6 +364,11 @@ credentials, so the rules are worth stating exactly.
                                           ur_maybe_free(): free iff
                                           doomed && inflight == 0
 ```
+
+Every `Connection` is in exactly one `Registry` (`gateway/src/core/registry.hpp`):
+`_clients`, `_upconns` (live upstreams, pooled ones too) or `_doomed`. Each member
+holds its own index, so a close moves it in O(1), and the destructor and the
+io_uring drain walk the registries instead of following `peer` to find upstreams.
 
 `inflight` counts submitted-but-uncompleted SQEs for one connection:
 

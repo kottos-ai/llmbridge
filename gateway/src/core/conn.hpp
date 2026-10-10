@@ -44,6 +44,8 @@ namespace llmbridge
 
         int fd = -1;
         bool is_client = true;
+        /// Index in the Registry that holds it: live clients, live upstreams or doomed.
+        uint32_t slot = UINT32_MAX;
 
         /// Upstream table index, -1 for none: an upstream's own venue (for its pool), or the
         /// venue serving a client's request in flight (for the response's dialect).
@@ -68,6 +70,8 @@ namespace llmbridge
 
         /// Bytes of wbuf on the socket, or fed to the Session: GATEWAY-INTERNALS.md 2b.
         size_t woff = 0;
+        /// Bytes the socket took over the connection's life, on either transport.
+        uint64_t sent_bytes = 0;
 
         /// Accept and first request byte on a client; socket creation and first
         /// response byte on an upstream.

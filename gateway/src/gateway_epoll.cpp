@@ -12,6 +12,7 @@
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
+#include "core/registry.hpp"
 #include "net/secure.hpp"
 #include "net/socket_util.hpp"
 #include "request.hpp"
@@ -170,7 +171,12 @@ namespace llmbridge
         while (c->woff < c->wbuf.size())
         {
             ssize_t n = ::write(c->fd, c->wbuf.data() + c->woff, c->wbuf.size() - c->woff);
-            if (n > 0) { c->woff += static_cast<size_t>(n); continue; }
+            if (n > 0)
+            {
+                c->woff += static_cast<size_t>(n);
+                c->sent_bytes += static_cast<uint64_t>(n);
+                continue;
+            }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
             if (n < 0 && errno == EINTR) continue;
             return false;
@@ -191,7 +197,12 @@ namespace llmbridge
         {
             const ssize_t n = ::write(u->fd, u->tls_out.data() + u->tls_out_off,
                                       u->tls_out.size() - u->tls_out_off);
-            if (n > 0) { u->tls_out_off += static_cast<size_t>(n); continue; }
+            if (n > 0)
+            {
+                u->tls_out_off += static_cast<size_t>(n);
+                u->sent_bytes += static_cast<uint64_t>(n);
+                continue;
+            }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             {
                 ep_arm_write(u);
@@ -292,6 +303,7 @@ namespace llmbridge
             return nullptr;
         }
 #endif
+        _upconns->add(u);
         ep_add_read(u);
         ep_arm_write(u); // learn when the non-blocking connect completes
         ++_stats.upstream_conns_opened;
@@ -338,6 +350,7 @@ namespace llmbridge
             return false;
         }
 #endif
+        _upconns->add(uf);
         ep_add_read(uf);
         ep_arm_write(uf); // learn when connect completes, then send the request
         ++_stats.upstream_conns_opened;
@@ -376,14 +389,11 @@ namespace llmbridge
         if (c->doomed) return;
         // Every close unpairs; an upstream mid-response is of no use to anyone else.
         if (Connection* u = unpair(c)) ep_close_upstream(u);
-        if (c->id)
-        {
-            _clients.erase(c->id);
-            LB_DEBUG("close ", *c, " clients=", _clients.size());
-        }
+        _clients->remove(c);
+        LB_DEBUG("close ", *c, " clients=", _clients->size());
         if (c->fd >= 0) { ::close(c->fd); c->fd = -1; }
         c->doomed = true;
-        _doomed.push_back(c);
+        _doomed->add(c);
     }
 
     void Gateway::ep_close_upstream(Connection* u) noexcept
@@ -391,11 +401,12 @@ namespace llmbridge
         if (u->doomed) return;
         unpair(u);
         _pool->remove(*u);
+        _upconns->remove(u);
         // After the erase, so `pool=` excludes this connection.
         LB_DEBUG("upstream close ", *u, " pool=", pooled_upstream_count());
         if (u->fd >= 0) { ::close(u->fd); u->fd = -1; }
         u->doomed = true;
-        _doomed.push_back(u);
+        _doomed->add(u);
     }
 
     void Gateway::ep_abort_pair(Connection* client) noexcept
@@ -465,8 +476,8 @@ namespace llmbridge
                 continue;
             }
 #endif
-            _clients[c->id] = c;
-            LB_DEBUG("accept ", *c, " clients=", _clients.size());
+            _clients->add(c);
+            LB_DEBUG("accept ", *c, " clients=", _clients->size());
             ep_add_read(c);
         }
     }
@@ -699,7 +710,7 @@ namespace llmbridge
         c->ever_framed = true;        // past the setup deadline for good
         c->ts_client_activity = now_ns(); // and the idle clock restarts here
         c->req.f.ts_req_built = now_ns();   // end of our request-side work
-        c->req.f.ts_up_activity = c->req.f.ts_req_built; // idle-timeout baseline for this request
+        c->req.f.ts_progress = c->req.f.ts_req_built; // idle-timeout baseline for this request
         // Per attempt: a failover's venue is not the last one's. Pooled means no handshake.
         c->req.f.ts_wire_ready = u->connected ? c->req.f.ts_req_built : 0;
         c->req.f.ts_up_sent = 0;
@@ -742,6 +753,7 @@ namespace llmbridge
 
     void Gateway::ep_on_upstream_writable(Connection* u) noexcept
     {
+        const uint64_t sent = u->sent_bytes;
         if (!u->connected)
         {
             int err = net::connect_result(u->fd);
@@ -779,6 +791,7 @@ namespace llmbridge
                 else ep_close_upstream(u);
                 return;
             }
+            if (u->peer && u->sent_bytes != sent) u->peer->req.f.ts_progress = now_ns();
             if (!tdone) return; // EPOLLOUT re-armed by ep_tls_flush
             ep_disarm_write(u); // ciphertext drained; handshake replies arrive via read
             if (u->peer && !was_flushed && tls_wbuf_flushed(u))
@@ -793,6 +806,7 @@ namespace llmbridge
             else ep_close_upstream(u);
             return;
         }
+        if (u->peer && u->sent_bytes != sent) u->peer->req.f.ts_progress = now_ns();
         if (!done) { ep_arm_write(u); return; }
         ep_disarm_write(u);
         if (u->peer) u->peer->req.f.ts_up_sent = now_ns(); // end of request-path work
@@ -831,7 +845,7 @@ namespace llmbridge
         // hands one client's bytes to the next as the head of its response. The
         // io_uring twin already closes here; this side kept the connection.
         if (client == nullptr) { ep_close_upstream(u); return; }
-        client->req.f.ts_up_activity = now_ns(); // upstream made progress
+        client->req.f.ts_progress = now_ns(); // upstream made progress
 
         // Mid-stream: pump the newly-arrived body bytes and return.
         if (client->req.f.streaming) { ep_stream_pump(u); return; }
@@ -1125,8 +1139,11 @@ namespace llmbridge
     // finalize if the stream has ended.
     void Gateway::ep_stream_flush(Connection* client) noexcept
     {
+        const uint64_t sent = client->sent_bytes;
         bool done = false;
         if (!ep_pump_write(client, &done)) { ep_abort_pair(client); return; } // client gone
+        // A client draining a paused stream is progress, though the upstream is silent.
+        if (client->sent_bytes != sent) client->req.f.ts_progress = now_ns();
         if (!done)
         {
             ep_arm_write(client);
@@ -1209,10 +1226,12 @@ namespace llmbridge
                     if (readable && !c->doomed) ep_on_upstream_readable(c);
                 }
             }
-            sweep_idle(/*uring=*/false); // abort requests whose upstream went silent
+            sweep_idle(); // heartbeat, pool reaping and every timeout
             if (_accept_resume_ns && now_ns() >= _accept_resume_ns) ep_resume_accept();
-            for (Connection* d : _doomed) { retire_wbuf(d); delete d; }
-            _doomed.clear();
+            _doomed->clear([this](Connection* d) {
+                retire_wbuf(d);
+                delete d;
+            });
         }
         return 0;
     }

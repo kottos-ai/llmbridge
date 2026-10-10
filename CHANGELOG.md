@@ -8,6 +8,43 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.80.0]. 2026-10-10
+
+### Fixed
+
+- **A slow client that keeps reading a stream is no longer cut by the idle timeout**
+  (G7). The deadline counted only upstream reads, so a stream whose upstream epoll had
+  paused for a slow client, or one the provider had finished while io_uring was still
+  sending it, aged toward `--upstream-timeout` while the client was taking bytes, was
+  truncated, and was logged as `upstream silent`. The deadline now measures progress on
+  either leg: a response byte read, a request byte sent, a byte the client took.
+
+### Changed
+
+- **Behaviour change: a client that stops reading is timed out as the client's
+  stall.** When neither leg moves and bytes are still owed to the client, the sweep
+  logs `TIMEOUT client stalled` and counts `client_idle_timeouts`, where it logged
+  `upstream silent` and counted `upstream_timeouts`. The action is unchanged: a stream
+  is cut without `[DONE]`.
+- **The idle sweep walks the clients once per tick**, with no temporary vectors, where
+  it walked them five times (GP1). Its teardowns pick the running backend themselves,
+  so `sweep_idle` takes no `uring` flag. The heartbeat line is unchanged; it is now
+  written after the walk that counts it, with the counts the tick began with.
+- **Connections are kept in `Registry` sets** (`gateway/src/core/registry.hpp`), dense
+  with O(1) add and remove: live clients, live upstreams (pooled ones too) and the
+  closed awaiting their free. They replace the clients `unordered_map` and the doomed
+  vector, which io_uring scanned on every free (LP1). The destructor and the io_uring
+  drain walk the registries instead of reaching in-flight upstreams through `peer`.
+
+### Tests
+
+- `ProxyStream.ADrainingSlowClientOutlivesTheIdleTimeout` and
+  `AClientThatStopsReadingIsTimedOutAsAClientStall`, both backends, each failing on
+  both with the fix reverted; `ASilentUpstreamStillGetsA504AtTheShortDeadline`.
+- `ProxyHeartbeat.TheHeartbeatCountsAnIdleClientAndItsPooledUpstream` and
+  `TheHeartbeatCountsARequestInFlight` pin the heartbeat's values, both backends.
+
+
 ## [0.79.0]. 2026-10-10
 
 One option table for the flags, the config file and `--help`. Each fix has a

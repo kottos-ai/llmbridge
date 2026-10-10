@@ -11,6 +11,7 @@
 #include "gateway/gateway.hpp"
 
 #include "core/limits.hpp"
+#include "core/registry.hpp"
 #include "net/secure.hpp"
 #include "request.hpp"
 
@@ -103,6 +104,9 @@ namespace llmbridge
                     ") but its mode does not build its own request target; only "
                     "--translate azure may carry one");
         }
+        _clients = std::make_unique<Registry<Connection>>();
+        _upconns = std::make_unique<Registry<Connection>>();
+        _doomed = std::make_unique<Registry<Connection>>();
         _pool = std::make_unique<UpstreamPool>();
         _pool->init(_upstreams.size(), kMaxIdleUpstreams);
         _rr_inflight.assign(_upstreams.size(), 0);
@@ -192,20 +196,15 @@ namespace llmbridge
         }
         _rr.cv.notify_all();
         if (_rr.thread.joinable()) _rr.thread.join();
-        for (auto& [id, c] : _clients)
-        {
-            // An in-flight (acquired, not pooled) upstream is reachable only via
-            // peer: free it too, or it leaks when we stop mid-request. (The
-            // io_uring loop already nulls these during its drain.)
-            if (Connection* u = c->peer) { if (u->fd >= 0) ::close(u->fd); delete u; }
+        // Every connection is in one registry, pooled and in-flight upstreams included,
+        // so this frees each once. The pool's links into the freed are never read again.
+        const auto free_conn = [](Connection* c) {
             if (c->fd >= 0) ::close(c->fd);
             delete c;
-        }
-        _pool->reap(INT64_MAX, [](Connection* u) {
-            if (u->fd >= 0) ::close(u->fd);
-            delete u;
-        });
-        for (Connection* d : _doomed) delete d;
+        };
+        _clients->clear(free_conn);
+        _upconns->clear(free_conn);
+        _doomed->clear(free_conn);
         if (_listen_fd >= 0) ::close(_listen_fd);
         if (_epfd >= 0) ::close(_epfd);
         delete _listen_conn;
