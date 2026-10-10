@@ -21,7 +21,8 @@ namespace llmbridge
 
     // Any doubt closes it. A connection is pooled only if it is open, the response and
     // the client both allow keep-alive, the body reached a real message boundary (a
-    // close-delimited one cannot tell finished from died), nothing past the response is buffered, our own request fully left, and the pool
+    // close-delimited one cannot tell finished from died), the venue has not sent EOF,
+    // nothing past the response is buffered, our own request fully left, and the pool
     // has room. Aborted, corrupt and timed-out exchanges arrive here as not keep-alive.
     UpstreamPool::Refusal UpstreamPool::release(Connection& u, bool keep_alive, bool body_ended,
                                                 bool request_sent, int64_t now) noexcept
@@ -30,6 +31,7 @@ namespace llmbridge
         if (u.doomed || u.fd < 0 || u.pooled) return Refusal::Closed;
         if (!keep_alive) return Refusal::NotKeepAlive;
         if (!body_ended) return Refusal::BodyOpen;
+        if (u.peer_eof) return Refusal::PeerClosed;
         if (!u.rbuf.empty()) return Refusal::Leftover;
         if (!request_sent) return Refusal::Unsent;
         if (_count >= _cap) return Refusal::Full;

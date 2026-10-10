@@ -808,6 +808,7 @@ namespace llmbridge
                      ep_drain_read(u);
         if (!read_ok)
         {
+            u->peer_eof = true; // never pooled now, whatever finishes the exchange
 #ifdef LLMBRIDGE_HAVE_TLS
             // TLS parity with the io_uring path: a fatal session error (bad record,
             // MAC failure) mid-stream must abort the client, never finalize the

@@ -554,6 +554,7 @@ namespace llmbridge
         if (res <= 0) // multishot ended: EOF (0) or error (<0)
         {
             if (flags & IORING_CQE_F_BUFFER) _bufring.recycle(flags >> IORING_CQE_BUFFER_SHIFT);
+            if (!c->is_client) c->peer_eof = true; // its recv is over: never pooled now
             if (c->is_client) { if (c->peer) ur_abort_pair(c); else ur_close(c); }
             else if (c->peer && c->peer->req.f.streaming) ur_stream_on_upstream_eof(c); // stream end, not a failure
             else if (!ur_retry_upstream(c))

@@ -116,6 +116,8 @@ namespace llmbridge
         Connection* pool_newer = nullptr;
         Connection* pool_older = nullptr;
         bool pooled = false;
+        /// Upstream conns: the venue sent EOF, so this connection is never pooled.
+        bool peer_eof = false;
 
 #ifdef LLMBRIDGE_HAVE_TLS
         /// Null = plaintext. Kept across pool cycles: a pooled reuse pays no handshake.

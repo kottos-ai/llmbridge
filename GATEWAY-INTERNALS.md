@@ -393,6 +393,7 @@ time to first token.
         |
         +-- closed already, or not keep-alive (response, or a byte-forward's client)
         +-- no message boundary: close-delimited, or a stream cut before its end
+        +-- the venue sent EOF (peer_eof)
         +-- bytes past the response in rbuf: a second message nobody asked for
         +-- request not fully on the wire: ++upstream_unsent  <- see below
         +-- kMaxIdleUpstreams (8192) connections pooled across all venues

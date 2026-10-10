@@ -27,6 +27,7 @@ namespace llmbridge
             Closed,       ///< already closed, or no descriptor
             NotKeepAlive, ///< the response or the client asked to close
             BodyOpen,     ///< no message boundary was reached
+            PeerClosed,   ///< the venue sent EOF
             Leftover,     ///< bytes past the response would read as the next one
             Unsent,       ///< our request was still going out
             Full,         ///< `cap` connections are pooled already

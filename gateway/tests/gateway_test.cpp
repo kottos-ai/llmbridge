@@ -7855,6 +7855,42 @@ TEST_P(ProxyPoolHygiene, AnUpstreamPooledAfterASlowStreamStillAnswers)
     EXPECT_EQ(Client::status_of(resp), 200) << resp.substr(0, 200);
 }
 
+// L2: io_uring pooled an upstream that had already sent EOF after its final chunk
+// when the EOF arrived while the stream's last send to the client was still in flight.
+// Its recv was over, so the next request on it was never answered.
+TEST_P(ProxyPoolHygiene, AnUpstreamThatClosedAfterTheStreamIsNeverPooled)
+{
+    std::string ev =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\n";
+    for (int i = 0; i < 4000; ++i)
+        ev += "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+              "{\"type\":\"text_delta\",\"text\":\"" + std::string(400, 'x') + "\"}}\n\n";
+    ev += "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+          "data: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                          "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+                          sse_chunk_encode(ev, 16384));
+    _backend.set_close_after_first(true); // the final chunk, then FIN
+    _client_sndbuf = 4096; // the last send stays in flight while the EOF arrives
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/0);
+    Client a;
+    ASSERT_TRUE(a.connect(_proxy_port, /*rcvbuf=*/4096));
+    ASSERT_TRUE(a.send(openai_stream_request("hi")));
+    timespec ts{0, 400'000'000}; // stall while the upstream finishes and closes
+    nanosleep(&ts, nullptr);
+    const std::string first = a.recv_stream(15000);
+    ASSERT_NE(first.find("0\r\n\r\n"), std::string::npos) << "the first stream did not end";
+    timespec settle{0, 100'000'000};
+    nanosleep(&settle, nullptr);
+    ASSERT_TRUE(a.send(openai_stream_request("again")));
+    const std::string second = a.recv_stream(5000);
+    a.close();
+    shutdown();
+    EXPECT_EQ(Client::status_of(second), 200) << second.substr(0, 200);
+    EXPECT_NE(second.find("0\r\n\r\n"), std::string::npos) << "the second stream never ended";
+    EXPECT_EQ(_gw->stats().upstream_reused, 0u) << "a connection the venue closed was pooled";
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyPoolHygiene,
                          ::testing::Values(llmbridge::IoBackend::Epoll,
                                            llmbridge::IoBackend::Uring),
