@@ -62,7 +62,7 @@ namespace llmbridge::detail
     /// the client's method; a translated request is always a POST.
     [[nodiscard]] inline bool sent_head(const Connection& c) noexcept
     {
-        return c.msg.head && !c.translate_body;
+        return c.msg.head && !c.req.f.translate_body;
     }
 
     [[nodiscard]] inline int64_t span_since(int64_t start, int64_t end) noexcept

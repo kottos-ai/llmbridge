@@ -9983,3 +9983,43 @@ TEST_P(ProxyRoute, EachRequestOnAKeepAliveConnectionRecordsItsOwnServedModelAndT
     EXPECT_EQ(recs[1].served_tier, "priority");
     EXPECT_EQ(recs[2].served_tier, "") << "the previous request's tier leaked";
 }
+
+// ── One per-request reset (RequestCtx::begin) ────────────────────────────────
+//
+// Each request starts from a state constructed fresh at framing, before any reply,
+// so nothing a request reports can belong to the one before it on the connection.
+
+// G9: a framing error used to reply before the sequencer ran, so its record carried
+// the previous request's sequence number, stamps, venue and model.
+TEST_P(ProxyRoute, AFramingErrorAfterASuccessIsARequestOfItsOwn)
+{
+    NamedBackend b;
+    b.start("alpha");
+    RecordingSink sink;
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, nullptr, &sink, {});
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send(make_request(R"({"model":"gpt-first"})")));
+    EXPECT_NE(c.recv_response().find("alpha"), std::string::npos);
+    ASSERT_TRUE(c.send("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n"));
+    EXPECT_EQ(c.recv_status(), 400);
+    c.close();
+    shutdown();
+    b.stop();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].model, "gpt-first");
+    EXPECT_NE(recs[1].r.seq, recs[0].r.seq) << "the 400 reused the previous request's number";
+    EXPECT_EQ(recs[1].r.status, 400);
+    EXPECT_TRUE(recs[1].r.error_reply);
+    EXPECT_GT(recs[1].r.ts_req_recvd, recs[0].r.ts_done);
+    EXPECT_EQ(recs[1].r.ts_req_built, 0) << "an upstream stamp of the request before";
+    EXPECT_EQ(recs[1].r.ts_wire_ready, 0);
+    EXPECT_EQ(recs[1].r.ts_up_sent, 0);
+    EXPECT_EQ(recs[1].r.ts_up_recvd, 0);
+    EXPECT_EQ(recs[1].r.upstream_index, -1) << "no venue served it";
+    EXPECT_EQ(recs[1].r.upstream_ip, 0u);
+    EXPECT_FALSE(recs[1].r.from_pool);
+    EXPECT_EQ(recs[1].model, "") << "the previous request's model";
+}

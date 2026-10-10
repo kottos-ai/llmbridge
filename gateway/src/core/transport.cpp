@@ -209,7 +209,7 @@ namespace llmbridge
             // reporting the TCP leg alone. See the attribution test in
             // gateway/tests/gateway_tls_test.cpp.
             u->wire_ready = true;
-            if (u->peer) u->peer->ts_wire_ready = now_ns();
+            if (u->peer) u->peer->req.f.ts_wire_ready = now_ns();
             if (u->woff < u->wbuf.size()) tls_push_wbuf(u);
         }
         return true;

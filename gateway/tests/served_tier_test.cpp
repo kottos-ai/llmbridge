@@ -34,14 +34,14 @@ TEST(ServedTier, GivesUpAfterFourTriesWithNothingFound)
     for (int i = 0; i < 4; ++i)
     {
         note_served_tier(&c, no_tier, /*tail=*/false);
-        EXPECT_EQ(c.served_tier_tries, i + 1);
+        EXPECT_EQ(c.req.f.served_tier_tries, i + 1);
     }
     // A 5th, 6th, 100th chunk must not keep scanning: the whole point of the
     // bound is that a chatty stream with no such field pays this cost once,
     // not once per chunk for its entire life.
     for (int i = 0; i < 96; ++i) note_served_tier(&c, no_tier, /*tail=*/false);
-    EXPECT_EQ(c.served_tier_tries, kTierTries) << "tries must not exceed the cap";
-    EXPECT_EQ(c.served_tier_len, 0);
+    EXPECT_EQ(c.req.f.served_tier_tries, kTierTries) << "tries must not exceed the cap";
+    EXPECT_EQ(c.req.f.served_tier.n, 0);
 }
 
 TEST(ServedTier, FindsItInTheHeadOfAChunk)
@@ -50,8 +50,8 @@ TEST(ServedTier, FindsItInTheHeadOfAChunk)
     const std::string chunk =
         R"({"id":"x","service_tier":"flex","choices":[{"delta":{"content":"hi"}}]})";
     note_served_tier(&c, chunk, /*tail=*/false);
-    ASSERT_GT(c.served_tier_len, 0);
-    EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "flex");
+    ASSERT_GT(c.req.f.served_tier.n, 0);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "flex");
 }
 
 TEST(ServedTier, FindsItInTheTailOfANonStreamedBody)
@@ -64,8 +64,8 @@ TEST(ServedTier, FindsItInTheTailOfANonStreamedBody)
         R"({"id":"x","choices":[{"message":{"content":"hi"}}])" + padding +
         R"(,"service_tier":"priority","usage":{"total_tokens":9}})";
     note_served_tier(&c, body, /*tail=*/true);
-    ASSERT_GT(c.served_tier_len, 0);
-    EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "priority");
+    ASSERT_GT(c.req.f.served_tier.n, 0);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "priority");
 }
 
 TEST(ServedTier, AToolInputBeforeTheUsageCannotNameIt)
@@ -76,12 +76,12 @@ TEST(ServedTier, AToolInputBeforeTheUsageCannotNameIt)
                      R"({"content":[{"type":"tool_use","input":{"service_tier":"priority"}}],)"
                      R"("usage":{"input_tokens":5,"service_tier":"standard"}})",
                      /*tail=*/true);
-    EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "standard");
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "standard");
     Connection q;
     note_served_tier(&q, R"({"choices":[{"delta":{"content":"\"service_tier\":\"x\""}}],)"
                          R"("service_tier":"flex"})",
                      /*tail=*/false);
-    EXPECT_EQ(std::string(q.served_tier, q.served_tier_len), "flex");
+    EXPECT_EQ(std::string(q.req.f.served_tier.view()), "flex");
 }
 
 TEST(ServedTier, OnceFoundIsNeverOverwritten)
@@ -89,16 +89,16 @@ TEST(ServedTier, OnceFoundIsNeverOverwritten)
     Connection c;
     const std::string first = R"({"service_tier":"flex","choices":[]})";
     note_served_tier(&c, first, /*tail=*/false);
-    ASSERT_EQ(std::string(c.served_tier, c.served_tier_len), "flex");
+    ASSERT_EQ(std::string(c.req.f.served_tier.view()), "flex");
 
     // A later chunk naming a different tier must not replace it: the field is a
     // property of the whole response, not of the chunk it happened to arrive in.
     const std::string second = R"({"service_tier":"priority","choices":[]})";
     note_served_tier(&c, second, /*tail=*/false);
-    EXPECT_EQ(std::string(c.served_tier, c.served_tier_len), "flex");
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "flex");
     // Finding it on the first try must not have spent any of the retry budget:
     // the two guards (found vs. exhausted) are independent conditions.
-    EXPECT_EQ(c.served_tier_tries, 1);
+    EXPECT_EQ(c.req.f.served_tier_tries, 1);
 }
 
 TEST(ServedTier, GivingUpIsPermanentEvenIfATierAppearsLater)
@@ -106,13 +106,13 @@ TEST(ServedTier, GivingUpIsPermanentEvenIfATierAppearsLater)
     Connection c;
     const std::string no_tier = R"({"choices":[{"delta":{"content":"x"}}]})";
     for (int i = 0; i < kTierTries; ++i) note_served_tier(&c, no_tier, /*tail=*/false);
-    ASSERT_EQ(c.served_tier_tries, kTierTries);
+    ASSERT_EQ(c.req.f.served_tier_tries, kTierTries);
 
     // A field that only shows up after the budget is spent is never recorded.
     // Deliberate: "give up quickly" would not hold if a late arrival reopened it.
     const std::string late = R"({"service_tier":"flex","choices":[]})";
     note_served_tier(&c, late, /*tail=*/false);
-    EXPECT_EQ(c.served_tier_len, 0);
+    EXPECT_EQ(c.req.f.served_tier.n, 0);
 }
 
 // note_served_model shares the budget's shape: found once, or given up on after
@@ -122,40 +122,40 @@ TEST(ServedModel, ReadsTheTopLevelModelOfEachDialectAndNothingNested)
     Connection a;
     note_served_model(&a, "event: message_start\ndata: {\"type\":\"message_start\","
                           "\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n", true);
-    EXPECT_EQ(std::string(a.served_model, a.served_model_len), "claude-x");
+    EXPECT_EQ(std::string(a.req.f.served_model.view()), "claude-x");
 
     Connection o;
     note_served_model(&o, "data: {\"id\":\"c\",\"meta\":{\"model\":\"decoy\"},\"model\":\"gpt-x\"}\n\n",
                       true);
-    EXPECT_EQ(std::string(o.served_model, o.served_model_len), "gpt-x");
+    EXPECT_EQ(std::string(o.req.f.served_model.view()), "gpt-x");
 
     Connection n;
     note_served_model(&n, R"({"choices":[{"message":{"model":"decoy"}}]})", false);
-    EXPECT_EQ(n.served_model_len, 0);
+    EXPECT_EQ(n.req.f.served_model.n, 0);
     // A model in a later event of the first read is found; one in a ping is not a model.
     Connection l;
     note_served_model(&l, "event: ping\ndata: {\"type\":\"ping\"}\n\n"
                           "data: {\"model\":\"later\"}\n\n", true);
-    EXPECT_EQ(std::string(l.served_model, l.served_model_len), "later");
+    EXPECT_EQ(std::string(l.req.f.served_model.view()), "later");
 }
 
 TEST(ServedModel, GivesUpAfterFourTriesAndCutsAt64Bytes)
 {
     Connection c;
     for (int i = 0; i < 10; ++i) note_served_model(&c, "data: {\"choices\":[]}\n\n", true);
-    EXPECT_EQ(c.served_model_tries, kTierTries);
+    EXPECT_EQ(c.req.f.served_model_tries, kTierTries);
     note_served_model(&c, "data: {\"model\":\"late\"}\n\n", true);
-    EXPECT_EQ(c.served_model_len, 0) << "giving up is permanent";
+    EXPECT_EQ(c.req.f.served_model.n, 0) << "giving up is permanent";
 
     Connection t;
     note_served_model(&t, R"({"model":")" + std::string(100, 'm') + R"("})", false);
-    EXPECT_EQ(std::string(t.served_model, t.served_model_len), std::string(64, 'm'));
+    EXPECT_EQ(std::string(t.req.f.served_model.view()), std::string(64, 'm'));
 }
 
 TEST(StreamChunk, WrapsWhatWasAppendedInOneHexSizedChunk)
 {
     Connection c;
-    c.stream_chunked_out = true;
+    c.req.f.stream_chunked_out = true;
     for (const size_t n : {size_t{1}, size_t{15}, size_t{16}, size_t{4122}, size_t{1} << 20})
     {
         std::string out = "head";

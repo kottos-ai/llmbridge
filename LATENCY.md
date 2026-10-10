@@ -113,11 +113,11 @@ assigns the stamp attributed to it.
 
 | | identifier | storage | stamped when | assigned in (epoll / io_uring) |
 |---|---|---|---|---|
-| **t0** | `ts_req_recvd` | `Connection` | the client's request is fully framed | `ep_on_client_readable` / `ur_try_forward_buffered` |
-| **t1** | `ts_req_built` | `Connection` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `ep_forward` / `ur_forward` |
-| **t2** | `ts_wire_ready` | `Connection` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `ep_forward`, `ep_on_upstream_writable`, `tls_feed` / `ur_forward`, `ur_on_connect` |
-| **t3** | `ts_up_sent` | `Connection` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `ep_forward`, `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
-| **t4** | `ts_up_recvd` | `Connection` | the provider's response arrived. **Non-streaming:** the body is framed. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `ep_on_upstream_readable` / `ur_on_recv` |
+| **t0** | `ts_req_recvd` | `ReqState` | the client's request is fully framed | `ep_on_client_readable` / `ur_try_forward_buffered` |
+| **t1** | `ts_req_built` | `ReqState` | the upstream request bytes exist: translation, auth mapping and re-serialisation done, nothing sent | `ep_forward` / `ur_forward` |
+| **t2** | `ts_wire_ready` | `ReqState` | the socket can carry the request. The **pooled** path sets it equal to t1 (no handshake happened); a **cold plaintext** connection stamps it when the connect completes; a **cold TLS** connection stamps it when the handshake completes, in `tls_feed`, because the wire cannot carry the request before then | `ep_forward`, `ep_on_upstream_writable`, `tls_feed` / `ur_forward`, `ur_on_connect` |
+| **t3** | `ts_up_sent` | `ReqState` | `write()` has handed the request to the kernel. Several sites (plaintext, TLS-flushed, partial-write completion) all meaning "fully sent" | `ep_forward`, `ep_on_upstream_writable`, `ep_tls_drain_read` / `ur_on_send` |
+| **t4** | `ts_up_recvd` | `ReqState` | the provider's response arrived. **Non-streaming:** the body is framed. **Streaming:** the response *head* is framed, before any data chunk (see §3; this is not the first token) | `ep_on_upstream_readable` / `ur_on_recv` |
 | **t5** | `ts_resp_built` | local | the response is built and the client write is about to begin. A local because it is consumed immediately by the header arithmetic | `ep_on_upstream_readable` / `ur_on_response` |
 | **t6** | `ts_resp_sent` | local | the response is fully flushed to the client. Taken where the histograms are recorded | `ep_finish_client` / `ur_finish_client` |
 

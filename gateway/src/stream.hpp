@@ -32,7 +32,7 @@ namespace llmbridge::detail
     /// A no-op on a close-delimited stream, so both framings share one write path.
     inline void chunk_wrap(const Connection* c, std::string& out, size_t pos)
     {
-        if (!c->stream_chunked_out || out.size() <= pos) return;
+        if (!c->req.f.stream_chunked_out || out.size() <= pos) return;
         char hdr[24];
         char* p = hdr + sizeof hdr;
         *--p = '\n';
@@ -46,7 +46,7 @@ namespace llmbridge::detail
     /// stream must not be given the marker that says it finished.
     inline void chunk_terminate(const Connection* c, std::string& out)
     {
-        if (c->stream_chunked_out) out.append("0\r\n\r\n", 5);
+        if (c->req.f.stream_chunked_out) out.append("0\r\n\r\n", 5);
     }
 
     /// The first chunk carrying a visible token, on the byte-forward path.
@@ -110,24 +110,18 @@ namespace llmbridge::detail
     /// it, beside the usage block.
     inline void note_served_tier(Connection* c, std::string_view bytes, bool tail) noexcept
     {
-        if (c->served_tier_len || c->served_tier_tries >= kTierTries) return;
-        ++c->served_tier_tries;
+        if (!c->req.f.served_tier.empty() || c->req.f.served_tier_tries >= kTierTries) return;
+        ++c->req.f.served_tier_tries;
         const size_t w = tail ? kTierTail : kTierHead;
         const std::string_view head =
             bytes.size() <= w ? bytes
                               : (tail ? bytes.substr(bytes.size() - w) : bytes.substr(0, w));
-        const std::string_view t = scan_string(head, "\"service_tier\"", tail);
-        const size_t n = t.size() < sizeof c->served_tier ? t.size()
-                                                          : sizeof c->served_tier;
-        c->served_tier_len = static_cast<uint8_t>(n);
-        if (n) std::memcpy(c->served_tier, t.data(), n);
+        c->req.f.served_tier.set(scan_string(head, "\"service_tier\"", tail));
     }
 
     inline void keep_served_model(Connection* c, std::string_view m) noexcept
     {
-        const size_t n = m.size() < sizeof c->served_model ? m.size() : sizeof c->served_model;
-        c->served_model_len = static_cast<uint8_t>(n);
-        if (n) std::memcpy(c->served_model, m.data(), n);
+        c->req.f.served_model.set(m);
     }
 
     /// The model a reply names. A non-streamed body is read whole, top level only;
@@ -135,8 +129,8 @@ namespace llmbridge::detail
     /// a time, since both dialects name the model in their first event.
     inline void note_served_model(Connection* c, std::string_view bytes, bool streamed) noexcept
     {
-        if (c->served_model_len || c->served_model_tries >= kTierTries) return;
-        ++c->served_model_tries;
+        if (!c->req.f.served_model.empty() || c->req.f.served_model_tries >= kTierTries) return;
+        ++c->req.f.served_model_tries;
         if (!streamed) return keep_served_model(c, provider::reply_model(bytes));
         const std::string_view head = bytes.substr(0, kTierHead);
         constexpr std::string_view kData = "data:";
@@ -156,7 +150,7 @@ namespace llmbridge::detail
     /// input and cache counts in the first event and OpenAI its totals in the last.
     inline void stream_note_usage(Connection* client, std::string_view bytes)
     {
-        client->stream_usage.feed(bytes);
+        client->req.stream_usage.feed(bytes);
     }
 
     /// A finished stream's token counts, from the Anthropic translator or from what a
@@ -164,8 +158,8 @@ namespace llmbridge::detail
     /// dialect that learns to stream adds its own branch here.
     inline BodyUsage stream_tokens(const Connection* c) noexcept
     {
-        if (c->sse_translating) return c->sse_xlate.usage();
-        return c->stream_usage.usage();
+        if (c->req.f.sse_translating) return c->sse_xlate.usage();
+        return c->req.stream_usage.usage();
     }
 
     // Did this stream end, or did it just stop? The two are not the same, and one
@@ -180,7 +174,7 @@ namespace llmbridge::detail
     // still finish there.
     inline bool stream_complete(const Connection* client, bool at_eof)
     {
-        if (client->stream_chunked) return client->chunkdec.done();
+        if (client->req.f.stream_chunked) return client->req.chunkdec.done();
         return at_eof;
     }
 
@@ -201,11 +195,11 @@ namespace llmbridge::detail
     inline StreamStep stream_step(Connection* client, std::string& in, std::string& out, bool at_eof)
     {
         // Reused, never re-allocated
-        std::string& sse_in = client->sse_scratch;
+        std::string& sse_in = client->req.sse_scratch;
         sse_in.clear();
-        if (client->stream_chunked)
+        if (client->req.f.stream_chunked)
         {
-            const bool ok = client->chunkdec.feed(in, sse_in);
+            const bool ok = client->req.chunkdec.feed(in, sse_in);
             in.clear();
             if (!ok) return StreamStep::Corrupt; // truncate honestly: no fake [DONE]
         }
@@ -221,12 +215,12 @@ namespace llmbridge::detail
         if (!sse_in.empty())
         {
             const int64_t now = now_ns();
-            if (client->ts_first_token != 0 && client->ts_last_chunk != 0)
+            if (client->req.f.ts_first_token != 0 && client->req.f.ts_last_chunk != 0)
             {
-                const int64_t gap = now - client->ts_last_chunk;
-                if (gap > client->max_chunk_gap_ns) client->max_chunk_gap_ns = gap;
+                const int64_t gap = now - client->req.f.ts_last_chunk;
+                if (gap > client->req.f.max_chunk_gap_ns) client->req.f.max_chunk_gap_ns = gap;
             }
-            client->ts_last_chunk = now;
+            client->req.f.ts_last_chunk = now;
             // Beside the gap stamp, and for the same reason: this is the one point
             // every chunk crosses in either dialect.
             note_served_tier(client, sse_in, /*tail=*/false);
@@ -239,33 +233,33 @@ namespace llmbridge::detail
         // never reached the pump at all: streaming was detected for the Anthropic
         // path only, so a passthrough stream was framed as a whole body and
         // delivered at the end.
-        if (!client->sse_translating)
+        if (!client->req.f.sse_translating)
         {
             if (!sse_in.empty())
             {
                 stream_note_usage(client, sse_in);
                 // Reasoning is stamped before the token, because it comes first on
                 // the wire and one read can carry both. See the two helpers.
-                if (client->ts_first_thinking == 0 && client->ts_first_token == 0 &&
+                if (client->req.f.ts_first_thinking == 0 && client->req.f.ts_first_token == 0 &&
                     sse_carries_thinking(sse_in))
-                    client->ts_first_thinking = now_ns();
-                if (client->ts_first_token == 0 && sse_carries_first_token(sse_in))
-                    client->ts_first_token = now_ns();
+                    client->req.f.ts_first_thinking = now_ns();
+                if (client->req.f.ts_first_token == 0 && sse_carries_first_token(sse_in))
+                    client->req.f.ts_first_token = now_ns();
                 const size_t at = out.size();
                 out.append(sse_in);
                 chunk_wrap(client, out, at);
             }
-            if (stream_complete(client, at_eof) && !client->stream_ended)
+            if (stream_complete(client, at_eof) && !client->req.f.stream_ended)
             {
                 chunk_terminate(client, out); // clean end only; see the helper
-                client->stream_ended = true;
+                client->req.f.stream_ended = true;
                 return StreamStep::Ended;
             }
             // EOF with the framing unfinished is the truncation. Reported, so the
             // backends tear the stream down honestly; returning Ok here left the
             // client holding an open connection that would never speak again.
-            if (at_eof && !client->stream_ended) return StreamStep::Corrupt;
-            return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
+            if (at_eof && !client->req.f.stream_ended) return StreamStep::Corrupt;
+            return client->req.f.stream_ended ? StreamStep::Ended : StreamStep::Ok;
         }
 
         // Honour the translator's own failure (its DoS caps are sticky): a
@@ -280,12 +274,12 @@ namespace llmbridge::detail
         // the bytes.
         // Before the token stamp, because reasoning comes first on the wire and a
         // single read can carry both.
-        if (client->ts_first_thinking == 0 && sse_carries_thinking(sse_in))
-            client->ts_first_thinking = now_ns();
-        if (client->ts_first_token == 0 && client->sse_xlate.content_started())
-            client->ts_first_token = now_ns();
+        if (client->req.f.ts_first_thinking == 0 && sse_carries_thinking(sse_in))
+            client->req.f.ts_first_thinking = now_ns();
+        if (client->req.f.ts_first_token == 0 && client->sse_xlate.content_started())
+            client->req.f.ts_first_token = now_ns();
 
-        if (stream_complete(client, at_eof) && !client->stream_ended)
+        if (stream_complete(client, at_eof) && !client->req.f.stream_ended)
         {
             // The translator's trailer ([DONE] and any final event) is body, so it
             // is framed like every other write before the terminator closes it.
@@ -293,11 +287,11 @@ namespace llmbridge::detail
             if (!client->sse_xlate.finish(out)) return StreamStep::Failed;
             chunk_wrap(client, out, fin_at);
             chunk_terminate(client, out);
-            client->stream_ended = true;
+            client->req.f.stream_ended = true;
             return StreamStep::Ended;
         }
-        if (at_eof && !client->stream_ended) return StreamStep::Corrupt; // see above
-        return client->stream_ended ? StreamStep::Ended : StreamStep::Ok;
+        if (at_eof && !client->req.f.stream_ended) return StreamStep::Corrupt; // see above
+        return client->req.f.stream_ended ? StreamStep::Ended : StreamStep::Ok;
     }
 
 } // namespace llmbridge::detail
