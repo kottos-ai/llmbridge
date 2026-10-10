@@ -57,6 +57,7 @@ namespace llmbridge::provider
         // Caps on untrusted input: an endless line or event is a bad peer, not a workload.
         static constexpr size_t kMaxPending = SseFrameReader::kMaxLine;
         static constexpr size_t kMaxEvent = SseFrameReader::kMaxEvent;
+        static constexpr size_t kMaxEcho = 256; // message id or model: longer fails the stream
 
         // `created_secs` fixes every chunk's `created` stamp (-1: the wall clock, read once).
         // `include_usage` mirrors stream_options.include_usage: `"usage": null` on each chunk,
@@ -68,7 +69,7 @@ namespace llmbridge::provider
 
         // Append the translation of these bytes to `out`; an incomplete event waits for the
         // next call, unknown or unparseable events are skipped, and nothing after the
-        // terminal event is read. False, permanently, on an `error` event or a cap.
+        // terminal event is read. False, permanently, on an `error` event or any cap.
         bool feed(std::string_view bytes, std::string& out);
 
         // Upstream EOF: [DONE] once a stop_reason said the message is whole; false, writing

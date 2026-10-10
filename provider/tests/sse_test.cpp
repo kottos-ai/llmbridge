@@ -1150,3 +1150,25 @@ TEST(Sse, AnErrorEventFailsTheStream)
     EXPECT_EQ(out.find("[DONE]"), std::string::npos) << out;
     EXPECT_EQ(out.find("\"finish_reason\":\"stop\""), std::string::npos) << out;
 }
+
+TEST(Sse, ALongIdOrModelFailsTheStreamInsteadOfRepeatingInEveryChunk)
+{
+    const std::string delta = "data: {\"type\":\"content_block_delta\",\"index\":0,"
+                              "\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    for (const char* field : {"model", "id"})
+    {
+        AnthropicToOpenAiSse t(kFixedCreated);
+        std::string out;
+        const std::string start = std::string("data: {\"type\":\"message_start\",\"message\":{\"") +
+                                  field + "\":\"" + std::string(64 * 1024, 'm') + "\"}}\n\n";
+        EXPECT_FALSE(t.feed(start + delta + delta + delta, out)) << field;
+        EXPECT_LT(out.size(), 1024u) << field << ": the long value was echoed";
+        EXPECT_FALSE(t.finish(out));
+    }
+    AnthropicToOpenAiSse ok(kFixedCreated);
+    std::string out;
+    EXPECT_TRUE(ok.feed("data: {\"type\":\"message_start\",\"message\":{\"id\":\"" +
+                            std::string(AnthropicToOpenAiSse::kMaxEcho, 'i') + "\",\"model\":\"" +
+                            std::string(AnthropicToOpenAiSse::kMaxEcho, 'm') + "\"}}\n\n" + delta,
+                        out));
+}

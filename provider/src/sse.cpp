@@ -274,8 +274,16 @@ namespace llmbridge::provider
         {
             if (const json::Value* m = v.find("message"))
             {
-                if (const std::string_view id = m->str_or("id"); !id.empty()) _id = sanitized(id);
-                _model = sanitized(m->str_or("model"));
+                // Both are echoed into every chunk, so an upstream's long one would
+                // multiply each tiny delta into a large write.
+                const std::string_view id = m->str_or("id"), model = m->str_or("model");
+                if (id.size() > kMaxEcho || model.size() > kMaxEcho)
+                {
+                    _failed = true;
+                    return;
+                }
+                if (!id.empty()) _id = sanitized(id);
+                _model = sanitized(model);
                 if (const json::Value* u = m->find("usage"))
                 {
                     const auto n = [](const json::Value* o, std::string_view k) {
