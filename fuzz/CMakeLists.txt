@@ -37,7 +37,7 @@ endif ()
 # assert() in a fuzz target was therefore compiled to nothing, so the structural
 # invariants in fuzz_http were never checked and CI was fuzzing for crashes alone.
 # A check that cannot fail is worse than no check: it reads as coverage.
-foreach (tgt json http sse)
+foreach (tgt json http sse scan)
     add_executable(fuzz_${tgt} fuzz_${tgt}.cpp)
     target_compile_options(fuzz_${tgt} PRIVATE -g -O1 -UNDEBUG -fsanitize=fuzzer,address,undefined)
     target_link_options(fuzz_${tgt} PRIVATE -fsanitize=fuzzer,address,undefined)
@@ -46,6 +46,7 @@ endforeach ()
 target_link_libraries(fuzz_json PRIVATE provider) # provider/include (json.hpp)
 target_link_libraries(fuzz_http PRIVATE net)      # net/include (http.hpp)
 target_link_libraries(fuzz_sse PRIVATE provider)  # provider/sse.hpp + compiled sse.cpp
+target_link_libraries(fuzz_scan PRIVATE provider) # provider/openai.hpp scans
 
 # The inbound TLS handshake: the first surface an unauthenticated remote peer
 # reaches. Only in a TLS build, because there is no server Session without one.

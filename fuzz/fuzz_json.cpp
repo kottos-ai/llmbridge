@@ -45,6 +45,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     const json::Value s = json::parse(lit, lit_ok);
     assert(lit_ok && s.is_string() && json::unescape_string(s.sv) == in);
     (void)s;
+    // The DOM-free walk agrees with the parser on every body the parser accepts: the
+    // same model, the same stream flag, and no repeated key.
+    if (ok && v.is_object())
+    {
+        const llmbridge::provider::TopLevelFacts f = llmbridge::provider::top_level_facts(in);
+        const json::Value* m = v.find("model");
+        const std::string_view dom_model =
+            m && m->is_string() && m->sv.find('\\') == std::string_view::npos ? m->sv
+                                                                               : std::string_view{};
+        assert(f.model == dom_model);
+        assert(dom_model.empty() || f.model.data() == dom_model.data());
+        const json::Value* st = v.find("stream");
+        assert(f.stream == (st && st->type == json::Value::Type::Bool && st->boolean));
+        (void)f;
+    }
     // The top-level readers the gateway runs on every body when a policy or sink is
     // installed, ahead of the parser. Same invariant: any bytes, no over-read.
     const std::string_view b(reinterpret_cast<const char*>(data), size);

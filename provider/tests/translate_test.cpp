@@ -16,6 +16,7 @@
 #include <string>
 
 #include "provider/json.hpp"
+#include "provider/openai.hpp"
 
 using llmbridge::provider::openai_to_anthropic_request;
 using llmbridge::provider::anthropic_to_openai_response;
@@ -446,7 +447,7 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
 {
     std::string in = R"({"candidates":[{"content":{"role":"model","parts":[
         {"text":"hello "},{"text":"world"}]},"finishReason":"STOP"}],
-        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":11,
+        "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"totalTokenCount":13,
         "cachedContentTokenCount":5,"thoughtsTokenCount":2},
         "modelVersion":"gemini-2.0"})";
     Value out = P(gemini_to_openai_response(in));
@@ -458,9 +459,9 @@ TEST(GeminiResp, JoinsPartsAndMapsUsage)
     EXPECT_EQ(ch->arr[0].str_or("finish_reason"), "stop");
     const Value* u = out.find("usage");
     EXPECT_EQ(u->num_or("prompt_tokens"), "8");
-    EXPECT_EQ(u->num_or("completion_tokens"), "3");
-    EXPECT_EQ(u->num_or("total_tokens"), "11");
-    // Gemini's cache read and thinking count, in the OpenAI shape the scanner reads.
+    // Gemini states thinking beside candidatesTokenCount and bills it as output.
+    EXPECT_EQ(u->num_or("completion_tokens"), "5");
+    EXPECT_EQ(u->num_or("total_tokens"), "13");
     EXPECT_EQ(u->find("prompt_tokens_details")->num_or("cached_tokens"), "5");
     EXPECT_EQ(u->find("completion_tokens_details")->num_or("reasoning_tokens"), "2");
 }
@@ -1603,4 +1604,159 @@ TEST(UpsertString, EveryAcceptedResultStillParses)
         ASSERT_NE(got, nullptr) << out;
         EXPECT_EQ(got->sv, "flex") << out;
     }
+}
+
+// ── openai::scan_usage and StreamUsage: key-anchored reads of venue bytes ──────
+namespace
+{
+    namespace oai = llmbridge::provider::openai;
+} // namespace
+
+TEST(JsonScanUsage, ReadsEachVenuesShape)
+{
+    const oai::Usage o = oai::scan_usage(
+        R"({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,)"
+        R"("prompt_tokens_details":{"cached_tokens":4,"audio_tokens":1},)"
+        R"("completion_tokens_details":{"reasoning_tokens":7,"audio_tokens":2}}})");
+    EXPECT_EQ(o.in, 10);
+    EXPECT_EQ(o.out, 20);
+    EXPECT_EQ(o.cached, 4);
+    EXPECT_EQ(o.audio_in, 1);
+    EXPECT_EQ(o.audio_out, 2);
+    EXPECT_EQ(o.reasoning, 7);
+    const oai::Usage a = oai::scan_usage(
+        R"({"content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":3,)"
+        R"("cache_creation_input_tokens":2,"output_tokens":9}})");
+    EXPECT_EQ(a.in, 10) << "the whole prompt: fresh, read and write";
+    EXPECT_EQ(a.cached, 3);
+    EXPECT_EQ(a.cache_write, 2);
+    EXPECT_EQ(a.out, 9);
+    EXPECT_EQ(oai::scan_usage(R"({"usage":null})").in, -1);
+    EXPECT_EQ(oai::scan_usage("").out, -1);
+}
+
+TEST(JsonScanUsage, GeminiThinkingIsOutput)
+{
+    const oai::Usage g = oai::scan_usage(
+        R"({"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,)"
+        R"("thoughtsTokenCount":2,"totalTokenCount":13}})");
+    EXPECT_EQ(g.in, 8);
+    EXPECT_EQ(g.out, 5) << "stated beside candidatesTokenCount, billed as output";
+    EXPECT_EQ(g.reasoning, 2);
+}
+
+TEST(JsonScanUsage, ANullDetailsBlockIsNotTheNextOne)
+{
+    const oai::Usage u = oai::scan_usage(
+        R"({"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":null,)"
+        R"("completion_tokens_details":{"reasoning_tokens":7,"audio_tokens":5}}})");
+    EXPECT_EQ(u.audio_in, -1) << "the prompt side stated nothing";
+    EXPECT_EQ(u.audio_out, 5);
+    EXPECT_EQ(u.reasoning, 7);
+}
+
+TEST(JsonScanUsage, ACountPastEighteenDigitsIsNotStated)
+{
+    const oai::Usage u = oai::scan_usage(
+        R"({"usage":{"prompt_tokens":99999999999999999999999,"completion_tokens":2}})");
+    EXPECT_EQ(u.in, -1);
+    EXPECT_EQ(u.out, 2);
+    EXPECT_EQ(oai::scan_usage(R"({"usage":{"prompt_tokens":999999999999999999}})").in,
+              999999999999999999LL);
+}
+
+TEST(JsonScanUsage, ModelOutputCannotForgeACount)
+{
+    // A quote in a string is escaped, so prompt or completion text is never a key.
+    EXPECT_EQ(oai::scan_usage(R"({"choices":[{"message":{"content":"x \"prompt_tokens"}}],)"
+                              R"("usage":{"prompt_tokens":10,"completion_tokens":2}})")
+                  .in,
+              10);
+    // A tool's input is raw JSON the model wrote, and it comes before the usage.
+    const std::string body =
+        R"({"content":[{"type":"tool_use","id":"t","name":"f","input":{"usage":)"
+        R"({"input_tokens":1,"cache_creation_input_tokens":900000},"service_tier":"priority"}}],)"
+        R"("usage":{"input_tokens":5000,"output_tokens":3,"service_tier":"standard"}})";
+    const oai::Usage u = oai::scan_usage(body);
+    EXPECT_EQ(u.in, 5000);
+    EXPECT_EQ(u.cache_write, 0);
+    EXPECT_EQ(oai::scan_string(body, "\"service_tier\"", /*last=*/true), "standard");
+    EXPECT_EQ(oai::scan_string(R"({"a":"\"service_tier\":\"x\"","service_tier":"flex"})",
+                               "\"service_tier\"", /*last=*/false),
+              "flex");
+}
+
+TEST(JsonScanUsage, TheErrorTypeIsTheErrorObjectsOwn)
+{
+    EXPECT_EQ(oai::scan_error_type(
+                  R"({"error":{"details":{"code":"nested"},"code":"rate_limit_exceeded"}})"),
+              "rate_limit_exceeded");
+    EXPECT_EQ(oai::scan_error_type(
+                  R"({"type":"error","error":{"type":"overloaded_error","message":"x"}})"),
+              "overloaded_error");
+    EXPECT_EQ(oai::scan_error_type(R"({"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}})"),
+              "");
+    EXPECT_EQ(oai::scan_error_type(R"({"message":"\"error\":{\"code\":\"x\"}"})"), "");
+}
+
+TEST(JsonScanStream, EverySplitOfAStreamGivesTheSameCounts)
+{
+    const std::string anthropic =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\","
+        "\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":30,"
+        "\"cache_creation_input_tokens\":5,\"cache_creation\":{\"ephemeral_5m_input_tokens\":5},"
+        "\"output_tokens\":1}}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\","
+        "\"text\":\"\\\"usage\\\":{\\\"output_tokens\\\":99}\"}}\n\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+        "\"usage\":{\"output_tokens\":42}}\n\n";
+    const std::string openai =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n"
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,"
+        "\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\ndata: [DONE]\n\n";
+    for (const std::string* s : {&anthropic, &openai})
+    {
+        oai::StreamUsage whole;
+        whole.feed(*s);
+        for (size_t cut = 0; cut <= s->size(); ++cut)
+            for (size_t cut2 = cut; cut2 <= s->size(); cut2 += 37)
+            {
+                oai::StreamUsage split;
+                split.feed(std::string_view(*s).substr(0, cut));
+                split.feed(std::string_view(*s).substr(cut, cut2 - cut));
+                split.feed(std::string_view(*s).substr(cut2));
+                const oai::Usage& a = whole.usage();
+                const oai::Usage& b = split.usage();
+                ASSERT_EQ(a.in, b.in) << cut << "," << cut2;
+                ASSERT_EQ(a.out, b.out) << cut << "," << cut2;
+                ASSERT_EQ(a.cached, b.cached) << cut << "," << cut2;
+                ASSERT_EQ(a.cache_write_5m, b.cache_write_5m) << cut << "," << cut2;
+                ASSERT_EQ(a.reasoning, b.reasoning) << cut << "," << cut2;
+            }
+    }
+    oai::StreamUsage a;
+    a.feed(anthropic);
+    EXPECT_EQ(a.usage().in, 47) << "first statement wins";
+    EXPECT_EQ(a.usage().out, 42) << "last statement wins";
+    EXPECT_EQ(a.usage().cached, 30);
+    EXPECT_EQ(a.usage().cache_write_5m, 5);
+    oai::StreamUsage o;
+    o.feed(openai);
+    EXPECT_EQ(o.usage().in, 7);
+    EXPECT_EQ(o.usage().reasoning, 1);
+    o.reset();
+    EXPECT_EQ(o.usage().in, -1);
+}
+
+TEST(JsonScanStream, CarriesOnlyWhatAnUnfinishedObjectNeeds)
+{
+    oai::StreamUsage s;
+    const std::string chunk =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"" + std::string(4000, 'x') +
+        "\"}}],\"usage\":null}\n\n";
+    for (int i = 0; i < 1000; ++i) s.feed(chunk);
+    s.feed("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":");
+    s.feed("5,\"completion_tokens\":6}}\n\n");
+    EXPECT_EQ(s.usage().in, 5);
+    EXPECT_EQ(s.usage().out, 6);
 }

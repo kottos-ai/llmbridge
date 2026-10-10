@@ -198,6 +198,9 @@ jobs:
       - name: Fuzz the inbound TLS handshake (60s, seeded)
         run: ./build-fuzz/bin/fuzz_tls_server -max_total_time=60 -print_final_stats=1
              -artifact_prefix=fuzz-artifacts/ fuzz/corpus/tls
+      - name: Fuzz the usage scanners (60s, seeded)
+        run: ./build-fuzz/bin/fuzz_scan -max_total_time=60 -max_len=8192 -print_final_stats=1
+             -artifact_prefix=fuzz-artifacts/ fuzz/corpus/scan
       - name: Fuzz the SSE translator (60s, seeded)
         # -max_len bounds input: fuzz_sse translates each input twice (whole +
         # chunked) to assert fragmentation-invariance, so keep units modest.

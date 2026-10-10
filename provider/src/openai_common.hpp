@@ -18,6 +18,8 @@
 #include <string>
 #include <string_view>
 
+#include "provider/openai.hpp"
+
 namespace llmbridge::provider::detail
 {
     // Append a raw (already JSON-escaped) span, neutralising C0 control bytes as
@@ -58,6 +60,42 @@ namespace llmbridge::provider::detail
     inline std::string created_now()
     {
         return std::to_string(static_cast<long long>(std::time(nullptr)));
+    }
+
+    // Each venue's counts in the OpenAI convention, written once for the whole-body
+    // translators, the stream translator and the byte-forward scans. -1: not stated.
+
+    // Anthropic's input_tokens is the fresh part only; the cache read and write are
+    // stated beside it, so the whole prompt is their sum.
+    inline openai::Usage anthropic_usage(long long fresh, long long out, long long read,
+                                         long long write, long long w5m, long long w1h) noexcept
+    {
+        openai::Usage u;
+        u.cached = read > 0 ? read : 0;
+        u.cache_write = write > 0 ? write : 0;
+        u.in = (fresh > 0 ? fresh : 0) + u.cached + u.cache_write;
+        u.out = out;
+        if (w5m >= 0 || w1h >= 0)
+        {
+            u.cache_write_5m = w5m > 0 ? w5m : 0;
+            u.cache_write_1h = w1h > 0 ? w1h : 0;
+        }
+        return u;
+    }
+
+    // Gemini states thinking beside candidatesTokenCount, not inside it, and bills it
+    // as output, so completion_tokens is their sum and reasoning the thinking part.
+    inline openai::Usage gemini_usage(long long prompt, long long candidates, long long thoughts,
+                                      long long cached, long long tool_prompt) noexcept
+    {
+        openai::Usage u;
+        u.in = prompt;
+        u.out = candidates;
+        if (thoughts >= 0) u.out = (candidates > 0 ? candidates : 0) + thoughts;
+        u.cached = cached;
+        u.reasoning = thoughts;
+        u.tool_prompt = tool_prompt;
+        return u;
     }
 
     // Anthropic Messages stop_reason -> OpenAI finish_reason. Returns a static

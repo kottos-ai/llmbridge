@@ -12,6 +12,7 @@
 // against a fresh library.
 
 #include "provider/json.hpp"
+#include "provider/openai.hpp"
 #include "provider/sse.hpp"
 #include "provider/translate.hpp"
 
@@ -55,6 +56,13 @@ int main()
     std::string out;
     (void)sse.feed("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", out);
 
-    std::printf("consumer: installed llmbridge OK (translate + json + sse)\n");
+    // 5. The usage scan is linked from the installed library.
+    if (llmbridge::provider::openai::scan_usage(R"({"usage":{"prompt_tokens":3}})").in != 3)
+    {
+        std::fprintf(stderr, "consumer: installed usage scan misread a usage block\n");
+        return 1;
+    }
+
+    std::printf("consumer: installed llmbridge OK (translate + json + sse + usage)\n");
     return 0;
 }

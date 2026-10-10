@@ -770,13 +770,9 @@ namespace llmbridge
         // Streaming usage, for the same reason and found by the same argument: a
         // keep-alive client's second stream inherited the first one's token counts,
         // because nothing cleared them between requests.
-        c->stream_tail.clear();
+        c->stream_usage.reset();
         c->sse_scratch.clear();
         c->sse_scratch.shrink_to_fit();
-        c->usage_in = c->usage_out = c->usage_cached = c->usage_cache_write = -1;
-        c->usage_cw_5m = c->usage_cw_1h = -1;
-        c->usage_reasoning = c->usage_audio_in = c->usage_audio_out = -1;
-        c->usage_accepted_pred = c->usage_rejected_pred = c->usage_tool_prompt = -1;
         // The non-streaming counters. They are assigned only where a body is scanned,
         // so a keep-alive request that fails before that (an upstream non-200, a translate failure)
         //  emitted a record carrying the token counts of the request before it.

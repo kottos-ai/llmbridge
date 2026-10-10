@@ -455,7 +455,11 @@ namespace llmbridge::detail
     {
         bool ok = false;
         const provider::json::Value v = provider::json::parse(body, ok);
-        if (!ok) return refuse::kNotJson;
+        if (!ok)
+        {
+            (void)provider::json::parse(body, ok, provider::json::Keys::Any);
+            return ok ? refuse::kRepeatedKey : refuse::kNotJson;
+        }
         if (!v.is_object()) return refuse::kNotObject;
         if (!v.find("model")) return refuse::kNoModel;
         const provider::json::Value* msgs = v.find("messages");
@@ -499,8 +503,7 @@ namespace llmbridge::detail
                     if (args.empty()) continue;
                     bool aok = false;
                     const provider::json::Value parsed = provider::json::parse(args, aok);
-                    if (!aok || !parsed.is_object() || parsed.sv.size() != args.size())
-                        return refuse::kToolArgs;
+                    if (!aok || !parsed.is_object()) return refuse::kToolArgs;
                 }
             }
         return refuse::kShape;
