@@ -53,6 +53,8 @@ namespace llmbridge
             "Bearer ACCESS_KEY_ID:SECRET or ACCESS_KEY_ID:SECRET:SESSION_TOKEN; the bearer "
             "sent is not one (a Bedrock API key is not accepted here)";
         inline constexpr const char* kNotJson = "request translate: body is not valid JSON";
+        inline constexpr const char* kRepeatedKey =
+            "request translate: an object in the body repeats a key";
         inline constexpr const char* kNotObject =
             "request translate: body is not a JSON object";
         inline constexpr const char* kNoModel = "request translate: no \"model\" field";

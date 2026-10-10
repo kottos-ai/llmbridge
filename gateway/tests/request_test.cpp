@@ -30,7 +30,24 @@ namespace
 {
     using llmbridge::UpstreamDialect;
     using llmbridge::detail::auth_headers_for;
+    using llmbridge::detail::translate_failure;
 } // namespace
+
+// The reason logged and shown for a refused translation names the actual defect.
+TEST(TranslateFailure, NamesARepeatedKeyAndNotWhitespaceAroundArguments)
+{
+    EXPECT_STREQ(translate_failure(R"({"model":"m","messages":[{"role":"user","content":"a",)"
+                                   R"("content":"b"}]})"),
+                 llmbridge::refuse::kRepeatedKey);
+    EXPECT_STREQ(translate_failure(R"({"model":"m","messages":[)"), llmbridge::refuse::kNotJson);
+    // Valid arguments with leading whitespace are one object; whatever failed, it was
+    // not them.
+    EXPECT_STREQ(translate_failure(
+                     R"({"model":"m","messages":[{"role":"assistant","content":null,)"
+                     R"("tool_calls":[{"id":"a","type":"function","function":{"name":"f",)"
+                     R"("arguments":" {\"a\":1}"}}]}]})"),
+                 llmbridge::refuse::kShape);
+}
 
 TEST(AuthHeaders, OrderDoesNotChangeTheResult)
 {
