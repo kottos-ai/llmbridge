@@ -15,6 +15,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace
@@ -148,4 +150,20 @@ TEST(ServedModel, GivesUpAfterFourTriesAndCutsAt64Bytes)
     Connection t;
     note_served_model(&t, R"({"model":")" + std::string(100, 'm') + R"("})", false);
     EXPECT_EQ(std::string(t.served_model, t.served_model_len), std::string(64, 'm'));
+}
+
+TEST(StreamChunk, WrapsWhatWasAppendedInOneHexSizedChunk)
+{
+    Connection c;
+    c.stream_chunked_out = true;
+    for (const size_t n : {size_t{1}, size_t{15}, size_t{16}, size_t{4122}, size_t{1} << 20})
+    {
+        std::string out = "head";
+        out.append(n, 'x');
+        llmbridge::detail::chunk_wrap(&c, out, 4);
+        char want[24];
+        std::snprintf(want, sizeof want, "%zx\r\n", n);
+        EXPECT_EQ(out.substr(0, 4 + std::strlen(want)), "head" + std::string(want)) << n;
+        EXPECT_EQ(out.size(), 4 + std::strlen(want) + n + 2) << n;
+    }
 }

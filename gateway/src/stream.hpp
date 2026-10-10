@@ -12,7 +12,6 @@
 // scan.hpp: this runs on every read of every stream.
 
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -34,9 +33,11 @@ namespace llmbridge::detail
     {
         if (!c->stream_chunked_out || out.size() <= pos) return;
         char hdr[24];
-        const int n = std::snprintf(hdr, sizeof hdr, "%zx\r\n", out.size() - pos);
-        if (n <= 0) return;
-        out.insert(pos, hdr, static_cast<size_t>(n));
+        char* p = hdr + sizeof hdr;
+        *--p = '\n';
+        *--p = '\r';
+        for (size_t n = out.size() - pos; n; n >>= 4) *--p = "0123456789abcdef"[n & 15];
+        out.insert(pos, p, static_cast<size_t>(hdr + sizeof hdr - p));
         out.append("\r\n", 2);
     }
 
