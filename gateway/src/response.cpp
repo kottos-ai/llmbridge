@@ -155,13 +155,12 @@ namespace llmbridge::detail
     // has several.
     //
     // Every detail passed here is a literal in this tree or a policy message that
-    // passed deny_message_ok, so nothing client-supplied is echoed back. Keep it
-    // that way: this string lands inside a JSON body with no escaping.
+    // passed deny_message_ok, so nothing client-supplied is echoed back.
     std::string build_error(int code, const char* detail)
     {
         const auto [line, type, msg] = error_shape(code);
-        const char* shown = (detail && code < 500) ? detail : msg;
-        std::string body = std::string("{\"error\":{\"message\":\"") + shown + "\",\"type\":\"" + type + "\"}}";
+        std::string body;
+        provider::openai::write_error(body, (detail && code < 500) ? detail : msg, type);
         std::string out;
         out.reserve(body.size() + 128);
         out.append(line);

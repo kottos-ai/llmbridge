@@ -15,7 +15,7 @@
 
 #include "content.hpp"
 #include "json_scan.hpp"
-#include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
+#include "openai_common.hpp" // detail::now_secs / anthropic_finish_reason
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -137,15 +137,14 @@ namespace llmbridge::provider
         }
 
         // Anthropic content blocks -> OpenAI tool_calls[]. Empty if none.
-        std::string openai_tool_calls(const json::Value* content)
+        // `,"tool_calls":[...]` for the tool_use blocks; nothing when there are none.
+        void append_tool_calls(std::string& out, const json::Value& content)
         {
-            if (!content || !content->is_array()) return {};
-            std::string out = "[";
             bool first = true;
-            for (const auto& blk : content->arr)
+            for (const auto& blk : content.arr)
             {
                 if (blk.str_or("type") != "tool_use") continue;
-                if (!first) out += ',';
+                out += first ? ",\"tool_calls\":[" : ",";
                 first = false;
                 out += "{\"id\":";
                 json::append_raw_string(out, blk.str_or("id"));
@@ -157,8 +156,7 @@ namespace llmbridge::provider
                 json::append_escaped(out, (in && !in->sv.empty()) ? in->sv : std::string_view{"{}"});
                 out += "}}";
             }
-            out += ']';
-            return first ? std::string{} : out;
+            if (!first) out += ']';
         }
     } // namespace
 
@@ -422,60 +420,64 @@ namespace llmbridge::provider
         return out;
     }
 
-    std::string anthropic_to_openai_response(std::string_view anthropic_body)
+    bool anthropic_to_openai_response(std::string_view anthropic_body, std::string& out,
+                                      openai::Usage& usage)
     {
+        out.clear();
+        usage = {};
         bool ok = false;
         json::Value v = json::parse(anthropic_body, ok);
-        if (!ok || !v.is_object()) return {};
+        if (!ok || !v.is_object()) return false;
 
-        // stop_reason -> OpenAI finish_reason.
-        const std::string_view sr = v.str_or("stop_reason", "end_turn");
-        const char* finish = detail::anthropic_finish_reason(sr);
-
-        openai::Usage u;
         if (const json::Value* m = v.find("usage"))
         {
-            const auto n = [m](std::string_view k) { return json_scan::count(m->num_or(k)); };
-            u = detail::anthropic_usage(n("input_tokens"), n("output_tokens"),
-                                        n("cache_read_input_tokens"),
-                                        n("cache_creation_input_tokens"), -1, -1);
+            const auto n = [](const json::Value* o, std::string_view k) {
+                return o ? json_scan::count(o->num_or(k)) : -1;
+            };
+            const json::Value* cc = m->find("cache_creation");
+            usage = detail::anthropic_usage(
+                n(m, "input_tokens"), n(m, "output_tokens"), n(m, "cache_read_input_tokens"),
+                n(m, "cache_creation_input_tokens"), n(cc, "ephemeral_5m_input_tokens"),
+                n(cc, "ephemeral_1h_input_tokens"));
         }
-        const long long in_tok = u.in > 0 ? u.in : 0, out_tok = u.out > 0 ? u.out : 0;
-        const long long cached_tok = u.cached > 0 ? u.cached : 0;
+        detail::as_written(usage);
 
-        std::string out = "{\"id\":";
-        json::append_raw_string(out, v.str_or("id", "chatcmpl-llmbridge"));
-        out += ",\"object\":\"chat.completion\",\"created\":" + detail::created_now() + ",\"model\":";
-        json::append_raw_string(out, v.str_or("model"));
-        out += ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":";
-        // content: array of blocks; emit the text of text-blocks verbatim.
+        if (out.capacity() < anthropic_body.size() + 256) out.reserve(anthropic_body.size() + 256);
+        openai::Envelope e(out, openai::Shape::Completion, v.str_or("id", "chatcmpl-llmbridge"),
+                           detail::now_secs(), v.str_or("model"));
+        e.choice();
+        out += "\"role\":\"assistant\",\"content\":";
+        // Text blocks verbatim. OpenAI sets content to null, not "", on a pure tool call,
+        // and SDKs branch on that.
         const json::Value* c = v.find("content");
-        const std::string tool_calls = openai_tool_calls(c);
+        bool text = false, tools = false;
+        if (c && c->is_array())
+            for (const auto& blk : c->arr)
+            {
+                const std::string_view t = blk.str_or("type");
+                text = text || (t == "text" && !blk.str_or("text").empty());
+                tools = tools || t == "tool_use";
+            }
+        if (!text && tools) out += "null";
+        else
         {
-            std::string text;
+            out += '"';
             if (c && c->is_array())
                 for (const auto& blk : c->arr)
-                    if (blk.str_or("type") == "text") text += blk.str_or("text");
-            // OpenAI sets content to NULL (not "") on a pure tool call. SDKs branch
-            // on that, so emitting "" would look like an empty answer instead of a
-            // call.
-            if (text.empty() && !tool_calls.empty()) out += "null";
-            else { out += '"'; out += text; out += '"'; }
+                    if (blk.str_or("type") == "text") out += blk.str_or("text");
+            out += '"';
         }
-        if (!tool_calls.empty())
-        {
-            out += ",\"tool_calls\":";
-            out += tool_calls;
-        }
-        out += "},\"finish_reason\":\"";
-        out += finish;
-        out += "\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(in_tok) +
-               ",\"completion_tokens\":" + std::to_string(out_tok) +
-               ",\"total_tokens\":" + std::to_string(in_tok + out_tok);
-        if (cached_tok > 0)
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":" +
-                   std::to_string(cached_tok) + "}";
-        out += "}}";
+        if (tools) append_tool_calls(out, *c);
+        e.end_choice(detail::anthropic_finish_reason(v.str_or("stop_reason", "end_turn")))
+            .close(&usage);
+        return true;
+    }
+
+    std::string anthropic_to_openai_response(std::string_view anthropic_body)
+    {
+        std::string out;
+        openai::Usage u;
+        anthropic_to_openai_response(anthropic_body, out, u);
         return out;
     }
 } // namespace llmbridge::provider

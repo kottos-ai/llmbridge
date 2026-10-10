@@ -11,6 +11,7 @@
 // and the bounded scans that read it from bytes nothing else parses.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -25,6 +26,34 @@ namespace llmbridge::provider::openai
         long long reasoning = -1, audio_in = -1, audio_out = -1;
         long long accepted_prediction = -1, rejected_prediction = -1, tool_prompt = -1;
     };
+
+    enum class Shape : uint8_t { Completion, Chunk };
+
+    /// The one writer of an OpenAI response object, appending to `out`. `id` and `model`
+    /// are JSON string contents, already escaped.
+    class Envelope
+    {
+    public:
+        /// Writes through `"choices":[`.
+        Envelope(std::string& out, Shape s, std::string_view id, long long created,
+                 std::string_view model);
+        /// Resumes an object another call opened.
+        Envelope(std::string& out, Shape s) noexcept : _out(out), _shape(s) {}
+        /// Opens choices[0] through its `message` or `delta` object.
+        Envelope& choice();
+        /// Closes the open choice; an empty `finish` writes null.
+        Envelope& end_choice(std::string_view finish);
+        /// Ends the object. `usage` null writes none, or `"usage":null` when `usage_null`;
+        /// a `total` below 0 is in + out.
+        void close(const Usage* usage, bool usage_null = false, long long total = -1);
+
+    private:
+        std::string& _out;
+        Shape _shape;
+    };
+
+    /// `{"error":{"message":..,"type":..,"code":null}}`, control bytes escaped.
+    void write_error(std::string& out, std::string_view message, std::string_view type);
 
     /// Bytes at the end of a body worth searching: a usage block sits within ~600.
     inline constexpr size_t kUsageWindow = 2048;

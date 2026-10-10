@@ -11,7 +11,7 @@
 #include <cstring>
 
 #include "json_scan.hpp"
-#include "openai_common.hpp" // detail::created_now / anthropic_finish_reason
+#include "openai_common.hpp" // detail::now_secs / anthropic_finish_reason
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -24,15 +24,6 @@ namespace llmbridge::provider
         // upstream inject fake events ("\n\ndata: ..."), and a raw control byte
         // anywhere makes our JSON unparseable to a strict client.
         using detail::append_sanitized;
-
-        // Sanitize into an owned string (for spans we store across events).
-        std::string sanitized(std::string_view raw)
-        {
-            std::string s;
-            s.reserve(raw.size());
-            append_sanitized(s, raw);
-            return s;
-        }
     } // namespace
 
     void SseFrameReader::reset() noexcept
@@ -139,64 +130,42 @@ namespace llmbridge::provider
     // wall clock. Constant across every chunk of the stream thereafter.
     void AnthropicToOpenAiSse::ensure_created()
     {
-        if (!_created.empty()) return;
-        _created = _created_secs >= 0 ? std::to_string(_created_secs) : detail::created_now();
+        if (_created < 0) _created = _created_secs >= 0 ? _created_secs : detail::now_secs();
     }
 
-    // Chunk envelope: everything up to the open of the delta object. Callers then
-    // append the delta body (e.g. "content":"...") and call emit_tail().
+    // A chunk through the open of its delta object; the caller appends the delta's
+    // members and calls emit_tail().
     void AnthropicToOpenAiSse::emit_head(std::string& out)
     {
         ensure_created();
-        out += "data: {\"id\":\"";
-        out += _id; // raw (already JSON-safe) span from message_start, or the default
-        out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
-        out += _created;
-        out += ",\"model\":\"";
-        out += _model;
-        out += "\",\"choices\":[{\"index\":0,\"delta\":{";
+        out += "data: ";
+        openai::Envelope(out, openai::Shape::Chunk, _id, _created, _model).choice();
     }
 
-    // Close the delta object + choice. `finish` == nullptr -> finish_reason:null.
+    // With include_usage, OpenAI puts a null `usage` on every normal chunk; the real
+    // numbers ride the dedicated final chunk (emit_usage).
     void AnthropicToOpenAiSse::emit_tail(std::string& out, const char* finish)
     {
-        out += "},\"finish_reason\":";
-        if (finish) { out += '"'; out += finish; out += '"'; }
-        else out += "null";
-        // With include_usage, OpenAI puts a null `usage` on every normal chunk;
-        // the real numbers ride the dedicated final chunk (emit_usage).
-        out += _include_usage ? "}],\"usage\":null}\n\n" : "}]}\n\n";
+        openai::Envelope(out, openai::Shape::Chunk)
+            .end_choice(finish ? finish : "")
+            .close(nullptr, _include_usage);
+        out += "\n\n";
     }
 
-    // The extra usage-only chunk OpenAI streams just before [DONE] when the client
-    // set stream_options.include_usage: `choices` is empty by spec, and the counts
-    // are Anthropic's own (input from message_start, cumulative output from
-    // message_delta): re-shaped, never estimated.
+    // The usage-only chunk OpenAI streams just before [DONE] when the client set
+    // stream_options.include_usage: `choices` is empty by spec, and the counts are
+    // Anthropic's own, re-shaped, never estimated.
     void AnthropicToOpenAiSse::emit_usage(std::string& out)
     {
         if (!_include_usage || _usage_emitted) return;
         ensure_created();
-        out += "data: {\"id\":\"";
-        out += _id;
-        out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
-        out += _created;
-        out += ",\"model\":\"";
-        out += _model;
-        out += "\",\"choices\":[],\"usage\":{\"prompt_tokens\":";
-        out += std::to_string(_in_tok);
-        out += ",\"completion_tokens\":";
-        out += std::to_string(_out_tok);
-        out += ",\"total_tokens\":";
-        out += std::to_string(_in_tok + _out_tok);
-        // Only when the provider reported cache reads, so a request that used no cache
-        // emits exactly the object it always did.
-        if (_cached_tok > 0)
-        {
-            out += ",\"prompt_tokens_details\":{\"cached_tokens\":";
-            out += std::to_string(_cached_tok);
-            out += "}";
-        }
-        out += "}}\n\n";
+        openai::Usage u;
+        u.in = _in_tok;
+        u.out = _out_tok;
+        u.cached = _cached_tok;
+        out += "data: ";
+        openai::Envelope(out, openai::Shape::Chunk, _id, _created, _model).close(&u);
+        out += "\n\n";
         _usage_emitted = true;
     }
 
@@ -210,13 +179,9 @@ namespace llmbridge::provider
         _done = true;
     }
 
-    // Strict index parse. detail::to_ll() cannot be used here: it wraps
-    // std::from_chars, which on overflow or garbage leaves its output untouched
-    // so `"index": 99999999999999999999` and `"index": "abc"` both come back as 0.
-    // Measured: that made a malformed index alias onto block 0 and attach its
-    // argument fragments to whichever call lived there, i.e. a customer's arguments
-    // routed to the wrong tool. Anything not a clean, fully-consumed, in-range
-    // integer is rejected as -1 and the event is ignored.
+    // Strict index parse: anything not a clean, fully consumed, in-range integer is -1
+    // and the event is ignored. A lenient parse read garbage as 0, which attached a
+    // malformed index's argument fragments to whichever call lived at block 0.
     static long long parse_block_index(const json::Value& v)
     {
         const std::string_view s = v.num_or("index");
@@ -282,8 +247,13 @@ namespace llmbridge::provider
                     _failed = true;
                     return;
                 }
-                if (!id.empty()) _id = sanitized(id);
-                _model = sanitized(model);
+                if (!id.empty())
+                {
+                    _id.clear();
+                    append_sanitized(_id, id);
+                }
+                _model.clear();
+                append_sanitized(_model, model);
                 if (const json::Value* u = m->find("usage"))
                 {
                     const auto n = [](const json::Value* o, std::string_view k) {
@@ -356,8 +326,8 @@ namespace llmbridge::provider
                 }
             // Anthropic reports output_tokens cumulatively on message_delta.
             if (const json::Value* u = v.find("usage"))
-                if (const std::string_view ot = u->num_or("output_tokens"); !ot.empty())
-                    _out_tok = detail::to_ll(ot);
+                if (const long long ot = json_scan::count(u->num_or("output_tokens")); ot >= 0)
+                    _out_tok = ot;
             if (_finish && !_finish_emitted) // finish chunk: empty delta + finish_reason
             {
                 emit_head(out);

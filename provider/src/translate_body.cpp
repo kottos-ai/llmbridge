@@ -18,7 +18,6 @@
 #include <string_view>
 
 #include "json_scan.hpp"
-#include "openai_common.hpp" // detail::append_sanitized
 #include "provider/json.hpp"
 
 namespace llmbridge::provider
@@ -342,20 +341,9 @@ namespace llmbridge::provider
             if (message.empty()) message = v.str_or("message");
         }
 
-        // Both spans come from an untrusted upstream body, so sanitize on the way
-        // out: the same rule the SSE passthrough follows. Otherwise a provider could
-        // make our own error envelope unparseable to a strict client.
-        //
-        // This is now defence in depth instead of the primary mitigation: the
-        // parser rejects raw control bytes in strings outright (RFC 8259 §7), so a
-        // body carrying one no longer parses and `message`/`type` come back empty,
-        // yielding the generic envelope below.
-        std::string out = "{\"error\":{\"message\":\"";
-        if (message.empty()) out += "upstream provider error";
-        else detail::append_sanitized(out, message);
-        out += "\",\"type\":\"";
-        detail::append_sanitized(out, type);
-        out += "\",\"code\":null}}";
+        // Both spans are an untrusted upstream's; write_error escapes control bytes.
+        std::string out;
+        openai::write_error(out, message.empty() ? "upstream provider error" : message, type);
         return out;
     }
 } // namespace llmbridge::provider

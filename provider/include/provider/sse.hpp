@@ -95,7 +95,7 @@ namespace llmbridge::provider
         void dispatch(std::string_view data, std::string& out);
         void ensure_created();                               // stamp _created once
         void emit_head(std::string& out);                    // up to `"delta":{`
-        void emit_tail(std::string& out, const char* finish); // from `}` on; null => finish_reason:null
+        void emit_tail(std::string& out, const char* finish); // from `}` on; null: finish_reason null
         void emit_tool_open(std::string& out, int ord, std::string_view id, std::string_view name);
         void emit_tool_args(std::string& out, int ord, std::string_view frag);
         int tool_ordinal_for(long long block_index);          // Anthropic index -> OpenAI ordinal
@@ -117,7 +117,7 @@ namespace llmbridge::provider
         // Cross-chunk context (copied out of the frag buffer, which churns).
         std::string _id = "chatcmpl-llmbridge"; // overwritten by message_start's id
         std::string _model;                     // from message_start
-        std::string _created;                   // epoch seconds as text, set once
+        long long _created = -1;                // epoch seconds, set once
         long long _created_secs = -1;           // fixed stamp, or -1 => wall clock
         const char* _finish = nullptr;          // mapped stop_reason (static literal)
         bool _role_emitted = false;
