@@ -95,6 +95,21 @@ namespace llmbridge::detail
         else _ops->close(*c);
     }
 
+    void Engine::sink_unfinished(ClientConn* c) noexcept
+    {
+        // Every way a request ends reaches forget(), so a request that never completed is
+        // recorded here whatever closed it: a client that left, a stream we truncated, a
+        // send that failed. A hedged request is recorded leg by leg (close_shadow).
+        ReqState& f = c->req.f;
+        if (!_sink || c->shadow || f.sunk || f.hedged || f.phase == Phase::Idle) return;
+        // A reply complete upstream keeps its status and a stream we cut stays a truncated
+        // 200, as finalize_stream records one. Otherwise the venue never finished, and 499,
+        // nginx's "client closed request", says the wait ended with the client.
+        const bool replied = f.phase == Phase::Replying;
+        const bool cut = f.streaming && c->close_after_resp;
+        sink_emit(c, replied ? status_of(c->out.bytes()) : cut ? 200 : 499, f.streaming);
+    }
+
     void Engine::send_continue(ClientConn* c) noexcept
     {
         // Phase stays Idle, so the send completing finishes nothing.
@@ -570,6 +585,7 @@ namespace llmbridge::detail
 
     ConnBase* Engine::forget(ClientConn* c) noexcept
     {
+        sink_unfinished(c); // before unpair: a stream's token counts live on its venue leg
         if (c->req.f.body_streaming && c->up) reset_venue(c->up);
         stop_body(c);
         c->req.f.body_parked = false;

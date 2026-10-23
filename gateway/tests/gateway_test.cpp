@@ -5235,6 +5235,12 @@ namespace
                             std::to_string(body.size()) + "\r\n\r\n" + body);
             _b.start();
         }
+        /// Read the request and never answer: a venue that hangs.
+        void start_silent()
+        {
+            _b.set_stall(1);
+            _b.start();
+        }
         uint16_t port() const { return _b.port(); }
         /// Answer once, then close: a provider dropping an idle pooled keep-alive.
         /// Only the first connection dies after one response; later ones stay
@@ -6760,6 +6766,40 @@ TEST_P(ProxyRoute, TheSinkSeesGatewayGeneratedErrorReplies)
     EXPECT_EQ(recs[0].cap[0], "");
 }
 
+// A client that gives up on a venue that never answers is still a request that waited.
+// Dropped from the tape, the slowest requests vanish and every latency series reads
+// better than the venue was.
+TEST_P(ProxyRoute, TheSinkSeesARequestWhoseClientGaveUpBeforeTheVenueAnswered)
+{
+    NamedBackend b;
+    b.start_silent();
+    RecordingSink sink;
+    NoFailoverPolicy pol(0);
+    start({{"127.0.0.1", b.port(), false, "", UpstreamDialect::OpenAI, ""}}, &pol, &sink,
+          {"x-kottos-run"});
+
+    Client c;
+    ASSERT_TRUE(c.connect(_port));
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\nx-kottos-run: run-7\r\n"
+                       "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"));
+    for (int i = 0; i < 200 && b.seen() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_EQ(b.seen(), 1) << "the venue must have the request before the client leaves";
+    c.close();
+    for (int i = 0; i < 300 && sink.records().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    shutdown();
+
+    b.stop();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u) << "one record for the abandoned request";
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.status, 499);
+    EXPECT_GT(r.ts_up_sent, 0) << "it was sent upstream";
+    EXPECT_EQ(r.ts_up_recvd, 0) << "and nothing came back";
+    EXPECT_GE(r.ts_done, r.ts_up_sent) << "the wait ends when the client left";
+    EXPECT_EQ(recs[0].cap[0], "run-7");
+}
+
 // After a failover the record must describe the venue that served, the attempts it
 // took, and the tag of the decision, or cost attribution lands on the dead venue.
 TEST_P(ProxyRoute, TheSinkRecordsTheServingVenueAfterFailover)
@@ -7026,6 +7066,55 @@ TEST_P(ProxyStream, TheSinkSeesAFinishedStreamWithTokenCounts)
     // No reasoning in this stream, so nothing to stamp. Zero and not the head: an
     // absent measurement must not read as an instant one.
     EXPECT_EQ(r.ts_first_thinking, 0);
+}
+
+// A client that leaves a stream half read is a request that was served for as long as it
+// waited. The record keeps the stamps the stream had reached.
+TEST_P(ProxyStream, TheSinkSeesAStreamTheClientAbandoned)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(sse_chunked_response(64));
+    _backend.set_stall(2); // half the stream, then silence: the client leaves in the silence
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_FALSE(c.recv_until("data:", 2000).empty()) << "the stream must have started";
+    c.close();
+    for (int i = 0; i < 300 && sink.records().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_EQ(r.status, 499);
+    EXPECT_TRUE(r.streamed);
+    EXPECT_GT(r.ts_up_recvd, 0) << "the response head had arrived";
+    EXPECT_GE(r.ts_done, r.ts_up_recvd);
+}
+
+// A stream the gateway cuts because the venue went silent leaves a record too, marked
+// truncated, as a stream that ends without its terminator does.
+TEST_P(ProxyStream, TheSinkSeesAStreamCutByTheIdleTimeout)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(sse_chunked_response(64));
+    _backend.set_stall(2);
+    start(0, true, UpstreamDialect::Anthropic, GetParam(), /*idle=*/300'000'000LL);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    (void)c.recv_all(3000); // returns when the gateway closes
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_TRUE(recs[0].r.streamed);
+    EXPECT_TRUE(recs[0].r.truncated);
 }
 
 // The same thing in the other dialect. An OpenAI-dialect upstream streams reasoning as

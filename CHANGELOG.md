@@ -8,6 +8,20 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.104.0]. 2026-10-23
+
+### Fixed
+
+- **A request that never completed is recorded.** When a connection closed after the
+  request was dispatched and before the reply finished, the gateway closed both sides and
+  wrote nothing to the sink, so the slowest requests, the ones a client gave up on or the
+  gateway cut, were missing from every record set. `forget()`, which every close passes
+  through, now records them once: **499** (the code nginx uses for a client that closed the
+  request) with the stamps reached so far and `ts_done` at the close, a stream the gateway
+  cut stays a truncated 200 as at its normal end, and a reply already complete upstream
+  keeps its own status. `streamed` is set once the SSE head has gone out. A hedged request
+  is still recorded leg by leg.
+
 ## [0.103.0]. 2026-10-17
 
 A hedge is now a race: the first leg with an answer serves the client, whichever venue it
