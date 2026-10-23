@@ -10720,6 +10720,64 @@ TEST_P(ProxyStream, TheWordReasoningInsideContentIsNotReasoning)
     EXPECT_GT(recs[0].r.ts_first_token, 0);
 }
 
+// The same reply as Together sent it over HTTP/1.1 on 2026-10-23 (gpt-oss-120b, eight output
+// tokens, no reasoning_effort), headers trimmed and nothing else touched: the HTTP chunks fall
+// mid-event, and the first holds every reasoning delta. This is the reply the live tape showed
+// with neither the first-thinking nor the first-token stamp set.
+TEST_P(ProxyStream, TogetherGptOssStreamAsReceived)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(std::string(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream;charset=utf-8\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: keep-alive\r\n"
+        "Cache-Control: no-cache, no-transform\r\n"
+        "\r\n"
+        "7f1\r\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":null}}],\"model\":\"openai/gpt-oss-120b\"}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\"The\"}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\" user\"}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\" wants\"}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\" a\"}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":null,\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\" short\"}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":\"length\",\"delta\":{\"token_id\":null,\"role\":\"assistant\",\"content\":\"\",\"reasoning\":null}}],\"model\":\"openai/gpt-oss-120b\",\"usage\":null}\n"
+        "\n"
+        "\r\n"
+        "1b\r\n"
+        "data: {\"id\":\"p6RPGWz-z1gNr-\r\n"
+        "11a\r\n"
+        "a4f363c3084352e5\",\"object\":\"chat.completion.chunk\",\"created\":1792786273,\"choices\":[],\"model\":\"openai/gpt-oss-120b\",\"usage\":{\"prompt_tokens\":78,\"completion_tokens\":8,\"total_tokens\":86,\"prompt_tokens_details\":{\"cached_tokens\":66},\"completion_tokens_details\":{\"reasoning_tokens\":6}}}\n"
+        "\n"
+        "\r\n"
+        "e\r\n"
+        "data: [DONE]\n"
+        "\n"
+        "\r\n"
+        "0\r\n"
+        "\r\n"));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const llmbridge::RequestRecord& r = recs[0].r;
+    EXPECT_GT(r.ts_first_thinking, 0) << "the reply reasons before it answers";
+    EXPECT_EQ(r.tokens_out, 8);
+}
+
 // ── The route sets the service tier ────────────────────────────────────────────
 // One model is sold at three prices under one name, chosen by a body field and not by
 // the model string. A route that means to buy the cheap tier has to say so in the
