@@ -8,6 +8,14 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.104.1]. 2026-10-23
+
+### Fixed
+
+- **A reply that reasons in a field named `reasoning` is stamped.** Together streams
+  gpt-oss reasoning as `"reasoning":"We"`, with `"content":""` beside it and
+  `"reasoning":null` where the model did not reason, as captured from api.together.xyz.
+
 ## [0.104.0]. 2026-10-23
 
 ### Fixed

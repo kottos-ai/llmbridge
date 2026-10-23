@@ -92,26 +92,37 @@ namespace llmbridge::detail
     }
 
     /// The first reasoning marker on the wire, shared by both stamp sites so the
-    /// two never diverge. `thinking_delta` (Anthropic) and `reasoning_content`
-    /// (OpenAI-dialect) are the streamed forms; `redacted_thinking` is the block
-    /// Anthropic emits when it safety-filters the chain of thought.
+    /// two never diverge. `thinking_delta` (Anthropic) is the streamed form there and
+    /// `redacted_thinking` the block it emits when it safety-filters the chain of
+    /// thought. An OpenAI-dialect server carries reasoning in a delta field whose name
+    /// the servers disagree on: `reasoning_content` (DeepSeek, DeepInfra, Baseten) and
+    /// `reasoning` (Together, OpenRouter, newer vLLM).
     inline bool sse_carries_thinking(std::string_view s) noexcept
     {
         // `thinking_delta` and `redacted_thinking` are type names: their presence
-        // is the signal. `reasoning_content` is a field, and an OpenAI-compatible
-        // server that supports reasoning sends it on every delta whether or not
-        // the model reasoned, as `"reasoning_content":null`.
+        // is the signal. The reasoning fields are fields, and an OpenAI-compatible
+        // server that supports reasoning sends one on every delta whether or not the
+        // model reasoned, as `"reasoning":null`: only a non-empty string counts.
         if (find_fast(s, "\"thinking_delta\"") != std::string_view::npos ||
             find_fast(s, "\"redacted_thinking\"") != std::string_view::npos)
             return true;
-        constexpr std::string_view kReason = "\"reasoning_content\":";
-        for (size_t pos = find_fast(s, kReason); pos != std::string_view::npos;
-             pos = find_fast(s, kReason, pos + 1))
+        // One search serves both names, which share this prefix: a second pass over every
+        // read of every stream costs more than the field does. The quote before it keeps
+        // it from matching text inside a JSON string, where an embedded quote is escaped.
+        constexpr std::string_view kStem = "\"reasoning";
+        constexpr std::string_view kLong = "_content\":";
+        constexpr std::string_view kShort = "\":";
+        for (size_t pos = find_fast(s, kStem); pos != std::string_view::npos;
+             pos = find_fast(s, kStem, pos + 1))
         {
-            size_t v = pos + kReason.size();
+            size_t v = pos + kStem.size();
+            if (s.substr(v, kLong.size()) == kLong) v += kLong.size();
+            else if (s.substr(v, kShort.size()) == kShort) v += kShort.size();
+            else if (v + kLong.size() > s.size()) break; // the name may continue in the next read
+            else continue;                               // some other name: reasoning_tokens
             while (v < s.size() && (s[v] == ' ' || s[v] == '\t')) ++v;
-            if (v >= s.size()) return false; // value byte not in this read yet
-            if (s[v] != '"') continue;       // null, and nothing else is a string
+            if (v >= s.size()) break;   // value byte not in this read yet
+            if (s[v] != '"') continue;  // null, and nothing else is a string
             if (v + 1 < s.size() && s[v + 1] != '"') return true; // non-empty
         }
         return false;

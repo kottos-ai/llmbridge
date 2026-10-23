@@ -10626,6 +10626,100 @@ TEST_P(ProxyStream, AFilledReasoningFieldStillStamps)
     EXPECT_LE(recs[0].r.ts_first_thinking, recs[0].r.ts_first_token);
 }
 
+// Together streams gpt-oss reasoning as `"reasoning"`, not `"reasoning_content"`, and
+// sends `"content":""` beside it on every delta. Captured from api.together.xyz on
+// 2026-10-23 with eight output tokens: the whole reply is reasoning and finishes on
+// length, so no content token ever arrives. Unread, that request has no first-token
+// stamp at all and the probe series counted a 200 as an error.
+TEST_P(ProxyStream, ReasoningInAFieldNamedReasoningStamps)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"content\":\"\",\"reasoning\":null}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"content\":\"\",\"reasoning\":\"We\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"content\":\"\",\"reasoning\":\" just\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"delta\":"
+            "{\"role\":\"assistant\",\"content\":\"\",\"reasoning\":null}}]}\n\n"
+            "data: [DONE]\n\n", 64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_GT(recs[0].r.ts_first_thinking, 0) << "a filled `reasoning` field is reasoning";
+    EXPECT_EQ(recs[0].r.ts_first_token, 0) << "and an empty content is no token";
+}
+
+// The control for the field above, as ANullReasoningFieldIsNotReasoning is for the other
+// name: Together sends `"reasoning":null` on a reply that did not reason.
+TEST_P(ProxyStream, ANullFieldNamedReasoningIsNotReasoning)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
+            "\"content\":\"\",\"reasoning\":null}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello.\","
+            "\"reasoning\":null}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.ts_first_thinking, 0);
+    EXPECT_GT(recs[0].r.ts_first_token, 0);
+}
+
+// A reply whose text happens to contain the words is not reasoning: inside a JSON string
+// the quotes are escaped, so `\"reasoning\":\"x\"` never reads as the field.
+TEST_P(ProxyStream, TheWordReasoningInsideContentIsNotReasoning)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    _backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+        sse_chunk_encode(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+            "\"the field \\\"reasoning\\\":\\\"x\\\" is a name\"}}]}\n\n"
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+            "data: [DONE]\n\n", 64));
+    start(0, true, UpstreamDialect::OpenAI, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(openai_stream_request("hi")));
+    ASSERT_NE(c.recv_stream().find("[DONE]"), std::string::npos);
+    c.close();
+    shutdown();
+
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.ts_first_thinking, 0);
+    EXPECT_GT(recs[0].r.ts_first_token, 0);
+}
+
 // ── The route sets the service tier ────────────────────────────────────────────
 // One model is sold at three prices under one name, chosen by a body field and not by
 // the model string. A route that means to buy the cheap tier has to say so in the
