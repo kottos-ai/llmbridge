@@ -812,6 +812,23 @@ routing header, reached a third-party provider. Translating modes were never aff
 they rebuild from a whitelist already. The key family is dropped whatever the list says
 (above).
 
+### A note at the end of a stream (`RequestSink::reply_note`)
+
+A sink sees each request's record, and part of it is worth telling the client: the
+request's cost is the case the hook was added for. The record is whole only once the
+stream has ended, long after the response head went out, so a header cannot carry it, and
+a `data:` event would reach an OpenAI or Anthropic SDK as a chunk to parse. An SSE comment
+line is text a parser following the specification ignores, so the note is `: <note>` and
+a blank line, after the last event and before the end, and only at a clean end. The
+default returns nothing, and with no sink, or one that keeps the default, the client gets
+the bytes it got before.
+
+The note is a sink's text inside a venue's stream, so it is checked the way a policy's
+message is: dropped whole, never repaired, when it is over `kReplyNoteMax` or holds a CR,
+LF or NUL, any of which would end the comment and start an event. It is also withheld
+after a byte-forwarded stream that stopped inside an event, which the note would join.
+GATEWAY-INTERNALS.md 6d.
+
 ## Logging
 
 A logger in a process that sells a latency number is a hazard, not a convenience.

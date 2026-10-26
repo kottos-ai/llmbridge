@@ -8,6 +8,62 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.105.0]. 2026-10-26
+
+A sink can tell the client something the record knows only at the end of a stream, such
+as what the request cost. Output is unchanged without a sink that overrides the new hook.
+GATEWAY-INTERNALS.md 6d.
+
+### Added
+
+- **`RequestSink::reply_note`**, a virtual whose default returns nothing, and
+  `kReplyNoteMax` (1024), in `gateway/sink.hpp`. At the clean end of a streamed reply the
+  gateway builds the request's record as it stands (status 200, `streamed`) and asks the
+  sink; a non-empty answer is written as one SSE comment line, `: <note>` and a blank
+  line, after the last event (the venue's `[DONE]` or `message_stop`, or the translator's
+  `[DONE]`) and before the terminating chunk, in a chunk of its own. `on_request` follows
+  at the finalize as before. A parser that follows the SSE specification ignores a
+  comment line, so a client that does not look for the note reads the stream it read
+  before.
+- **Only a clean end a client reads gets one**: never a truncated, corrupt or failed
+  stream, a whole reply, or a hedge leg that lost. A hedged stream asks once, after the
+  race, with the serving leg's record.
+
+### Security
+
+- **A note cannot become an event.** One over `kReplyNoteMax`, or holding a CR, LF or
+  NUL, is dropped whole, never cut or cleaned. So is a note after a byte-forwarded venue's
+  stream that stopped inside an event, which the note would have joined: a close-delimited
+  venue's EOF is always a clean end, mid-event included. Each drop is a WARN with the
+  reason and the length, never the text.
+
+### Changed
+
+- **The terminating chunk is staged by `stream_flush`**, once, after a hedge has chosen
+  its leg, and no longer by `stream_step`: that is what puts both stream kinds and both
+  backends through one note path. The bytes are the same. A stock build pays one
+  predicted-false branch per stream and two byte stores per byte-forwarded read; a sink,
+  one record built and one virtual call per stream. `stream_pump`'s cap check now runs
+  before the terminator is staged, so its five bytes, and a note, are not counted against
+  io_uring's 8 MiB cap.
+- **ABI: rebuild a sink against this header.** `RequestSink` has a new virtual. Source
+  compatible.
+
+### Tests
+
+- `ProxyReplyNote.*` on both backends: the note after a byte-forwarded venue's `[DONE]`
+  and after the translator's, in its own chunk before the terminator, unframed and last on
+  a client that asked to close, with the record's final token counts and `reply_note`
+  before `on_request`; no sink and a sink that keeps the default leaving the stream as it
+  was; no note, and no call, on a cut, corrupt or failed stream or a whole reply; a note
+  with a CR, LF, CRLF or NUL, or one byte over the cap, dropped whole, and one exactly at
+  the cap written; a venue stream that stopped inside an event left as it was, and one that
+  ended on a blank line in CRLF, CR or mixed line endings given its note; a hedge's
+  one note from the leg that served, whether it won in the read that ended it or earlier,
+  and none from the leg that lost. Two mutations each fail the test that guards them and
+  no other: without the length and CR, LF and NUL checks every one of the five notes
+  reaches the client, on both backends, and without the event check both venue streams do.
+
 ## [0.104.1]. 2026-10-23
 
 ### Fixed

@@ -20,6 +20,8 @@ namespace llmbridge
     /// been reused; a longer value is truncated to the cap.
     inline constexpr size_t kSinkCaptureMax = 2;
     inline constexpr size_t kSinkCaptureBytes = 48;
+    /// The longest RequestSink::reply_note written; a longer one is dropped whole.
+    inline constexpr size_t kReplyNoteMax = 1024;
 
     /// What Policy::confirm() made of a decision taken on the head of a body.
     enum class ConfirmOutcome : uint8_t
@@ -195,6 +197,13 @@ namespace llmbridge
       public:
         virtual ~RequestSink() = default;
         virtual void on_request(const RequestRecord&) noexcept = 0;
+        /// Text for the client at the clean end of a streamed reply, written as one SSE
+        /// comment line, `: <note>`, after the last event and before the stream's end.
+        /// Called on the loop thread with the record as it stands then (status 200,
+        /// streamed), before on_request; the view must stay valid until the next call.
+        /// Empty sends nothing. A note over kReplyNoteMax bytes, or holding a CR, LF or
+        /// NUL, is dropped whole, never cut or cleaned.
+        virtual std::string_view reply_note(const RequestRecord&) noexcept { return {}; }
 
       protected:
         RequestSink() = default;

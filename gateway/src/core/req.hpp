@@ -157,13 +157,17 @@ namespace llmbridge
         /// Streaming: `streaming` latches in begin_stream; `stream_body` is the
         /// upstream's framing (`stream_left` bytes to go when it is a Content-Length),
         /// `stream_chunked_out` ours; `stream_ended` with `close_after_resp` set means
-        /// truncated (GATEWAY-INTERNALS.md 6b).
+        /// truncated (GATEWAY-INTERNALS.md 6b). `stream_terminated`: the terminating chunk,
+        /// and a sink's note before it, are staged; `stream_tail`: the last four bytes a
+        /// byte-forward sent, which a note must follow as a blank line (6d).
         uint64_t stream_left = 0;
         net::http::Body stream_body = net::http::Body::None;
         bool streaming = false;
         bool stream_chunked_out = false;
         bool stream_ended = false;
+        bool stream_terminated = false;
         bool stream_keep_alive = false; ///< the upstream may be pooled at the end
+        char stream_tail[4] = {};
         bool sse_translating = false;
         bool responses_api = false; ///< its search calls are counted for the sink
         Phase phase = Phase::Idle;

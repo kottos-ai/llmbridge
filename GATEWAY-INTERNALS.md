@@ -345,7 +345,8 @@ Three flags carry the state, and their meanings are precise:
 - **`streaming`** latches in `begin_stream` and is cleared only when a stream
   finalizes on a connection that is kept; the next request's `begin()` resets the
   rest.
-- **`stream_ended`** means no further output will be produced. It becomes true
+- **`stream_ended`** means the stream will produce no further event; a clean end's
+  note and terminating chunk follow from `stream_terminate` (6d). It becomes true
   two ways: cleanly, when the translator emitted its terminal `[DONE]`; or by
   truncation via `stream_truncate()`, which emits **no** `[DONE]` on purpose so a
   client sees a cut-off stream instead of a fabricated clean finish. So
@@ -365,7 +366,7 @@ It becomes true two ways, and only one of them is a finished answer:
 
 | | what happened | `close_after_resp` |
 |---|---|---|
-| **clean** | `stream_step()` saw the end of the body and the SSE translator emitted its terminal `[DONE]` | false |
+| **clean** | `stream_step()` saw the end of the body and the SSE translator emitted its terminal `[DONE]`; `stream_terminate` stages the terminating chunk (6d) | false |
 | **truncated** | the stream is being aborted, so no `[DONE]` is emitted, deliberately: a client must see a cut-off stream instead of a fabricated clean finish. Always via `stream_truncate()` | true |
 
 So `stream_ended && close_after_resp` is the truncated case. That pairing is the
@@ -414,6 +415,47 @@ sweep logs `client stalled` and counts `client_idle_timeouts`, not
 `read_paused` is written only by a backend's `set_read`, which both guard on the
 current value. A stream pauses its upstream only where `stream_backpressure` holds,
 and so does the release to the pool, which resumes reads first (8).
+
+### 6d. A sink's note at the clean end
+
+`RequestSink::reply_note` lets a sink tell the client something only the finished record
+knows, such as what the request cost. At a stream's clean end the gateway builds the
+record as it stands (status 200, `streamed`), asks the sink, and writes a non-empty
+answer as one SSE comment line, `: <note>` and a blank line, which a parser following the
+SSE specification ignores. It goes after the last event (the venue's own `[DONE]` or
+`message_stop` on a byte-forward, the translator's `[DONE]` on a translated stream), in a
+chunk of its own, before the terminating chunk; on a close-delimited client stream it is
+the last bytes before the close. `on_request` comes later, at the finalize, as before.
+
+One path writes it for both stream kinds and both backends. `stream_step` sets
+`stream_ended` and no longer stages the terminator. `stream_flush`, which every stream
+passes on either backend, calls `stream_terminate` once (`stream_terminated`) when the
+end is clean (`stream_ended` without `close_after_resp`) and a client will read the bytes
+(no `shadow`). `stream_terminate` stages the note through `sink_note`, then the
+terminator, and `sink_note` builds its record with `record_of`, as `sink_emit` does.
+
+The call sits after the hedge block in `stream_flush` because that is where a leg learns
+whether it won (13). A leg whose stream ended with no token while another was still live
+lost, and never reaches it. A winner reaches it on the client, after `adopt_leg` swapped
+its state in, so the record is the winner's, `hedge_won` set, whether its end came in the
+read that made it win or later.
+
+Nothing else gets a note: a truncated, corrupt or failed stream (6b), a whole reply, a
+gateway with no sink, an empty answer. A note is dropped whole, never cut or cleaned, with
+a WARN naming the reason and the length and never the text, when it is over
+`kReplyNoteMax` (1 KiB) or holds a CR, LF or NUL, which would end the comment line and
+let the rest parse as an event. It is dropped too when a byte-forwarded venue's bytes did
+not end in a blank line, in any of the line endings the SSE specification allows (LF, CRLF,
+CR, mixed; `stream_tail`, the last four bytes it sent): the note would join
+the venue's last line, or its blank line would dispatch an event a parser would otherwise
+have dropped. A close-delimited venue's EOF is always a clean end (6b), so this is the
+venue that died mid-event. Translated output always ends on a whole event.
+
+Without a sink the note costs one predicted branch per stream and the tail two stores per
+byte-forwarded read; with a sink, one record and one virtual call per stream. The cap
+check in `stream_pump` runs before the note and the terminator are staged, so those last
+bytes, at most a KiB, are not counted against io_uring's 8 MiB cap.
+`ProxyReplyNote.*` in `gateway/tests/gateway_test.cpp` covers both backends.
 
 ## 7. Connection lifetime, and why the two backends free differently
 
@@ -1088,6 +1130,8 @@ A loser is recorded as it ends and closed. The winner is adopted (`adopt_leg`): 
 `close_on_drain`), its SSE translator moves mid-stream, its staged bytes are appended to
 the client's `out`, and its venue connection is paired with the client. Then
 `settle_hedge` cuts every leg still open, and the flush or reply continues on the client.
+A stream's note (6d) is asked for there, after the adoption, so a leg that lost is never
+asked and the client gets one note, built from the winner's record.
 
 **The last leg gone with no answer.** A leg can also end with nothing to show the client:
 aborted mid-stream, or closed by the sweep. When that leaves no live leg and the client is

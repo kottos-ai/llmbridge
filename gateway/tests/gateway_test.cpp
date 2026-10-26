@@ -13534,6 +13534,425 @@ TEST_P(ProxyHedge, ALegToASignedVenueFailsAloneAndReachesNothing)
     for (TestBackend* t : {&signed_venue, &b}) t->stop();
 }
 
+// ── A note at the end of a stream (RequestSink::reply_note) ──────────────────────────
+//
+// A sink may hand the client one SSE comment line at a stream's clean end, after the last
+// event and before the terminating chunk. Nothing else about the stream may change, no
+// other end gets one, and the sink's text never becomes an event of its own.
+namespace
+{
+    const std::string kNote = R"(kottos {"cost_usd":0.000743125})";
+
+    /// Answers every reply_note with its note and keeps what both calls were handed, in
+    /// order: 'n' for reply_note, 'r' for on_request. A record's views die with its call,
+    /// so only its numbers are read.
+    class NoteSink final : public llmbridge::RequestSink
+    {
+      public:
+        explicit NoteSink(std::string note) : _note(std::move(note)) {}
+        std::string_view reply_note(const llmbridge::RequestRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            _noted.push_back(r);
+            _calls += 'n';
+            return _note;
+        }
+        void on_request(const llmbridge::RequestRecord& r) noexcept override
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            _recorded.push_back(r);
+            _calls += 'r';
+        }
+        std::vector<llmbridge::RequestRecord> noted()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _noted;
+        }
+        std::vector<llmbridge::RequestRecord> recorded()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _recorded;
+        }
+        std::string calls()
+        {
+            std::lock_guard<std::mutex> lk(_mu);
+            return _calls;
+        }
+
+      private:
+        std::mutex _mu; // read from the test thread while the loop may still write
+        const std::string _note;
+        std::vector<llmbridge::RequestRecord> _noted, _recorded;
+        std::string _calls;
+    };
+
+    /// How the client must get `note`: one comment line in a chunk of its own, then the end.
+    std::string note_end(const std::string& note)
+    {
+        return sse_chunk_open(": " + note + "\n\n") + "0\r\n\r\n";
+    }
+
+    std::string payload_of(const std::string& raw)
+    {
+        const size_t hdr = raw.find("\r\n\r\n");
+        std::string body;
+        if (hdr == std::string::npos || !dechunk(std::string_view(raw).substr(hdr + 4), body))
+            ADD_FAILURE() << "not a chunk-framed stream: " << raw;
+        return body;
+    }
+
+    /// A translated payload with its `created` stamps blanked: the wall clock is all that
+    /// differs between two runs of one stream.
+    std::string without_created(std::string s)
+    {
+        constexpr std::string_view kCreated = "\"created\":";
+        for (size_t at = s.find(kCreated); at != std::string::npos; at = s.find(kCreated, at + 1))
+        {
+            const size_t v = at + kCreated.size();
+            size_t e = v;
+            while (e < s.size() && s[e] >= '0' && s[e] <= '9') ++e;
+            s.erase(v, e - v);
+        }
+        return s;
+    }
+
+    llmbridge::Upstream plain_venue(uint16_t port, UpstreamDialect d)
+    {
+        return {"127.0.0.1", port, false, "", d, ""};
+    }
+
+    std::string sse_close_response(const std::string& body)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" + body;
+    }
+} // namespace
+
+class ProxyReplyNote : public ProxyKeyHeader
+{
+  protected:
+    /// One stream through a gateway of its own, with `sink`, and what the client got. Joined
+    /// before it returns, so the sink may be read.
+    std::string stream_once(const std::string& reply, UpstreamDialect d, llmbridge::RequestSink* sink,
+                            const std::string& request, bool venue_closes = false)
+    {
+        TestBackend v;
+        v.set_response(reply);
+        v.set_close_after_first(venue_closes);
+        v.start();
+        start({plain_venue(v.port(), d)}, nullptr, sink);
+        Client c;
+        std::string raw;
+        if (c.connect(_port) && c.send(request)) raw = c.recv_stream();
+        c.close();
+        restart();
+        v.stop();
+        return raw;
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyReplyNote,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) { return be_name(i.param); });
+
+// After the venue's own [DONE], in a chunk of its own; the record it is built from has the
+// stream's final counts, and on_request follows for the same request.
+TEST_P(ProxyReplyNote, AByteForwardedStreamEndsWithTheNote)
+{
+    NoteSink sink(kNote);
+    const std::string raw = stream_once(openai_sse_response(4096), UpstreamDialect::OpenAI, &sink,
+                                        openai_stream_request_with_usage());
+    EXPECT_EQ(payload_of(raw), openai_sse_events() + ": " + kNote + "\n\n") << "the venue's events changed";
+    EXPECT_TRUE(raw.ends_with("data: [DONE]\n\n\r\n" + note_end(kNote))) << raw;
+    EXPECT_EQ(sink.calls(), "nr") << "reply_note once, then the record";
+    const auto noted = sink.noted();
+    const auto recorded = sink.recorded();
+    ASSERT_EQ(noted.size(), 1u);
+    ASSERT_EQ(recorded.size(), 1u);
+    const llmbridge::RequestRecord& r = noted[0];
+    EXPECT_EQ(r.seq, recorded[0].seq);
+    EXPECT_EQ(r.status, 200);
+    EXPECT_TRUE(r.streamed);
+    EXPECT_FALSE(r.truncated);
+    EXPECT_FALSE(r.translated);
+    EXPECT_EQ(r.tokens_in, 11);
+    EXPECT_EQ(r.tokens_out, 5);
+    EXPECT_EQ(r.cached_tokens, 7);
+
+    // A client that asked to close gets an unframed stream: the note last, then the close.
+    NoteSink closing(kNote);
+    const std::string body = R"({"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},)"
+                             R"("messages":[{"role":"user","content":"hi"}]})";
+    const std::string unframed = stream_once(openai_sse_response(4096), UpstreamDialect::OpenAI, &closing,
+                                             make_request(body, /*keep_alive=*/false));
+    const size_t hdr = unframed.find("\r\n\r\n");
+    ASSERT_NE(hdr, std::string::npos) << unframed;
+    EXPECT_EQ(unframed.substr(hdr + 4), openai_sse_events() + ": " + kNote + "\n\n");
+    EXPECT_EQ(closing.calls(), "nr");
+}
+
+// After the translator's [DONE]: the translated events are the ones a gateway with no sink
+// sends, and the record has the counts the translator read.
+TEST_P(ProxyReplyNote, ATranslatedStreamEndsWithTheNoteAfterTheTranslatorsDone)
+{
+    const std::string plain = stream_once(sse_tool_response(4096), UpstreamDialect::Anthropic, nullptr,
+                                          openai_stream_request("hi"));
+    NoteSink sink(kNote);
+    const std::string raw = stream_once(sse_tool_response(4096), UpstreamDialect::Anthropic, &sink,
+                                        openai_stream_request("hi"));
+    EXPECT_EQ(without_created(payload_of(raw)), without_created(payload_of(plain)) + ": " + kNote + "\n\n");
+    EXPECT_TRUE(raw.ends_with("data: [DONE]\n\n\r\n" + note_end(kNote))) << raw;
+    const Streamed s = parse_streamed(raw);
+    EXPECT_TRUE(s.done);
+    EXPECT_EQ(s.content, "Checking.");
+    EXPECT_EQ(s.finish, "tool_calls");
+    EXPECT_EQ(sink.calls(), "nr");
+    const auto noted = sink.noted();
+    const auto recorded = sink.recorded();
+    ASSERT_EQ(noted.size(), 1u);
+    ASSERT_EQ(recorded.size(), 1u);
+    EXPECT_EQ(noted[0].seq, recorded[0].seq);
+    EXPECT_EQ(noted[0].status, 200);
+    EXPECT_TRUE(noted[0].streamed);
+    EXPECT_FALSE(noted[0].truncated);
+    EXPECT_TRUE(noted[0].translated);
+    EXPECT_EQ(noted[0].tokens_in, 9);
+    EXPECT_EQ(noted[0].tokens_out, 14);
+}
+
+// No sink, or a sink that keeps reply_note's default: the terminating chunk follows the last
+// event, as before, and a translated stream is the same with the sink as without.
+TEST_P(ProxyReplyNote, NoSinkOrASinkThatKeepsTheDefaultLeavesTheStreamAsItWas)
+{
+    RecordingSink records_only;
+    std::vector<std::string> translated;
+    for (llmbridge::RequestSink* sink :
+         {static_cast<llmbridge::RequestSink*>(nullptr), static_cast<llmbridge::RequestSink*>(&records_only)})
+    {
+        SCOPED_TRACE(sink ? "a sink with no note" : "no sink");
+        const std::string fwd = stream_once(openai_sse_response(4096), UpstreamDialect::OpenAI, sink,
+                                            openai_stream_request_with_usage());
+        EXPECT_EQ(payload_of(fwd), openai_sse_events());
+        EXPECT_TRUE(fwd.ends_with("data: [DONE]\n\n\r\n0\r\n\r\n")) << fwd;
+        const std::string xl = stream_once(sse_tool_response(4096), UpstreamDialect::Anthropic, sink,
+                                           openai_stream_request("hi"));
+        EXPECT_TRUE(xl.ends_with("data: [DONE]\n\n\r\n0\r\n\r\n")) << xl;
+        translated.push_back(without_created(payload_of(xl)));
+    }
+    ASSERT_EQ(translated.size(), 2u);
+    EXPECT_EQ(translated[0], translated[1]);
+    EXPECT_EQ(records_only.records().size(), 2u) << "the records still go";
+}
+
+// Only a clean end gets a note: never a stream cut short, corrupt or failed, and never a
+// whole reply. The sink is not even asked.
+TEST_P(ProxyReplyNote, OnlyACleanStreamEndGetsANote)
+{
+    const std::string ev = anthropic_sse_events();
+    std::string corrupt = sse_chunk_encode(ev.substr(0, ev.size() / 2), 64);
+    corrupt.erase(corrupt.size() - 5); // its terminating chunk
+    corrupt += "ZZZZ\r\ngarbage\r\n";  // a chunk-size line the decoder refuses
+    std::string unended = sse_chunk_encode(openai_sse_events(), 64);
+    unended.erase(unended.size() - 5);
+    const std::string chunked =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const struct
+    {
+        const char* what;
+        std::string reply;
+        UpstreamDialect dialect;
+        std::string request;
+    } cases[] = {
+        {"translated, cut before its stop reason", sse_close_response(ev.substr(0, ev.find("event: message_delta"))),
+         UpstreamDialect::Anthropic, openai_stream_request("hi")},
+        {"translated, corrupt framing", chunked + corrupt, UpstreamDialect::Anthropic, openai_stream_request("hi")},
+        {"byte-forwarded, cut before its terminating chunk", chunked + unended, UpstreamDialect::OpenAI,
+         openai_stream_request_with_usage()},
+    };
+    for (const auto& k : cases)
+    {
+        SCOPED_TRACE(k.what);
+        NoteSink sink(kNote);
+        const std::string raw = stream_once(k.reply, k.dialect, &sink, k.request, /*venue_closes=*/true);
+        EXPECT_EQ(raw.find(kNote), std::string::npos) << raw;
+        EXPECT_FALSE(raw.ends_with("0\r\n\r\n")) << "a cut stream was given its end: " << raw;
+        EXPECT_EQ(sink.calls(), "r") << "asked for a note on a stream that did not end";
+        const auto recs = sink.recorded();
+        ASSERT_EQ(recs.size(), 1u);
+        EXPECT_TRUE(recs[0].truncated);
+    }
+    TestBackend v;
+    v.set_response(venue_reply(UpstreamDialect::OpenAI));
+    v.start();
+    NoteSink whole(kNote);
+    start({plain_venue(v.port(), UpstreamDialect::OpenAI)}, nullptr, &whole);
+    EXPECT_EQ(Client::status_of(exchange(openai_request("hi"))), 200);
+    restart();
+    v.stop();
+    EXPECT_EQ(whole.calls(), "r") << "a whole reply has no stream to end";
+}
+
+// The security property: a sink's text never becomes an event. A note that could end its
+// comment line, or one over kReplyNoteMax, is dropped whole and the stream is the venue's.
+TEST_P(ProxyReplyNote, ANoteThatCouldEndItsLineIsDroppedWhole)
+{
+    const std::string event = R"(data: {"choices":[{"delta":{"content":"injected"}}]})";
+    const std::string bad[] = {
+        "kottos\n\n" + event,
+        "kottos\r" + event,
+        "kottos\r\n\r\n" + event,
+        std::string("kottos") + '\0' + event,
+        std::string(llmbridge::kReplyNoteMax + 1, 'k'),
+    };
+    for (size_t i = 0; i < std::size(bad); ++i)
+    {
+        SCOPED_TRACE(i);
+        NoteSink sink(bad[i]);
+        const std::string raw = stream_once(openai_sse_response(4096), UpstreamDialect::OpenAI, &sink,
+                                            openai_stream_request_with_usage());
+        EXPECT_EQ(payload_of(raw), openai_sse_events()) << "the note reached the client";
+        EXPECT_EQ(raw.find("injected"), std::string::npos) << raw;
+        EXPECT_TRUE(raw.ends_with("data: [DONE]\n\n\r\n0\r\n\r\n")) << raw;
+        EXPECT_EQ(sink.calls(), "nr") << "asked once, and the record still goes";
+    }
+    // The cap is inclusive: exactly kReplyNoteMax bytes is a note.
+    const std::string longest(llmbridge::kReplyNoteMax, 'k');
+    NoteSink sink(longest);
+    const std::string raw = stream_once(openai_sse_response(4096), UpstreamDialect::OpenAI, &sink,
+                                        openai_stream_request_with_usage());
+    EXPECT_EQ(payload_of(raw), openai_sse_events() + ": " + longest + "\n\n");
+}
+
+// A close-delimited venue's stream ends at any EOF, inside an event too. A note there would
+// join the venue's last line, or dispatch the event a parser would have dropped, so it is
+// withheld and the venue's bytes reach the client as they were.
+TEST_P(ProxyReplyNote, AVenueStreamThatStopsInsideAnEventGetsNoNote)
+{
+    const std::string ev = openai_sse_events();
+    const std::string cut[] = {
+        ev.substr(0, ev.size() - 1),                    // `data: [DONE]` and one LF: never dispatched
+        ev.substr(0, ev.find("\"completion_tokens\"")), // inside a data line
+    };
+    for (size_t i = 0; i < std::size(cut); ++i)
+    {
+        SCOPED_TRACE(i);
+        NoteSink sink(kNote);
+        const std::string raw = stream_once(sse_close_response(cut[i]), UpstreamDialect::OpenAI, &sink,
+                                            openai_stream_request_with_usage(), /*venue_closes=*/true);
+        EXPECT_EQ(payload_of(raw), cut[i]) << "the venue's bytes changed";
+        EXPECT_EQ(raw.find(kNote), std::string::npos) << raw;
+        EXPECT_EQ(sink.calls(), "nr");
+    }
+}
+
+// A blank line in any of the line endings the SSE specification allows, LF, CRLF and CR,
+// mixed included, ends a whole event, so the note follows it. One line end alone does not.
+TEST_P(ProxyReplyNote, AVenueStreamEndingOnABlankLineInAnyLineEndingGetsTheNote)
+{
+    const std::string lf = openai_sse_events();
+    ASSERT_TRUE(lf.ends_with("data: [DONE]\n\n"));
+    const auto ended_with = [&](const char* eol) {
+        std::string s;
+        for (const char ch : lf) s += ch == '\n' ? std::string(eol) : std::string(1, ch);
+        return s;
+    };
+    const std::string crlf = ended_with("\r\n"), cr = ended_with("\r");
+    const std::string last = lf.substr(0, lf.size() - 2); // up to `data: [DONE]`
+    const std::string whole[] = {crlf, cr, last + "\n\r\n", last + "\r\r\n", last + "\n\r"};
+    for (size_t i = 0; i < std::size(whole); ++i)
+    {
+        SCOPED_TRACE(i);
+        NoteSink sink(kNote);
+        const std::string raw = stream_once(sse_close_response(whole[i]), UpstreamDialect::OpenAI, &sink,
+                                            openai_stream_request_with_usage(), /*venue_closes=*/true);
+        EXPECT_EQ(payload_of(raw), whole[i] + ": " + kNote + "\n\n") << raw;
+        EXPECT_EQ(sink.calls(), "nr");
+    }
+    const std::string one_end[] = {last + "\r\n", last + "\r", crlf.substr(0, crlf.size() - 2)};
+    for (size_t i = 0; i < std::size(one_end); ++i)
+    {
+        SCOPED_TRACE(i);
+        NoteSink sink(kNote);
+        const std::string raw = stream_once(sse_close_response(one_end[i]), UpstreamDialect::OpenAI, &sink,
+                                            openai_stream_request_with_usage(), /*venue_closes=*/true);
+        EXPECT_EQ(payload_of(raw), one_end[i]) << "the venue's bytes changed";
+        EXPECT_EQ(raw.find(kNote), std::string::npos) << raw;
+        EXPECT_EQ(sink.calls(), "nr");
+    }
+}
+
+// A hedge asks after its race: the leg whose stream ended with no token lost and is never
+// asked, and the winner, ending in the read that made it win, asks with its own record.
+TEST_P(ProxyReplyNote, AHedgedStreamGetsOneNoteFromTheLegThatServed)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b;
+    a.set_response(sse_head("req-alpha") + sse_chunk_encode(sse_role() + "data: [DONE]\n\n", 4096));
+    b.set_response(sse_head("req-bravo") + sse_chunk_encode(sse_role() + sse_word("bravo"), 4096));
+    b.hold_first_reply(&go); // until the first leg has ended and lost
+    for (TestBackend* t : {&a, &b}) t->start();
+    NoteSink sink(kNote);
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_stream_request_hdrs(hedge_keys())));
+    ASSERT_TRUE(within_2s([&] { return sink.recorded().size() == 1; })) << "the leg with no token never ended";
+    go = true;
+    const std::string resp = cl.recv_stream();
+    cl.close();
+    shutdown();
+    EXPECT_NE(resp.find("req-bravo"), std::string::npos) << resp;
+    EXPECT_EQ(resp.find("req-alpha"), std::string::npos) << "the losing leg reached the client: " << resp;
+    EXPECT_EQ(occurrences(resp, kNote), 1u) << resp;
+    EXPECT_TRUE(resp.ends_with("data: [DONE]\n\n\r\n" + note_end(kNote))) << resp;
+    EXPECT_EQ(sink.calls(), "rnr") << "the losing leg's record, then the winner's note and record";
+    const auto noted = sink.noted();
+    const auto recorded = sink.recorded();
+    ASSERT_EQ(noted.size(), 1u);
+    ASSERT_EQ(recorded.size(), 2u);
+    EXPECT_EQ(noted[0].hedge_leg, 1u);
+    EXPECT_TRUE(noted[0].hedged);
+    EXPECT_TRUE(noted[0].hedge_won) << "asked before the winner held the client";
+    EXPECT_EQ(noted[0].seq, recorded[1].seq);
+    EXPECT_EQ(recorded[0].hedge_leg, 0u);
+    EXPECT_FALSE(recorded[0].hedge_won);
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
+// The winner taken at its first token, its end arriving later on the client's connection:
+// the note comes then, once, from the winning leg's record.
+TEST_P(ProxyReplyNote, AHedgeLegThatWonMidStreamEndsWithItsNote)
+{
+    TestBackend a, b;
+    a.set_response(sse_head("req-alpha") +
+                   sse_chunk_open(sse_role() + R"(data: {"choices":[{"delta":{"content":"alpha"}}]})" "\n\n"));
+    a.set_late_bytes(sse_chunk_open("data: [DONE]\n\n") + "0\r\n\r\n", 300);
+    b.set_stall(3);
+    for (TestBackend* t : {&a, &b}) t->start();
+    NoteSink sink(kNote);
+    HedgePolicy pol(hedged("x-kottos-key-a"), {{.upstream_index = 1, .credential_header = "x-kottos-key-b"}});
+    start({oai_venue(a.port()), oai_venue(b.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_stream_request_hdrs(hedge_keys())));
+    const std::string resp = cl.recv_stream();
+    cl.close();
+    shutdown();
+    EXPECT_NE(resp.find("alpha\""), std::string::npos) << resp;
+    EXPECT_EQ(occurrences(resp, kNote), 1u) << resp;
+    EXPECT_TRUE(resp.ends_with("data: [DONE]\n\n\r\n" + note_end(kNote))) << resp;
+    EXPECT_EQ(sink.calls(), "rnr") << "the cut leg's record, then the winner's note and record";
+    const auto noted = sink.noted();
+    const auto recorded = sink.recorded();
+    ASSERT_EQ(noted.size(), 1u);
+    ASSERT_EQ(recorded.size(), 2u);
+    EXPECT_EQ(noted[0].hedge_leg, 0u);
+    EXPECT_TRUE(noted[0].hedge_won);
+    EXPECT_EQ(noted[0].seq, recorded[1].seq);
+    EXPECT_TRUE(recorded[0].hedge_cut);
+    for (TestBackend* t : {&a, &b}) t->stop();
+}
+
 // ── What a relayed response keeps, and what a forwarded request drops ─────────────
 
 class ProxyRelay : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend>

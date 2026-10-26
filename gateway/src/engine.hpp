@@ -230,6 +230,7 @@ namespace llmbridge::detail
         static void stream_warn_if_encoded(const ClientConn* client, const net::http::ResponseHead& h) noexcept;
         void stream_record_latency(const ClientConn* client) noexcept;
         void stream_truncate(ClientConn* client) noexcept; // no [DONE]: the three mutations together
+        void stream_terminate(ClientConn* client) noexcept; // a clean end: the sink's note, then the terminator
 
         // Hedges (core/hedge.cpp): GATEWAY-INTERNALS.md 13.
         bool apply_hedge(ClientConn* c, const Decision& d) noexcept; // false: refused, replied
@@ -251,8 +252,12 @@ namespace llmbridge::detail
         void sink_capture(ClientConn* c) noexcept;
         [[nodiscard]] const char* capture_model(ClientConn* c) noexcept; // why to refuse, or null
         [[nodiscard]] static uint64_t prefix_hash_of(std::string_view lead) noexcept; // RequestFacts::prefix_hash
+        /// The record as it stands; its word views point into `u`, which must outlive it.
+        [[nodiscard]] RequestRecord record_of(const ClientConn* c, int status, bool streamed,
+                                              provider::openai::Usage& u) const noexcept;
         void sink_emit(ClientConn* c, int status, bool streamed) noexcept;
         void sink_unfinished(ClientConn* c) noexcept;   // a request closed before it completed
+        void sink_note(const ClientConn* c, std::string& out) noexcept; // reply_note, checked, into `out`
         void sweep_idle() noexcept; // heartbeat, pool reaping and every timeout, one walk
         void sweep_client(ClientConn* c, int64_t now, bool busy) noexcept;
 

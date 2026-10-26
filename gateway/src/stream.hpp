@@ -290,11 +290,15 @@ namespace llmbridge::detail
                 const size_t at = out.size();
                 out.append(sse_in);
                 chunk_wrap(client, out, at);
+                // The venue's last four bytes: a sink's note may follow only a blank line (6d).
+                char* tail = client->req.f.stream_tail;
+                const size_t k = sse_in.size() < 4 ? sse_in.size() : 4;
+                std::memmove(tail, tail + k, 4 - k);
+                std::memcpy(tail + 4 - k, sse_in.data() + sse_in.size() - k, k);
             }
             if (stream_complete(client, at_eof) && !client->req.f.stream_ended)
             {
-                chunk_terminate(client, out); // clean end only; see the helper
-                client->req.f.stream_ended = true;
+                client->req.f.stream_ended = true; // clean: stream_flush stages the terminator
                 return StreamStep::Ended;
             }
             // EOF with the framing unfinished is the truncation. Reported, so the
@@ -324,11 +328,10 @@ namespace llmbridge::detail
         if (stream_complete(client, at_eof) && !client->req.f.stream_ended)
         {
             // The translator's trailer ([DONE] and any final event) is body, so it
-            // is framed like every other write before the terminator closes it.
+            // is framed like every other write; stream_flush stages the terminator.
             const size_t fin_at = out.size();
             if (!client->sse_xlate.finish(out)) return StreamStep::Failed;
             chunk_wrap(client, out, fin_at);
-            chunk_terminate(client, out);
             client->req.f.stream_ended = true;
             return StreamStep::Ended;
         }

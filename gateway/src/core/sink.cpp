@@ -5,8 +5,8 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-// The request sink: header capture and the model read at framing, the record at
-// completion.
+// The request sink: header capture and the model read at framing, a stream's note at
+// its clean end, the record at completion.
 
 #include "engine.hpp"
 
@@ -105,7 +105,7 @@ namespace llmbridge::detail
         return net::Sha256::truncated(net::Sha256::hash(lead));
     }
 
-    void Engine::sink_emit(ClientConn* c, int status, bool streamed) noexcept
+    RequestRecord Engine::record_of(const ClientConn* c, int status, bool streamed, BodyUsage& u) const noexcept
     {
         RequestRecord r;
         r.seq = c->req.f.req_seq;
@@ -148,7 +148,7 @@ namespace llmbridge::detail
         r.from_pool = c->req.f.upstream_pooled;
         // A stream's counts from its translator or its own usage events; -1 is "not
         // reported" and not "zero".
-        const BodyUsage u = streamed ? stream_tokens(c) : c->req.f.tok;
+        u = streamed ? stream_tokens(c) : c->req.f.tok;
         r.tokens_in = static_cast<int32_t>(u.in);
         r.tokens_out = static_cast<int32_t>(u.out);
         r.cached_tokens = static_cast<int32_t>(u.cached);
@@ -175,7 +175,7 @@ namespace llmbridge::detail
         r.prior_cached_tokens = static_cast<int32_t>(u.prior_cached);
         r.prior_cache_write_tokens = static_cast<int32_t>(u.prior_cache_write);
         r.prior_attempts = static_cast<int32_t>(u.prior_attempts);
-        r.prior_model = u.prior_model.view(); // `u` outlives on_request
+        r.prior_model = u.prior_model.view(); // into the caller's `u`, as are the next two
         r.served_speed = u.speed.view();
         r.served_geo = u.inference_geo.view();
         r.served_latency = c->req.f.served_latency.view();
@@ -197,8 +197,53 @@ namespace llmbridge::detail
         r.hedge_leg = c->req.f.hedge_leg;
         r.hedge_won = c->req.f.hedge_won;
         r.hedge_cut = c->req.f.hedge_cut;
+        return r;
+    }
+
+    void Engine::sink_emit(ClientConn* c, int status, bool streamed) noexcept
+    {
+        BodyUsage u;
+        const RequestRecord r = record_of(c, status, streamed, u);
         c->req.f.sunk = true;
         _sink->on_request(r);
+    }
+
+    // Whether a venue's last four bytes, oldest first, end in a blank line: two line ends in a
+    // row, each LF, CRLF or CR, as the SSE specification allows them, mixed included.
+    static bool ends_blank_line(const char (&t)[4]) noexcept
+    {
+        if (t[3] == '\n' && t[2] == '\r') return t[1] == '\n' || t[1] == '\r';
+        if (t[3] == '\n') return t[2] == '\n';
+        return t[3] == '\r' && (t[2] == '\r' || t[2] == '\n');
+    }
+
+    // Why `note` cannot follow `c`'s stream as one SSE comment line that dispatches nothing,
+    // or null when it can. A line break or a NUL would let the rest be parsed as an event,
+    // and a venue's bytes that stop inside an event would take the note into it.
+    static const char* note_refusal(const ClientConn* c, std::string_view note) noexcept
+    {
+        if (note.size() > kReplyNoteMax) return "longer than kReplyNoteMax";
+        for (const char ch : note)
+            if (ch == '\r' || ch == '\n' || ch == '\0') return "holding a CR, LF or NUL";
+        if (!c->req.f.sse_translating && !ends_blank_line(c->req.f.stream_tail))
+            return "the venue's stream ended inside an event";
+        return nullptr;
+    }
+
+    void Engine::sink_note(const ClientConn* c, std::string& out) noexcept
+    {
+        BodyUsage u;
+        const std::string_view note = _sink->reply_note(record_of(c, 200, /*streamed=*/true, u));
+        if (note.empty()) return;
+        // Dropped whole. The reason is logged, never the text: a note that failed is no safer in a log.
+        if (const char* why = note_refusal(c, note))
+        {
+            LB_WARN(ReqId{c->req.f.req_seq}, " sink reply_note dropped: ", why, " (", note.size(), " bytes)");
+            return;
+        }
+        const size_t at = out.size();
+        out.append(": ", 2).append(note).append("\n\n", 2);
+        chunk_wrap(c, out, at);
     }
 
 } // namespace llmbridge::detail

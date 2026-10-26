@@ -119,6 +119,11 @@ namespace llmbridge::detail
             if (!token && !f.stream_ended) return;
             if (token || leg_alone(client)) client = adopt_leg(client);
         }
+        // After the hedge chose, so a leg that lost never asks for a note and the winner asks
+        // with its own record; once, for both stream kinds on both backends (6d).
+        if (client->req.f.stream_ended && !client->req.f.stream_terminated && !client->close_after_resp &&
+            !client->shadow)
+            stream_terminate(client);
         const uint64_t sent = client->sent_bytes;
         const Sent s = _ops->send(*client);
         // A client draining a paused stream is progress, though the upstream is silent.
@@ -144,6 +149,15 @@ namespace llmbridge::detail
             _ops->set_read(*u, true);
             LB_WARN("CAP backpressure cleared, resuming upstream reads ", *u);
         }
+    }
+
+    // A clean end a client reads: the sink's note, then the terminating chunk.
+    void Engine::stream_terminate(ClientConn* client) noexcept
+    {
+        client->req.f.stream_terminated = true;
+        std::string& out = client->out.stage();
+        if (_sink) sink_note(client, out);
+        chunk_terminate(client, out);
     }
 
     // The upstream closed: translate what remains, emit the terminal [DONE] if the

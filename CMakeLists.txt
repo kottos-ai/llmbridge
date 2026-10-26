@@ -12,7 +12,7 @@
 # CLI below); nothing else is required.
 
 cmake_minimum_required(VERSION 3.20)
-project(llmbridge VERSION 0.104.1 LANGUAGES CXX)
+project(llmbridge VERSION 0.105.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
