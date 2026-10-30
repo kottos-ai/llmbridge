@@ -45,6 +45,9 @@ a log line's request line stops at its query. DESIGN.md "Gemini clients and Vert
 
 ### Changed
 
+- **ABI: rebuild a sink and an embedder against these headers.** `RequestRecord` and
+  `Upstream` have new fields, `Venue` a new value and `kSinkCaptureMax` is 3. Source
+  compatible.
 - **Gemini stream stamps.** The first token is a part with non-empty `text` not marked
   `"thought": true`, or a `functionCall`; an empty part carrying only a
   `thoughtSignature` is not. Thinking is a part marked `"thought": true`. Before, a
@@ -52,9 +55,15 @@ a log line's request line stops at its query. DESIGN.md "Gemini clients and Vert
 - **`scan_error_type`** reads Google's `error.status` when the first 512 bytes name no
   `code` or `type`, within 8 KiB, past a long `message`. Google's numeric `code` is
   still not a name.
-- **No reply note to a Gemini client.** google-genai for Python parses every line that
-  is not `data: ` as JSON and fails the stream on a comment line, so the sink is not
-  asked.
+- **`RequestRecord::comment_unsafe`: the client breaks on a reply note**, and the sink
+  decides whether to send one. Measured 2026-10-29 against a stream the gateway writes:
+  google-genai 2.34.0 for Python, sync and async, fails it with `UnknownApiResponseError`
+  (it parses every line that is not `data: ` as JSON, a comment line included), while
+  @google/genai 2.32.0 for JS reads it. The Python SDK names itself in
+  `x-goog-api-client` (`google-genai-sdk/2.34.0 gl-python/3.13.17`, JS `gl-node/`), so a
+  Gemini client whose header carries a `gl-python/` token is marked. llmbridge writes
+  whatever the sink returns, as for every other client.
+- **`kSinkCaptureMax` is 3** (was 2), for a header a sink reads to choose its note.
 
 ### Security
 

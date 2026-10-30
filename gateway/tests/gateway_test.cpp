@@ -17674,9 +17674,10 @@ TEST_P(ProxyGeminiPath, AnErrorEventAfterTheHeadMarksTheRecord)
     EXPECT_EQ(recs[0].upstream_error, "UNAVAILABLE");
 }
 
-// google-genai for Python fails a stream on a comment line, so a Gemini client is never
-// asked for a note, and gets the venue's bytes as they were.
-TEST_P(ProxyGeminiPath, AGeminiStreamGetsNoNote)
+// google-genai for Python fails a stream on a comment line; its JS twin and every other
+// client skip one. The gateway says which on the record and the sink decides: asked for a
+// note, every client gets it, the record telling the sink whether this one breaks on it.
+TEST_P(ProxyGeminiPath, TheRecordSaysWhenAClientBreaksOnTheNote)
 {
     NoteSink sink("kottosai {\"cost\":1}");
     _sink = &sink;
@@ -17684,14 +17685,50 @@ TEST_P(ProxyGeminiPath, AGeminiStreamGetsNoNote)
     pol.opt_in = false;
     _backend.set_response(gemini_sse_response(gemini_sse_events(), 4096));
     start_gemini(pol);
+    const auto stream = [&](const std::string& extra) {
+        Client c;
+        if (!c.connect(_proxy_port) || !c.send(gemini_post(kGeminiStream, kGeminiBody, extra))) return std::string();
+        return c.recv_stream();
+    };
+    const std::string py = stream("x-goog-api-client: google-genai-sdk/2.34.0 gl-python/3.13.17\r\n");
+    const std::string js = stream("x-goog-api-client: google-genai-sdk/2.32.0 gl-node/v22.22.0\r\n");
+    const std::string bare = stream("");
+    const std::string lookalike = stream("x-goog-api-client: my-gl-python/1\r\n");
+    shutdown();
+    for (const std::string* raw : {&py, &js, &bare, &lookalike})
+        EXPECT_NE(raw->find(": kottosai"), std::string::npos) << "the sink's note was not written";
+    const auto noted = sink.noted();
+    ASSERT_EQ(noted.size(), 4u);
+    EXPECT_TRUE(noted[0].comment_unsafe) << "the Python SDK";
+    EXPECT_FALSE(noted[1].comment_unsafe) << "the JS SDK";
+    EXPECT_FALSE(noted[2].comment_unsafe) << "no SDK named";
+    EXPECT_FALSE(noted[3].comment_unsafe) << "gl-python/ only as its own token";
+}
+
+// Only a Gemini client: the Python SDK token on another dialect says nothing about it.
+TEST_P(ProxyGeminiPath, OnlyAGeminiClientIsMarked)
+{
+    NoteSink sink("n");
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0}};
+    _policy = &pol;
+    _backend.set_response(openai_sse_response(4096));
+    _backend.start();
+    _upstreams = {{"127.0.0.1", _backend.port(), false, "", UpstreamDialect::OpenAI, ""}};
+    start(0, false, UpstreamDialect::OpenAI, GetParam());
     Client c;
     ASSERT_TRUE(c.connect(_proxy_port));
-    ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
-    const std::string raw = c.recv_stream();
+    const std::string body = R"({"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},)"
+                             R"("messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nx-goog-api-client: gl-python/3.13\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_stream();
     c.close();
     shutdown();
-    EXPECT_EQ(raw.find("kottosai"), std::string::npos) << raw;
-    EXPECT_EQ(sink.calls(), "r") << "reply_note was asked";
+    ASSERT_EQ(sink.noted().size(), 1u);
+    EXPECT_FALSE(sink.noted()[0].comment_unsafe);
 }
 
 // A whole generateContent reply is read the same way, and URL context marks the tool

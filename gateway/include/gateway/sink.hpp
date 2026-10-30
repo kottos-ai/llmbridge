@@ -18,7 +18,7 @@ namespace llmbridge
     /// Header values the gateway may copy for the sink, chosen at set_request_sink.
     /// Bounded and copied at framing, because by completion the request buffer has
     /// been reused; a longer value is truncated to the cap.
-    inline constexpr size_t kSinkCaptureMax = 2;
+    inline constexpr size_t kSinkCaptureMax = 3;
     inline constexpr size_t kSinkCaptureBytes = 48;
     /// The longest RequestSink::reply_note written; a longer one is dropped whole.
     inline constexpr size_t kReplyNoteMax = 1024;
@@ -112,6 +112,9 @@ namespace llmbridge
         /// web_search_requests holds its grounding queries. DESIGN.md "Gemini clients and Vertex".
         bool tool_prompt_input = false;
         bool stream_error = false; ///< a 200 stream then sent an error event; upstream_error names it
+        /// The client fails a stream on an SSE comment line, so a reply_note would break it:
+        /// google-genai for Python (`gl-python/` in x-goog-api-client) on a Gemini route.
+        bool comment_unsafe = false;
         /// The venue's own price for this request in picodollars (DeepInfra's
         /// estimated_cost), a check on ours.
         int64_t venue_cost_pdollars = -1;

@@ -459,8 +459,10 @@ still say something: every line before the first token, after it only one naming
 not yet read. The first token is non-empty `text` not marked `"thought": true`, or a
 `functionCall`; thinking is a part so marked, which appears only when the client asked
 for `includeThoughts`. A stream that fails after its head sends `data: {"error":...}` on a
-200, recorded as `stream_error`. A Gemini client is never sent a reply note: the Python
-SDK fails a stream on a comment line.
+200, recorded as `stream_error`. google-genai for Python fails a stream on an SSE comment
+line, which a reply note is; the JS SDK does not. The Python SDK names itself in
+`x-goog-api-client` (`gl-python/`), so the record says `comment_unsafe` and the sink, whose
+note it is, decides whether to send one.
 
 ### Signing for Bedrock (`net/sigv4.hpp`)
 

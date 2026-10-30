@@ -64,6 +64,7 @@ namespace llmbridge::detail
         c->req.f.wall_t0 = static_cast<int64_t>(tw.tv_sec) * 1000000000 + tw.tv_nsec;
         const std::string_view head(c->rbuf.data(), c->msg.header_len);
         c->req.f.responses_api = responses_api(head); // read at the reply, when rbuf has moved on
+        c->req.f.comment_unsafe = comment_unsafe_client(head);
         for (size_t i = 0; i < kSinkCaptureMax && i < _sink_capture_names.size(); ++i)
             c->req.f.captured[i].set(net::http::find_header(head, _sink_capture_names[i]));
     }
@@ -166,6 +167,7 @@ namespace llmbridge::detail
         if (c->req.f.search_queries >= 0) r.web_search_requests = c->req.f.search_queries; // Gemini's grounding
         r.tool_prompt_input = c->req.f.tool_prompt_input;
         r.stream_error = c->req.f.stream_error;
+        r.comment_unsafe = c->req.f.comment_unsafe;
         r.web_fetch_requests = static_cast<int32_t>(u.web_fetch);
         r.code_exec_requests = static_cast<int32_t>(u.code_exec);
         r.file_search_calls = static_cast<int32_t>(u.file_search);
@@ -235,9 +237,6 @@ namespace llmbridge::detail
 
     void Engine::sink_note(const ClientConn* c, std::string& out) noexcept
     {
-        // Not asked for a Gemini client: google-genai for Python parses every line but
-        // `data: ` as JSON, a comment line included, and fails the stream on it.
-        if (c->req.f.model_in_path) return;
         BodyUsage u;
         const std::string_view note = _sink->reply_note(record_of(c, 200, /*streamed=*/true, u));
         if (note.empty()) return;

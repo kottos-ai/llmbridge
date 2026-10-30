@@ -391,6 +391,17 @@ namespace llmbridge::detail
         return f;
     }
 
+    bool comment_unsafe_client(std::string_view head) noexcept
+    {
+        if (client_dialect_of(head) != Dialect::Gemini) return false;
+        // `google-genai-sdk/2.34.0 gl-python/3.13.17`: its stream parser takes every line
+        // but `data: ` for JSON, and fails on a comment line. The JS SDK's says gl-node.
+        const std::string_view v = net::http::find_header(head, "x-goog-api-client");
+        for (size_t at = v.find("gl-python/"); at != std::string_view::npos; at = v.find("gl-python/", at + 1))
+            if (at == 0 || v[at - 1] == ' ') return true;
+        return false;
+    }
+
     std::string_view target_of(std::string_view head) noexcept
     {
         const std::string_view rl = head.substr(0, head.find("\r\n"));

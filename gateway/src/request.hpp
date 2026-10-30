@@ -113,6 +113,9 @@ namespace llmbridge::detail
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
+    /// The client is google-genai for Python on a Gemini route, which fails a stream on an
+    /// SSE comment line: RequestRecord::comment_unsafe.
+    [[nodiscard]] bool comment_unsafe_client(std::string_view head) noexcept;
     /// The request target of `head`'s request line, query included; empty if it has none.
     [[nodiscard]] std::string_view target_of(std::string_view head) noexcept;
     /// Why a target is refused before any venue hears of it: a `key` query parameter, the

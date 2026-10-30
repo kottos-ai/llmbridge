@@ -229,6 +229,7 @@ namespace llmbridge
         bool gemini_reply = false;
         bool stream_error = false;      ///< a 200 stream sent an error event
         bool tool_prompt_input = false; ///< URL context or code execution ran
+        bool comment_unsafe = false;    ///< RequestRecord::comment_unsafe, read at framing
         int32_t search_queries = -1;    ///< grounding queries, the most any one event names
         bool event_line_dropped = false; ///< the Gemini line arriving is over kGeminiLineMax
         /// The model a path names in place of the client's: the override, else the
