@@ -399,6 +399,14 @@ namespace llmbridge::detail
             client->req.f.tok = scan_usage(body); // a byte-forward reports its counts too
             if (client->req.f.responses_api) provider::openai::count_search_calls(body, false, client->req.f.tok);
         }
+        // A declined attempt with no output is billed by its category, which only the reply's
+        // fallback blocks name: read only when the usage held one.
+        if (provider::openai::Usage& tok = client->req.f.tok; tok.prior_held_n)
+        {
+            provider::openai::RefusalTriggers t;
+            provider::openai::scan_refusal_triggers(body, t);
+            provider::openai::bill_declined(tok, t);
+        }
         client->req.f.phase = Phase::Replying;
         unpair(u);
         // Anything past the message is a second response, and keeps it out of the pool.

@@ -1810,25 +1810,117 @@ TEST(JsonScanUsage, TogethersFlatCachedCount)
     EXPECT_EQ(u.cached, 1024) << "beside prompt_tokens, not in its details";
 }
 
-TEST(JsonScanUsage, AnthropicsFallbackAttemptsAreBilledApart)
+// Anthropic bills a declined attempt as it bills a refusal ("How refusals are billed"): one
+// that produced output always; one before any output only in the bio, frontier_llm and
+// reasoning_extraction categories, which only the reply's fallback block names.
+namespace
 {
-    // Anthropic's own example: the declined attempt is not in the top-level counts.
-    const oai::Usage u = oai::scan_usage(
-        R"({"content":[],"usage":{"input_tokens":412,"output_tokens":264,)"
-        R"("cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[)"
-        R"({"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":0,)"
-        R"("cache_read_input_tokens":20,"cache_creation_input_tokens":7},)"
-        R"({"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,)"
-        R"("output_tokens":264,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}})");
-    EXPECT_EQ(u.in, 412) << "the top level is the attempt that answered";
-    EXPECT_EQ(u.out, 264);
-    EXPECT_EQ(u.prior_in, 562) << "its cache read and write are part of its prompt";
-    EXPECT_EQ(u.prior_out, 0);
-    EXPECT_EQ(u.prior_cached, 20);
-    EXPECT_EQ(u.prior_cache_write, 7);
-    EXPECT_EQ(u.prior_attempts, 1);
-    EXPECT_EQ(u.prior_model.view(), "claude-fable-5");
-    EXPECT_EQ(u.compaction_in, -1);
+    std::string fallback_reply(const std::string& category)
+    {
+        return R"({"content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},)"
+               R"("trigger":{"type":"refusal","category":)" + category + R"(}},{"type":"text","text":"Hi"}],)"
+               R"("usage":{"input_tokens":412,"output_tokens":264,)"
+               R"("cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":[)"
+               R"({"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":0,)"
+               R"("cache_read_input_tokens":20,"cache_creation_input_tokens":7},)"
+               R"({"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,)"
+               R"("output_tokens":264,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}})";
+    }
+    oai::Usage billed(const std::string& body)
+    {
+        oai::Usage u = oai::scan_usage(body, 0);
+        oai::RefusalTriggers t;
+        oai::scan_refusal_triggers(body, t);
+        oai::bill_declined(u, t);
+        return u;
+    }
+} // namespace
+
+TEST(JsonScanUsage, ADeclineBeforeAnyOutputIsBilledOnlyInABilledCategory)
+{
+    const oai::Usage held = oai::scan_usage(fallback_reply(R"("bio")"), 0);
+    EXPECT_EQ(held.in, 412) << "the top level is the attempt that answered";
+    EXPECT_EQ(held.out, 264);
+    EXPECT_EQ(held.prior_attempts, 1);
+    EXPECT_EQ(held.prior_in, 0) << "held for its category, not yet billed";
+    EXPECT_EQ(held.prior_held_n, 1);
+    EXPECT_EQ(held.prior_model.view(), "claude-fable-5");
+    EXPECT_EQ(held.compaction_in, -1);
+
+    for (const char* cat : {R"("bio")", R"("frontier_llm")", R"("reasoning_extraction")"})
+    {
+        const oai::Usage u = billed(fallback_reply(cat));
+        EXPECT_EQ(u.prior_in, 562) << cat << ": its cache read and write are part of its prompt";
+        EXPECT_EQ(u.prior_out, 0);
+        EXPECT_EQ(u.prior_cached, 20);
+        EXPECT_EQ(u.prior_cache_write, 7);
+        EXPECT_EQ(u.prior_billed, 1);
+        EXPECT_EQ(u.prior_unverified, 0);
+        EXPECT_EQ(u.prior_held_n, 0);
+    }
+    for (const char* cat : {R"("cyber")", R"("general_harms")", "null"})
+    {
+        const oai::Usage u = billed(fallback_reply(cat));
+        EXPECT_EQ(u.prior_in, 0) << cat << " is not billed before any output";
+        EXPECT_EQ(u.prior_billed, 0);
+        EXPECT_EQ(u.prior_unverified, 0) << "its category was read";
+        EXPECT_EQ(u.prior_attempts, 1);
+    }
+    // No fallback block to read: left out, said so.
+    oai::Usage blind = oai::scan_usage(fallback_reply(R"("bio")"), 0);
+    oai::bill_declined(blind, {});
+    EXPECT_EQ(blind.prior_in, 0);
+    EXPECT_EQ(blind.prior_unverified, 1);
+    oai::bill_declined(blind, {});
+    EXPECT_EQ(blind.prior_unverified, 1) << "judged once";
+}
+
+// A decline after some output is billed whatever its category; in a chain, each attempt is
+// judged by its own block, in order.
+TEST(JsonScanUsage, EachDeclinedAttemptIsJudgedByItsOwnBlock)
+{
+    const std::string body =
+        R"({"content":[{"type":"text","text":"Part"},)"
+        R"({"type":"fallback","from":{"model":"a"},"to":{"model":"b"},"trigger":{"type":"refusal","category":"cyber"}},)"
+        R"({"type":"fallback","from":{"model":"b"},"to":{"model":"c"},"trigger":{"type":"refusal","category":"cyber"}},)"
+        R"({"type":"fallback","from":{"model":"c"},"to":{"model":"d"},"trigger":{"type":"refusal","category":"bio"}},)"
+        R"({"type":"text","text":"Hi"}],"usage":{"input_tokens":10,"output_tokens":5,"iterations":[)"
+        R"({"type":"message","model":"a","input_tokens":100,"output_tokens":30},)"
+        R"({"type":"message","model":"b","input_tokens":200,"output_tokens":0},)"
+        R"({"type":"message","model":"c","input_tokens":400,"output_tokens":0},)"
+        R"({"type":"fallback_message","model":"d","input_tokens":10,"output_tokens":5}]}})";
+    const oai::Usage u = billed(body);
+    EXPECT_EQ(u.prior_attempts, 3);
+    EXPECT_EQ(u.prior_billed, 2) << "a produced output; c declined in bio; b in cyber before any";
+    EXPECT_EQ(u.prior_in, 100 + 400);
+    EXPECT_EQ(u.prior_out, 30);
+    EXPECT_EQ(u.prior_model.view(), "a");
+    // Text that mentions a trigger is not one: its quotes are escaped.
+    oai::RefusalTriggers t;
+    oai::scan_refusal_triggers(R"({"text":"\"trigger\":{\"type\":\"refusal\",\"category\":\"bio\"}"})", t);
+    EXPECT_EQ(t.n, 0);
+}
+
+// A stream's fallback block can be split across reads anywhere: it is read once.
+TEST(JsonScanStream, ADeclinedAttemptsCategoryIsReadAcrossReads)
+{
+    const std::string stream =
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":"
+        "{\"type\":\"fallback\",\"from\":{\"model\":\"claude-fable-5\"},\"to\":{\"model\":\"claude-opus-4-8\"},"
+        "\"trigger\":{\"type\":\"refusal\",\"category\":\"reasoning_extraction\"}}}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":264,\"iterations\":["
+        "{\"type\":\"message\",\"model\":\"claude-fable-5\",\"input_tokens\":535,\"output_tokens\":0},"
+        "{\"type\":\"fallback_message\",\"model\":\"claude-opus-4-8\",\"input_tokens\":412,\"output_tokens\":264}]}}\n\n";
+    for (size_t step = 1; step <= stream.size(); step += (step < 40 ? 1 : 37))
+    {
+        oai::StreamUsage s;
+        s.reset();
+        for (size_t at = 0; at < stream.size(); at += step) s.feed(std::string_view(stream).substr(at, step));
+        const oai::Usage u = s.usage();
+        EXPECT_EQ(u.prior_billed, 1) << "reads of " << step;
+        EXPECT_EQ(u.prior_in, 535) << "reads of " << step;
+        EXPECT_EQ(u.prior_unverified, 0) << "reads of " << step;
+    }
 }
 
 TEST(JsonScanUsage, AnthropicsCompactionPassIsBilledApart)

@@ -118,9 +118,9 @@ namespace llmbridge
         /// The venue's own price for this request in picodollars (DeepInfra's
         /// estimated_cost), a check on ours.
         int64_t venue_cost_pdollars = -1;
-        /// Anthropic's `usage.iterations`, billed beside the counts above, which leave
-        /// them out: a compaction pass on the served model, and attempts declined before
-        /// a fallback, on `prior_model`. Inputs include their cached part, as tokens_in does.
+        /// Anthropic's `usage.iterations`, billed beside the counts above: a compaction pass,
+        /// and attempts declined before a fallback on `prior_model`, prior_* the billed ones
+        /// only (DESIGN.md "Declined attempts"). Inputs include their cached part.
         int32_t compaction_in_tokens = -1;
         int32_t compaction_out_tokens = -1;
         int32_t compaction_cached_tokens = -1;
@@ -129,6 +129,8 @@ namespace llmbridge
         int32_t prior_cached_tokens = -1;
         int32_t prior_cache_write_tokens = -1;
         int32_t prior_attempts = -1;
+        int32_t prior_billed_attempts = -1;
+        int32_t prior_unverified_attempts = -1;
         std::string_view prior_model;
         /// What served, as the venue says: Anthropic's `usage.speed` and
         /// `usage.inference_geo`, Bedrock's latency header. Each prices the request.

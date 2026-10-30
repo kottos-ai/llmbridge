@@ -53,6 +53,10 @@ namespace llmbridge::provider::openai
             long long g_total = -1, g_audio_in = -1, g_audio_out = -1;
             std::string_view speed, geo;
             Attempts compaction, declined; // declined: `message` entries, before a fallback
+            Attempts output_declined;       // the declined attempts that produced output: billed
+            Usage::HeldAttempt held[Usage::kMaxHeld];
+            uint8_t held_n = 0;
+            long long held_over = 0; // no-output attempts past kMaxHeld: not judged, unverified
             bool fallback = false;
         };
 
@@ -137,7 +141,21 @@ namespace llmbridge::provider::openai
                     return true;
                 });
                 if (type == "compaction") r.compaction.add(fresh, out, read, write, model);
-                else if (type == "message") r.declined.add(fresh, out, read, write, model);
+                else if (type == "message")
+                {
+                    // An attempt that produced output is billed whatever its category; one
+                    // that declined before any is held for its category (bill_declined).
+                    const long long k = r.declined.n;
+                    r.declined.add(fresh, out, read, write, model);
+                    if (out > 0) r.output_declined.add(fresh, out, read, write, model);
+                    else if (r.held_n < Usage::kMaxHeld && k < 256)
+                    {
+                        const Usage t = detail::anthropic_usage(fresh, 0, read, write, -1, -1);
+                        r.held[r.held_n++] = {t.in > 0 ? t.in : 0, t.cached > 0 ? t.cached : 0,
+                                              t.cache_write > 0 ? t.cache_write : 0, static_cast<uint8_t>(k)};
+                    }
+                    else ++r.held_over;
+                }
                 else if (type == "fallback_message") r.fallback = true;
                 return true;
             });
@@ -200,12 +218,17 @@ namespace llmbridge::provider::openai
             // top-level counts already hold them.
             if (const Attempts& d = r.declined; d.n && r.fallback)
             {
-                const Usage t = detail::anthropic_usage(d.fresh, d.out, d.read, d.write, -1, -1);
-                u.prior_in = t.in;
+                const Attempts& b = r.output_declined;
+                const Usage t = b.n ? detail::anthropic_usage(b.fresh, b.out, b.read, b.write, -1, -1) : Usage{};
+                u.prior_in = t.in > 0 ? t.in : 0;
                 u.prior_out = t.out > 0 ? t.out : 0;
-                u.prior_cached = t.cached;
-                u.prior_cache_write = t.cache_write;
+                u.prior_cached = t.cached > 0 ? t.cached : 0;
+                u.prior_cache_write = t.cache_write > 0 ? t.cache_write : 0;
                 u.prior_attempts = d.n;
+                u.prior_billed = b.n;
+                u.prior_unverified = r.held_over;
+                for (uint8_t i = 0; i < r.held_n; ++i) u.prior_held[i] = r.held[i];
+                u.prior_held_n = r.held_n;
                 u.prior_model.set(d.model);
             }
         }
@@ -419,6 +442,10 @@ namespace llmbridge::provider::openai
             into.prior_cached = u.prior_cached;
             into.prior_cache_write = u.prior_cache_write;
             into.prior_attempts = u.prior_attempts;
+            into.prior_billed = u.prior_billed;
+            into.prior_unverified = u.prior_unverified;
+            for (uint8_t i = 0; i < u.prior_held_n; ++i) into.prior_held[i] = u.prior_held[i];
+            into.prior_held_n = u.prior_held_n;
             into.prior_model = u.prior_model;
         }
     }
@@ -491,8 +518,116 @@ namespace llmbridge::provider::openai
         }
     }
 
+    bool refusal_billed(std::string_view category) noexcept
+    {
+        return category == "bio" || category == "frontier_llm" || category == "reasoning_extraction";
+    }
+
+    namespace
+    {
+        constexpr std::string_view kTrigger = "\"trigger\"";
+
+        // f(key_at, end, billed) for each whole trigger object of a refusal in `s`.
+        template <class F>
+        void each_trigger(std::string_view s, F&& f) noexcept
+        {
+            for (size_t from = 0; from < s.size();)
+            {
+                const void* p = ::memmem(s.data() + from, s.size() - from, kTrigger.data(), kTrigger.size());
+                if (!p) return;
+                const auto at = static_cast<size_t>(static_cast<const char*>(p) - s.data());
+                from = at + 1;
+                const size_t v = key_value_at(s, at, kTrigger.size());
+                if (v == kNpos || s[v] != '{') continue;
+                const size_t e = skip_value(s, v);
+                if (e == kNpos) continue; // cut off: read whole later, or never
+                std::string_view type, category;
+                bool has_category = false;
+                (void)for_each_member(s.substr(v, e - v), [&](std::string_view k, std::string_view raw) {
+                    if (k == "type") type = plain_string(raw);
+                    else if (k == "category")
+                    {
+                        has_category = true;
+                        category = plain_string(raw); // null reads empty, as not billed
+                    }
+                    return true;
+                });
+                if (type == "refusal" && has_category) f(at, e, refusal_billed(category));
+                from = e;
+            }
+        }
+
+        void add_trigger(RefusalTriggers& t, bool billed) noexcept
+        {
+            if (t.n < RefusalTriggers::kMax) t.billed[t.n] = billed;
+            if (t.n < 255) ++t.n;
+        }
+    } // namespace
+
+    void scan_refusal_triggers(std::string_view bytes, RefusalTriggers& t) noexcept
+    {
+        each_trigger(bytes, [&](size_t, size_t, bool billed) { add_trigger(t, billed); });
+    }
+
+    void bill_declined(Usage& u, const RefusalTriggers& t) noexcept
+    {
+        for (uint8_t i = 0; i < u.prior_held_n; ++i)
+        {
+            const Usage::HeldAttempt& h = u.prior_held[i];
+            const bool named = h.index < t.n && h.index < RefusalTriggers::kMax;
+            if (named && t.billed[h.index])
+            {
+                u.prior_in = (u.prior_in > 0 ? u.prior_in : 0) + h.in;
+                u.prior_cached = (u.prior_cached > 0 ? u.prior_cached : 0) + h.cached;
+                u.prior_cache_write = (u.prior_cache_write > 0 ? u.prior_cache_write : 0) + h.cache_write;
+                u.prior_billed = (u.prior_billed > 0 ? u.prior_billed : 0) + 1;
+            }
+            else if (!named) u.prior_unverified = (u.prior_unverified > 0 ? u.prior_unverified : 0) + 1;
+        }
+        u.prior_held_n = 0;
+    }
+
+    // A trigger split across reads is read from the kept tail and this read's start;
+    // one wholly in this read is read from it. Each is counted once, where it ends.
+    void StreamUsage::note_triggers(std::string_view bytes) noexcept
+    {
+        // The kept tail holds a trigger's key, or ends inside one: only then is the joint read.
+        const auto may_start = [this]() noexcept {
+            const std::string_view t(_trig_tail, _trig_tail_n);
+            if (::memmem(t.data(), t.size(), kTrigger.data(), kTrigger.size())) return true;
+            for (size_t k = 1; k < kTrigger.size() && k <= t.size(); ++k)
+                if (t.substr(t.size() - k) == kTrigger.substr(0, k)) return true;
+            return false;
+        };
+        if (_trig_tail_n && may_start())
+        {
+            char joint[2 * kTrigTail];
+            const size_t lead = bytes.size() < kTrigTail ? bytes.size() : kTrigTail;
+            std::memcpy(joint, _trig_tail, _trig_tail_n);
+            std::memcpy(joint + _trig_tail_n, bytes.data(), lead);
+            each_trigger({joint, _trig_tail_n + lead}, [&](size_t at, size_t end, bool billed) {
+                if (at < _trig_tail_n && end > _trig_tail_n) add_trigger(_triggers, billed);
+            });
+        }
+        scan_refusal_triggers(bytes, _triggers);
+        if (bytes.size() >= kTrigTail)
+        {
+            std::memcpy(_trig_tail, bytes.data() + bytes.size() - kTrigTail, kTrigTail);
+            _trig_tail_n = kTrigTail;
+        }
+        else
+        {
+            const size_t keep = _trig_tail_n + bytes.size() > kTrigTail ? kTrigTail - bytes.size() : _trig_tail_n;
+            std::memmove(_trig_tail, _trig_tail + _trig_tail_n - keep, keep);
+            std::memcpy(_trig_tail + keep, bytes.data(), bytes.size());
+            _trig_tail_n = keep + bytes.size();
+        }
+    }
+
     void StreamUsage::feed(std::string_view bytes)
     {
+        // Anthropic's fallback blocks, which say whether a declined attempt is billed.
+        note_triggers(bytes);
         // Bytes kept ahead of the next search: the `,` or `{` before a key split
         // across reads, with the indentation of a pretty-printed body.
         constexpr size_t kLead = 64;

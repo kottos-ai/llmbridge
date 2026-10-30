@@ -180,6 +180,13 @@ namespace llmbridge::detail
         r.prior_cached_tokens = static_cast<int32_t>(u.prior_cached);
         r.prior_cache_write_tokens = static_cast<int32_t>(u.prior_cache_write);
         r.prior_attempts = static_cast<int32_t>(u.prior_attempts);
+        // An attempt still held was judged nowhere: unverified, as one no block named.
+        if (u.prior_attempts >= 0)
+        {
+            r.prior_billed_attempts = static_cast<int32_t>(u.prior_billed > 0 ? u.prior_billed : 0);
+            r.prior_unverified_attempts =
+                static_cast<int32_t>((u.prior_unverified > 0 ? u.prior_unverified : 0) + u.prior_held_n);
+        }
         r.prior_model = u.prior_model.view(); // into the caller's `u`, as are the next two
         r.served_speed = u.speed.view();
         r.served_geo = u.inference_geo.view();

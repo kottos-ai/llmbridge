@@ -65,6 +65,16 @@ a log line's request line stops at its query. DESIGN.md "Gemini clients and Vert
   Gemini client whose header carries a `gl-python/` token is marked. llmbridge writes
   whatever the sink returns, as for every other client.
 - **`kSinkCaptureMax` is 3** (was 2), for a header a sink reads to choose its note.
+- **Declined attempts are reported as Anthropic bills them.** `prior_*` held every attempt
+  declined before a server-side fallback; Anthropic bills one that produced output, and one
+  that declined before any output only in the `bio`, `frontier_llm` and
+  `reasoning_extraction` categories. Each attempt is now judged alone, its category read from
+  the `fallback` content block that marks its switch (`trigger.category`), in a whole reply
+  or a stream, a block split across reads included: `prior_*` holds the billed ones,
+  `prior_attempts` every one, `RequestRecord::prior_billed_attempts` those counted, and
+  `prior_unverified_attempts` those no block named, left out. `openai::refusal_billed`,
+  `scan_refusal_triggers` and `bill_declined` are the rule; `StreamUsage::usage()` returns
+  its counts so judged, by value. DESIGN.md "Declined attempts".
 
 ### Security
 

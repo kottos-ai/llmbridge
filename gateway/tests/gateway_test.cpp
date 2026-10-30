@@ -17983,3 +17983,87 @@ TEST_P(ProxyVertex, AnOAuthVertexVenueNeedsAProjectScopedPath)
     EXPECT_EQ(Client::status_of(scoped), 200) << scoped;
     EXPECT_EQ(_second.requests_seen(), 1);
 }
+
+// ── Attempts Anthropic declined before a fallback, billed as Anthropic bills them ──
+
+class ProxyDeclined : public ProxyIT, public ::testing::WithParamInterface<llmbridge::IoBackend> {};
+
+namespace
+{
+    std::string declined_iterations(int out0)
+    {
+        return R"("iterations":[{"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":)" +
+               std::to_string(out0) +
+               R"(},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,"output_tokens":264}])";
+    }
+    std::string fallback_block(const char* category)
+    {
+        return std::string(R"({"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},)") +
+               R"("trigger":{"type":"refusal","category":")" + category + R"("}})";
+    }
+} // namespace
+
+TEST_P(ProxyDeclined, AWholeReplysDeclineIsBilledByItsCategory)
+{
+    for (const auto& [category, billed] : {std::pair{"cyber", false}, std::pair{"bio", true}})
+    {
+        RecordingSink sink;
+        TestBackend b;
+        b.set_response(http_ok(R"({"id":"m","type":"message","model":"claude-opus-4-8","content":[)" +
+                               fallback_block(category) + R"(,{"type":"text","text":"Hi"}],)"
+                               R"("usage":{"input_tokens":412,"output_tokens":264,)" + declined_iterations(0) + "}}"));
+        b.start();
+        Gateway gw(0, "127.0.0.1", b.port(), 0, UpstreamDialect::Anthropic, GetParam());
+        gw.set_request_sink(&sink, {});
+        std::thread loop([&] { gw.run(); });
+        Client c;
+        ASSERT_TRUE(c.connect(gw.bound_port()));
+        ASSERT_TRUE(c.send(anthropic_request_hdrs("hi", "x-api-key: k\r\n")));
+        EXPECT_EQ(c.recv_status(), 200);
+        c.close();
+        gw.request_stop();
+        loop.join();
+        b.stop();
+        const auto recs = sink.records();
+        ASSERT_EQ(recs.size(), 1u);
+        EXPECT_EQ(recs[0].r.prior_attempts, 1) << category;
+        EXPECT_EQ(recs[0].r.prior_billed_attempts, billed ? 1 : 0) << category;
+        EXPECT_EQ(recs[0].r.prior_in_tokens, billed ? 535 : 0) << category;
+        EXPECT_EQ(recs[0].r.prior_unverified_attempts, 0) << category;
+        EXPECT_EQ(recs[0].prior_model, "claude-fable-5");
+    }
+}
+
+TEST_P(ProxyDeclined, AStreamsDeclineIsBilledByItsBlockAndByItsOutput)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    const std::string events =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-opus-4-8\","
+        "\"usage\":{\"input_tokens\":412,\"output_tokens\":1}}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":" +
+        fallback_block("general_harms") +
+        "}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+        "\"usage\":{\"output_tokens\":264," + declined_iterations(40) + "}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    _backend.set_response("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n"
+                          "Connection: keep-alive\r\n\r\n" + sse_chunk_encode(events, 9));
+    start(0, true, UpstreamDialect::Anthropic, GetParam());
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    const std::string body = R"({"model":"claude-fable-5","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]})";
+    ASSERT_TRUE(c.send("POST /v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: k\r\nanthropic-version: 2023-06-01\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.prior_billed_attempts, 1) << "it produced output, so a general_harms decline is billed";
+    EXPECT_EQ(recs[0].r.prior_in_tokens, 535);
+    EXPECT_EQ(recs[0].r.prior_out_tokens, 40);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyDeclined,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

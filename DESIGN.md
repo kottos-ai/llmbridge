@@ -466,6 +466,21 @@ line, which a reply note is; the JS SDK does not. The Python SDK names itself in
 `x-goog-api-client` (`gl-python/`), so the record says `comment_unsafe` and the sink, whose
 note it is, decides whether to send one.
 
+### Declined attempts
+
+Anthropic's server-side fallback reports each attempt in `usage.iterations`: a `message`
+entry per model that declined, then the `fallback_message` that served. The record carries
+them as Anthropic bills them ("How refusals are billed"), never as reported: an attempt that
+produced output is billed at its model's rates whatever its category; one that declined
+before any output is billed only in the `bio`, `frontier_llm` and `reasoning_extraction`
+categories, as of September 2026 (`openai::refusal_billed`). The category is not in the
+usage: each switch is a `fallback` content block whose `trigger.category` names why the
+model before it declined, so the k-th block judges the k-th declined attempt. A whole reply
+is read for its blocks only when its usage held a no-output decline; a stream reads them as
+they pass, a block split across reads read once from a kept tail. An attempt no block names
+is left out and counted as `prior_unverified_attempts`, never billed on a guess. The
+translated stream keeps no block, so its no-output declines are unverified there.
+
 ### Signing for Bedrock (`net/sigv4.hpp`)
 
 SigV4 is a defined procedure, not a format to approximate: canonical request, string

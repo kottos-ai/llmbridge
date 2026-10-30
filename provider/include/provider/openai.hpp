@@ -47,12 +47,26 @@ namespace llmbridge::provider::openai
         /// The venue's own price for the request, picodollars (DeepInfra's estimated_cost).
         long long venue_cost_pdollars = -1;
         /// Anthropic's `usage.iterations`, the attempts its top-level counts leave out, in
-        /// this convention. Compaction runs on the served model; an attempt declined
-        /// before a fallback ran on `prior_model`, the first such attempt's.
+        /// this convention. Compaction runs on the served model, always billed. Attempts
+        /// declined before a fallback ran on `prior_model`, the first such attempt's, and
+        /// are billed as Anthropic bills them: one that produced output always, one that
+        /// declined before any output only in a billed category (refusal_billed). prior_*
+        /// counts the billed ones, `prior_attempts` every one, `prior_billed` those counted,
+        /// `prior_unverified` those no fallback block named a category for, left out.
         long long compaction_in = -1, compaction_out = -1, compaction_cached = -1;
         long long prior_in = -1, prior_out = -1, prior_cached = -1, prior_cache_write = -1;
-        long long prior_attempts = -1;
+        long long prior_attempts = -1, prior_billed = -1, prior_unverified = -1;
         Word<48> prior_model;
+        /// Declined attempts with no output, held for bill_declined to judge by category:
+        /// the `index`-th declined attempt, its prompt in this convention.
+        struct HeldAttempt
+        {
+            long long in = 0, cached = 0, cache_write = 0;
+            uint8_t index = 0;
+        };
+        static constexpr size_t kMaxHeld = 4;
+        HeldAttempt prior_held[kMaxHeld] = {};
+        uint8_t prior_held_n = 0;
         Word<16> speed, inference_geo; // Anthropic: what served, not what was asked
     };
 
@@ -159,6 +173,29 @@ namespace llmbridge::provider::openai
     /// `.completed` events, which name each call once where its items name it thrice.
     void count_search_calls(std::string_view bytes, bool events, Usage& u) noexcept;
 
+    /// The refusal categories of a reply's fallback blocks, in order: the k-th names why the
+    /// k-th declined attempt in `usage.iterations` declined.
+    struct RefusalTriggers
+    {
+        static constexpr size_t kMax = 8;
+        uint8_t n = 0;
+        bool billed[kMax] = {}; ///< refusal_billed of its category
+    };
+
+    /// Whether Anthropic bills a refusal before any output in `category` (its
+    /// stop_details.category, raw; empty for null): `bio`, `frontier_llm` and
+    /// `reasoning_extraction`, as of September 2026 ("How refusals are billed").
+    [[nodiscard]] bool refusal_billed(std::string_view category) noexcept;
+
+    /// Each fallback block's `"trigger":{"type":"refusal","category":...}` in `bytes`, in
+    /// order, appended to `t`; one cut off at the end of `bytes` is not read.
+    void scan_refusal_triggers(std::string_view bytes, RefusalTriggers& t) noexcept;
+
+    /// Folds the held no-output declined attempts into `u` by `t`: a billed category adds
+    /// it to prior_* and prior_billed; one `t` names no category for is prior_unverified,
+    /// left out. Idempotent: the held attempts are judged once.
+    void bill_declined(Usage& u, const RefusalTriggers& t) noexcept;
+
     /// A byte-forwarded stream's usage, fed each read once, merged by merge_stated.
     class StreamUsage
     {
@@ -172,8 +209,16 @@ namespace llmbridge::provider::openai
             _u = Usage{};
             _calls = search_calls;
             _tail_n = 0;
+            _triggers = {};
+            _trig_tail_n = 0;
         }
-        [[nodiscard]] const Usage& usage() const noexcept { return _u; }
+        /// The counts stated so far, declined attempts billed by the fallback blocks read.
+        [[nodiscard]] Usage usage() const noexcept
+        {
+            Usage u = _u;
+            bill_declined(u, _triggers);
+            return u;
+        }
 
     private:
         void count_calls(std::string_view bytes) noexcept;
@@ -184,5 +229,10 @@ namespace llmbridge::provider::openai
         bool _calls = false;
         char _tail[kTail] = {}; // the last bytes of the previous read, for a split name
         size_t _tail_n = 0;
+        void note_triggers(std::string_view bytes) noexcept;
+        static constexpr size_t kTrigTail = 256; // past the longest trigger object
+        RefusalTriggers _triggers;
+        char _trig_tail[kTrigTail] = {}; // the previous reads' last bytes, for a split trigger
+        size_t _trig_tail_n = 0;
     };
 } // namespace llmbridge::provider::openai

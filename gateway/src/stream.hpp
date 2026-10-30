@@ -272,7 +272,14 @@ namespace llmbridge::detail
     /// dialect that learns to stream adds its own branch here.
     inline BodyUsage stream_tokens(const ClientConn* c) noexcept
     {
-        if (c->req.f.sse_translating) return c->sse_xlate.usage();
+        // The translator keeps no fallback block, so a no-output declined attempt it held
+        // is unverified there, and left out; a byte-forward reads its blocks (StreamUsage).
+        if (c->req.f.sse_translating)
+        {
+            BodyUsage u = c->sse_xlate.usage();
+            provider::openai::bill_declined(u, {});
+            return u;
+        }
         return c->req.stream_usage.usage();
     }
 
