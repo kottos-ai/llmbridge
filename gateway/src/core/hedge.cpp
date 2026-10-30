@@ -32,6 +32,10 @@ namespace llmbridge::detail
         // One client key would otherwise reach every venue, each another company's.
         else if (d.credential_header.empty()) bad = "policy hedge names no key for its own venue";
         else if (!d.substitute_model.empty()) bad = "policy hedge with a model substitution";
+        // A path names the model (Gemini): each leg's goes in a request line, so all are
+        // checked here, before any leg is sent, as dispatch checks a single venue's.
+        else if (f.model_in_path && !d.model.empty() && !provider::path_model_ok(d.model))
+            bad = "policy model unusable in a path";
         for (uint8_t i = 0; !bad && i < d.hedge_legs; ++i)
         {
             const HedgeLeg& l = d.hedge[i];
@@ -41,6 +45,8 @@ namespace llmbridge::detail
                 bad = "policy hedge leg past the table";
             else if (!key_header_ok(l.credential_header))
                 bad = "policy hedge leg names no usable key";
+            else if (f.model_in_path && !l.model.empty() && !provider::path_model_ok(l.model))
+                bad = "policy hedge leg model unusable in a path";
             else if (!l.anthropic_beta.empty() && !beta_token_ok(l.anthropic_beta))
                 bad = "policy hedge leg anthropic_beta unusable";
             else if (!k.model.set(l.model) || !k.tier.set(l.service_tier) || !k.speed.set(l.speed) ||

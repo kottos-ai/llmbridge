@@ -50,9 +50,12 @@ namespace llmbridge
         inline constexpr const char* kNoMessages = "request translate: no \"messages\" field";
         inline constexpr const char* kShape = "request translate: unsupported request shape";
         inline constexpr const char* kKeyInUrl =
-            "an API key in the URL is not forwarded: send it in a header, such as x-goog-api-key";
+            "a key or token in the URL is not forwarded: send it in a header, such as x-goog-api-key";
         inline constexpr const char* kGeminiNoSse =
             "a Gemini streamGenerateContent request needs alt=sse in its query";
+        inline constexpr const char* kVertexProject =
+            "this Vertex venue takes an OAuth token, which needs a project-scoped Gemini path: "
+            "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:...";
         inline constexpr const char* kGeminiInteractions = "the Gemini Interactions API is not supported";
         inline constexpr const char* kPathModel =
             "the model in the path must be 1 to 255 of A-Z, a-z, 0-9, dot, underscore and hyphen";

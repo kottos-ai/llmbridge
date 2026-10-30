@@ -34,7 +34,8 @@ namespace llmbridge::detail
     inline std::string_view request_line(std::string_view buf) noexcept
     {
         constexpr size_t kMax = 128;
-        const size_t eol = std::min(buf.find('\r'), buf.find('?'));
+        const size_t cr = buf.find('\r');
+        const size_t eol = std::min(cr, buf.substr(0, cr).find('?'));
         size_t n = eol == std::string_view::npos ? buf.size() : eol;
         if (n > kMax) n = kMax;
         return buf.substr(0, n);

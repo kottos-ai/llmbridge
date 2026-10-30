@@ -100,7 +100,9 @@ namespace llmbridge::provider
     /// body, or one streamed event. Views point into the input, still JSON-escaped.
     struct GeminiFacts
     {
-        bool token = false;    ///< a part with non-empty text not marked thought, or a functionCall
+        /// A part not marked thought with non-empty text, a functionCall, inlineData (audio,
+        /// an image) or executableCode.
+        bool token = false;
         bool thinking = false; ///< a part marked `"thought": true`
         /// An URL context or code execution part, whose tool-use prompt tokens bill as input.
         bool tool_input = false;

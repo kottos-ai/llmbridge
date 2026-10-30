@@ -17536,6 +17536,16 @@ TEST_P(ProxyGeminiPath, UnservableTargetsAreRefusedBeforeAnyVenue)
         {gemini_post("/v1beta/models/m:generateContent?key=AIzaSECRET", kGeminiBody), llmbridge::refuse::kKeyInUrl},
         {gemini_post("/v1beta/models/m:streamGenerateContent?alt=sse&key=AIza", kGeminiBody),
          llmbridge::refuse::kKeyInUrl},
+        // As a server reads a name: percent-decoded, in any case, `;` a separator too, and
+        // Google's OAuth form beside its API key.
+        {gemini_post("/v1beta/models/m:generateContent?%6Bey=AIza", kGeminiBody), llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:generateContent?k%65Y=AIza", kGeminiBody), llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:generateContent?KEY=AIza", kGeminiBody), llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:streamGenerateContent?alt=sse;key=AIza", kGeminiBody),
+         llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:generateContent?access_token=ya29.x", kGeminiBody),
+         llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:generateContent?key", kGeminiBody), llmbridge::refuse::kKeyInUrl},
         {"POST /v1/chat/completions?key=sk HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
          llmbridge::refuse::kKeyInUrl},
         {gemini_post("/v1beta/models/m:streamGenerateContent", kGeminiBody), llmbridge::refuse::kGeminiNoSse},
@@ -17872,7 +17882,7 @@ TEST_P(ProxyVertex, ANamedKeyGoesAsBearerAtAVenueTakingOAuth)
     pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .credential_header = "x-kottos-key-google"}};
     start_both(pol, /*bearer=*/true);
     EXPECT_EQ(Client::status_of(exchange(gemini_post(
-                  kGeminiStream, kGeminiBody, "Authorization: Bearer client\r\nx-kottos-key-google: ya29.tok\r\n"))),
+                  "/v1/projects/p/locations/global/publishers/google/models/m:streamGenerateContent?alt=sse", kGeminiBody, "Authorization: Bearer client\r\nx-kottos-key-google: ya29.tok\r\n"))),
               200);
     shutdown();
     const std::string up = lower_case(_second.last_request());
@@ -17883,3 +17893,93 @@ TEST_P(ProxyVertex, ANamedKeyGoesAsBearerAtAVenueTakingOAuth)
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyVertex,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// Every leg's path model is checked before any leg is sent: a bad one is the policy's
+// 500, and no venue hears of the request.
+TEST_P(ProxyGeminiPath, AHedgeLegsPathModelIsCheckedBeforeAnyLegGoes)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    static const llmbridge::HedgeLeg leg{.upstream_index = 1, .model = "models/gemini-2.5-pro",
+                                         .credential_header = "x-kottos-key-g"};
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .credential_header = "x-kottos-key-g",
+                                     .hedge = &leg, .hedge_legs = 1}};
+    start_gemini(pol);
+    const std::string r = exchange(gemini_post("/v1beta/models/m:generateContent", kGeminiBody,
+                                               "x-kottos-key-g: gk2\r\n"));
+    shutdown();
+    EXPECT_EQ(Client::status_of(r), 500) << r;
+    EXPECT_EQ(_backend.accepted(), 0) << "leg 0 went before leg 1 was checked";
+    EXPECT_EQ(_second.accepted(), 0);
+}
+
+// A policy's model for a Gemini target with no /models/ segment has nowhere to go: the
+// policy's 500, as policy.hpp says, never the client's 400.
+TEST_P(ProxyGeminiPath, APolicyModelForATargetNamingNoneIsThePolicys500)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .model = "gemini-3.8-flash"}};
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/tunedModels/t:generateContent", kGeminiBody))), 500);
+    shutdown();
+    EXPECT_EQ(_backend.accepted(), 0);
+}
+
+// An image or audio stream says nothing in text: its first inlineData part is its first
+// token. A thought and text in one event stamp both.
+TEST_P(ProxyGeminiPath, InlineDataIsATokenAndOneEventCanStampBoth)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0},
+                 llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    _backend.set_response(gemini_sse_response(
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"inlineData\": {\"mimeType\": \"audio/L16\", "
+        "\"data\": \"AAAA\"}}]}}]}\r\n\r\n", 4096));
+    _second.set_response(gemini_sse_response(
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"plan\", \"thought\": true}, "
+        "{\"text\": \"Hi\"}]}}]}\r\n\r\n", 4096));
+    start_gemini(pol);
+    for (int i = 0; i < 2; ++i)
+    {
+        Client c;
+        ASSERT_TRUE(c.connect(_proxy_port));
+        ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
+        (void)c.recv_stream();
+    }
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_GT(recs[0].r.ts_first_token, 0) << "inlineData";
+    EXPECT_GT(recs[1].r.ts_first_token, 0);
+    EXPECT_GT(recs[1].r.ts_first_thinking, 0) << "the thought before the text, in one event";
+}
+
+// An OAuth token reaches Vertex only under a project: anything else is refused, never sent
+// to the express-mode path that takes an API key alone.
+TEST_P(ProxyVertex, AnOAuthVertexVenueNeedsAProjectScopedPath)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    start_both(pol, /*bearer=*/true);
+    const std::string api = exchange(gemini_post(kGeminiStream, kGeminiBody, "Authorization: Bearer ya29.t\r\n"));
+    const std::string xlate = exchange(openai_request_hdrs("hi", "Authorization: Bearer ya29.t\r\n"));
+    const std::string fake = exchange(gemini_post(
+        "/v1/publishers/google/models/m:streamGenerateContent?alt=sse&x=/projects/p/locations/l", kGeminiBody,
+        "Authorization: Bearer ya29.t\r\n"));
+    const std::string scoped = exchange(gemini_post(
+        "/v1/projects/p/locations/global/publishers/google/models/m:streamGenerateContent?alt=sse", kGeminiBody,
+        "Authorization: Bearer ya29.t\r\n"));
+    shutdown();
+    for (const std::string* r : {&api, &xlate, &fake})
+    {
+        EXPECT_EQ(Client::status_of(*r), 400) << *r;
+        EXPECT_NE(r->find(llmbridge::refuse::kVertexProject), std::string::npos) << *r;
+    }
+    EXPECT_EQ(Client::status_of(scoped), 200) << scoped;
+    EXPECT_EQ(_second.requests_seen(), 1);
+}

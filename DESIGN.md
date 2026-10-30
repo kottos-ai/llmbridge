@@ -446,9 +446,11 @@ is rewritten into `/v1/publishers/google/models/`, a Vertex publisher path sent 
 `gemini` venue into `/v1beta/models/`, and a project-scoped Vertex path goes as written,
 its project the client's. The credential is a per-venue choice, not the dialect's:
 `x-goog-api-key` by default, `Authorization: Bearer` with `auth_bearer`, and never both.
+An OAuth token is served only under a project, so an `auth_bearer` Vertex venue takes a
+project-scoped path from the client and refuses the rest, a translated request included.
 
-Refused before any venue: a `key` query parameter, which would ride every log that keeps
-a URL; `:streamGenerateContent` without `alt=sse`, which streams one JSON array; and the
+Refused before any venue: a `key` or `access_token` query parameter, its name decoded and
+in any case, which would ride every log that keeps a URL and go beside a named key; `:streamGenerateContent` without `alt=sse`, which streams one JSON array; and the
 Interactions API, not built.
 
 **Gemini replies** say in their objects what other venues say in headers: the model

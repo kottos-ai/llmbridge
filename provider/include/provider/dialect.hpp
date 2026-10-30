@@ -147,6 +147,14 @@ namespace llmbridge::provider
     };
     [[nodiscard]] constexpr PathModel gemini_path_model(std::string_view target) noexcept;
 
+    /// A Vertex path under a project, `/v1/projects/{p}/locations/{l}/...`, in the path
+    /// and not the query: the only layout an OAuth token is served at.
+    [[nodiscard]] constexpr bool gemini_vertex_scoped(std::string_view target) noexcept
+    {
+        const std::string_view path = target.substr(0, target.find('?'));
+        return path.find("/projects/") != std::string_view::npos && path.find("/locations/") != std::string_view::npos;
+    }
+
     /// A Gemini client's target as `venue` takes it, appended to `into`: its model
     /// replaced by `model` when set (path_model_ok), and its layout the venue's when the
     /// client wrote the other host's. A Gemini API venue gets `/v1beta/models/{model}:...`

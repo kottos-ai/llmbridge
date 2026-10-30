@@ -412,16 +412,41 @@ namespace llmbridge::detail
 
     namespace
     {
-        // Whether a query names parameter `name`, with or without a value.
-        bool query_has(std::string_view query, std::string_view name) noexcept
+        // Whether a query names a credential parameter, `key` or `access_token` (Google's
+        // query forms of an API key and an OAuth token), with or without a value. A name is
+        // compared as a server reads it: percent-decoded, in any case, `&` or `;` apart, so
+        // `?%6Bey=` and `?KEY=` are the same key.
+        bool query_has_credential(std::string_view query) noexcept
         {
+            static constexpr std::string_view kNames[] = {"key", "access_token"};
+            const auto hex = [](char c) {
+                return c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (c | 0x20) - 'a' + 10 : -1;
+            };
             while (!query.empty())
             {
-                const size_t amp = query.find('&');
-                const std::string_view pair = query.substr(0, amp);
-                if (pair.substr(0, pair.find('=')) == name) return true;
-                if (amp == std::string_view::npos) break;
-                query.remove_prefix(amp + 1);
+                const size_t end = query.find_first_of("&;");
+                std::string_view raw = query.substr(0, end);
+                raw = raw.substr(0, raw.find('='));
+                char name[16];
+                size_t n = 0;
+                bool fits = true;
+                for (size_t i = 0; i < raw.size() && fits; ++i)
+                {
+                    char c = raw[i];
+                    if (c == '%' && i + 2 < raw.size() && hex(raw[i + 1]) >= 0 && hex(raw[i + 2]) >= 0)
+                    {
+                        c = static_cast<char>(hex(raw[i + 1]) * 16 + hex(raw[i + 2]));
+                        i += 2;
+                    }
+                    else if (c == '+') c = ' ';
+                    if (n == sizeof name) fits = false;
+                    else name[n++] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c | 0x20) : c;
+                }
+                if (fits)
+                    for (const std::string_view k : kNames)
+                        if (std::string_view(name, n) == k) return true;
+                if (end == std::string_view::npos) break;
+                query.remove_prefix(end + 1);
             }
             return false;
         }
@@ -445,7 +470,7 @@ namespace llmbridge::detail
         const std::string_view path = target.substr(0, q);
         const std::string_view query = q == std::string_view::npos ? std::string_view{} : target.substr(q + 1);
         // A key in the URL rides every log, proxy and history that keeps one: never sent on.
-        if (query_has(query, "key")) return {"key in the URL", refuse::kKeyInUrl};
+        if (query_has_credential(query)) return {"key in the URL", refuse::kKeyInUrl};
         for (const std::string_view v : {"/v1beta/interactions", "/v1alpha/interactions", "/v1/interactions"})
             if (path.starts_with(v) && (path.size() == v.size() || path[v.size()] == '/' || path[v.size()] == ':'))
                 return {"Gemini Interactions API", refuse::kGeminiInteractions};

@@ -138,7 +138,9 @@ namespace llmbridge::provider
                 const json::Value* thought = part.find("thought");
                 const bool is_thought = thought && thought->type == json::Value::Type::Bool && thought->boolean;
                 if (is_thought) f.thinking = true;
-                else if (!part.str_or("text").empty() || part.find("functionCall")) f.token = true;
+                else if (!part.str_or("text").empty() || part.find("functionCall") || part.find("inlineData") ||
+                         part.find("executableCode"))
+                    f.token = true;
                 if (part.find("executableCode") || part.find("codeExecutionResult")) f.tool_input = true;
             }
         }

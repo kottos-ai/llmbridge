@@ -339,6 +339,8 @@ namespace llmbridge::detail
         if (same)
         {
             f.confirm_outcome = ConfirmOutcome::Kept;
+            if (!f.splice && !f.body_parked && f.model_in_path && whole.model_substituted)
+                ++_stats.streamed_model_substituted;
             if (f.splice)
             {
                 f.model_substituted = whole.model_substituted;
@@ -434,11 +436,18 @@ namespace llmbridge::detail
         // A path model goes into a request line: a policy's that cannot stand there is refused.
         if (c->req.f.model_in_path)
         {
-            if (const std::string_view pm = c->req.f.path_model(); !pm.empty() && !provider::path_model_ok(pm))
+            if (const std::string_view pm = c->req.f.path_model();
+                !pm.empty() && (!provider::path_model_ok(pm) ||
+                                provider::gemini_path_model(target_of(c->rbuf)).at == std::string_view::npos))
                 return error_respond(c, 500, "policy model unusable in a path");
             if (c->req.f.body_streaming)
                 c->req.f.model_substituted = c->req.f.model_override.empty() && !c->req.f.path_model().empty();
         }
+        // An OAuth token reaches Vertex only under a project; the publisher path the gateway
+        // writes is express mode's, which takes an API key alone.
+        if (up.dialect == UpstreamDialect::Vertex && up.auth_bearer &&
+            (c->req.f.translate_body || !provider::gemini_vertex_scoped(target_of(c->rbuf))))
+            return error_respond(c, 400, "vertex oauth without a project", refuse::kVertexProject);
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
         note_build(c->msg.total_len);
         const std::string_view body = body_so_far(c);

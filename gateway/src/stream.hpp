@@ -228,8 +228,9 @@ namespace llmbridge::detail
             provider::GeminiFacts g;
             if (!provider::gemini_facts(l.substr(5), g)) return;
             keep_gemini_facts(c, g);
-            seen.token = seen.token || g.token;
+            // Thinking first: a line holding a thought and then text shows both.
             seen.thinking = seen.thinking || (g.thinking && !seen.token);
+            seen.token = seen.token || g.token;
         };
         while (!bytes.empty())
         {
@@ -247,7 +248,7 @@ namespace llmbridge::detail
                 break;
             }
             if (dropped) dropped = false;
-            else if (line.empty()) read_line(bytes.substr(0, eol));
+            else if (line.empty()) { if (eol <= kGeminiLineMax) read_line(bytes.substr(0, eol)); }
             else if (line.size() + eol <= kGeminiLineMax)
             {
                 line.append(bytes.substr(0, eol));

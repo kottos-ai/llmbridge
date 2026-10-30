@@ -48,8 +48,9 @@ a log line's request line stops at its query. DESIGN.md "Gemini clients and Vert
 - **ABI: rebuild a sink and an embedder against these headers.** `RequestRecord` and
   `Upstream` have new fields, `Venue` a new value and `kSinkCaptureMax` is 3. Source
   compatible.
-- **Gemini stream stamps.** The first token is a part with non-empty `text` not marked
-  `"thought": true`, or a `functionCall`; an empty part carrying only a
+- **Gemini stream stamps.** The first token is a part not marked `"thought": true` with
+  non-empty `text`, a `functionCall`, `inlineData` (an audio or image stream) or
+  `executableCode`; one event holding a thought and then text stamps both; an empty part carrying only a
   `thoughtSignature` is not. Thinking is a part marked `"thought": true`. Before, a
   Gemini stream never stamped either: `"content": {` is no content string.
 - **`scan_error_type`** reads Google's `error.status` when the first 512 bytes name no
@@ -68,11 +69,15 @@ a log line's request line stops at its query. DESIGN.md "Gemini clients and Vert
 ### Security
 
 - **Refused before any venue hears of it**, on both backends, with a fixed message and
-  the target never logged: a `key` query parameter (`?key=`), whatever the dialect; the
+  the target never logged: a `key` or `access_token` query parameter, whatever the
+  dialect, its name read as a server reads it (percent-decoded, in any case, `&` or `;`
+  apart, so `?%6Bey=` and `?KEY=` are refused too, and never sent beside a named key); the
   Gemini Interactions API (`/v1beta/interactions`); a `:streamGenerateContent` without
   `alt=sse`, whose single JSON array would be held to its end; and a path model outside
   `[A-Za-z0-9._-]`, 1 to 255 bytes (`provider::path_model_ok`). A policy's model that
-  cannot stand in the path is a 500. A log line's request line now stops at its query.
+  cannot stand in the path, or for a target naming none, is a 500, every hedge leg's
+  checked before any leg is sent. An OAuth (`auth_bearer`) Vertex venue is sent only a
+  project-scoped path: the publisher path is express mode's, which takes an API key alone. A log line's request line now stops at its query.
 
 ### Tests
 

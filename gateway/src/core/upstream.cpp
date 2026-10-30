@@ -437,6 +437,7 @@ namespace llmbridge::detail
             stop_body(client);
             f.body_parked = true;
             f.splice = false; // nothing goes spliced: the body is rewritten whole after the confirm
+            f.model_substituted = false; // a path's, decided again when it is sent whole
             f.ts_progress = 0; // no venue to time out: the body's deadline holds it (12b)
             ++_stats.streamed_body_parked;
             return true;
