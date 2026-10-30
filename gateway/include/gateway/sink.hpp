@@ -108,6 +108,10 @@ namespace llmbridge
         int32_t web_fetch_requests = -1;
         int32_t code_exec_requests = -1;
         int32_t file_search_calls = -1;
+        /// Gemini: URL context or code execution ran, so tool_prompt_tokens bill as input;
+        /// web_search_requests holds its grounding queries. DESIGN.md "Gemini clients and Vertex".
+        bool tool_prompt_input = false;
+        bool stream_error = false; ///< a 200 stream then sent an error event; upstream_error names it
         /// The venue's own price for this request in picodollars (DeepInfra's
         /// estimated_cost), a check on ours.
         int64_t venue_cost_pdollars = -1;

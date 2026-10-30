@@ -161,7 +161,7 @@ TEST(Dialect, OnlyAVenueThatStreamsServesAStreamedTranslation)
 TEST(Dialect, EveryVenueHasOneName)
 {
     const auto names = llmbridge::provider::venue_names();
-    ASSERT_EQ(names.size(), 6u);
+    ASSERT_EQ(names.size(), 7u);
     for (size_t i = 0; i < names.size(); ++i)
     {
         const auto v = static_cast<UpstreamDialect>(i);

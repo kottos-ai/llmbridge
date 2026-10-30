@@ -432,6 +432,36 @@ to build, so the translator refuses it.
 `{"error":{"message":"...","type":"...","code":null}}`, so a rate limit, an overload or
 a context-length error reaches the client as an actionable error.
 
+### Gemini clients and Vertex
+
+A Gemini client names its model in the path, `/v1beta/models/{model}:generateContent`,
+and whether it streams in the method, so the body has neither. `RequestFacts::model` and
+`stream` are the path's, known on the head, and every model a policy picks for such a
+request (`Decision::model`, a retry's, a substitution) rewrites that segment and never the
+body. A model goes into a request line, so the client's and the policy's must be 1 to 255
+bytes of `[A-Za-z0-9._-]`: the client's is a 400 otherwise, the policy's a 500.
+
+`vertex` is Gemini's body at Google Cloud's publisher path. A Gemini API path sent there
+is rewritten into `/v1/publishers/google/models/`, a Vertex publisher path sent to a
+`gemini` venue into `/v1beta/models/`, and a project-scoped Vertex path goes as written,
+its project the client's. The credential is a per-venue choice, not the dialect's:
+`x-goog-api-key` by default, `Authorization: Bearer` with `auth_bearer`, and never both.
+
+Refused before any venue: a `key` query parameter, which would ride every log that keeps
+a URL; `:streamGenerateContent` without `alt=sse`, which streams one JSON array; and the
+Interactions API, not built.
+
+**Gemini replies** say in their objects what other venues say in headers: the model
+served (`modelVersion`, which differs from the alias asked for), the id (`responseId`),
+the tier (`serviceTier`, or Vertex's `trafficType`), and grounding queries. A stream's
+`data:` lines are joined across reads and parsed one at a time, but only a line that can
+still say something: every line before the first token, after it only one naming a key
+not yet read. The first token is non-empty `text` not marked `"thought": true`, or a
+`functionCall`; thinking is a part so marked, which appears only when the client asked
+for `includeThoughts`. A stream that fails after its head sends `data: {"error":...}` on a
+200, recorded as `stream_error`. A Gemini client is never sent a reply note: the Python
+SDK fails a stream on a comment line.
+
 ### Signing for Bedrock (`net/sigv4.hpp`)
 
 SigV4 is a defined procedure, not a format to approximate: canonical request, string

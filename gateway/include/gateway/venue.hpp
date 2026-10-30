@@ -64,6 +64,11 @@ namespace llmbridge
         /// makes a Bedrock venue refuse every request instead of signing with a guess.
         std::string aws_region{};
 
+        /// A Gemini or Vertex venue that takes a Google OAuth token: a named key goes as
+        /// `Authorization: Bearer`, and a translated request sends the client's Bearer,
+        /// never an x-goog-api-key beside it. Off, the key goes as x-goog-api-key.
+        bool auth_bearer = false;
+
 
         std::vector<std::string> ips{};
         std::string host{};

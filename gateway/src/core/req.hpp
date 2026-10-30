@@ -187,7 +187,7 @@ namespace llmbridge
         FixedStr<8> asked_cache_ttl; ///< the client's prompt_cache_options.ttl
         FixedStr<32> upstream_error; ///< the venue's name for a failure
         FixedStr<64> venue_req_id;
-        FixedStr<16> served_tier;
+        FixedStr<32> served_tier;    ///< 32: Vertex's PROVISIONED_THROUGHPUT is 22
         FixedStr<16> served_latency; ///< Bedrock's performance config, from its header
         FixedStr<64> served_model;   ///< cut at 64: longer ids are Bedrock ARNs
         FixedStr<kSinkCaptureBytes> captured[kSinkCaptureMax];
@@ -218,8 +218,26 @@ namespace llmbridge
         /// only the members can be spliced in (member_overrides), never a model.
         [[nodiscard]] bool rewrites_body() const noexcept
         {
-            return !(model_override.empty() && tier_override.empty() && speed_override.empty() &&
-                     geo_override.empty());
+            return !((model_in_path || model_override.empty()) && tier_override.empty() &&
+                     speed_override.empty() && geo_override.empty());
+        }
+        /// The client names its model in the path (Gemini), so a model override or
+        /// substitution rewrites the path and never the body, streamed or not.
+        bool model_in_path = false;
+        /// The venue answers in Gemini's shape (gemini_facts): its model, id, tier, server
+        /// tools and a stream's error event are in its reply objects, not its headers.
+        bool gemini_reply = false;
+        bool stream_error = false;      ///< a 200 stream sent an error event
+        bool tool_prompt_input = false; ///< URL context or code execution ran
+        int32_t search_queries = -1;    ///< grounding queries, the most any one event names
+        bool event_line_dropped = false; ///< the Gemini line arriving is over kGeminiLineMax
+        /// The model a path names in place of the client's: the override, else the
+        /// substitution when the client's is its sentinel; empty sends the client's.
+        [[nodiscard]] std::string_view path_model() const noexcept
+        {
+            if (!model_in_path) return {};
+            if (!model_override.empty()) return model_override.view();
+            return !subst_model.empty() && model.view() == subst_for.view() ? subst_model.view() : std::string_view{};
         }
         /// A conditional model substitution (GATEWAY-INTERNALS.md 12d), the decision's or the
         /// retry's. `subst_tracked`: BodyScan has tracked the model from the first byte, so a
@@ -273,6 +291,7 @@ namespace llmbridge
         net::http::ChunkDecoder chunkdec;        ///< the upstream's chunked stream body
         provider::openai::StreamUsage stream_usage; ///< usage a byte-forwarded stream states
         std::string sse_scratch;                 ///< one stream step's decoded bytes
+        std::string event_line; ///< a Gemini stream's line still arriving (note_gemini_events)
         /// Client bytes still owed to a request that is over, dropped as they arrive;
         /// then close if the reply said so. Survive begin(): they precede the next frame.
         uint64_t discard = 0;
@@ -289,6 +308,7 @@ namespace llmbridge
             chunkdec = net::http::ChunkDecoder{};
             stream_usage.reset();
             sse_scratch.clear();
+            event_line.clear();
         }
         [[nodiscard]] bool can_redispatch() const noexcept { return f.phase == Phase::Dispatched; }
     };

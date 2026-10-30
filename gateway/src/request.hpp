@@ -12,6 +12,7 @@
 // its credential headers, and the response translated back. The credential path
 // is in here, in one file.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,12 +28,13 @@
 
 namespace llmbridge::detail
 {
-    /// The request line for a log line: no credential, unlike every header after it;
-    /// cut at 128 bytes so a hostile URI cannot dominate the log, and at the first CR.
+    /// The request line for a log line, up to its query, which may hold a key (`?key=`)
+    /// as no header after it may; cut at 128 bytes so a hostile URI cannot dominate the
+    /// log, and at the first CR.
     inline std::string_view request_line(std::string_view buf) noexcept
     {
         constexpr size_t kMax = 128;
-        const size_t eol = buf.find('\r');
+        const size_t eol = std::min(buf.find('\r'), buf.find('?'));
         size_t n = eol == std::string_view::npos ? buf.size() : eol;
         if (n > kMax) n = kMax;
         return buf.substr(0, n);
@@ -99,7 +101,7 @@ namespace llmbridge::detail
     /// framing walk's facts alone. Refused for a venue that signs, past the walk's table,
     /// repeated in any case, absent or empty, or unsafe; nothing else stands in.
     [[nodiscard]] Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
-                                    UpstreamDialect venue, NamedKey& out) noexcept;
+                                    UpstreamDialect venue, NamedKey& out, bool bearer = false) noexcept;
 
     /// The policy's anthropic-beta token for `up`: only a venue taking an x-api-key gets one.
     [[nodiscard]] inline std::string_view beta_for(const Upstream& up, const ReqState& f) noexcept
@@ -111,6 +113,13 @@ namespace llmbridge::detail
     /// The client's dialect from the request line of `head`: client_wire on its method
     /// and full target.
     [[nodiscard]] Dialect client_dialect_of(std::string_view head) noexcept;
+    /// The request target of `head`'s request line, query included; empty if it has none.
+    [[nodiscard]] std::string_view target_of(std::string_view head) noexcept;
+    /// Why a target is refused before any venue hears of it: a `key` query parameter, the
+    /// Gemini Interactions API, a Gemini stream without alt=sse, a path model that cannot
+    /// stand as a segment. The target itself is never logged: it may hold the key.
+    [[nodiscard]] Refusal target_refusal(std::string_view head) noexcept;
+
     /// The request line of `head` creates an OpenAI Responses API response, whose
     /// search calls are billed per call and stated only as output items.
     [[nodiscard]] bool responses_api(std::string_view head) noexcept;
@@ -130,12 +139,15 @@ namespace llmbridge::detail
     /// The byte-forwarded request into `into`, capacity kept: `msg`'s head, then `body`,
     /// all or the first part of one `declared` bytes long. Null, or why to refuse it,
     /// with `into` empty. A named `key` replaces every credential header the client sent.
-    /// A `beta` token goes as one anthropic-beta line, after the client's own value.
+    /// A `beta` token goes as one anthropic-beta line, after the client's own value. A
+    /// `path_model` (path_model_ok) replaces the model a Gemini target names, and a
+    /// Gemini or Vertex `venue` gets its own path layout (provider::gemini_forward_target).
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
                               std::string& into, size_t declared, const NamedKey& key = {},
-                              std::string_view beta = {});
+                              std::string_view beta = {}, std::string_view path_model = {},
+                              UpstreamDialect venue = UpstreamDialect::OpenAI);
     /// A conditional model substitution spliced into a body forwarded as it arrives
     /// (GATEWAY-INTERNALS.md 12d). The head declares the client's length plus grow(): a
     /// value that is the sentinel goes as the replacement, then shrink() spaces; any other

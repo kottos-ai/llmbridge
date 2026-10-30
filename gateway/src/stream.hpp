@@ -18,6 +18,7 @@
 
 #include "core/conn.hpp"
 #include "engine.hpp"
+#include "provider/translate.hpp"
 #include "scan.hpp"
 
 namespace llmbridge::detail
@@ -179,6 +180,85 @@ namespace llmbridge::detail
         }
     }
 
+    /// What a Gemini reply object states beside its usage, kept where the sink reads it:
+    /// the first model, id and tier, the most grounding queries any one names, and an
+    /// error event after the head, which means the venue served nothing.
+    inline void keep_gemini_facts(ClientConn* c, const provider::GeminiFacts& g) noexcept
+    {
+        ReqState& f = c->req.f;
+        if (f.served_model.empty() && !g.model_version.empty()) f.served_model.set(g.model_version);
+        if (f.venue_req_id.empty() && !g.response_id.empty()) f.venue_req_id.set(g.response_id);
+        if (f.served_tier.empty() && !g.tier.empty()) f.served_tier.set(g.tier);
+        if (g.search_queries > f.search_queries) f.search_queries = static_cast<int32_t>(g.search_queries);
+        if (g.tool_input) f.tool_prompt_input = true;
+        if (g.error)
+        {
+            f.stream_error = true;
+            f.upstream_error.set(g.error_status);
+        }
+    }
+
+    /// A Gemini event line longer than this is passed on unread: a reply's facts and
+    /// first token come in small events, and a line is held only until it ends.
+    constexpr size_t kGeminiLineMax = 256 * 1024;
+
+    /// Each whole `data:` line of a Gemini stream read through gemini_facts, a line split
+    /// across reads joined first. Only a line that can still say something is parsed:
+    /// before the first token every one, after it one naming a key not yet seen.
+    /// Returns what the lines showed of a token and of thinking, for stream_step to stamp.
+    inline provider::GeminiFacts note_gemini_events(ClientConn* c, std::string_view bytes)
+    {
+        provider::GeminiFacts seen;
+        std::string& line = c->req.event_line;
+        const auto wanted = [c](std::string_view l) {
+            const ReqState& f = c->req.f;
+            if (f.ts_first_token == 0 || (f.served_model.empty() && find_fast(l, "\"modelVersion\"") != std::string_view::npos) ||
+                (f.venue_req_id.empty() && find_fast(l, "\"responseId\"") != std::string_view::npos) ||
+                (f.served_tier.empty() && (find_fast(l, "\"serviceTier\"") != std::string_view::npos ||
+                                           find_fast(l, "\"trafficType\"") != std::string_view::npos)))
+                return true;
+            for (const std::string_view k : {"\"error\"", "\"groundingMetadata\"", "\"executableCode\"",
+                                             "\"codeExecutionResult\"", "\"urlContextMetadata\""})
+                if (find_fast(l, k) != std::string_view::npos) return true;
+            return false;
+        };
+        const auto read_line = [&](std::string_view l) {
+            if (!l.empty() && l.back() == '\r') l.remove_suffix(1);
+            if (l.substr(0, 5) != "data:" || !wanted(l)) return;
+            provider::GeminiFacts g;
+            if (!provider::gemini_facts(l.substr(5), g)) return;
+            keep_gemini_facts(c, g);
+            seen.token = seen.token || g.token;
+            seen.thinking = seen.thinking || (g.thinking && !seen.token);
+        };
+        while (!bytes.empty())
+        {
+            const size_t eol = bytes.find('\n');
+            bool& dropped = c->req.f.event_line_dropped;
+            if (eol == std::string_view::npos)
+            {
+                // Over the cap, the rest of the line is dropped as it comes.
+                if (!dropped && line.size() + bytes.size() <= kGeminiLineMax) line.append(bytes);
+                else
+                {
+                    dropped = true;
+                    line.clear();
+                }
+                break;
+            }
+            if (dropped) dropped = false;
+            else if (line.empty()) read_line(bytes.substr(0, eol));
+            else if (line.size() + eol <= kGeminiLineMax)
+            {
+                line.append(bytes.substr(0, eol));
+                read_line(line);
+            }
+            line.clear();
+            bytes.remove_prefix(eol + 1);
+        }
+        return seen;
+    }
+
     /// Usage a byte-forwarded stream states, read as it arrives: Anthropic states its
     /// input and cache counts in the first event and OpenAI its totals in the last.
     inline void stream_note_usage(ClientConn* client, std::string_view bytes)
@@ -281,12 +361,24 @@ namespace llmbridge::detail
             {
                 stream_note_usage(client, sse_in);
                 // Reasoning is stamped before the token, because it comes first on
-                // the wire and one read can carry both. See the two helpers.
-                if (client->req.f.ts_first_thinking == 0 && client->req.f.ts_first_token == 0 &&
-                    sse_carries_thinking(sse_in))
+                // the wire and one read can carry both. See the two helpers. Gemini's
+                // parts say both in its own words, read event by event.
+                bool thinking = false, token = false;
+                if (client->req.f.gemini_reply)
+                {
+                    const provider::GeminiFacts g = note_gemini_events(client, sse_in);
+                    thinking = g.thinking;
+                    token = g.token;
+                }
+                else
+                {
+                    thinking = client->req.f.ts_first_thinking == 0 && client->req.f.ts_first_token == 0 &&
+                               sse_carries_thinking(sse_in);
+                    token = client->req.f.ts_first_token == 0 && sse_carries_first_token(sse_in);
+                }
+                if (thinking && client->req.f.ts_first_thinking == 0 && client->req.f.ts_first_token == 0)
                     client->req.f.ts_first_thinking = now_ns();
-                if (client->req.f.ts_first_token == 0 && sse_carries_first_token(sse_in))
-                    client->req.f.ts_first_token = now_ns();
+                if (token && client->req.f.ts_first_token == 0) client->req.f.ts_first_token = now_ns();
                 const size_t at = out.size();
                 out.append(sse_in);
                 chunk_wrap(client, out, at);

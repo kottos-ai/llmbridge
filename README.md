@@ -202,7 +202,7 @@ llmbridge --listen 8088 --upstream 127.0.0.1:9001 --upstream-dialect anthropic
 #          --upstream also takes HOST:PORT or http(s)://HOST[:PORT][/BASE]
 #                                (resolved at startup; /BASE for providers serving
 #                                 an OpenAI-compatible API below the root)
-#                    --upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure
+#                    --upstream-dialect openai|anthropic|gemini|cohere|bedrock|azure|vertex
 #          --upstream-timeout 120   # seconds of upstream silence before aborting (0 = off)
 ```
 

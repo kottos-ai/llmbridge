@@ -31,6 +31,7 @@ namespace llmbridge::provider
         Cohere,
         Bedrock,
         Azure,
+        Vertex, ///< Gemini on Google Cloud: Gemini's body, the publisher's model path
     };
 
     /// A body's wire format, apart from auth and URL layout.
@@ -121,5 +122,48 @@ namespace llmbridge::provider
             return Wire::Gemini;
         if (detail::ends_with(path, "/v2/chat")) return Wire::Cohere;
         return Wire::OpenAI;
+    }
+
+    /// Whether `m` can stand as a model's path segment as it is: 1 to 255 bytes of
+    /// [A-Za-z0-9._-], so it can neither leave its segment nor need encoding.
+    [[nodiscard]] constexpr bool path_model_ok(std::string_view m) noexcept
+    {
+        if (m.empty() || m.size() > 255) return false;
+        for (const char c : m)
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' ||
+                  c == '_' || c == '-'))
+                return false;
+        return true;
+    }
+
+    /// Where a Gemini target names its model: the segment after the last `/models/` of
+    /// the path, up to the method's colon (`/v1beta/models/{model}:generateContent`, and
+    /// Vertex's `.../publishers/google/models/{model}:...`). `at` is its offset in
+    /// `target`; npos when the path names none.
+    struct PathModel
+    {
+        size_t at = std::string_view::npos;
+        std::string_view model{};
+    };
+    [[nodiscard]] constexpr PathModel gemini_path_model(std::string_view target) noexcept;
+
+    /// A Gemini client's target as `venue` takes it, appended to `into`: its model
+    /// replaced by `model` when set (path_model_ok), and its layout the venue's when the
+    /// client wrote the other host's. A Gemini API venue gets `/v1beta/models/{model}:...`
+    /// for a Vertex publisher path; a Vertex venue gets `/v1/publishers/google/models/
+    /// {model}:...` for a Gemini API path; a project-scoped Vertex path goes as written.
+    /// False when `model` is set and the target names none to replace.
+    bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue, std::string& into);
+
+    constexpr PathModel gemini_path_model(std::string_view target) noexcept
+    {
+        const std::string_view path = target.substr(0, target.find('?'));
+        const size_t colon = path.rfind(':');
+        if (colon == std::string_view::npos) return {};
+        constexpr std::string_view kModels = "/models/";
+        const size_t m = path.substr(0, colon).rfind(kModels);
+        if (m == std::string_view::npos) return {};
+        const size_t at = m + kModels.size();
+        return {at, path.substr(at, colon - at)};
     }
 } // namespace llmbridge::provider

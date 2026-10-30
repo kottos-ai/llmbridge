@@ -2009,8 +2009,9 @@ TEST(JsonScanUsage, TheErrorTypeIsTheErrorObjectsOwn)
     EXPECT_EQ(oai::scan_error_type(
                   R"({"type":"error","error":{"type":"overloaded_error","message":"x"}})"),
               "overloaded_error");
+    // Google's code is a number, never a name; its name is `status`.
     EXPECT_EQ(oai::scan_error_type(R"({"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}})"),
-              "");
+              "RESOURCE_EXHAUSTED");
     EXPECT_EQ(oai::scan_error_type(R"({"message":"\"error\":{\"code\":\"x\"}"})"), "");
 }
 
@@ -2464,4 +2465,85 @@ TEST(VenueTargets, AnOverrideThroughRequestOutMatchesTheSplice)
         ASSERT_TRUE(spec(v).request(sp, e));
         EXPECT_EQ(out, expect) << spec(v).name;
     }
+}
+
+// ── Gemini: what a reply states beside its usage ─────────────────────────────
+
+TEST(GeminiFacts, PartsSayTokenThinkingAndTools)
+{
+    namespace p = llmbridge::provider;
+    p::GeminiFacts f;
+    ASSERT_TRUE(p::gemini_facts(R"({"candidates": [{"content": {"parts": [{"text": "", "thoughtSignature": "x"}]}}]})", f));
+    EXPECT_FALSE(f.token) << "an empty text part with a signature";
+    EXPECT_FALSE(f.thinking);
+    f = {};
+    ASSERT_TRUE(p::gemini_facts(R"({"candidates": [{"content": {"parts": [{"text": "hmm", "thought": true}]}}]})", f));
+    EXPECT_TRUE(f.thinking);
+    EXPECT_FALSE(f.token) << "a thought is not shown";
+    f = {};
+    ASSERT_TRUE(p::gemini_facts(R"({"candidates": [{"content": {"parts": [{"functionCall": {"name": "f"}}]}}]})", f));
+    EXPECT_TRUE(f.token);
+    f = {};
+    ASSERT_TRUE(p::gemini_facts(
+        R"({"candidates": [{"content": {"parts": [{"executableCode": {"code": "1"}}]}}, {"groundingMetadata": )"
+        R"({"webSearchQueries": ["a"]}}, {"groundingMetadata": {"webSearchQueries": ["b", "c"]}}],)"
+        R"("usageMetadata": {"serviceTier": "flex"}, "modelVersion": "gemini-3.8-flash", "responseId": "r"})",
+        f));
+    EXPECT_TRUE(f.tool_input);
+    EXPECT_EQ(f.search_queries, 3) << "every candidate's";
+    EXPECT_EQ(f.tier, "flex");
+    EXPECT_EQ(f.model_version, "gemini-3.8-flash");
+    EXPECT_EQ(f.response_id, "r");
+    f = {};
+    ASSERT_TRUE(p::gemini_facts(R"({"error": {"code": 503, "message": "m", "status": "UNAVAILABLE"}})", f));
+    EXPECT_TRUE(f.error);
+    EXPECT_EQ(f.error_status, "UNAVAILABLE");
+    EXPECT_FALSE(p::gemini_facts("[{}]", f));
+    EXPECT_FALSE(p::gemini_facts("{\"candidates\": [", f));
+}
+
+TEST(GeminiUsage, AudioAndAThoughtsCountTheTotalHolds)
+{
+    namespace oai = llmbridge::provider::openai;
+    const oai::Usage u = oai::scan_usage(
+        R"({"usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5, "totalTokenCount": 33,)"
+        R"( "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 8}, {"modality": "AUDIO", "tokenCount": 12}],)"
+        R"( "candidatesTokensDetails": [{"modality": "AUDIO", "tokenCount": 5}]}})");
+    EXPECT_EQ(u.in, 20);
+    EXPECT_EQ(u.reasoning, 8) << "33 - 20 - 5, thoughts left out";
+    EXPECT_EQ(u.out, 13);
+    EXPECT_EQ(u.audio_in, 12);
+    EXPECT_EQ(u.audio_out, 5);
+    const oai::Usage t = oai::scan_usage(
+        R"({"usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5, "toolUsePromptTokenCount": 8,)"
+        R"( "totalTokenCount": 33}})");
+    EXPECT_EQ(t.reasoning, -1) << "the remainder is the tool prompt";
+    EXPECT_EQ(t.out, 5);
+}
+
+TEST(ScanErrorType, GooglesStatusPastALongMessage)
+{
+    namespace oai = llmbridge::provider::openai;
+    const std::string g = R"({"error": {"code": 429, "message": ")" + std::string(2000, 'x') +
+                          R"(", "status": "RESOURCE_EXHAUSTED"}})";
+    EXPECT_EQ(oai::scan_error_type(g), "RESOURCE_EXHAUSTED");
+    EXPECT_EQ(oai::scan_error_type(R"({"type":"error","error":{"type":"overloaded_error","message":"x"}})"),
+              "overloaded_error");
+    EXPECT_EQ(oai::scan_error_type(R"({"error":{"code":"rate_limit_exceeded","status":"S"}})"), "rate_limit_exceeded");
+}
+
+TEST(GeminiPathModel, TheSegmentAfterTheLastModels)
+{
+    namespace p = llmbridge::provider;
+    EXPECT_EQ(p::gemini_path_model("/v1beta/models/gemini-4-argon:generateContent").model, "gemini-4-argon");
+    EXPECT_EQ(p::gemini_path_model("/v1/projects/p/locations/global/publishers/google/models/m-1:streamGenerateContent"
+                                   "?alt=sse").model,
+              "m-1");
+    EXPECT_EQ(p::gemini_path_model("/v1beta/tunedModels/x:generateContent").at, std::string_view::npos);
+    EXPECT_EQ(p::gemini_path_model("/v1beta/models/a:b?x=/models/c:d").model, "a") << "never the query";
+    EXPECT_TRUE(p::path_model_ok("gemini-3.1-pro-preview"));
+    EXPECT_FALSE(p::path_model_ok("a/b"));
+    EXPECT_FALSE(p::path_model_ok("a%2Fb"));
+    EXPECT_FALSE(p::path_model_ok(""));
+    EXPECT_FALSE(p::path_model_ok(std::string(256, 'a')));
 }

@@ -38,7 +38,7 @@ Flags override the file wherever they appear. In parentheses: the file key.
   --tls-cert PATH             certificate chain, PEM (listen.cert)
   --tls-key PATH              private key, PEM, owner-only (listen.key)
   --upstream URL              IP:PORT, HOST:PORT or http(s)://HOST[:PORT][/BASE] (upstream.url)
-  --upstream-dialect NAME     what the venue speaks: openai|anthropic|gemini|cohere|bedrock|azure (upstream.dialect)
+  --upstream-dialect NAME     what the venue speaks: openai|anthropic|gemini|cohere|bedrock|azure|vertex (upstream.dialect)
   --upstream-timeout SECONDS  upstream silence before a request is aborted, 0 = off (timeouts.upstream_s)
   --client-idle SECONDS       idle client lifetime, 0 = off (timeouts.client_idle_s)
   --pool-idle SECONDS         idle pooled upstream lifetime, 0 = off (timeouts.pool_idle_s)

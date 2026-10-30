@@ -163,6 +163,9 @@ namespace llmbridge::detail
         r.tool_prompt_tokens = static_cast<int32_t>(u.tool_prompt);
         r.image_in_tokens = static_cast<int32_t>(u.image_in);
         r.web_search_requests = static_cast<int32_t>(u.web_search);
+        if (c->req.f.search_queries >= 0) r.web_search_requests = c->req.f.search_queries; // Gemini's grounding
+        r.tool_prompt_input = c->req.f.tool_prompt_input;
+        r.stream_error = c->req.f.stream_error;
         r.web_fetch_requests = static_cast<int32_t>(u.web_fetch);
         r.code_exec_requests = static_cast<int32_t>(u.code_exec);
         r.file_search_calls = static_cast<int32_t>(u.file_search);
@@ -232,6 +235,9 @@ namespace llmbridge::detail
 
     void Engine::sink_note(const ClientConn* c, std::string& out) noexcept
     {
+        // Not asked for a Gemini client: google-genai for Python parses every line but
+        // `data: ` as JSON, a comment line included, and fails the stream on it.
+        if (c->req.f.model_in_path) return;
         BodyUsage u;
         const std::string_view note = _sink->reply_note(record_of(c, 200, /*streamed=*/true, u));
         if (note.empty()) return;

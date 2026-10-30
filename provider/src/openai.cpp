@@ -50,6 +50,7 @@ namespace llmbridge::provider::openai
             long long w5m = -1, w1h = -1;
             long long web_search = -1, web_fetch = -1, code_exec = -1, cost = -1;
             long long g_prompt = -1, g_candidates = -1, g_thoughts = -1, g_cached = -1, g_tool = -1;
+            long long g_total = -1, g_audio_in = -1, g_audio_out = -1;
             std::string_view speed, geo;
             Attempts compaction, declined; // declined: `message` entries, before a fallback
             bool fallback = false;
@@ -97,7 +98,27 @@ namespace llmbridge::provider::openai
             {"", "thoughtsTokenCount", &Raw::g_thoughts},
             {"", "cachedContentTokenCount", &Raw::g_cached},
             {"", "toolUsePromptTokenCount", &Raw::g_tool},
+            {"", "totalTokenCount", &Raw::g_total},
         };
+
+        // The AUDIO entry of a Gemini `*TokensDetails` array, `[{"modality":"AUDIO",
+        // "tokenCount":N},...]`; -1 when it names none.
+        long long modality_count(std::string_view arr, std::string_view modality) noexcept
+        {
+            long long n = -1;
+            (void)for_each_element(arr, [&](std::string_view e) {
+                std::string_view m;
+                long long c = -1;
+                (void)for_each_member(e, [&](std::string_view k, std::string_view v) {
+                    if (k == "modality") m = plain_string(v);
+                    else if (k == "tokenCount") c = count(v);
+                    return true;
+                });
+                if (m == modality && c >= 0) n = (n > 0 ? n : 0) + c;
+                return true;
+            });
+            return n;
+        }
 
         // Each entry of `usage.iterations`: a compaction pass, a declined attempt, or
         // the `fallback_message` attempt the top-level counts describe.
@@ -137,6 +158,8 @@ namespace llmbridge::provider::openai
                     if (v.front() == '[')
                     {
                         if (k == "iterations") read_iterations(v, r);
+                        else if (k == "promptTokensDetails") r.g_audio_in = modality_count(v, "AUDIO");
+                        else if (k == "candidatesTokensDetails") r.g_audio_out = modality_count(v, "AUDIO");
                         return true;
                     }
                     if (v.front() == '"')
@@ -234,8 +257,11 @@ namespace llmbridge::provider::openai
             if (gemini)
             {
                 read_members(obj, {}, kGeminiKeys, r);
-                return detail::gemini_usage(r.g_prompt, r.g_candidates, r.g_thoughts,
-                                            r.g_cached, r.g_tool);
+                Usage u = detail::gemini_usage(r.g_prompt, r.g_candidates, r.g_thoughts, r.g_cached, r.g_tool,
+                                               r.g_total);
+                u.audio_in = r.g_audio_in;
+                u.audio_out = r.g_audio_out;
+                return u;
             }
             read_members(obj, {}, kUsageKeys, r);
             return from_usage(r);
@@ -348,18 +374,23 @@ namespace llmbridge::provider::openai
     std::string_view scan_error_type(std::string_view body) noexcept
     {
         constexpr size_t kErrorWindow = 512; // `message`, the long field, comes after these
-        const std::string_view head = body.substr(0, kErrorWindow);
-        std::string_view code, type;
-        each_key(head, "\"error\"", [&](size_t v) {
-            if (head[v] != '{') return true;
-            (void)for_each_member(head.substr(v), [&](std::string_view k, std::string_view raw) {
-                if (k == "code") code = plain_string(raw);
-                else if (k == "type") type = plain_string(raw);
-                return true;
+        // Google's name is `status`, after its `message`: read only when the window named none.
+        constexpr size_t kStatusWindow = 8192;
+        const auto read = [](std::string_view head, bool status) {
+            std::string_view code, type;
+            each_key(head, "\"error\"", [&](size_t v) {
+                if (head[v] != '{') return true;
+                (void)for_each_member(head.substr(v), [&](std::string_view k, std::string_view raw) {
+                    if (k == "code") code = plain_string(raw); // Google's is a number: none
+                    else if (k == (status ? "status" : "type")) type = plain_string(raw);
+                    return true;
+                });
+                return false;
             });
-            return false;
-        });
-        return code.empty() ? type : code;
+            return code.empty() ? type : code;
+        };
+        const std::string_view named = read(body.substr(0, kErrorWindow), false);
+        return named.empty() && body.size() > 0 ? read(body.substr(0, kStatusWindow), true) : named;
     }
 
     Usage usage_of(std::string_view object) noexcept { return read_usage(object, false); }

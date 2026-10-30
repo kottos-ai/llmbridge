@@ -214,7 +214,8 @@ namespace llmbridge::detail
             const std::string_view head(client->rbuf.data(), client->msg.header_len);
             NamedKey key;
             if ((!client->req.f.key_header.empty() &&
-                 named_key(head, client->req.f.head, client->req.f.key_header.view(), upstream_of(u).dialect, key)) ||
+                 named_key(head, client->req.f.head, client->req.f.key_header.view(), upstream_of(u).dialect, key,
+                           upstream_of(u).auth_bearer)) ||
                 forward_parts(client, upstream_of(u), key, uf->out.stage()))
             {
                 delete uf;
@@ -347,6 +348,8 @@ namespace llmbridge::detail
         note_upstream_error(client, h, r.body);
         note_served_tier(client, r.body, /*tail=*/true);
         note_served_model(client, r.body, /*streamed=*/false);
+        if (provider::GeminiFacts g; client->req.f.gemini_reply && h.status == 200 && provider::gemini_facts(r.body, g))
+            keep_gemini_facts(client, g);
         note_reply(client, h.status, /*streamed=*/false);
         on_response(u, h, r.body, r.total_len);
     }
@@ -428,7 +431,7 @@ namespace llmbridge::detail
         // substitution spliced if its model was tracked from the first byte, members if the
         // client's own were, else it parks to its last byte (GATEWAY-INTERNALS.md 12c-12e).
         else if (f.body_streaming && !(overrides_stream(client, /*at_head=*/false) &&
-                                       (f.subst_model.empty() || f.subst_tracked) &&
+                                       (f.subst_model.empty() || f.subst_tracked || f.model_in_path) &&
                                        venue_streams(client_dialect_of(client->rbuf), client->upstream_slot)))
         {
             stop_body(client);

@@ -111,9 +111,11 @@ namespace llmbridge::detail
         }
 
         /// The line a venue takes a named key on, up to the key; none for one that signs.
-        std::string_view key_line_for(UpstreamDialect venue) noexcept
+        /// A Google venue set to `bearer` takes an OAuth token instead of an API key.
+        std::string_view key_line_for(UpstreamDialect venue, bool bearer) noexcept
         {
             using provider::Auth;
+            if (bearer && provider::spec(venue).auth == Auth::GoogApiKey) return "Authorization: Bearer ";
             switch (provider::spec(venue).auth)
             {
                 case Auth::Forward:
@@ -130,7 +132,8 @@ namespace llmbridge::detail
         /// credential the client sent is checked first, whether or not this venue reads
         /// it, so a malformed value cannot route around the check by picking another.
         const char* append_auth(UpstreamDialect mode, std::string_view head, const HeadFacts& f,
-                                const NamedKey& key, std::string& out, std::string_view beta = {})
+                                const NamedKey& key, std::string& out, std::string_view beta = {},
+                                bool bearer = false)
         {
             const std::string_view auth = f.authorization.in(head), x_api_key = f.x_api_key.in(head),
                                    api_key = f.api_key.in(head), goog = f.x_goog_api_key.in(head),
@@ -160,7 +163,13 @@ namespace llmbridge::detail
                     line("anthropic-beta", beta);
                     return nullptr;
                 case Auth::GoogApiKey:
-                    line("x-goog-api-key", goog.empty() ? bearer_token(auth) : goog);
+                    // Exactly one credential: Google refuses a request carrying two.
+                    if (bearer)
+                    {
+                        if (bearer_token(auth).empty()) return "no credential";
+                        line("Authorization", auth);
+                    }
+                    else line("x-goog-api-key", goog.empty() ? bearer_token(auth) : goog);
                     return nullptr;
                 case Auth::Bearer:
                     line("Authorization", auth); // Cohere speaks Bearer natively
@@ -296,11 +305,11 @@ namespace llmbridge::detail
     }
 
     Refusal named_key(std::string_view head, const HeadFacts& f, std::string_view name,
-                      UpstreamDialect venue, NamedKey& out) noexcept
+                      UpstreamDialect venue, NamedKey& out, bool bearer) noexcept
     {
         out = {};
         // A signature covers a key pair; a bearer key has no header there to go in.
-        const std::string_view line = key_line_for(venue);
+        const std::string_view line = key_line_for(venue, bearer);
         if (line.empty()) return {kWhyKeyUnusable, refuse::kKeyHeaderUnusable};
         // Every line that could match is in the table, so a repeat is never missed.
         if (f.key_headers > HeadFacts::kKeyHeaders) return {kWhyKeyTooMany, refuse::kKeyHeaderTooMany};
@@ -366,11 +375,79 @@ namespace llmbridge::detail
     /// because TranslationPlan lives in dialect.hpp which already includes gateway.hpp.
     provider::TopLevelFacts body_facts(std::string_view head, std::string_view body) noexcept
     {
-        if (client_dialect_of(head) == Dialect::OpenAI) return provider::top_level_facts(body);
+        const Dialect client = client_dialect_of(head);
+        if (client == Dialect::OpenAI) return provider::top_level_facts(body);
         provider::TopLevelFacts f;
+        // Gemini names the model, and whether it streams, in the path: the body has neither.
+        if (client == Dialect::Gemini)
+        {
+            const std::string_view target = target_of(head);
+            const std::string_view model = provider::gemini_path_model(target).model;
+            if (provider::path_model_ok(model)) f.model = model;
+            f.stream = target.substr(0, target.find('?')).ends_with(":streamGenerateContent");
+            return f;
+        }
         f.model = provider::model_of(body);
         return f;
     }
+
+    std::string_view target_of(std::string_view head) noexcept
+    {
+        const std::string_view rl = head.substr(0, head.find("\r\n"));
+        const size_t sp1 = rl.find(' '), sp2 = rl.rfind(' ');
+        if (sp1 == std::string_view::npos || sp2 <= sp1) return {};
+        return rl.substr(sp1 + 1, sp2 - sp1 - 1);
+    }
+
+    namespace
+    {
+        // Whether a query names parameter `name`, with or without a value.
+        bool query_has(std::string_view query, std::string_view name) noexcept
+        {
+            while (!query.empty())
+            {
+                const size_t amp = query.find('&');
+                const std::string_view pair = query.substr(0, amp);
+                if (pair.substr(0, pair.find('=')) == name) return true;
+                if (amp == std::string_view::npos) break;
+                query.remove_prefix(amp + 1);
+            }
+            return false;
+        }
+        bool query_is(std::string_view query, std::string_view pair) noexcept
+        {
+            while (!query.empty())
+            {
+                const size_t amp = query.find('&');
+                if (query.substr(0, amp) == pair) return true;
+                if (amp == std::string_view::npos) break;
+                query.remove_prefix(amp + 1);
+            }
+            return false;
+        }
+    } // namespace
+
+    Refusal target_refusal(std::string_view head) noexcept
+    {
+        const std::string_view target = target_of(head);
+        const size_t q = target.find('?');
+        const std::string_view path = target.substr(0, q);
+        const std::string_view query = q == std::string_view::npos ? std::string_view{} : target.substr(q + 1);
+        // A key in the URL rides every log, proxy and history that keeps one: never sent on.
+        if (query_has(query, "key")) return {"key in the URL", refuse::kKeyInUrl};
+        for (const std::string_view v : {"/v1beta/interactions", "/v1alpha/interactions", "/v1/interactions"})
+            if (path.starts_with(v) && (path.size() == v.size() || path[v.size()] == '/' || path[v.size()] == ':'))
+                return {"Gemini Interactions API", refuse::kGeminiInteractions};
+        if (client_dialect_of(head) != Dialect::Gemini) return {};
+        // Without alt=sse Google streams one JSON array, which would be held to its end.
+        if (path.ends_with(":streamGenerateContent") && !query_is(query, "alt=sse"))
+            return {"Gemini stream without alt=sse", refuse::kGeminiNoSse};
+        const provider::PathModel pm = provider::gemini_path_model(target);
+        if (pm.at != std::string_view::npos && !provider::path_model_ok(pm.model))
+            return {"model in the path unusable", refuse::kPathModel};
+        return {};
+    }
+
 
     TranslationPlan resolve_dialect(const ClientConn* c, const Upstream& venue) noexcept
     {
@@ -497,7 +574,7 @@ namespace llmbridge::detail
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
                               std::string& into, size_t declared, const NamedKey& key,
-                              std::string_view beta)
+                              std::string_view beta, std::string_view path_model, UpstreamDialect venue)
     {
         using net::http::Field;
         into.clear();
@@ -531,9 +608,18 @@ namespace llmbridge::detail
         const std::string_view version = rl.substr(sp2 + 1);
 
         const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() +
-                            key.line.size() + key.value.size() + beta.size() + 80;
+                            key.line.size() + key.value.size() + beta.size() + path_model.size() + 80;
         if (into.capacity() < need) into.reserve(need + need / 8);
-        into.append(rl.substr(0, sp1 + 1)).append(base_path).append(target).append(" ");
+        if (!path_model.empty() && !provider::path_model_ok(path_model)) return "model override unusable in a path";
+        into.append(rl.substr(0, sp1 + 1)).append(base_path);
+        // A Gemini venue takes the model, and its host's layout, in the path.
+        if (provider::spec(venue).wire != provider::Wire::Gemini) into.append(target);
+        else if (!provider::gemini_forward_target(target, path_model, venue, into))
+        {
+            into.clear();
+            return "model override for a target that names no model";
+        }
+        into.append(" ");
         into.append(version == "HTTP/1.0" ? std::string_view("HTTP/1.1") : version).append("\r\n");
         if (!host_hdr.empty()) into.append("Host: ").append(host_hdr).append("\r\n");
         // A bodyless request that carried no length keeps carrying none. A body still
@@ -611,7 +697,7 @@ namespace llmbridge::detail
             if (const Refusal r = named_key(msg, f, key_header, venue, key)) return fail(r);
         const std::string_view body = body_override.empty() ? msg.substr(header_len) : body_override;
         if (const char* bad = build_forward(msg, header_len, f, strip, host_hdr, base_path, body, into,
-                                            body.size(), key, beta))
+                                            body.size(), key, beta, {}, venue))
             return fail({bad, nullptr});
         return true;
     }
@@ -662,7 +748,7 @@ namespace llmbridge::detail
             if (!sign_bedrock(up, f.authorization.in(head), path, tbody, out, why))
             { out.clear(); return false; }
         }
-        else if (const char* bad = append_auth(mode, head, f, key, out, beta))
+        else if (const char* bad = append_auth(mode, head, f, key, out, beta, up.auth_bearer))
         { why = bad; out.clear(); return false; }
         out.append("Content-Type: application/json\r\nConnection: keep-alive\r\n");
         net::http::append_content_length(out, tbody.size());

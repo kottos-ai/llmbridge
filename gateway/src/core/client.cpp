@@ -26,9 +26,11 @@ namespace llmbridge::detail
     {
         // A streamed body's splice is done once it is whole: every member set went in (12e).
         const uint8_t spliced = whole && c->req.f.splice ? c->req.f.member_overrides() : 0;
+        // A path names the model, so its substitution is done at the head (model_in_path).
+        const bool substituted = c->req.f.model_in_path ? c->req.f.model_substituted : c->req.f.splice && splice_hit(c);
         return {std::string_view(c->rbuf.data(), c->msg.header_len), c->msg.body_len, c->req.f.model.view(),
                 c->req.f.prefix_hash, c->req.f.req_seq, c->req.f.asked_stream, c->req.f.asked_usage, whole,
-                whole && c->req.f.splice && splice_hit(c), (spliced & provider::BodyScan::kServiceTier) != 0,
+                whole && substituted, (spliced & provider::BodyScan::kServiceTier) != 0,
                 (spliced & provider::BodyScan::kSpeed) != 0, (spliced & provider::BodyScan::kInferenceGeo) != 0};
     }
 
@@ -158,6 +160,7 @@ namespace llmbridge::detail
         open_request(c, m, facts, t0);
         if (st == net::http::FrameStatus::Error) return error_respond(c, 400, "request framing");
         if (!net::http::request_line_ok(c->rbuf)) return error_respond(c, 400, "request line");
+        if (const Refusal r = target_refusal(c->rbuf)) return error_respond(c, 400, r.why, r.detail);
         // Nothing here inflates, and every reader downstream assumes JSON.
         if (c->msg.encoded) return error_respond(c, 415, "compressed request body");
         if (_sink) sink_capture(c);
@@ -234,8 +237,11 @@ namespace llmbridge::detail
         // A model only once it has closed in the bytes so far, as capture_model bounds it;
         // the hash over the bytes a held body's covers, which try_frame waited for.
         const std::string_view body = body_so_far(c);
-        if (const std::string_view model = provider::model_of(body); model.size() <= sizeof f.model.b)
-            f.model.set(model);
+        // A path names the model and whether it streams, so both are known on the head.
+        const provider::TopLevelFacts path = f.model_in_path ? body_facts(c->rbuf, {}) : provider::TopLevelFacts{};
+        const std::string_view model = f.model_in_path ? path.model : provider::model_of(body);
+        if (model.size() <= sizeof f.model.b) f.model.set(model);
+        f.asked_stream = path.stream;
         if (_wants_prefix_hash) f.prefix_hash = prefix_hash_of(body.substr(0, std::min(m.body_len, kPrefixHashBytes)));
         const Decision d = policy_decision(c, /*whole=*/false);
         if (!d.allow)
@@ -312,7 +318,8 @@ namespace llmbridge::detail
             return !model.empty() ? model : !sub.empty() && f.model.view() == sub_for ? sub : std::string_view{};
         };
         std::string_view now = f.model_override.view();
-        if (f.splice) now = whole.model_substituted ? f.subst_model.view() : std::string_view{};
+        if (f.model_in_path) now = f.path_model();
+        else if (f.splice) now = whole.model_substituted ? f.subst_model.view() : std::string_view{};
         else if (f.body_parked) now = served(now, f.subst_model.view(), f.subst_for.view());
         // So for service_tier, speed and inference_geo: on a spliced body the venue gets the
         // override, or with none the client's own member, which the scan read (12e).
@@ -373,6 +380,7 @@ namespace llmbridge::detail
         c->req.f.ts_req_recvd = t0;
         c->msg = m;
         c->req.f.head = f;
+        c->req.f.model_in_path = client_dialect_of(c->rbuf) == Dialect::Gemini;
         c->req.f.client_upload_ns = span_since(c->ts_first_byte, t0);
         c->req.f.client_conn_reused = c->ever_framed;
         c->req.f.client_conn_setup_ns = c->req.f.client_conn_reused ? 0 : span_since(c->ts_accepted, t0);
@@ -415,13 +423,22 @@ namespace llmbridge::detail
             if (!plan.ok) return error_respond(c, 400, plan.why);
             c->req.f.translate_body = plan.translate;
             c->req.f.effective_dialect = plan.venue;
+            c->req.f.gemini_reply = provider::spec(up.dialect).wire == provider::Wire::Gemini;
         }
         // A key the policy named is this venue's only credential, or nothing is sent.
         NamedKey key;
         if (!c->req.f.key_header.empty())
             if (const Refusal r = named_key(std::string_view(c->rbuf.data(), c->msg.header_len), c->req.f.head,
-                                            c->req.f.key_header.view(), up.dialect, key))
+                                            c->req.f.key_header.view(), up.dialect, key, up.auth_bearer))
                 return error_respond(c, 400, r.why, r.detail);
+        // A path model goes into a request line: a policy's that cannot stand there is refused.
+        if (c->req.f.model_in_path)
+        {
+            if (const std::string_view pm = c->req.f.path_model(); !pm.empty() && !provider::path_model_ok(pm))
+                return error_respond(c, 500, "policy model unusable in a path");
+            if (c->req.f.body_streaming)
+                c->req.f.model_substituted = c->req.f.model_override.empty() && !c->req.f.path_model().empty();
+        }
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
         note_build(c->msg.total_len);
         const std::string_view body = body_so_far(c);
@@ -449,8 +466,10 @@ namespace llmbridge::detail
             {
                 const ReqState& f = c->req.f;
                 std::string_view had;
+                // A path names the model, which build_forward rewrites there.
                 if (!provider::apply_overrides(body,
-                                               {f.model_override.view(), f.tier_override.view(),
+                                               {f.model_in_path ? std::string_view{} : f.model_override.view(),
+                                                f.tier_override.view(),
                                                 f.speed_override.view(), f.geo_override.view()},
                                                &had, _xlate))
                     return error_respond(c, 400, "cannot apply route overrides");
@@ -477,8 +496,8 @@ namespace llmbridge::detail
                                                      c->msg.header_len, c->req.f.head, _strip_headers,
                                                      up.host_hdr, up.base_path, rewritten.empty() ? body : rewritten,
                                                      _rebuild, rewritten.empty() ? c->msg.body_len : rewritten.size(),
-                                                     key,
-                                                beta_for(up, c->req.f)))
+                                                     key, beta_for(up, c->req.f), c->req.f.path_model(),
+                                                     up.dialect))
                 return error_respond(c, 400, bad);
         }
 

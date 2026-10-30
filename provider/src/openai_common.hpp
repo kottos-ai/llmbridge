@@ -68,10 +68,15 @@ namespace llmbridge::provider::detail
     }
 
     // Gemini states thinking beside candidatesTokenCount, not inside it, and bills it
-    // as output, so completion_tokens is their sum and reasoning the thinking part.
+    // as output, so completion_tokens is their sum and reasoning the thinking part. Its
+    // total is prompt + tool-use prompt + thoughts + candidates, so a thoughts count it
+    // leaves out (3.1 Pro at thinking level LOW) is what the total holds beyond the rest.
     inline openai::Usage gemini_usage(long long prompt, long long candidates, long long thoughts,
-                                      long long cached, long long tool_prompt) noexcept
+                                      long long cached, long long tool_prompt, long long total = -1) noexcept
     {
+        if (thoughts < 0 && total >= 0 && prompt >= 0 && candidates >= 0)
+            if (const long long rest = total - prompt - candidates - (tool_prompt > 0 ? tool_prompt : 0); rest > 0)
+                thoughts = rest;
         openai::Usage u;
         u.in = prompt;
         u.out = candidates;

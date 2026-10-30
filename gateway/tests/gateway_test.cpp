@@ -17358,3 +17358,491 @@ TEST_P(ProxyHeadDecide, AFailoverAfterTheWholeSplicedBodyRewritesItWhole)
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyHeadDecide,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// ── A Gemini client names its model in the path ───────────────────────────────
+//
+// `/v1beta/models/{model}:generateContent` has no `model` in its body, so the policy is
+// handed the path's, and a model the policy picks rewrites that segment, never the body.
+// A target that would carry a key or that cannot be served is refused before any venue.
+namespace
+{
+    std::string gemini_post(const std::string& target, const std::string& body, const std::string& extra = "")
+    {
+        return "POST " + target + " HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nx-goog-api-key: gk\r\n" +
+               extra + "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    }
+    const std::string kGeminiBody = R"({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})";
+} // namespace
+
+class ProxyGeminiPath : public ProxyHeadDecide
+{
+  protected:
+    /// Both venues speak Gemini.
+    void start_gemini(HeadPolicy& pol)
+    {
+        _policy = &pol;
+        _backend.start();
+        _second.start();
+        _upstreams = {{"127.0.0.1", _backend.port(), false, "", UpstreamDialect::Gemini, ""},
+                      {"127.0.0.1", _second.port(), false, "", UpstreamDialect::Gemini, ""}};
+        start(0, false, UpstreamDialect::OpenAI, GetParam());
+    }
+    std::string exchange(const std::string& req)
+    {
+        Client c;
+        if (!c.connect(_proxy_port) || !c.send(req)) return {};
+        return c.recv_response();
+    }
+};
+
+TEST_P(ProxyGeminiPath, ThePolicySeesThePathModelAndStreamFlag)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/gemini-3.5-flash-lite:generateContent", kGeminiBody))),
+              200);
+    EXPECT_EQ(Client::status_of(exchange(
+                  gemini_post("/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", kGeminiBody))),
+              200);
+    shutdown();
+    const auto d = pol.decides();
+    ASSERT_EQ(d.size(), 2u);
+    EXPECT_EQ(d[0].model, "gemini-3.5-flash-lite");
+    EXPECT_FALSE(d[0].stream);
+    EXPECT_EQ(d[1].model, "gemini-4-argon");
+    EXPECT_TRUE(d[1].stream);
+}
+
+// Vertex names the publisher's model below the project and location.
+TEST_P(ProxyGeminiPath, AVertexPathNamesItsModelToo)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    start_gemini(pol);
+    const std::string target =
+        "/v1/projects/p-1/locations/global/publishers/google/models/gemini-3.8-flash:generateContent";
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(target, kGeminiBody))), 200);
+    shutdown();
+    ASSERT_EQ(pol.decides().size(), 1u);
+    EXPECT_EQ(pol.decides()[0].model, "gemini-3.8-flash");
+    // The Gemini API has no projects: the path goes in its own layout.
+    EXPECT_EQ(_backend.last_request().rfind("POST /v1beta/models/gemini-3.8-flash:generateContent HTTP/1.1\r\n", 0), 0u)
+        << _backend.last_request();
+}
+
+TEST_P(ProxyGeminiPath, ADecisionModelRewritesThePathAndLeavesTheBody)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "gemini-3.8-flash"}};
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(
+                  gemini_post("/v1beta/models/auto:streamGenerateContent?alt=sse", kGeminiBody))),
+              200);
+    shutdown();
+    const std::string up = _second.last_request();
+    EXPECT_EQ(up.rfind("POST /v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse HTTP/1.1\r\n", 0), 0u)
+        << up;
+    EXPECT_EQ(body_of(up), kGeminiBody);
+    EXPECT_TRUE(declares(up, kGeminiBody.size()));
+}
+
+TEST_P(ProxyGeminiPath, ASubstitutionRewritesThePathOnlyForItsSentinel)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {auto_route(0, "gemini-3.5-flash-lite"), auto_route(1, "gemini-3.5-flash-lite")};
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/auto:generateContent", kGeminiBody))), 200);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/gemini-4-argon:generateContent", kGeminiBody))),
+              200);
+    shutdown();
+    const std::string first = _backend.last_request();
+    EXPECT_EQ(first.rfind("POST /v1beta/models/gemini-3.5-flash-lite:generateContent HTTP/1.1\r\n", 0), 0u) << first;
+    EXPECT_EQ(body_of(first), kGeminiBody);
+    const std::string second = _second.last_request();
+    EXPECT_EQ(second.rfind("POST /v1beta/models/gemini-4-argon:generateContent HTTP/1.1\r\n", 0), 0u) << second;
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].model, "auto");
+    EXPECT_TRUE(recs[0].r.model_substituted);
+    EXPECT_FALSE(recs[1].r.model_substituted);
+}
+
+// The model is in the head, so a body decided on its head streams under a rewritten path
+// with no park, and the confirm keeps it.
+TEST_P(ProxyGeminiPath, AHeadDecidedBodyStreamsUnderTheRewrittenPath)
+{
+    HeadPolicy pol;
+    pol.heads = {auto_route(0, "gemini-3.8-flash")};
+    start_gemini(pol);
+    const std::string part = R"({"contents":[{"role":"user","parts":[{"text":")" + std::string(64 * 1024, 'p');
+    const std::string rest = R"("}]}]})";
+    const std::string head = "POST /v1beta/models/auto:streamGenerateContent?alt=sse HTTP/1.1\r\nHost: x\r\n"
+                             "Content-Type: application/json\r\nx-goog-api-key: gk\r\nContent-Length: " +
+                             std::to_string(part.size() + rest.size()) + "\r\n\r\n";
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(head + part));
+    EXPECT_TRUE(wait_for([&] { return _backend.bytes_seen() > 16 * 1024; })) << "held to its last byte";
+    ASSERT_TRUE(c.send(rest));
+    ASSERT_EQ(c.recv_status(), 200);
+    c.close();
+    shutdown();
+    const std::string up = _backend.last_request();
+    EXPECT_EQ(up.rfind("POST /v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse HTTP/1.1\r\n", 0), 0u)
+        << up.substr(0, 200);
+    EXPECT_EQ(body_of(up), part + rest);
+    const auto d = pol.decides();
+    ASSERT_EQ(d.size(), 1u);
+    EXPECT_FALSE(d[0].whole);
+    EXPECT_EQ(d[0].model, "auto") << "known from the head";
+    EXPECT_TRUE(d[0].stream);
+    const auto w = pol.confirms();
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_TRUE(w[0].substituted);
+    EXPECT_EQ(_gw->stats().streamed_body_redone, 0u);
+    EXPECT_EQ(_gw->stats().streamed_body_parked, 0u);
+}
+
+// A model the policy names that cannot stand in a path is refused, never encoded or cut.
+TEST_P(ProxyGeminiPath, APolicyModelThatCannotStandInAPathIsRefused)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .model = "a/../b"}};
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/m:generateContent", kGeminiBody))), 500);
+    shutdown();
+    EXPECT_EQ(_backend.accepted(), 0);
+}
+
+// Every one of these reaches no venue, with or without a policy, and the target is not
+// logged. The key in a URL is refused whatever the dialect.
+TEST_P(ProxyGeminiPath, UnservableTargetsAreRefusedBeforeAnyVenue)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    start_gemini(pol);
+    struct Case
+    {
+        std::string req;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {gemini_post("/v1beta/models/m:generateContent?key=AIzaSECRET", kGeminiBody), llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:streamGenerateContent?alt=sse&key=AIza", kGeminiBody),
+         llmbridge::refuse::kKeyInUrl},
+        {"POST /v1/chat/completions?key=sk HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+         llmbridge::refuse::kKeyInUrl},
+        {gemini_post("/v1beta/models/m:streamGenerateContent", kGeminiBody), llmbridge::refuse::kGeminiNoSse},
+        {gemini_post("/v1beta/models/m:streamGenerateContent?alt=json", kGeminiBody),
+         llmbridge::refuse::kGeminiNoSse},
+        {gemini_post("/v1beta/interactions", kGeminiBody), llmbridge::refuse::kGeminiInteractions},
+        {gemini_post("/v1beta/models/m%2F..:generateContent", kGeminiBody), llmbridge::refuse::kPathModel},
+        {gemini_post("/v1beta/models/:generateContent", kGeminiBody), llmbridge::refuse::kPathModel},
+    };
+    for (const Case& k : cases)
+    {
+        const std::string r = exchange(k.req);
+        EXPECT_EQ(Client::status_of(r), 400) << k.req.substr(0, 80);
+        EXPECT_NE(r.find(k.detail), std::string::npos) << r;
+    }
+    shutdown();
+    EXPECT_EQ(_backend.accepted(), 0);
+    EXPECT_TRUE(pol.decides().empty()) << "refused before the policy";
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyGeminiPath,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
+
+// ── A Gemini venue's reply: what it states in its objects, not its headers ───
+//
+// Google writes `": "` with a space, puts its model, id and tier in the body, marks thinking
+// with `"thought": true`, and may end a 200 stream with an error event.
+namespace
+{
+    std::string gemini_sse_events()
+    {
+        return "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"\", \"thoughtSignature\": \"c2ln\"}],"
+               "\"role\": \"model\"}}],\"usageMetadata\": {\"promptTokenCount\": 9,\"trafficType\": \"ON_DEMAND\"},"
+               "\"modelVersion\": \"gemini-3.8-flash\",\"responseId\": \"r-77\"}\r\n\r\n"
+               "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"weighing it\", \"thought\": true}],"
+               "\"role\": \"model\"}}],\"modelVersion\": \"gemini-3.8-flash\",\"responseId\": \"r-77\"}\r\n\r\n"
+               "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hello\"}],\"role\": \"model\"}}],"
+               "\"modelVersion\": \"gemini-3.8-flash\",\"responseId\": \"r-77\"}\r\n\r\n"
+               "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \" there\"}],\"role\": \"model\"},"
+               "\"finishReason\": \"STOP\",\"groundingMetadata\": {\"webSearchQueries\": [\"a\", \"b\", \"c\"]}}],"
+               "\"usageMetadata\": {\"promptTokenCount\": 9,\"candidatesTokenCount\": 4,\"thoughtsTokenCount\": 6,"
+               "\"totalTokenCount\": 19,\"promptTokensDetails\": [{\"modality\": \"AUDIO\",\"tokenCount\": 5},"
+               "{\"modality\": \"TEXT\",\"tokenCount\": 4}],\"trafficType\": \"ON_DEMAND\"},"
+               "\"modelVersion\": \"gemini-3.8-flash\",\"responseId\": \"r-77\"}\r\n\r\n";
+    }
+    std::string gemini_sse_response(const std::string& events, size_t chunk)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n"
+               "Connection: keep-alive\r\n\r\n" + sse_chunk_encode(events, chunk);
+    }
+    const std::string kGeminiStream = "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse";
+} // namespace
+
+// Read in 7-byte reads, so every line is split: the facts and the stamps are the events'.
+TEST_P(ProxyGeminiPath, AStreamsFactsAndStampsComeFromItsEvents)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    _backend.set_response(gemini_sse_response(gemini_sse_events(), 7));
+    start_gemini(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
+    const std::string raw = c.recv_stream();
+    c.close();
+    shutdown();
+    EXPECT_NE(raw.find("Hello"), std::string::npos);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    const auto& r = recs[0];
+    EXPECT_TRUE(r.r.streamed);
+    EXPECT_FALSE(r.r.stream_error);
+    EXPECT_EQ(r.served_model, "gemini-3.8-flash");
+    EXPECT_EQ(r.venue_req_id, "r-77");
+    EXPECT_EQ(r.served_tier, "ON_DEMAND");
+    EXPECT_EQ(r.r.web_search_requests, 3);
+    EXPECT_FALSE(r.r.tool_prompt_input);
+    EXPECT_EQ(r.r.tokens_in, 9);
+    EXPECT_EQ(r.r.tokens_out, 10) << "candidates plus thoughts";
+    EXPECT_EQ(r.r.reasoning_tokens, 6);
+    EXPECT_EQ(r.r.audio_in_tokens, 5);
+    EXPECT_GT(r.r.ts_first_thinking, 0) << "a thought part";
+    EXPECT_GT(r.r.ts_first_token, 0);
+    EXPECT_GE(r.r.ts_first_token, r.r.ts_first_thinking);
+}
+
+// An empty text part that only carries a thoughtSignature is not a token.
+TEST_P(ProxyGeminiPath, ASignatureAloneIsNoToken)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    const std::string events =
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"\", \"thoughtSignature\": \"c2ln\"}]}}]}\n\n";
+    _backend.set_response(gemini_sse_response(events, 4096));
+    start_gemini(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.ts_first_token, 0);
+    EXPECT_EQ(recs[0].r.ts_first_thinking, 0);
+}
+
+// A stream that fails after its head says so in an event on HTTP 200: the record says the
+// venue served nothing, with Google's status name.
+TEST_P(ProxyGeminiPath, AnErrorEventAfterTheHeadMarksTheRecord)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    const std::string events =
+        "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hel\"}]}}]}\r\n\r\n"
+        "data: {\"error\": {\"code\": 503,\"message\": \"" + std::string(900, 'm') +
+        "\",\"status\": \"UNAVAILABLE\"}}\r\n\r\n";
+    _backend.set_response(gemini_sse_response(events, 64));
+    start_gemini(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
+    (void)c.recv_stream();
+    c.close();
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].r.status, 200);
+    EXPECT_TRUE(recs[0].r.stream_error);
+    EXPECT_EQ(recs[0].upstream_error, "UNAVAILABLE");
+}
+
+// google-genai for Python fails a stream on a comment line, so a Gemini client is never
+// asked for a note, and gets the venue's bytes as they were.
+TEST_P(ProxyGeminiPath, AGeminiStreamGetsNoNote)
+{
+    NoteSink sink("kottosai {\"cost\":1}");
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    _backend.set_response(gemini_sse_response(gemini_sse_events(), 4096));
+    start_gemini(pol);
+    Client c;
+    ASSERT_TRUE(c.connect(_proxy_port));
+    ASSERT_TRUE(c.send(gemini_post(kGeminiStream, kGeminiBody)));
+    const std::string raw = c.recv_stream();
+    c.close();
+    shutdown();
+    EXPECT_EQ(raw.find("kottosai"), std::string::npos) << raw;
+    EXPECT_EQ(sink.calls(), "r") << "reply_note was asked";
+}
+
+// A whole generateContent reply is read the same way, and URL context marks the tool
+// prompt as input. A 429's name is Google's `status`, past a long message.
+TEST_P(ProxyGeminiPath, AWholeReplysFactsAndAnErrorsStatus)
+{
+    RecordingSink sink;
+    _sink = &sink;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0},
+                 llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    _backend.set_response(http_ok(
+        R"({"candidates": [{"content": {"parts": [{"text": "ok"}]},"urlContextMetadata": {"urlMetadata": []}}],)"
+        R"("usageMetadata": {"promptTokenCount": 3,"candidatesTokenCount": 1,"toolUsePromptTokenCount": 40,)"
+        R"("totalTokenCount": 46},"modelVersion": "gemini-3.5-flash-lite","responseId": "w-1"})"));
+    const std::string err = R"({"error": {"code": 429,"message": ")" + std::string(700, 'q') +
+                            R"(","status": "RESOURCE_EXHAUSTED"}})";
+    _second.set_response("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: " +
+                         std::to_string(err.size()) + "\r\n\r\n" + err);
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/m:generateContent", kGeminiBody))), 200);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/m:generateContent", kGeminiBody))), 429);
+    shutdown();
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_EQ(recs[0].served_model, "gemini-3.5-flash-lite");
+    EXPECT_EQ(recs[0].venue_req_id, "w-1");
+    EXPECT_TRUE(recs[0].r.tool_prompt_input);
+    EXPECT_EQ(recs[0].r.tool_prompt_tokens, 40);
+    EXPECT_EQ(recs[0].r.reasoning_tokens, 2) << "the total's remainder";
+    EXPECT_EQ(recs[1].upstream_error, "RESOURCE_EXHAUSTED");
+}
+
+// python-genai sends x-goog-user-project with user credentials; a byte-forward keeps it.
+TEST_P(ProxyGeminiPath, TheUserProjectHeaderIsForwarded)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    start_gemini(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1beta/models/m:generateContent", kGeminiBody,
+                                                     "x-goog-user-project: proj-9\r\n"))),
+              200);
+    shutdown();
+    EXPECT_NE(_backend.last_request().find("\r\nx-goog-user-project: proj-9\r\n"), std::string::npos);
+}
+
+// ── Vertex: Gemini's body at Google Cloud's path, and a choice of credential ──
+
+class ProxyVertex : public ProxyGeminiPath
+{
+  protected:
+    /// Venue 0 the Gemini API, venue 1 Vertex, `bearer` taking an OAuth token.
+    void start_both(HeadPolicy& pol, bool bearer = false)
+    {
+        _policy = &pol;
+        _backend.start();
+        _second.start();
+        _upstreams = {{"127.0.0.1", _backend.port(), false, "", UpstreamDialect::Gemini, ""},
+                      {"127.0.0.1", _second.port(), false, "", UpstreamDialect::Vertex, ""}};
+        _upstreams[1].auth_bearer = bearer;
+        start(0, false, UpstreamDialect::OpenAI, GetParam());
+    }
+};
+
+TEST_P(ProxyVertex, EachVenueGetsItsOwnLayout)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "gemini-3.8-flash"},
+                 llmbridge::Decision{.allow = true, .upstream_index = 0},
+                 llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    start_both(pol);
+    // A Gemini API client to Vertex, then a Vertex client to the Gemini API, then a
+    // project-scoped path to Vertex, which goes as written.
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(kGeminiStream, kGeminiBody))), 200);
+    const std::string vertex_pub = "/v1/publishers/google/models/gemini-4-argon:generateContent";
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(vertex_pub, kGeminiBody))), 200);
+    const std::string scoped =
+        "/v1/projects/p-1/locations/us/publishers/google/models/gemini-4-argon:streamGenerateContent?alt=sse";
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(scoped, kGeminiBody))), 200);
+    shutdown();
+    EXPECT_EQ(_backend.last_request().rfind("POST /v1beta/models/gemini-4-argon:generateContent HTTP/1.1\r\n", 0), 0u)
+        << _backend.last_request();
+    EXPECT_EQ(_second.last_request().rfind("POST " + scoped + " HTTP/1.1\r\n", 0), 0u) << _second.last_request();
+    EXPECT_EQ(_second.requests_seen(), 2);
+}
+
+TEST_P(ProxyVertex, AGeminiClientsPathIsRewrittenForVertex)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "gemini-3.8-flash"}};
+    start_both(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(kGeminiStream, kGeminiBody))), 200);
+    shutdown();
+    EXPECT_EQ(_second.last_request().rfind(
+                  "POST /v1/publishers/google/models/gemini-3.8-flash:streamGenerateContent?alt=sse HTTP/1.1\r\n", 0),
+              0u)
+        << _second.last_request();
+}
+
+// An OpenAI client translated for Vertex goes to the publisher path with the API key.
+TEST_P(ProxyVertex, ATranslatedRequestTakesThePublisherPath)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1}};
+    _second.set_response(http_ok(gemini_resp_body("ok")));
+    start_both(pol);
+    EXPECT_EQ(Client::status_of(exchange(openai_request_hdrs("hi", "Authorization: Bearer AQ.key\r\n"))), 200);
+    shutdown();
+    const std::string up = _second.last_request();
+    EXPECT_EQ(up.rfind("POST /v1/publishers/google/models/gpt-4o:generateContent HTTP/1.1\r\n", 0), 0u) << up;
+    EXPECT_NE(up.find("\r\nx-goog-api-key: AQ.key\r\n"), std::string::npos) << up;
+    EXPECT_EQ(lower_case(up).find("authorization"), std::string::npos) << "two credentials: " << up;
+}
+
+// A named key goes as the venue takes it, and only that one: x-goog-api-key, or a Bearer
+// token at a venue set to take one. Google refuses a request carrying both.
+TEST_P(ProxyVertex, ANamedKeyGoesAsXGoogApiKey)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .credential_header = "x-kottos-key-google"}};
+    start_both(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(
+                  kGeminiStream, kGeminiBody, "Authorization: Bearer client\r\nx-kottos-key-google: AQ.named\r\n"))),
+              200);
+    shutdown();
+    const std::string up = lower_case(_second.last_request());
+    EXPECT_NE(up.find("\r\nx-goog-api-key: aq.named\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("x-goog-api-key: gk"), std::string::npos) << "the client's own key went: " << up;
+    EXPECT_EQ(up.find("authorization"), std::string::npos) << up;
+}
+
+TEST_P(ProxyVertex, ANamedKeyGoesAsBearerAtAVenueTakingOAuth)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .credential_header = "x-kottos-key-google"}};
+    start_both(pol, /*bearer=*/true);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(
+                  kGeminiStream, kGeminiBody, "Authorization: Bearer client\r\nx-kottos-key-google: ya29.tok\r\n"))),
+              200);
+    shutdown();
+    const std::string up = lower_case(_second.last_request());
+    EXPECT_NE(up.find("\r\nauthorization: bearer ya29.tok\r\n"), std::string::npos) << up;
+    EXPECT_EQ(up.find("x-goog-api-key"), std::string::npos) << "two credentials: " << up;
+    EXPECT_EQ(up.find("client"), std::string::npos) << up;
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyVertex,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));

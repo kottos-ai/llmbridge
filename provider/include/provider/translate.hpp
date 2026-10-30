@@ -96,6 +96,24 @@ namespace llmbridge::provider
     /// still yields one, typed `fallback_type`, so the upstream's status can be relayed.
     std::string upstream_error_to_openai(std::string_view body, std::string_view fallback_type);
 
+    /// What one Gemini reply object states beside its usage: a whole generateContent
+    /// body, or one streamed event. Views point into the input, still JSON-escaped.
+    struct GeminiFacts
+    {
+        bool token = false;    ///< a part with non-empty text not marked thought, or a functionCall
+        bool thinking = false; ///< a part marked `"thought": true`
+        /// An URL context or code execution part, whose tool-use prompt tokens bill as input.
+        bool tool_input = false;
+        bool error = false;    ///< `{"error":{...}}`, as a stream that fails after its head sends it
+        std::string_view error_status; ///< `error.status`: RESOURCE_EXHAUSTED, UNAVAILABLE, ...
+        std::string_view model_version; ///< the model served and billed
+        std::string_view response_id;
+        std::string_view tier;          ///< `serviceTier` (Gemini API) or `trafficType` (Vertex)
+        long long search_queries = -1;  ///< `groundingMetadata.webSearchQueries`, every candidate
+    };
+    /// False when `json` is not one JSON object; `f` is then left as it was.
+    bool gemini_facts(std::string_view json, GeminiFacts& f);
+
     std::string openai_to_gemini_request(std::string_view openai_body);
     std::string gemini_to_openai_response(std::string_view gemini_body);
     bool gemini_to_openai_response(std::string_view gemini_body, std::string& out,

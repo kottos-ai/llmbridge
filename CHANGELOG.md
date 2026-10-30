@@ -8,6 +8,68 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.106.0]. 2026-10-29
+
+Gemini clients routed by model, Vertex as a venue, and a Gemini reply read in its own
+words. A non-Gemini client sees no change but two: a `key` query parameter is refused, and
+a log line's request line stops at its query. DESIGN.md "Gemini clients and Vertex".
+
+### Added
+
+- **A Gemini client's model is its path's.** `/v1beta/models/{model}:generateContent`
+  and Vertex's `.../publishers/google/models/{model}:...` carry no `model` in the body, so
+  `RequestFacts::model` was empty and a policy could neither route nor price them. It is
+  now the path segment, and `RequestFacts::stream` is `:streamGenerateContent`, both known
+  on the head. `Decision::model`, a `Retry`'s and a substitution rewrite that segment,
+  never the body, so a body decided on its head still streams with no park.
+- **`vertex`**, `Venue::Vertex`: Gemini's body at Google Cloud's publisher path,
+  `/v1/publishers/google/models/{model}:generateContent`, which an API key reaches with
+  no project. A Gemini API path sent to it is rewritten into that layout, a Vertex
+  publisher path sent to a `gemini` venue into `/v1beta/models/`, and a project-scoped
+  Vertex path goes as written.
+- **`Upstream::auth_bearer`**: a Google venue that takes an OAuth token. A named key goes
+  as `Authorization: Bearer` there, and as `x-goog-api-key` everywhere else; a
+  translated request sends exactly one, since Google refuses two.
+- **What a Gemini reply states in its body**, read by `provider::gemini_facts` from a
+  whole reply and from each `data:` line of a stream, a line split across reads joined
+  first: `modelVersion` as `served_model`, `responseId` as `venue_req_id`, `serviceTier`
+  or Vertex's `trafficType` as `served_tier` (now held to 32 bytes, for
+  `PROVISIONED_THROUGHPUT`), and `groundingMetadata.webSearchQueries` as
+  `web_search_requests`. `RequestRecord::tool_prompt_input` says URL context or code
+  execution ran, so `tool_prompt_tokens` bill as input.
+- **`RequestRecord::stream_error`**: a 200 stream that then sent `data: {"error":...}`,
+  as Google does when a stream fails after its head; `upstream_error` names its `status`.
+- **Gemini usage**: `AUDIO` entries of `promptTokensDetails` and
+  `candidatesTokensDetails` as audio in and out, and a `thoughtsTokenCount` left out (3.1
+  Pro at thinking level LOW) taken from what `totalTokenCount` holds beyond the rest.
+
+### Changed
+
+- **Gemini stream stamps.** The first token is a part with non-empty `text` not marked
+  `"thought": true`, or a `functionCall`; an empty part carrying only a
+  `thoughtSignature` is not. Thinking is a part marked `"thought": true`. Before, a
+  Gemini stream never stamped either: `"content": {` is no content string.
+- **`scan_error_type`** reads Google's `error.status` when the first 512 bytes name no
+  `code` or `type`, within 8 KiB, past a long `message`. Google's numeric `code` is
+  still not a name.
+- **No reply note to a Gemini client.** google-genai for Python parses every line that
+  is not `data: ` as JSON and fails the stream on a comment line, so the sink is not
+  asked.
+
+### Security
+
+- **Refused before any venue hears of it**, on both backends, with a fixed message and
+  the target never logged: a `key` query parameter (`?key=`), whatever the dialect; the
+  Gemini Interactions API (`/v1beta/interactions`); a `:streamGenerateContent` without
+  `alt=sse`, whose single JSON array would be held to its end; and a path model outside
+  `[A-Za-z0-9._-]`, 1 to 255 bytes (`provider::path_model_ok`). A policy's model that
+  cannot stand in the path is a 500. A log line's request line now stops at its query.
+
+### Tests
+
+- `ProxyGeminiPath.*` and `ProxyVertex.*` on both backends; `GeminiFacts`,
+  `GeminiUsage`, `ScanErrorType`, `GeminiPathModel` in the translator tests.
+
 ## [0.105.0]. 2026-10-26
 
 A sink can tell the client something the record knows only at the end of a stream, such

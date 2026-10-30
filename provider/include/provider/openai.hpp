@@ -140,7 +140,8 @@ namespace llmbridge::provider::openai
     std::string_view scan_string(std::string_view bytes, std::string_view quoted,
                                  bool last) noexcept;
 
-    /// The `code`, else the `type`, an error object names within the first 512 bytes.
+    /// The `code`, else the `type`, an error object names within the first 512 bytes;
+    /// else Google's `status` (RESOURCE_EXHAUSTED) within the first 8 KiB.
     std::string_view scan_error_type(std::string_view body) noexcept;
 
     /// The members of one `usage` object (its value, braces included), any venue's

@@ -23,7 +23,7 @@ namespace llmbridge
     {
         std::string_view head;  ///< request line + headers, through the CRLFCRLF
         size_t body_bytes = 0;  ///< Content-Length as framed. Bytes, not tokens
-        std::string_view model; ///< top-level plain-string `model`, else empty
+        std::string_view model; ///< top-level plain-string `model`, else empty; Gemini's path model
         uint64_t prefix_hash = 0;
         uint64_t seq = 0; ///< the gateway's request sequencer
         /// Top-level `"stream": true` and `stream_options.include_usage`; anything else is false.
@@ -31,8 +31,8 @@ namespace llmbridge
         bool include_usage = false;
         /// False when decide() runs on the head of a body still arriving (decides_on_head):
         /// `model` is a top-level `model` that has closed in the bytes so far, else empty;
-        /// `stream` and `include_usage` are false; `prefix_hash` is over the same bytes as
-        /// a held body's, the gateway waiting for them. confirm() gets the whole body's.
+        /// `stream` and `include_usage` are false (a Gemini client's: its path's); `prefix_hash`
+        /// is over a held body's bytes, the gateway waiting for them. confirm() gets the whole's.
         bool body_whole = true;
         /// At confirm() only: the body is streaming to the venue with its top-level `model`,
         /// the plain string Decision::substitute_for (`model` above), already replaced by
@@ -145,9 +145,9 @@ namespace llmbridge
         /// first one, but past the end with credential_header set is a 500. Ignored unless `allow`.
         int upstream_index = -1;
 
-        /// Rewrite the request's `model` before sending; empty leaves the client's. Valid
-        /// until decide() returns; the gateway copies it, and a longer one than 255 bytes
-        /// gets the request a 500 instead of a cut name.
+        /// Rewrite the request's `model` before sending (in a Gemini path: path_model_ok); empty
+        /// leaves the client's. Valid until decide() returns; the gateway copies it, and a longer
+        /// one than 255 bytes, or one a path cannot hold, gets the request a 500.
         std::string_view model{};
 
         /// Set the request's `service_tier`, at most 32 bytes; empty leaves the body alone.

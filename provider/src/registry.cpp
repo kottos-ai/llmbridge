@@ -99,6 +99,15 @@ namespace llmbridge::provider
             path += ":generateContent";
             return true;
         }
+        // Vertex's global publisher path, which an API key reaches with no project.
+        bool vertex_target(std::string_view model, std::string& path)
+        {
+            if (model.substr(0, 7) == "models/") model.remove_prefix(7);
+            path += "/v1/publishers/google/models/";
+            if (!append_segment(path, model)) return false;
+            path += ":generateContent";
+            return true;
+        }
         bool bedrock_target(std::string_view model, std::string& path)
         {
             path += "/model/";
@@ -127,7 +136,7 @@ namespace llmbridge::provider
             return cohere_to_openai_response(body, out, u);
         }
 
-        constexpr std::string_view kNames[] = {"openai", "anthropic", "gemini", "cohere", "bedrock", "azure"};
+        constexpr std::string_view kNames[] = {"openai", "anthropic", "gemini", "cohere", "bedrock", "azure", "vertex"};
 
         // Indexed by Venue. Bedrock answers with Anthropic's envelope, so it shares the
         // response leg; it cannot stream, since its stream is AWS event-stream framing.
@@ -143,7 +152,10 @@ namespace llmbridge::provider
              anthropic_response, bedrock_target, kAnthropicFinish, F::Stop},
             {kNames[5], Wire::OpenAI, Auth::ApiKey, true, false, detail::azure_request,
              azure_response, azure_target, {}, F::Stop},
+            {kNames[6], Wire::Gemini, Auth::GoogApiKey, false, true, detail::gemini_request,
+             gemini_response, vertex_target, kGeminiFinish, F::Stop},
         };
+        static_assert(std::size(kSpecs) == std::size(kNames));
     } // namespace
 
     // Azure serves the OpenAI dialect: the body goes as the client wrote it, so an option
@@ -167,6 +179,24 @@ namespace llmbridge::provider
     }
 
     const VenueSpec& spec(Venue v) noexcept { return kSpecs[static_cast<size_t>(v)]; }
+
+    bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue, std::string& into)
+    {
+        const PathModel pm = gemini_path_model(target);
+        if (pm.at == std::string_view::npos)
+        {
+            if (!model.empty()) return false;
+            into.append(target);
+            return true;
+        }
+        constexpr std::string_view kPublisher = "/publishers/google/models/";
+        std::string_view head = target.substr(0, pm.at);
+        const bool publisher = head.ends_with(kPublisher);
+        if (venue == Venue::Vertex && !publisher) head = "/v1/publishers/google/models/";
+        else if (venue == Venue::Gemini && publisher) head = "/v1beta/models/";
+        into.append(head).append(model.empty() ? pm.model : model).append(target.substr(pm.at + pm.model.size()));
+        return true;
+    }
 
     std::optional<Venue> venue_named(std::string_view name) noexcept
     {

@@ -103,6 +103,49 @@ namespace llmbridge::provider
         return true;
     }
 
+    bool gemini_facts(std::string_view body, GeminiFacts& f)
+    {
+        bool ok = false;
+        const json::Value v = json::parse(body, ok, json::Keys::Any);
+        if (!ok || !v.is_object()) return false;
+        if (const json::Value* e = v.find("error"); e && e->is_object())
+        {
+            f.error = true;
+            f.error_status = e->str_or("status");
+            return true;
+        }
+        if (const std::string_view m = v.str_or("modelVersion"); !m.empty()) f.model_version = m;
+        if (const std::string_view id = v.str_or("responseId"); !id.empty()) f.response_id = id;
+        // The tier sits at the top level or in usageMetadata, by venue.
+        for (const json::Value* o : {&v, v.find("usageMetadata")})
+            if (o)
+                for (const std::string_view k : {"serviceTier", "trafficType"})
+                    if (const std::string_view t = o->str_or(k); !t.empty()) f.tier = t;
+        const json::Value* cands = v.find("candidates");
+        if (!cands || !cands->is_array()) return true;
+        long long queries = -1;
+        for (const json::Value& c : cands->arr)
+        {
+            if (c.find("urlContextMetadata")) f.tool_input = true;
+            if (const json::Value* g = c.find("groundingMetadata"))
+                if (const json::Value* q = g->find("webSearchQueries"); q && q->is_array())
+                    queries = (queries > 0 ? queries : 0) + static_cast<long long>(q->arr.size());
+            const json::Value* content = c.find("content");
+            const json::Value* parts = content ? content->find("parts") : nullptr;
+            if (!parts || !parts->is_array()) continue;
+            for (const json::Value& part : parts->arr)
+            {
+                const json::Value* thought = part.find("thought");
+                const bool is_thought = thought && thought->type == json::Value::Type::Bool && thought->boolean;
+                if (is_thought) f.thinking = true;
+                else if (!part.str_or("text").empty() || part.find("functionCall")) f.token = true;
+                if (part.find("executableCode") || part.find("codeExecutionResult")) f.tool_input = true;
+            }
+        }
+        if (queries >= 0) f.search_queries = queries;
+        return true;
+    }
+
     std::string openai_to_gemini_request(std::string_view openai_body)
     {
         bool ok = false;
@@ -140,10 +183,10 @@ namespace llmbridge::provider
         if (const json::Value* m = v.find("usageMetadata"))
         {
             const auto n = [m](std::string_view k) { return json_scan::count(m->num_or(k)); };
+            total = n("totalTokenCount");
             usage = detail::gemini_usage(n("promptTokenCount"), n("candidatesTokenCount"),
                                          n("thoughtsTokenCount"), n("cachedContentTokenCount"),
-                                         n("toolUsePromptTokenCount"));
-            total = n("totalTokenCount");
+                                         n("toolUsePromptTokenCount"), total);
         }
         detail::as_written(usage);
         if (total <= 0) total = usage.in + usage.out;

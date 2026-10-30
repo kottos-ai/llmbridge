@@ -28,7 +28,7 @@ namespace llmbridge::detail
         if (!_stream_body || (_policy && !_decides_on_head) || m.body_len < _stream_body_min || m.encoded ||
             c->rbuf.size() >= m.total_len)
             return false;
-        if (!net::http::request_line_ok(c->rbuf)) return false; // the framing path refuses it
+        if (!net::http::request_line_ok(c->rbuf) || target_refusal(c->rbuf)) return false; // the framing path refuses it
         const Dialect client = client_dialect_of(std::string_view(c->rbuf.data(), m.header_len));
         if (client == Dialect::OpenAI && !_stream_openai_body) return false;
         // A byte-forward only: a translation reads the whole body. A policy picks the venue
@@ -64,7 +64,7 @@ namespace llmbridge::detail
         f.body_in_rbuf = true;
         const bool json = json_media_type(f.head.content_type.in(c->rbuf));
         const bool openai = client_dialect_of(c->rbuf) == Dialect::OpenAI;
-        f.subst_tracked = json && forward && !f.subst_model.empty();
+        f.subst_tracked = json && forward && !f.subst_model.empty() && !f.model_in_path;
         f.members_tracked = json && forward ? f.member_overrides() : 0;
         f.body_scanned = json && (openai || f.subst_tracked || f.members_tracked);
         if (f.body_scanned)
@@ -189,6 +189,8 @@ namespace llmbridge::detail
         }
         Splice splice_of(const ReqState& f) noexcept
         {
+            // A path names the model (model_in_path): only members go into the body.
+            if (f.model_in_path) return {{}, members_of(f)};
             return {{f.subst_for.view(), f.subst_model.view()}, members_of(f)};
         }
     } // namespace
@@ -211,7 +213,7 @@ namespace llmbridge::detail
     bool Engine::overrides_stream(const ClientConn* c, bool at_head) const noexcept
     {
         const ReqState& f = c->req.f;
-        if (!f.model_override.empty()) return false;
+        if (!f.model_override.empty() && !f.model_in_path) return false;
         const uint8_t m = f.member_overrides();
         if (!m) return true;
         if (!members_of(f).plain()) return false;
@@ -238,11 +240,12 @@ namespace llmbridge::detail
         const std::string_view beta = beta_for(up, f);
         if (!f.splice)
             return build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr, up.base_path,
-                                 body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key, beta);
+                                 body_so_far(c).substr(0, f.body_sent), into, c->msg.body_len, key, beta,
+                                 f.path_model(), up.dialect);
         // The length is ours: the client's, and what the replacement and members add (12d, 12e).
         if (const char* bad = build_forward(head, c->msg.header_len, f.head, _strip_headers, up.host_hdr,
                                             up.base_path, {}, into, c->msg.body_len + splice_of(f).grow(), key,
-                                            beta))
+                                            beta, f.path_model(), up.dialect))
             return bad;
         append_spliced(c, into, 0, f.body_sent);
         return nullptr;
