@@ -2639,3 +2639,48 @@ TEST(GeminiPathModel, TheSegmentAfterTheLastModels)
     EXPECT_FALSE(p::path_model_ok(""));
     EXPECT_FALSE(p::path_model_ok(std::string(256, 'a')));
 }
+
+// A project goes into a request line: an id or a number, and nothing that could leave its
+// segment, end the line or need encoding.
+TEST(VertexProject, AnIdOrANumberAndNothingElse)
+{
+    namespace p = llmbridge::provider;
+    for (const char* ok : {"668021740376", "kottos-ai-1", "abcdef", "a23456789012345678901234567890"})
+        EXPECT_TRUE(p::vertex_project_ok(ok)) << ok;
+    for (const char* bad : {"", "abcde", "a234567890123456789012345678901", "Kottos-ai", "-kottos", "kottos-",
+                            "1234ab", "kottos/ai", "kottos%2Fai", "kottos ai", "kottos\r\nx: 1", "kottos.ai",
+                            "kottos_ai", "../../v1"})
+        EXPECT_FALSE(p::vertex_project_ok(bad)) << bad;
+}
+
+TEST(VertexProject, APathNamingNoProjectGoesToTheGlobalEndpoint)
+{
+    namespace p = llmbridge::provider;
+    using llmbridge::provider::Venue;
+    const auto fwd = [](std::string_view target, std::string_view model, Venue v, std::string_view project) {
+        std::string out;
+        return p::gemini_forward_target(target, model, v, project, out) ? out : std::string("(false)");
+    };
+    EXPECT_EQ(fwd("/v1beta/models/m:streamGenerateContent?alt=sse", "", Venue::Vertex, "kottos-1"),
+              "/v1/projects/kottos-1/locations/global/publishers/google/models/m:streamGenerateContent?alt=sse");
+    EXPECT_EQ(fwd("/v1beta1/publishers/google/models/m:generateContent", "gemini-4-argon", Venue::Vertex, "668021740376"),
+              "/v1beta1/projects/668021740376/locations/global/publishers/google/models/gemini-4-argon:generateContent")
+        << "a publisher path keeps its version";
+    const std::string scoped = "/v1/projects/theirs-1/locations/us-east5/publishers/google/models/m:generateContent";
+    EXPECT_EQ(fwd(scoped, "", Venue::Vertex, "kottos-1"), scoped) << "the client's project and location stand";
+    EXPECT_EQ(fwd("/v1/publishers/google/models/m:generateContent", "", Venue::Gemini, "kottos-1"),
+              "/v1beta/models/m:generateContent") << "the Gemini API takes no project";
+    EXPECT_EQ(fwd("/v1beta/models/m:generateContent", "", Venue::Vertex, ""),
+              "/v1/publishers/google/models/m:generateContent") << "none: the project-less path, as before";
+    EXPECT_EQ(fwd("/v1beta/models/m:generateContent", "", Venue::Vertex, "kottos/../x"), "(false)");
+    std::string untouched;
+    EXPECT_FALSE(p::gemini_forward_target("/v1beta/models/m:generateContent", "", Venue::Vertex, "a\r\nb: c", untouched));
+    EXPECT_TRUE(untouched.empty()) << "nothing written before the refusal: " << untouched;
+
+    std::string t;
+    ASSERT_TRUE(p::vertex_project_target("668021740376", "models/gemini-4-argon", t));
+    EXPECT_EQ(t, "/v1/projects/668021740376/locations/global/publishers/google/models/gemini-4-argon:generateContent");
+    t.clear();
+    EXPECT_FALSE(p::vertex_project_target("bad/project", "m", t));
+    EXPECT_FALSE(p::vertex_project_target("kottos-1", "", t));
+}

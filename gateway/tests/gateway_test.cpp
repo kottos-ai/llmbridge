@@ -17891,6 +17891,105 @@ TEST_P(ProxyVertex, ANamedKeyGoesAsBearerAtAVenueTakingOAuth)
     EXPECT_EQ(up.find("client"), std::string::npos) << up;
 }
 
+// The project-less publisher path is one Google places in a region it picks. A policy's
+// project sends the request to the global endpoint instead, byte-forwarded or translated;
+// a client's own project stands, and the Gemini API never sees one.
+TEST_P(ProxyVertex, APolicyProjectSendsVertexToItsGlobalEndpoint)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {
+        llmbridge::Decision{.allow = true, .upstream_index = 1, .model = "gemini-4-argon", .vertex_project = "kottos-1"},
+        llmbridge::Decision{.allow = true, .upstream_index = 1, .vertex_project = "668021740376"},
+        llmbridge::Decision{.allow = true, .upstream_index = 1, .vertex_project = "kottos-1"},
+        llmbridge::Decision{.allow = true, .upstream_index = 0, .vertex_project = "kottos-1"}};
+    start_both(pol);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(kGeminiStream, kGeminiBody))), 200);
+    const std::string first = _second.last_request();
+    _second.set_response(http_ok(gemini_resp_body("ok")));
+    EXPECT_EQ(Client::status_of(exchange(openai_request_hdrs("hi", "Authorization: Bearer AQ.key\r\n"))), 200);
+    const std::string translated = _second.last_request();
+    const std::string scoped =
+        "/v1/projects/theirs-1/locations/us-east5/publishers/google/models/m:streamGenerateContent?alt=sse";
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(scoped, kGeminiBody))), 200);
+    const std::string theirs = _second.last_request();
+    EXPECT_EQ(Client::status_of(exchange(gemini_post("/v1/publishers/google/models/m:generateContent", kGeminiBody))),
+              200);
+    shutdown();
+    EXPECT_EQ(first.rfind("POST /v1/projects/kottos-1/locations/global/publishers/google/models/gemini-4-argon:"
+                          "streamGenerateContent?alt=sse HTTP/1.1\r\n", 0),
+              0u)
+        << first;
+    EXPECT_EQ(translated.rfind("POST /v1/projects/668021740376/locations/global/publishers/google/models/gpt-4o:"
+                               "generateContent HTTP/1.1\r\n", 0),
+              0u)
+        << translated;
+    EXPECT_EQ(theirs.rfind("POST " + scoped + " HTTP/1.1\r\n", 0), 0u) << theirs;
+    EXPECT_EQ(_backend.last_request().rfind("POST /v1beta/models/m:generateContent HTTP/1.1\r\n", 0), 0u)
+        << _backend.last_request();
+}
+
+// A project lands in the request line, so one that could leave its segment or end the line
+// is the policy's 500, and no venue hears of the request.
+TEST_P(ProxyVertex, AnUnusableProjectReachesNoVenue)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .vertex_project = "kottos-1/../../x"},
+                 llmbridge::Decision{.allow = true, .upstream_index = 1, .vertex_project = "kottos\r\nx-evil: 1"},
+                 llmbridge::Decision{.allow = true, .upstream_index = 0, .vertex_project = "abc"}};
+    start_both(pol);
+    const std::string a = exchange(gemini_post(kGeminiStream, kGeminiBody));
+    const std::string b = exchange(gemini_post(kGeminiStream, kGeminiBody));
+    const std::string c = exchange(gemini_post(kGeminiStream, kGeminiBody));
+    shutdown();
+    for (const std::string* r : {&a, &b, &c}) EXPECT_EQ(Client::status_of(*r), 500) << *r;
+    EXPECT_EQ(_second.requests_seen(), 0);
+    EXPECT_EQ(_backend.requests_seen(), 0) << "refused even for a venue that would not use it";
+    EXPECT_EQ(_second.bytes_seen(), 0u);
+}
+
+// An OAuth venue served only under a project takes the policy's: a Gemini API path and a
+// translated request reach it, where without one they are refused.
+TEST_P(ProxyVertex, AnOAuthVertexVenueTakesThePolicysProject)
+{
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 1, .vertex_project = "kottos-1"}};
+    start_both(pol, /*bearer=*/true);
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(kGeminiStream, kGeminiBody, "Authorization: Bearer ya29.t\r\n"))),
+              200);
+    const std::string up = _second.last_request();
+    _second.set_response(http_ok(gemini_resp_body("ok")));
+    EXPECT_EQ(Client::status_of(exchange(openai_request_hdrs("hi", "Authorization: Bearer ya29.t\r\n"))), 200);
+    shutdown();
+    EXPECT_EQ(up.rfind("POST /v1/projects/kottos-1/locations/global/publishers/google/models/", 0), 0u) << up;
+    EXPECT_EQ(_second.last_request().rfind("POST /v1/projects/kottos-1/locations/global/", 0), 0u)
+        << _second.last_request();
+    EXPECT_EQ(_second.requests_seen(), 2);
+}
+
+// The project is the request's: a failover from the Gemini API to Vertex goes under it.
+TEST_P(ProxyVertex, AFailoverToVertexKeepsTheProject)
+{
+    const DeadPort dead;
+    HeadPolicy pol;
+    pol.opt_in = false;
+    pol.heads = {llmbridge::Decision{.allow = true, .upstream_index = 0, .vertex_project = "kottos-1"}};
+    pol.retry = {.retry = true, .upstream_index = 1};
+    _policy = &pol;
+    _second.start();
+    _upstreams = {{"127.0.0.1", dead.port(), false, "", UpstreamDialect::Gemini, ""},
+                  {"127.0.0.1", _second.port(), false, "", UpstreamDialect::Vertex, ""}};
+    start(0, false, UpstreamDialect::OpenAI, GetParam());
+    EXPECT_EQ(Client::status_of(exchange(gemini_post(kGeminiStream, kGeminiBody))), 200);
+    shutdown();
+    EXPECT_EQ(_gw->stats().upstream_failovers, 1u);
+    EXPECT_EQ(_second.last_request().rfind("POST /v1/projects/kottos-1/locations/global/publishers/google/models/", 0),
+              0u)
+        << _second.last_request();
+}
+
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyVertex,
                          ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring));
 

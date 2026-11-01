@@ -145,13 +145,15 @@ namespace llmbridge::detail
     /// with `into` empty. A named `key` replaces every credential header the client sent.
     /// A `beta` token goes as one anthropic-beta line, after the client's own value. A
     /// `path_model` (path_model_ok) replaces the model a Gemini target names, and a
-    /// Gemini or Vertex `venue` gets its own path layout (provider::gemini_forward_target).
+    /// Gemini or Vertex `venue` gets its own path layout (provider::gemini_forward_target),
+    /// a Vertex one under `vertex_project` when the target names no project.
     const char* build_forward(std::string_view msg, size_t header_len, const HeadFacts& f,
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
                               std::string& into, size_t declared, const NamedKey& key = {},
                               std::string_view beta = {}, std::string_view path_model = {},
-                              UpstreamDialect venue = UpstreamDialect::OpenAI);
+                              UpstreamDialect venue = UpstreamDialect::OpenAI,
+                              std::string_view vertex_project = {});
     /// A conditional model substitution spliced into a body forwarded as it arrives
     /// (GATEWAY-INTERNALS.md 12d). The head declares the client's length plus grow(): a
     /// value that is the sentinel goes as the replacement, then shrink() spaces; any other
@@ -232,14 +234,15 @@ namespace llmbridge::detail
     /// keep their capacity. `head` is the client's, `f` its facts. On false, `why` is
     /// "translate", "credential", "bedrock credential" or "no credential". A named `key`
     /// is the only credential sent. A `beta` token is the only anthropic-beta line, sent
-    /// to a venue taking an x-api-key: the client's own does not cross a translation.
+    /// to a venue taking an x-api-key: the client's own does not cross a translation. A
+    /// Vertex `mode` with a `vertex_project` goes to the global endpoint under it.
     bool build_translated_request(const Upstream& up, UpstreamDialect mode,
                                   std::string_view body, std::string_view head,
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override = {},
                                   bool* wants_stream_usage = nullptr, const NamedKey& key = {},
-                                  std::string_view beta = {});
+                                  std::string_view beta = {}, std::string_view vertex_project = {});
     /// The credential lines a translated request carries, from one header block, the key
     /// in family header `key_header` when one is named. A test seam over the facts the
     /// framing walk reads.

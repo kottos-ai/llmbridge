@@ -23,6 +23,7 @@
 #include "gateway/venue.hpp"
 #include "net/http.hpp"
 #include "provider/body_scan.hpp"
+#include "provider/dialect.hpp"
 #include "provider/openai.hpp"
 
 namespace llmbridge
@@ -182,6 +183,7 @@ namespace llmbridge
         FixedStr<32> geo_override;
         FixedStr<kMaxBetaToken> beta_override; ///< added to anthropic-beta at an x-api-key venue
         FixedStr<kMaxKeyHeaderName> key_header; ///< the family header holding this attempt's key
+        FixedStr<provider::kMaxGoogleProject> vertex_project; ///< the decision's, for every attempt
         FixedStr<64> model;          ///< the client's, for the policy and the sink
         FixedStr<16> asked_tier;     ///< the client's own service_tier
         FixedStr<8> asked_cache_ttl; ///< the client's prompt_cache_options.ttl

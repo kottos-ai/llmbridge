@@ -610,7 +610,8 @@ namespace llmbridge::detail
                               const std::vector<std::string>& strip, std::string_view host_hdr,
                               std::string_view base_path, std::string_view body,
                               std::string& into, size_t declared, const NamedKey& key,
-                              std::string_view beta, std::string_view path_model, UpstreamDialect venue)
+                              std::string_view beta, std::string_view path_model, UpstreamDialect venue,
+                              std::string_view vertex_project)
     {
         using net::http::Field;
         into.clear();
@@ -644,13 +645,19 @@ namespace llmbridge::detail
         const std::string_view version = rl.substr(sp2 + 1);
 
         const size_t need = header_len + host_hdr.size() + base_path.size() + body.size() +
-                            key.line.size() + key.value.size() + beta.size() + path_model.size() + 80;
+                            key.line.size() + key.value.size() + beta.size() + path_model.size() +
+                            vertex_project.size() + 120;
         if (into.capacity() < need) into.reserve(need + need / 8);
         if (!path_model.empty() && !provider::path_model_ok(path_model)) return "model override unusable in a path";
+        if (!vertex_project.empty() && !provider::vertex_project_ok(vertex_project))
+            return "vertex project unusable in a path";
         into.append(rl.substr(0, sp1 + 1)).append(base_path);
-        // A Gemini venue takes the model, and its host's layout, in the path.
+        // A Gemini venue takes the model, and its host's layout, in the path; Vertex the
+        // project too, when the client named none.
         if (provider::spec(venue).wire != provider::Wire::Gemini) into.append(target);
-        else if (!provider::gemini_forward_target(target, path_model, venue, into))
+        else if (!provider::gemini_forward_target(target, path_model, venue,
+                                                  venue == UpstreamDialect::Vertex ? vertex_project : std::string_view{},
+                                                  into))
         {
             into.clear();
             return "model override for a target that names no model";
@@ -748,7 +755,7 @@ namespace llmbridge::detail
                                   const HeadFacts& f, std::string& out,
                                   std::string& body_scratch, const char*& why,
                                   std::string_view model_override, bool* wants_stream_usage,
-                                  const NamedKey& key, std::string_view beta)
+                                  const NamedKey& key, std::string_view beta, std::string_view vertex_project)
     {
         why = "translate";
         out.clear();
@@ -766,12 +773,15 @@ namespace llmbridge::detail
         const std::string_view tbody = body_scratch;
 
         const size_t need = tbody.size() + up.base_path.size() + up.query.size() + up.host_hdr.size() +
-                            key.value.size() + beta.size() + 640;
+                            key.value.size() + beta.size() + vertex_project.size() + 640;
         if (out.capacity() < need) out.reserve(need + need / 8);
         // The venue's path from the model it is asked for; its query, not the client's:
-        // Azure's api-version rides there.
+        // Azure's api-version rides there. Vertex under a project goes to its global endpoint.
         out.append("POST ").append(up.base_path);
-        if (!s.target(model_override.empty() ? v.str_or("model") : model_override, out))
+        const std::string_view model = model_override.empty() ? v.str_or("model") : model_override;
+        if (mode == UpstreamDialect::Vertex && !vertex_project.empty()
+                ? !provider::vertex_project_target(vertex_project, model, out)
+                : !s.target(model, out))
         { out.clear(); return false; }
         if (!up.query.empty()) out.append("?").append(up.query);
         out.append(" HTTP/1.1\r\nHost: ").append(up.host_hdr).append("\r\n");

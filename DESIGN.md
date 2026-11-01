@@ -447,7 +447,17 @@ is rewritten into `/v1/publishers/google/models/`, a Vertex publisher path sent 
 its project the client's. The credential is a per-venue choice, not the dialect's:
 `x-goog-api-key` by default, `Authorization: Bearer` with `auth_bearer`, and never both.
 An OAuth token is served only under a project, so an `auth_bearer` Vertex venue takes a
-project-scoped path from the client and refuses the rest, a translated request included.
+project-scoped path from the client and refuses the rest, a translated request included,
+unless the policy names a project.
+
+The project-less publisher path is not Vertex's global endpoint: Google places it in a
+region of its choosing (`us-central1` and `us-south1` were both seen on 2026-11-01), bills
+it as a regional request, and answers 404 for a model served only globally. Only
+`/v1/projects/{p}/locations/global/...` reaches the global endpoint, so
+`Decision::vertex_project` names the project a Vertex request goes under when its client
+named none, byte-forwarded or translated, for every attempt of the request. It lands in
+the request line, so it must be a project id or number (`provider::vertex_project_ok`)
+or the request is the policy's 500, before any venue.
 
 Refused before any venue: a `key` or `access_token` query parameter, its name decoded and
 in any case, which would ride every log that keeps a URL and go beside a named key; `:streamGenerateContent` without `alt=sse`, which streams one JSON array; and the

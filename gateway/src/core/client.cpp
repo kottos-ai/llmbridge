@@ -213,6 +213,10 @@ namespace llmbridge::detail
         if (!d.credential_header.empty() && !key_header_ok(d.credential_header))
             return error_respond(c, 400, kWhyKeyUnusable, refuse::kKeyHeaderUnusable), false;
         f.key_header.set(d.credential_header);
+        // Lands in a request line: a project or nothing, refused before any venue hears of it.
+        if (!d.vertex_project.empty() && !provider::vertex_project_ok(d.vertex_project))
+            return error_respond(c, 500, "policy vertex_project unusable"), false;
+        f.vertex_project.set(d.vertex_project);
         f.policy_tag = d.tag;
         return apply_hedge(c, d);
     }
@@ -284,6 +288,7 @@ namespace llmbridge::detail
         d.hold = c->req.f.held;
         d.substitute_model = c->req.f.subst_model.view();
         d.substitute_for = c->req.f.subst_for.view();
+        d.vertex_project = c->req.f.vertex_project.view();
         return d;
     }
 
@@ -334,7 +339,8 @@ namespace llmbridge::detail
             member(d.service_tier, BodyScan::kServiceTier) == member(f.tier_override.view(), BodyScan::kServiceTier) &&
             member(d.speed, BodyScan::kSpeed) == member(f.speed_override.view(), BodyScan::kSpeed) &&
             member(d.inference_geo, BodyScan::kInferenceGeo) == member(f.geo_override.view(), BodyScan::kInferenceGeo) &&
-            d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view();
+            d.anthropic_beta == f.beta_override.view() && d.credential_header == f.key_header.view() &&
+            d.vertex_project == f.vertex_project.view();
         f.policy_tag = d.tag; // a tag alone changing is still a keep
         if (same)
         {
@@ -443,9 +449,9 @@ namespace llmbridge::detail
             if (c->req.f.body_streaming)
                 c->req.f.model_substituted = c->req.f.model_override.empty() && !c->req.f.path_model().empty();
         }
-        // An OAuth token reaches Vertex only under a project; the publisher path the gateway
-        // writes is express mode's, which takes an API key alone.
-        if (up.dialect == UpstreamDialect::Vertex && up.auth_bearer &&
+        // An OAuth token reaches Vertex only under a project, the client's or the policy's;
+        // the project-less publisher path is express mode's, which takes an API key alone.
+        if (up.dialect == UpstreamDialect::Vertex && up.auth_bearer && c->req.f.vertex_project.empty() &&
             (c->req.f.translate_body || !provider::gemini_vertex_scoped(target_of(c->rbuf))))
             return error_respond(c, 400, "vertex oauth without a project", refuse::kVertexProject);
         // Built before an upstream is acquired, so a bad body cannot leak a pooled one.
@@ -457,7 +463,8 @@ namespace llmbridge::detail
             const char* why = "";
             if (!build_translated_request(up, c->req.f.effective_dialect, body, head, c->req.f.head,
                                           _rebuild, _xlate, why, c->req.f.model_override.view(),
-                                          &c->req.f.wants_usage, key, c->req.f.beta_override.view()))
+                                          &c->req.f.wants_usage, key, c->req.f.beta_override.view(),
+                                          c->req.f.vertex_project.view()))
             {
                 // A credential is never echoed: it would land in a JSON body unescaped.
                 if (why[0] == 't') return error_respond(c, 400, "translate", translate_failure(body));
@@ -506,7 +513,7 @@ namespace llmbridge::detail
                                                      up.host_hdr, up.base_path, rewritten.empty() ? body : rewritten,
                                                      _rebuild, rewritten.empty() ? c->msg.body_len : rewritten.size(),
                                                      key, beta_for(up, c->req.f), c->req.f.path_model(),
-                                                     up.dialect))
+                                                     up.dialect, c->req.f.vertex_project.view()))
                 return error_respond(c, 400, bad);
         }
 

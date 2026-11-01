@@ -8,6 +8,35 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.107.0]. 2026-11-01
+
+A Vertex request can reach Vertex's global endpoint. Nothing changes for a policy that
+names no project.
+
+### Added
+
+- **`Decision::vertex_project`.** The publisher path the gateway writes for Vertex,
+  `/v1/publishers/google/models/{model}`, is not the global endpoint: Google places it in a
+  region of its choosing (`us-central1` and `us-south1` on 2026-11-01), bills it at the
+  non-global rate, 10% more for Gemini 3 and later, and answers 404 for a model served only
+  globally, such as `gemini-4-argon`. With a project named, a Gemini API path, a publisher
+  path or a translated request goes to `{version}/projects/{p}/locations/global/publishers/
+  google/models/{model}:...` instead, the version a publisher path's own. A client's own
+  project-scoped path still goes as written. The project is the request's: a hedge leg or
+  a failover to a Vertex venue goes under it, and other venues ignore it.
+- **`provider::vertex_project_ok`**, the rule for it: a project id (6 to 30 of `[a-z0-9-]`,
+  a letter first, no hyphen last) or a project number. Anything else is the policy's 500,
+  before any venue hears of the request, at a venue that would not use it too.
+- **`provider::gemini_forward_target` with a project**, an overload, and
+  **`provider::vertex_project_target`** for a translated request. The existing signature is
+  unchanged.
+
+### Changed
+
+- An `auth_bearer` Vertex venue serves a Gemini API path or a translated request when the
+  policy names a project; without one they are still refused (`refuse::kVertexProject`).
+
+
 ## [0.106.0]. 2026-10-29
 
 Gemini clients routed by model, Vertex as a venue, and a Gemini reply read in its own

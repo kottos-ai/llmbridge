@@ -136,6 +136,25 @@ namespace llmbridge::provider
         return true;
     }
 
+    inline constexpr size_t kMaxGoogleProject = 30;
+
+    /// Whether `p` fits a Vertex path's project segment unencoded: a Google Cloud project
+    /// id (6 to 30 of [a-z0-9-], a letter first, no hyphen last) or a project number (6 to
+    /// 30 digits). Nothing else can reach the request line.
+    [[nodiscard]] constexpr bool vertex_project_ok(std::string_view p) noexcept
+    {
+        if (p.size() < 6 || p.size() > kMaxGoogleProject) return false;
+        const bool number = p[0] >= '0' && p[0] <= '9';
+        if (!number && !(p[0] >= 'a' && p[0] <= 'z')) return false;
+        if (p.back() == '-') return false;
+        for (const char c : p)
+        {
+            const bool digit = c >= '0' && c <= '9';
+            if (number ? !digit : !(digit || (c >= 'a' && c <= 'z') || c == '-')) return false;
+        }
+        return true;
+    }
+
     /// Where a Gemini target names its model: the segment after the last `/models/` of
     /// the path, up to the method's colon (`/v1beta/models/{model}:generateContent`, and
     /// Vertex's `.../publishers/google/models/{model}:...`). `at` is its offset in
@@ -162,6 +181,17 @@ namespace llmbridge::provider
     /// {model}:...` for a Gemini API path; a project-scoped Vertex path goes as written.
     /// False when `model` is set and the target names none to replace.
     bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue, std::string& into);
+    /// As above, with a Vertex venue's `project` (vertex_project_ok, else false): a target
+    /// naming no project, a Gemini API path or a publisher one, goes to Vertex's global
+    /// endpoint under it, `{version}/projects/{project}/locations/global/publishers/google/
+    /// models/{model}:...`, the version a publisher path's own and `/v1` otherwise. Google
+    /// places the project-less publisher path in a region of its choosing. An empty
+    /// `project` is the overload above; a project-scoped target still goes as written.
+    bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue,
+                               std::string_view project, std::string& into);
+    /// A translated request's Vertex target under `project` at the global endpoint, appended
+    /// to `path`; false when the project is unusable (vertex_project_ok) or the model missing.
+    bool vertex_project_target(std::string_view project, std::string_view model, std::string& path);
 
     constexpr PathModel gemini_path_model(std::string_view target) noexcept
     {

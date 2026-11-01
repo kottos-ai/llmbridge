@@ -197,6 +197,9 @@ namespace llmbridge
         /// request is a 500. Valid until decide() returns; the gateway copies the legs.
         const HedgeLeg* hedge = nullptr;
         uint8_t hedge_legs = 0;
+
+        /// Vertex's project when the target names none (global endpoint): vertex_project_ok, else 500.
+        std::string_view vertex_project{};
     };
 
     /// A venue did not answer (refused connect, failed write, EOF or silence before the

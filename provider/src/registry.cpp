@@ -99,7 +99,8 @@ namespace llmbridge::provider
             path += ":generateContent";
             return true;
         }
-        // Vertex's global publisher path, which an API key reaches with no project.
+        // Vertex's publisher path, which an API key reaches with no project, in a region
+        // Google picks (vertex_project_target is the global endpoint's).
         bool vertex_target(std::string_view model, std::string& path)
         {
             if (model.substr(0, 7) == "models/") model.remove_prefix(7);
@@ -182,6 +183,13 @@ namespace llmbridge::provider
 
     bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue, std::string& into)
     {
+        return gemini_forward_target(target, model, venue, {}, into);
+    }
+
+    bool gemini_forward_target(std::string_view target, std::string_view model, Venue venue,
+                               std::string_view project, std::string& into)
+    {
+        if (!project.empty() && !vertex_project_ok(project)) return false;
         const PathModel pm = gemini_path_model(target);
         if (pm.at == std::string_view::npos)
         {
@@ -190,11 +198,27 @@ namespace llmbridge::provider
             return true;
         }
         constexpr std::string_view kPublisher = "/publishers/google/models/";
-        std::string_view head = target.substr(0, pm.at);
+        const std::string_view head = target.substr(0, pm.at);
         const bool publisher = head.ends_with(kPublisher);
-        if (venue == Venue::Vertex && !publisher) head = "/v1/publishers/google/models/";
-        else if (venue == Venue::Gemini && publisher) head = "/v1beta/models/";
-        into.append(head).append(model.empty() ? pm.model : model).append(target.substr(pm.at + pm.model.size()));
+        if (venue == Venue::Vertex && !project.empty() && !gemini_vertex_scoped(target))
+        {
+            const std::string_view version = publisher ? head.substr(0, head.size() - kPublisher.size()) : "/v1";
+            into.append(version).append("/projects/").append(project).append("/locations/global").append(kPublisher);
+        }
+        else if (venue == Venue::Vertex && !publisher) into.append("/v1/publishers/google/models/");
+        else if (venue == Venue::Gemini && publisher) into.append("/v1beta/models/");
+        else into.append(head);
+        into.append(model.empty() ? pm.model : model).append(target.substr(pm.at + pm.model.size()));
+        return true;
+    }
+
+    bool vertex_project_target(std::string_view project, std::string_view model, std::string& path)
+    {
+        if (!vertex_project_ok(project)) return false;
+        if (model.substr(0, 7) == "models/") model.remove_prefix(7);
+        path.append("/v1/projects/").append(project).append("/locations/global/publishers/google/models/");
+        if (!append_segment(path, model)) return false;
+        path += ":generateContent";
         return true;
     }
 
