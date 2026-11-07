@@ -8,6 +8,39 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.108.0]. 2026-11-07
+
+A streamed Responses API reply has a first token and a first thinking stamp, so a hedged
+Responses request can be won. Nothing changes for Chat Completions or Anthropic streams.
+
+### Fixed
+
+- **A Responses stream recorded no first token, and a hedge of one could not be won.** The
+  byte-forward rule matched Chat Completions' `"content":"..."` and Anthropic's event
+  names; a Responses stream says neither. Its opening events echo the request and open a
+  message with `"content":[]`, and its text arrives in `response.output_text.delta`, so
+  `ts_first_token` stayed 0 on every such stream. In a hedge, a Responses leg therefore
+  ended with no token while the other legs still raced, lost, and the client got whichever
+  leg ended last. Now a filled `delta` in a `response.output_text.delta`,
+  `response.function_call_arguments.delta` or `response.refusal.delta` event is the first
+  token, and one in `response.reasoning_summary_text.delta` or
+  `response.reasoning_text.delta` is the first thinking. Five tests (both backends) fail
+  without it, the hedge among them; an empty delta and the opening events stay no token.
+- **Cost:** one more search of each read, only until the stream's first stamp. Responses
+  deltas are the only events read here whose `delta` is a string (Chat Completions and
+  Anthropic send an object), so no other dialect ever matches it. An event whose `type`
+  is not in the same read as its `delta` is left unstamped, never guessed, the same
+  split-read limit as the other stamps.
+- Hidden reasoning, the default on OpenAI without `reasoning.summary`, sends no reasoning
+  delta, so such a stream's first stamp is its first token, as on Chat Completions.
+
+### Tests
+
+- **Two service tiers at one venue are two hedge legs**, each its own tier in its own body
+  and the same key. No code change: it pins down what a policy racing `flex` against
+  `ultrafast` at one company relies on.
+
+
 ## [0.107.0]. 2026-11-01
 
 A Vertex request can reach Vertex's global endpoint. Nothing changes for a policy that

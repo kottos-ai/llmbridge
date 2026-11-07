@@ -8286,6 +8286,146 @@ TEST_P(ProxyForwardStream, ResponsesStreamedSearchCallsReachTheSink)
     EXPECT_EQ(recs[0].r.tokens_in, 30);
 }
 
+// A Responses stream, event by event as OpenAI documents it: its opening echoes the request
+// (instructions, parallel_tool_calls, a reasoning object) and opens a message with empty
+// content, and only a delta event carries text.
+namespace
+{
+    std::string responses_event(const std::string& type, const std::string& rest)
+    {
+        return "event: " + type + "\ndata: {\"type\":\"" + type + "\"," + rest + "}\n\n";
+    }
+
+    std::string responses_opening()
+    {
+        return responses_event("response.created",
+                               R"("sequence_number":0,"response":{"id":"resp_1","object":"response",)"
+                               R"("status":"in_progress","instructions":"Answer briefly.",)"
+                               R"("parallel_tool_calls":true,"reasoning":{"effort":"low","summary":null},)"
+                               R"("service_tier":"flex","text":{"format":{"type":"text"}},"tools":[],"output":[]})") +
+               responses_event("response.output_item.added",
+                               R"("sequence_number":1,"output_index":0,"item":{"id":"msg_1","type":"message",)"
+                               R"("status":"in_progress","content":[],"role":"assistant"})") +
+               responses_event("response.content_part.added",
+                               R"("sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,)"
+                               R"("part":{"type":"output_text","annotations":[],"text":""})");
+    }
+
+    std::string responses_text(const std::string& delta)
+    {
+        return responses_event("response.output_text.delta",
+                               R"("sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,)"
+                               R"("delta":")" + delta + "\"");
+    }
+
+    std::string responses_completed()
+    {
+        return responses_event("response.completed",
+                               R"("sequence_number":9,"response":{"id":"resp_1","status":"completed",)"
+                               R"("output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}],)"
+                               R"("usage":{"input_tokens":9,"output_tokens":1}})");
+    }
+
+    std::string responses_reasoning(const std::string& delta)
+    {
+        return responses_event("response.output_item.added",
+                               R"("sequence_number":1,"output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]})") +
+               responses_event("response.reasoning_summary_text.delta",
+                               R"("sequence_number":2,"item_id":"rs_1","output_index":0,"summary_index":0,)"
+                               R"("delta":")" + delta + "\"");
+    }
+
+    std::string responses_sse(const std::string& events)
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+               "Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+               sse_chunk_encode(events, 4096);
+    }
+
+    constexpr const char* kResponsesStream = R"({"model":"m","input":"hi","stream":true})";
+} // namespace
+
+class ProxyResponsesStream : public ProxyForwardStream
+{
+  protected:
+    /// One streamed Responses request against `reply`, and the record it left.
+    llmbridge::RequestRecord record_of(const std::string& reply)
+    {
+        RecordingSink sink;
+        _sink = &sink;
+        _backend.set_response(reply);
+        start(0, true, UpstreamDialect::OpenAI, GetParam());
+        Client c;
+        EXPECT_TRUE(c.connect(_proxy_port));
+        EXPECT_TRUE(c.send(responses_request(kResponsesStream)));
+        (void)c.recv_chunked(2000);
+        c.close();
+        shutdown();
+        const auto recs = sink.records();
+        EXPECT_EQ(recs.size(), 1u);
+        return recs.empty() ? llmbridge::RequestRecord{} : recs[0].r;
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProxyResponsesStream,
+                         ::testing::Values(llmbridge::IoBackend::Epoll, llmbridge::IoBackend::Uring),
+                         [](const testing::TestParamInfo<llmbridge::IoBackend>& i) {
+                             return i.param == llmbridge::IoBackend::Epoll ? "epoll" : "uring";
+                         });
+
+// Chat Completions' first-token rule never matched a Responses stream, so its record had no
+// first token and a hedged Responses leg could never win on one (GATEWAY-INTERNALS.md 13).
+TEST_P(ProxyResponsesStream, TextDeltaIsTheFirstToken)
+{
+    const auto r = record_of(responses_sse(responses_opening() + responses_text("Hi") + responses_completed()));
+    EXPECT_GT(r.ts_first_token, 0);
+    EXPECT_EQ(r.ts_first_thinking, 0) << "a reasoning object in the echo is not reasoning";
+}
+
+// The control: everything but a filled delta, the finished text in response.completed
+// included, is no token. Without it the rule above could match the opening unnoticed.
+TEST_P(ProxyResponsesStream, OpeningIsNoToken)
+{
+    const auto r = record_of(responses_sse(responses_opening() + responses_text("") + responses_completed()));
+    EXPECT_EQ(r.ts_first_token, 0) << "an empty delta is no token";
+    EXPECT_EQ(r.ts_first_thinking, 0);
+}
+
+// A reasoning summary is reasoning and no token, whichever order the event's keys come in:
+// the first delta here is empty, so only the reversed one can stamp.
+TEST_P(ProxyResponsesStream, ReasoningSummaryIsReasoning)
+{
+    const std::string keys_reversed =
+        "event: response.reasoning_summary_text.delta\n"
+        "data: {\"delta\":\" the units.\",\"type\":\"response.reasoning_summary_text.delta\"}\n\n";
+    const auto r = record_of(responses_sse(responses_reasoning("") + keys_reversed + responses_completed()));
+    EXPECT_GT(r.ts_first_thinking, 0);
+    EXPECT_EQ(r.ts_first_token, 0) << "reasoning alone shows the client nothing";
+}
+
+TEST_P(ProxyResponsesStream, ReasoningThenTextStampsBoth)
+{
+    const auto r = record_of(
+        responses_sse(responses_reasoning("Checking") + responses_text("Hi") + responses_completed()));
+    EXPECT_GT(r.ts_first_thinking, 0);
+    EXPECT_GE(r.ts_first_token, r.ts_first_thinking);
+}
+
+// A tool call shows the client its arguments, as Chat Completions' tool_calls deltas do.
+TEST_P(ProxyResponsesStream, ToolArgumentsAreAToken)
+{
+    const auto r = record_of(
+        responses_sse(
+                   responses_event("response.output_item.added",
+                                   R"("sequence_number":1,"output_index":0,"item":{"id":"fc_1",)"
+                                   R"("type":"function_call","name":"weather","arguments":""})") +
+                   responses_event("response.function_call_arguments.delta",
+                                   R"("sequence_number":2,"item_id":"fc_1","output_index":0,"delta":"{\"city\"")") +
+                   responses_completed()));
+    EXPECT_GT(r.ts_first_token, 0);
+    EXPECT_EQ(r.ts_first_thinking, 0);
+}
+
 // Anthropic states what served, its server tools and its other attempts in usage.
 TEST_P(ProxyForwardStream, AnthropicsServedSpeedToolsAndAttemptsReachTheSink)
 {
@@ -13037,6 +13177,83 @@ TEST_P(ProxyHedge, AStreamCutsTheOtherLegsAtItsFirstToken)
         }
     }
     for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
+// A Responses stream wins at its first delta. Before its events were read, it ended with no
+// token while the other legs still raced, so it lost, and the client was answered by
+// whichever stalled venue gave up last.
+TEST_P(ProxyHedge, AResponsesStreamCutsTheOtherLegsAtItsFirstDelta)
+{
+    std::atomic<bool> go{false};
+    TestBackend a, b, c;
+    a.set_response(responses_sse(responses_opening() + responses_text("Hi") + responses_completed()));
+    a.hold_first_reply(&go);
+    b.set_stall(3);
+    c.set_stall(3);
+    for (TestBackend* t : {&a, &b, &c}) t->start();
+    RecordingSink sink;
+    HedgePolicy pol(hedged("x-kottos-key-a"), legs_bc());
+    start({oai_venue(a.port()), oai_venue(b.port()), oai_venue(c.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    const std::string body = kResponsesStream;
+    ASSERT_TRUE(cl.send("POST /v1/responses HTTP/1.1\r\nHost: x\r\n" + hedge_keys() +
+                        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body));
+    ASSERT_TRUE(within_2s([&] { return b.requests_seen() == 1 && c.requests_seen() == 1; }));
+    go = true;
+    const std::string resp = cl.recv_chunked(2000);
+    EXPECT_NE(resp.find("\"delta\":\"Hi\""), std::string::npos) << resp;
+    EXPECT_NE(resp.find("response.completed"), std::string::npos) << resp;
+    EXPECT_TRUE(within_2s([&] { return b.closed_by_gateway() == 1 && c.closed_by_gateway() == 1; }));
+    cl.close();
+    shutdown();
+    EXPECT_EQ(b.resets(), 1);
+    EXPECT_EQ(c.resets(), 1);
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 3u);
+    for (const auto& r : recs)
+    {
+        SCOPED_TRACE(r.r.hedge_leg);
+        EXPECT_EQ(r.r.hedge_won, r.r.hedge_leg == 0);
+        EXPECT_EQ(r.r.hedge_cut, r.r.hedge_leg != 0);
+    }
+    for (TestBackend* t : {&a, &b, &c}) t->stop();
+}
+
+// Two service tiers of one model at one venue are two legs: each its own connection, its own
+// tier spliced into its own body, the same key. What a route racing flex against ultrafast
+// at one company sends.
+TEST_P(ProxyHedge, TwoTiersAtOneVenueEachCarryTheirOwnTier)
+{
+    TestBackend a;
+    a.set_response(venue_reply(UpstreamDialect::OpenAI));
+    a.start();
+    RecordingSink sink;
+    llmbridge::Decision d = hedged("x-kottos-key-a");
+    d.service_tier = "flex";
+    HedgePolicy pol(d, {{.upstream_index = 0, .service_tier = "ultrafast", .credential_header = "x-kottos-key-a"}});
+    start({oai_venue(a.port())}, &pol, &sink);
+    Client cl;
+    ASSERT_TRUE(cl.connect(_port));
+    ASSERT_TRUE(cl.send(openai_request_hdrs("hi", hedge_keys())));
+    EXPECT_EQ(Client::status_of(cl.recv_response()), 200);
+    cl.close();
+    shutdown();
+    a.stop();
+    EXPECT_EQ(a.requests_seen(), 2);
+    const std::string seen = a.all_requests();
+    for (const char* tier : {"\"service_tier\":\"flex\"", "\"service_tier\":\"ultrafast\""})
+    {
+        SCOPED_TRACE(tier);
+        const size_t at = seen.find(tier);
+        EXPECT_NE(at, std::string::npos) << seen;
+        EXPECT_EQ(seen.find(tier, at + 1), std::string::npos) << "each tier on one leg alone";
+    }
+    const auto recs = sink.records();
+    ASSERT_EQ(recs.size(), 2u);
+    EXPECT_NE(recs[0].r.hedge_leg, recs[1].r.hedge_leg);
+    EXPECT_EQ(recs[0].r.hedge_group, recs[1].r.hedge_group);
+    EXPECT_EQ(static_cast<int>(recs[0].r.hedge_won) + static_cast<int>(recs[1].r.hedge_won), 1);
 }
 
 // Every malformed hedge is a 500 before any venue is contacted: a leg past the table never

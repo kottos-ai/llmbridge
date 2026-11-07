@@ -1122,6 +1122,8 @@ its client waits:
 - `stream_flush`: a stream holds what it staged, its head included, and sends nothing. Its
   first token or thinking delta wins; a head alone never does, since a 200 head can precede
   an error event. A stream that ends without a token has lost, unless it is the last leg.
+  On the Responses API both are delta events with a filled `delta` (`sse_responses_delta`):
+  its opening events echo the request and carry no text.
 - `respond`: a whole reply wins if it is a 2xx. Any other status loses, unless it is the
   last leg, and then it is what the client gets.
 

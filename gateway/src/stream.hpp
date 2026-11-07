@@ -72,6 +72,32 @@ namespace llmbridge::detail
         if (c->req.f.stream_chunked_out) out.append("0\r\n\r\n", 5);
     }
 
+    /// A Responses API delta with a non-empty value, of reasoning (`reasoning_summary_text`,
+    /// `reasoning_text`) or not (`output_text`, `function_call_arguments`, `refusal`). They
+    /// are the only events read here whose `delta` is a string: Chat Completions and
+    /// Anthropic send an object, so neither dialect ever matches. The event's own type, in
+    /// the same data line, says which kind; a line whose type is not in this read is
+    /// neither, never a guess.
+    inline bool sse_responses_delta(std::string_view s, bool reasoning) noexcept
+    {
+        constexpr std::string_view kDelta = "\"delta\":\"";
+        constexpr std::string_view kType = "\"type\":\"response.";
+        for (size_t pos = find_fast(s, kDelta); pos != std::string_view::npos;
+             pos = find_fast(s, kDelta, pos + 1))
+        {
+            const size_t v = pos + kDelta.size();
+            if (v >= s.size()) return false; // value byte not in this read yet
+            if (s[v] == '"') continue;       // empty
+            const size_t nl = s.rfind('\n', pos);
+            const size_t a = nl == std::string_view::npos ? 0 : nl + 1;
+            const std::string_view line = s.substr(a, s.find('\n', v) - a);
+            const size_t t = line.find(kType);
+            if (t == std::string_view::npos) continue;
+            if (line.substr(t + kType.size()).starts_with("reasoning") == reasoning) return true;
+        }
+        return false;
+    }
+
     /// The first chunk carrying a visible token, on the byte-forward path.
     ///
     /// Empty content is not a token. OpenAI opens a stream with
@@ -89,7 +115,7 @@ namespace llmbridge::detail
         }
         return find_fast(s, "\"text_delta\"") != std::string_view::npos ||
                find_fast(s, "\"type\":\"tool_use\"") != std::string_view::npos ||
-               find_fast(s, "\"tool_calls\"") != std::string_view::npos;
+               find_fast(s, "\"tool_calls\"") != std::string_view::npos || sse_responses_delta(s, false);
     }
 
     /// The first reasoning marker on the wire, shared by both stamp sites so the
@@ -126,7 +152,7 @@ namespace llmbridge::detail
             if (s[v] != '"') continue;  // null, and nothing else is a string
             if (v + 1 < s.size() && s[v + 1] != '"') return true; // non-empty
         }
-        return false;
+        return sse_responses_delta(s, true);
     }
 
     /// Bytes of a reply worth searching for the served tier, and it is a different
