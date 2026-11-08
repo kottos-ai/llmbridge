@@ -8348,23 +8348,30 @@ namespace
 class ProxyResponsesStream : public ProxyForwardStream
 {
   protected:
-    /// One streamed Responses request against `reply`, and the record it left.
-    llmbridge::RequestRecord record_of(const std::string& reply)
+    /// One Responses request with `body` against `reply`, written `trickle` bytes at a time
+    /// when set, and the sink's copy of the record it left.
+    RecordingSink::Copy copy_of(const std::string& reply, const std::string& body = kResponsesStream,
+                                int trickle = 0)
     {
         RecordingSink sink;
         _sink = &sink;
         _backend.set_response(reply);
+        if (trickle) _backend.set_trickle(trickle);
         start(0, true, UpstreamDialect::OpenAI, GetParam());
         Client c;
         EXPECT_TRUE(c.connect(_proxy_port));
-        EXPECT_TRUE(c.send(responses_request(kResponsesStream)));
-        (void)c.recv_chunked(2000);
+        EXPECT_TRUE(c.send(responses_request(body)));
+        if (body.find("\"stream\":true") != std::string::npos) (void)c.recv_chunked(2000);
+        else (void)c.recv_response();
         c.close();
         shutdown();
         const auto recs = sink.records();
         EXPECT_EQ(recs.size(), 1u);
-        return recs.empty() ? llmbridge::RequestRecord{} : recs[0].r;
+        return recs.empty() ? RecordingSink::Copy{} : recs[0];
     }
+
+    /// One streamed Responses request against `reply`, and the record it left.
+    llmbridge::RequestRecord record_of(const std::string& reply) { return copy_of(reply).r; }
 };
 
 INSTANTIATE_TEST_SUITE_P(Backends, ProxyResponsesStream,
@@ -8409,6 +8416,50 @@ TEST_P(ProxyResponsesStream, ReasoningThenTextStampsBoth)
         responses_sse(responses_reasoning("Checking") + responses_text("Hi") + responses_completed()));
     EXPECT_GT(r.ts_first_thinking, 0);
     EXPECT_GE(r.ts_first_token, r.ts_first_thinking);
+}
+
+// The tier that served is in a Responses stream's last event. response.created only echoes
+// the one asked for, `auto` when the request named none, and that echo is what the record
+// kept. Trickled, the last event reaches the gateway in reads of its own.
+namespace
+{
+    std::string tiered_responses_sse()
+    {
+        return responses_sse(
+            responses_event("response.created",
+                            R"("sequence_number":0,"response":{"id":"r","status":"in_progress",)"
+                            R"("output":[],"service_tier":"auto","tools":[]})") +
+            responses_text("Hi") +
+            responses_event("response.completed",
+                            R"("sequence_number":9,"response":{"id":"r","status":"completed","output":[],)"
+                            R"("service_tier":"default","tools":[],"usage":{"input_tokens":9,"output_tokens":1},)"
+                            R"("metadata":{"service_tier":"gold"}})"));
+    }
+} // namespace
+
+TEST_P(ProxyResponsesStream, TheServedTierIsTheLastEventsNotTheEcho)
+{
+    const auto c = copy_of(tiered_responses_sse());
+    EXPECT_EQ(c.served_tier, "default");
+    EXPECT_GT(c.r.ts_first_token, 0);
+}
+
+TEST_P(ProxyResponsesStream, TheServedTierIsTheLastEventsInReadsOfItsOwn)
+{
+    const auto c = copy_of(tiered_responses_sse(), kResponsesStream, /*trickle=*/97);
+    EXPECT_EQ(c.served_tier, "default");
+}
+
+// A reply not streamed states its tier ahead of the client's tools and metadata, which can
+// run past the tail a body is searched in, and the metadata can name one of its own.
+TEST_P(ProxyResponsesStream, AReplyNotStreamedStatesItsTierAheadOfLongTools)
+{
+    const auto c = copy_of(http_ok(R"({"id":"r","object":"response","status":"completed","output":[],)"
+                                   R"("service_tier":"default","tools":[)" + std::string(3000, ' ') +
+                                   R"(],"usage":{"input_tokens":9,"output_tokens":1},)"
+                                   R"("metadata":{"service_tier":"gold"}})"),
+                           R"({"model":"m","input":"hi"})");
+    EXPECT_EQ(c.served_tier, "default");
 }
 
 // A tool call shows the client its arguments, as Chat Completions' tool_calls deltas do.

@@ -25,6 +25,24 @@ namespace
     using llmbridge::detail::kTierTries;
     using llmbridge::detail::note_served_model;
     using llmbridge::detail::note_served_tier;
+    using llmbridge::detail::note_stream_tier;
+
+    /// A Responses stream's first and last events, each the whole response object, and a
+    /// delta between them. The last names its own tier, then the client's tools and
+    /// metadata, each of which can name one too.
+    const std::string kCreated =
+        "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,"
+        "\"response\":{\"id\":\"r\",\"status\":\"in_progress\",\"output\":[],"
+        "\"service_tier\":\"auto\",\"tools\":[]}}\n\n";
+    const std::string kDelta =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\","
+        "\"delta\":\"the \\\"type\\\":\\\"response.completed\\\" event\"}\n\n";
+    const std::string kCompleted =
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":9,"
+        "\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[],\"service_tier\":\"default\","
+        "\"tools\":[{\"type\":\"function\",\"parameters\":{\"properties\":{\"service_tier\":"
+        "{\"type\":\"string\"}}}}],\"usage\":{\"input_tokens\":9,\"output_tokens\":1},"
+        "\"metadata\":{\"service_tier\":\"gold\"}}}\n\n";
 } // namespace
 
 TEST(ServedTier, GivesUpAfterFourTriesWithNothingFound)
@@ -165,5 +183,81 @@ TEST(StreamChunk, WrapsWhatWasAppendedInOneHexSizedChunk)
         std::snprintf(want, sizeof want, "%zx\r\n", n);
         EXPECT_EQ(out.substr(0, 4 + std::strlen(want)), "head" + std::string(want)) << n;
         EXPECT_EQ(out.size(), 4 + std::strlen(want) + n + 2) << n;
+    }
+}
+
+// A Responses stream states its tier twice: response.created echoes what the request asked,
+// `auto` when it named none, and the last event states what served. Read the Chat
+// Completions way, the first and only tier kept was the echo. The echo stands in until the
+// last event, which comes after the whole reply, past the four reads a stream is searched.
+TEST(ServedTier, AResponsesStreamTakesItsLastEventsTierOverTheEcho)
+{
+    ClientConn c;
+    c.req.f.responses_api = true;
+    note_stream_tier(&c, kCreated);
+    for (int i = 0; i < 6; ++i) note_stream_tier(&c, kDelta);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "auto")
+        << "the echo stands in, and a marker quoted in the reply's text is not the last event";
+    note_stream_tier(&c, kCompleted);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "default")
+        << "the tools' and the metadata's keys come after the reply's own";
+}
+
+// The last event in two reads, its type in one and its tier in the next.
+TEST(ServedTier, AResponsesStreamsLastEventSplitAcrossReadsStillNamesIt)
+{
+    ClientConn c;
+    c.req.f.responses_api = true;
+    note_stream_tier(&c, kCreated);
+    const size_t cut = kCompleted.find("\"output\"");
+    note_stream_tier(&c, kCompleted.substr(0, cut));
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "auto");
+    note_stream_tier(&c, kCompleted.substr(cut));
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "default");
+}
+
+// A Chat Completions stream is read as before: its first tier, within four reads.
+TEST(ServedTier, AChatStreamIsUnchangedByTheResponsesRule)
+{
+    ClientConn c;
+    note_stream_tier(&c, R"({"service_tier":"flex","choices":[]})");
+    note_stream_tier(&c, kCompleted);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "flex");
+    EXPECT_EQ(c.req.f.served_tier_tries, 1);
+}
+
+// A Responses body states its tier ahead of the client's tools and metadata, which can run
+// past the 2 KiB tail a body is searched in, and the metadata can name a tier of its own.
+TEST(ServedTier, AResponsesBodyStatesItAheadOfToolsLongerThanTheTail)
+{
+    ClientConn c;
+    c.req.f.responses_api = true;
+    const std::string body = R"({"id":"r","object":"response","output":[],"service_tier":"default","tools":[)" +
+                             std::string(3000, ' ') +
+                             R"(],"usage":{"input_tokens":9},"metadata":{"service_tier":"gold"}})";
+    note_served_tier(&c, body, /*tail=*/true);
+    EXPECT_EQ(std::string(c.req.f.served_tier.view()), "default");
+}
+
+// A read boundary can fall anywhere in the last event, its type and its tier included: every
+// split of it, and the whole stream in reads of 1, 3, 7 and 97 bytes, still names its tier.
+TEST(ServedTier, EveryReadBoundaryInAResponsesStreamStillNamesItsTier)
+{
+    for (size_t cut = 1; cut < kCompleted.size(); ++cut)
+    {
+        ClientConn c;
+        c.req.f.responses_api = true;
+        note_stream_tier(&c, kCreated);
+        note_stream_tier(&c, kCompleted.substr(0, cut));
+        note_stream_tier(&c, kCompleted.substr(cut));
+        ASSERT_EQ(std::string(c.req.f.served_tier.view()), "default") << "split at " << cut;
+    }
+    const std::string stream = kCreated + kDelta + kCompleted;
+    for (const size_t n : {1, 3, 7, 97})
+    {
+        ClientConn c;
+        c.req.f.responses_api = true;
+        for (size_t at = 0; at < stream.size(); at += n) note_stream_tier(&c, std::string_view(stream).substr(at, n));
+        EXPECT_EQ(std::string(c.req.f.served_tier.view()), "default") << "reads of " << n;
     }
 }

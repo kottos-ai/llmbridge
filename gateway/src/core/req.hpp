@@ -171,6 +171,9 @@ namespace llmbridge
         char stream_tail[4] = {};
         bool sse_translating = false;
         bool responses_api = false; ///< its search calls are counted for the sink
+        bool responses_last_event = false; ///< a Responses stream's last event has begun
+        bool responses_tier_read = false;  ///< and its own service_tier was read
+        FixedStr<64> responses_carry;     ///< the last read's tail, for a marker a boundary split
         Phase phase = Phase::Idle;
         uint8_t quota_exhausted = 0;
         uint16_t retry_after_s = 0;

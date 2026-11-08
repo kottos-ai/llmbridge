@@ -167,16 +167,82 @@ namespace llmbridge::detail
     constexpr uint8_t kTierTries = 4;
 
     /// `tail` searches the end of `bytes`, which is where a non-streamed body puts
-    /// it, beside the usage block.
+    /// it, beside the usage block. A Responses body puts it ahead of the client's tools
+    /// and metadata, which can run past any tail and name one of their own: its first.
     inline void note_served_tier(ClientConn* c, std::string_view bytes, bool tail) noexcept
     {
         if (!c->req.f.served_tier.empty() || c->req.f.served_tier_tries >= kTierTries) return;
         ++c->req.f.served_tier_tries;
+        if (tail && c->req.f.responses_api)
+        {
+            c->req.f.served_tier.set(scan_string(bytes, "\"service_tier\"", /*last=*/false));
+            return;
+        }
         const size_t w = tail ? kTierTail : kTierHead;
         const std::string_view head =
             bytes.size() <= w ? bytes
                               : (tail ? bytes.substr(bytes.size() - w) : bytes.substr(0, w));
         c->req.f.served_tier.set(scan_string(head, "\"service_tier\"", tail));
+    }
+
+    /// Where in `s` an event that ends a Responses stream begins, each the whole response
+    /// object again: one search for the type every event starts with, then its name.
+    inline size_t responses_last_event_at(std::string_view s) noexcept
+    {
+        constexpr std::string_view kType = "\"type\":\"response.";
+        for (size_t at = find_fast(s, kType); at != std::string_view::npos; at = find_fast(s, kType, at + 1))
+        {
+            const std::string_view name = s.substr(at + kType.size());
+            if (name.starts_with("completed\"") || name.starts_with("incomplete\"") || name.starts_with("failed\""))
+                return at;
+        }
+        return std::string_view::npos;
+    }
+
+    /// The last event's type in `s`, when not yet seen, then the reply's own tier after it.
+    inline bool responses_tier_in(ReqState& f, std::string_view s) noexcept
+    {
+        size_t from = 0;
+        if (!f.responses_last_event)
+        {
+            from = responses_last_event_at(s);
+            if (from == std::string_view::npos) return false;
+            f.responses_last_event = true;
+        }
+        const std::string_view t = scan_string(s.substr(from), "\"service_tier\"", /*last=*/false);
+        if (t.empty()) return false;
+        f.served_tier.set(t);
+        f.responses_tier_read = true;
+        return true;
+    }
+
+    /// A Responses stream states its tier twice: response.created echoes what was asked
+    /// (`auto` when the request named none), and its last event what served. The echo,
+    /// note_served_tier's, stands in until then, so a stream cut short keeps it. In the
+    /// last event the reply's own tier comes ahead of the client's tools and metadata:
+    /// the first after its type. Searched each read until read, since it ends the stream,
+    /// and across each boundary too, joining the last read's tail to this one's head.
+    inline void note_responses_tier(ClientConn* c, std::string_view read) noexcept
+    {
+        ReqState& f = c->req.f;
+        if (f.responses_tier_read || read.empty()) return;
+        constexpr size_t kCarry = sizeof(f.responses_carry.b);
+        char join[2 * kCarry];
+        const std::string_view tail = f.responses_carry.view();
+        const size_t head = read.size() < kCarry ? read.size() : kCarry;
+        std::memcpy(join, tail.data(), tail.size());
+        std::memcpy(join + tail.size(), read.data(), head);
+        const std::string_view joined(join, tail.size() + head);
+        if (responses_tier_in(f, joined) || responses_tier_in(f, read)) return;
+        f.responses_carry.set(read.size() >= kCarry ? read.substr(read.size() - kCarry)
+                                                    : joined.substr(joined.size() > kCarry ? joined.size() - kCarry : 0));
+    }
+
+    /// The served tier, from one read of a stream.
+    inline void note_stream_tier(ClientConn* c, std::string_view read) noexcept
+    {
+        note_served_tier(c, read, /*tail=*/false);
+        if (c->req.f.responses_api) note_responses_tier(c, read);
     }
 
     inline void keep_served_model(ClientConn* c, std::string_view m) noexcept
@@ -379,7 +445,7 @@ namespace llmbridge::detail
             client->req.f.ts_last_chunk = now;
             // Beside the gap stamp, and for the same reason: this is the one point
             // every chunk crosses in either dialect.
-            note_served_tier(client, sse_in, /*tail=*/false);
+            note_stream_tier(client, sse_in);
             note_served_model(client, sse_in, /*streamed=*/true);
         }
 

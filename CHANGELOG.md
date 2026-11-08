@@ -8,6 +8,47 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.108.1]. 2026-11-08
+
+The tier a Responses reply served is the one recorded. Nothing changes for Chat
+Completions or Anthropic replies.
+
+### Fixed
+
+- **A streamed Responses reply recorded the tier it asked for, not the one that served.**
+  `response.created` echoes the request's `service_tier` (`auto` when it named none), and
+  the last event (`response.completed`, `.incomplete` or `.failed`), the whole response
+  object again, states what served. The stream was read the Chat Completions way: the
+  first tier within four reads, kept. Found on 2026-11-08 through kottos, where standard
+  requests streamed `auto` and then `default` and the record said `auto`; a tier served
+  below the one bought would not have shown either. The echo now stands in until the last
+  event, whose own tier replaces it: the first after its type, since the client's tools
+  and metadata follow it and can name one of their own. A stream cut short keeps the echo.
+- **A Responses reply not streamed lost its tier behind long tools.** The tier was read
+  from the body's last 2 KiB, but a Responses body states it ahead of the tools and
+  metadata the client sent: tools past 2 KiB hid it, and metadata naming a `service_tier`
+  stood in for it. It is now the body's first.
+- **Read boundaries.** The last event's type and its tier are found across one: the
+  previous read's last 64 bytes are joined to the next read's first 64
+  (`ReqState::responses_carry`). Every split of the last event, and a whole stream in reads
+  of 1, 3, 7 and 97 bytes, names its tier.
+- **Cost**, measured on the development laptop for a 197 KB Responses stream of 1,000
+  delta events, until the last event's tier is read: about 60 us more in 4 KiB reads
+  (1.2 us a read) and 110 us in 512-byte reads (0.28 us a read). One search per read for
+  the type every Responses event starts with, then its name: three searches, one per
+  name, cost 190 us at 512 bytes. Chat Completions and Anthropic streams still stop after
+  four reads.
+
+### Tests
+
+- `served_tier_test.cpp`: the last event's tier over the echo, its type and tier split
+  across two reads, every split of it and reads of 1, 3, 7 and 97 bytes, a body with tools
+  past the tail, and a Chat Completions control. End to end on both backends: a stream, the
+  same stream in 97-byte writes, and a body with long tools. All but the control fail
+  without the fix; the every-split test and the 97-byte stream also fail with the carry
+  alone removed.
+
+
 ## [0.108.0]. 2026-11-07
 
 A streamed Responses API reply has a first token and a first thinking stamp, so a hedged
