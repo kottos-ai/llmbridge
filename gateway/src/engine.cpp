@@ -159,21 +159,25 @@ namespace llmbridge::detail
                         "' is not an IPv4 address and it has no host to resolve; every request to it is refused");
         }
 
-        // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel
-        // supports it, else epoll. Uring requested but unavailable -> epoll.
+        // Resolve the event-loop backend: io_uring for Uring/Auto when the kernel has it,
+        // else epoll for Auto. Uring never falls back: whoever asked for io_uring and got
+        // epoll would take the slower backend's numbers for the faster one's.
 #ifdef LLMBRIDGE_HAVE_URING
-        const bool uring_ok = UringIo::available();
-        if (_io == IoBackend::Uring || _io == IoBackend::Auto) _uring_active = uring_ok;
-        if (_io == IoBackend::Uring && !uring_ok)
-            LB_WARN("io_uring requested but unavailable; falling back to epoll");
-        else if (_io == IoBackend::Auto && !uring_ok)
-            LB_WARN("io_uring unavailable, using epoll. Inside a container this is "
-                    "usually the default seccomp profile blocking io_uring_setup: run "
-                    "with --security-opt seccomp=unconfined, or a profile that permits "
-                    "the io_uring syscalls, to get the faster backend");
+        const int uring_err = net::uring::setup_errno();
+        if (_io == IoBackend::Uring || _io == IoBackend::Auto) _uring_active = uring_err == 0;
+        if (uring_err && _io == IoBackend::Uring)
+            LB_ERROR("io_uring requested and unavailable, and Uring never falls back to epoll, "
+                     "so this worker will not serve: ", net::uring::why_unavailable(uring_err));
+        else if (uring_err && _io == IoBackend::Auto)
+            LB_WARN("io_uring unavailable, using epoll: ", net::uring::why_unavailable(uring_err));
+#else
+        if (_io == IoBackend::Uring)
+            LB_ERROR("io_uring requested, and this build has none (linux/io_uring.h was missing "
+                     "when it was compiled), so this worker will not serve");
 #endif
         const char* want = _io == IoBackend::Uring ? "uring" : _io == IoBackend::Epoll ? "epoll" : "auto";
-        LB_INFO("backend requested=", want, " active=", _uring_active ? "io_uring" : "epoll");
+        const char* active = _uring_active ? "io_uring" : _io == IoBackend::Uring ? "none" : "epoll";
+        LB_INFO("backend requested=", want, " active=", active);
     }
 
     Engine::~Engine()
@@ -383,9 +387,18 @@ namespace llmbridge::detail
         if (_uring_active)
         {
             UringIo io(*this);
-            if (io.ready()) return io.run(); // else it said why, and epoll runs instead
+            if (io.ready()) return io.run(); // else it said why
+            if (_io == IoBackend::Uring)
+            {
+                LB_ERROR("io_uring could not be set up (above): the backend needs Linux 6.0 or "
+                         "newer and the io_uring syscalls allowed. Uring never falls back to "
+                         "epoll, so this worker will not serve");
+                return 1;
+            }
+            LB_WARN("io_uring could not be set up, using epoll");
         }
 #endif
+        if (_io == IoBackend::Uring) return 1; // the constructor said why
         EpollIo io(*this);
         return io.run();
     }

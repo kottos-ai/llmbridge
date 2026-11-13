@@ -62,6 +62,25 @@ if (LLMBRIDGE_BUILD_TESTS)
     llmbridge_cli_refuses(CliRefusesBadPort "out of range"
             --listen 70000 --upstream 127.0.0.1:9)
 
+    # --io uring is io_uring or nothing. Until 0.109.0 it served epoll where io_uring was
+    # blocked, so these ran until the timeout failed them. no_uring is in gateway/tests.
+    if (LLMBRIDGE_HAVE_URING)
+        function(llmbridge_cli_without_uring name blocked expect)
+            add_test(NAME ${name} COMMAND no_uring ${blocked} $<TARGET_FILE:llmbridge> ${ARGN})
+            set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${expect}"
+                    SKIP_REGULAR_EXPRESSION "unavailable here even without a filter" TIMEOUT 10)
+        endfunction()
+        llmbridge_cli_without_uring(CliUringRefusesWhenSetupIsBlocked setup
+                "never falls back to epoll. io_uring_setup failed: Operation not permitted; a seccomp filter"
+                --io uring --listen 0 --upstream 127.0.0.1:9)
+        llmbridge_cli_without_uring(CliUringRefusesWhenRegisterIsBlocked register
+                "Uring never falls back to epoll, so this worker will not serve"
+                --io uring --listen 0 --upstream 127.0.0.1:9)
+        llmbridge_cli_without_uring(CliAutoServesEpollWhenSetupIsBlocked setup
+                "backend requested=auto active=epoll"
+                --listen 0 --upstream 127.0.0.1:9 --duration 0.3)
+    endif ()
+
     llmbridge_cli_refuses(CliRefusesCertWithoutListenTls
             "certificate/key was given without enabling the"
             --listen 0 --upstream 127.0.0.1:9 --tls-cert /nonexistent --tls-key /nonexistent)

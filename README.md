@@ -280,29 +280,36 @@ properties worth knowing:
 - **Paths, never secrets.** `cert` and `key` are filenames. Do not put provider API
   keys in it; those travel per request, from the client.
 
-### Running in a container: unblock io_uring
+### Running in a container: io_uring or nothing
 
-The gateway picks io_uring on a kernel that has it and falls back to epoll otherwise.
-Docker's default seccomp profile blocks the io_uring syscalls, so a container run
-with the defaults gets the epoll path, on a machine that could have done better. It
-starts up saying so:
+The image serves on io_uring or not at all. Docker 25 and later block the io_uring
+syscalls in their default seccomp profile, and the image cannot change that: the
+profile is chosen by whoever runs the container. So the image's entrypoint passes
+`--io uring`, and a container started with the defaults exits at once, saying what to
+add:
 
 ```
-WARN  io_uring unavailable, using epoll. Inside a container this is usually the
-      default seccomp profile blocking io_uring_setup ...
-INFO  backend requested=auto active=epoll
+llmbridge: --io uring: io_uring is unavailable, and it never falls back to epoll.
+io_uring_setup failed: Operation not permitted; a seccomp filter is blocking it ...
 ```
 
-Give it a profile that permits the io_uring syscalls, or lift the filter entirely:
+Run it with the filter lifted:
 
 ```sh
-docker run --security-opt seccomp=unconfined ... llmbridge --listen 8080 --upstream ...
+docker run --security-opt seccomp=unconfined -p 8088:8088 ghcr.io/kottos-ai/llmbridge \
+    --listen 8088 --upstream https://api.anthropic.com --upstream-dialect anthropic
 ```
 
-Measured on one box, the epoll fallback served about a quarter less throughput than
-io_uring at the same concurrency. Lifting seccomp widens the container's syscall
-surface, so on a shared host prefer a custom profile that allows `io_uring_setup`,
-`io_uring_enter` and `io_uring_register` and nothing else.
+Lifting seccomp widens the container's syscall surface, so on a shared host prefer a
+profile that adds `io_uring_setup`, `io_uring_enter` and `io_uring_register` to Docker's
+default, passed as `--security-opt seccomp=PATH`. The host has to allow io_uring as
+well: Linux 6.0 or newer, and `kernel.io_uring_disabled` at 0, which Red Hat Enterprise
+Linux 9 does not default to. Measured on one box, epoll served about a quarter less throughput than
+io_uring at the same concurrency, which is why the image does not fall back to it.
+`--io epoll` after the image name serves on epoll on purpose.
+
+Outside a container the default is `--io auto`: io_uring where it can, else epoll with
+a warning that names the cause. `--io uring` refuses there too, like the image.
 
 ### Inbound TLS: terminating the client's connection
 

@@ -74,7 +74,7 @@ namespace llmbridge
         std::string host{};
     };
 
-    /// Event-loop backend. Auto is io_uring when the kernel has it, else epoll.
+    /// Event-loop backend. Auto is io_uring where usable, else epoll; Uring is io_uring or no service.
     enum class IoBackend
     {
         Auto,

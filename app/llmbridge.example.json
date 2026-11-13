@@ -56,7 +56,7 @@
   },
 
   "runtime": {
-    "_io": "auto | epoll | uring. auto prefers io_uring and falls back to epoll when it is unavailable.",
+    "_io": "auto | epoll | uring. auto prefers io_uring and falls back to epoll when it is unavailable; uring refuses to start without it.",
     "io": "auto",
 
     "_log_level": "trace | debug | info | warn | error | off. Lines BELOW the level compiled in at build time do not exist at all, so raising this at runtime cannot resurrect them: build with -DLLMBRIDGE_LOG_LEVEL=debug for the per-connection lines. Release compiles in info and above so the published latency numbers are measured on what ships.",

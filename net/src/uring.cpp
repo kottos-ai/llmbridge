@@ -15,12 +15,32 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace llmbridge::net::uring
 {
     namespace
     {
+        // The integer after `key` on the first line of `path` that starts with it, else -1.
+        int read_field(const char* path, const char* key) noexcept
+        {
+            std::FILE* f = std::fopen(path, "r");
+            if (!f) return -1;
+            char line[256];
+            int v = -1;
+            const size_t n = std::strlen(key);
+            while (std::fgets(line, sizeof line, f))
+                if (std::strncmp(line, key, n) == 0)
+                {
+                    if (std::sscanf(line + n, "%d", &v) != 1) v = -1;
+                    break;
+                }
+            std::fclose(f);
+            return v;
+        }
+
         // Raw syscalls: glibc doesn't wrap these, and we don't pull in liburing.
         int sys_io_uring_setup(unsigned entries, io_uring_params* p) noexcept
         {
@@ -39,14 +59,30 @@ namespace llmbridge::net::uring
         }
     } // namespace
 
-    bool available() noexcept
+    int setup_errno() noexcept
     {
         io_uring_params p;
         std::memset(&p, 0, sizeof(p));
         const int fd = sys_io_uring_setup(4, &p);
-        if (fd < 0) return false;
+        if (fd < 0) return errno ? errno : EINVAL;
         ::close(fd);
-        return true;
+        return 0;
+    }
+
+    std::string why_unavailable(int err)
+    {
+        std::string why = std::string("io_uring_setup failed: ") + std::strerror(err);
+        // The host's switch first: no container option lifts it.
+        if (const int v = read_field("/proc/sys/kernel/io_uring_disabled", ""); v > 0)
+            return why + "; kernel.io_uring_disabled is " + std::to_string(v) +
+                   " on this host, and only the host can set it to 0";
+        if (read_field("/proc/self/status", "Seccomp:") == 2)
+            return why + "; a seccomp filter is blocking it, which in a container is the runtime's "
+                         "default profile (Docker 25 and later): run the container with "
+                         "--security-opt seccomp=unconfined, or with a profile that also allows "
+                         "io_uring_setup, io_uring_enter and io_uring_register";
+        if (err == ENOSYS) return why + "; this kernel has no io_uring";
+        return why;
     }
 
     bool Ring::init(unsigned entries, unsigned flags) noexcept

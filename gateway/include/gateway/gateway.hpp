@@ -93,7 +93,9 @@ namespace llmbridge
         Gateway(const Gateway&) = delete;
         Gateway& operator=(const Gateway&) = delete;
 
-        /// Run the event loop until request_stop() is called. Returns 0.
+        /// Run the event loop until request_stop() is called. Returns 0, or 1 at once when
+        /// no loop could start: IoBackend::Uring where io_uring is unavailable (it never
+        /// falls back to epoll), or no epoll instance.
         int run();
         /// Flips a flag the loop observes within one poll tick; safe from any thread.
         void request_stop() noexcept;

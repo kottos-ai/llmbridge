@@ -32,6 +32,7 @@
 #include "gateway/gateway.hpp"
 #include "net/log.hpp"
 #include "net/upstream.hpp"
+#include "net/uring.hpp"
 
 namespace
 {
@@ -147,6 +148,22 @@ static int run(int argc, char** argv)
     }
 #endif
 
+    // --io uring is io_uring or nothing, refused here once instead of once per worker.
+    const llmbridge::IoBackend io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
+                                    : cfg.io == "uring" ? llmbridge::IoBackend::Uring
+                                                        : llmbridge::IoBackend::Auto;
+#ifdef LLMBRIDGE_HAVE_URING
+    if (io == llmbridge::IoBackend::Uring)
+        if (const int e = llmbridge::net::uring::setup_errno())
+            return refuse("--io uring: io_uring is unavailable, and it never falls back to epoll. " +
+                          llmbridge::net::uring::why_unavailable(e) +
+                          ". To serve on epoll instead, pass --io epoll.");
+#else
+    if (io == llmbridge::IoBackend::Uring)
+        return refuse("--io uring needs io_uring, and this build has none (linux/io_uring.h was "
+                      "missing when it was compiled). To serve on epoll instead, pass --io epoll.");
+#endif
+
     // Parse + resolve --upstream, here on the setup path, and refuse a name that does not
     // resolve: with no policy there is no failover, so a venue with no address would fail
     // every request. A worker re-resolves the name off its loop after a failed connect.
@@ -239,9 +256,6 @@ static int run(int argc, char** argv)
     // the hot path; per-worker upstream pools and stats, merged at the end.
     const int64_t warmup_ns = static_cast<int64_t>(cfg.warmup_s * 1e9);
     const int64_t up_timeout_ns = static_cast<int64_t>(cfg.upstream_s * 1e9);
-    const llmbridge::IoBackend io = cfg.io == "epoll"   ? llmbridge::IoBackend::Epoll
-                                    : cfg.io == "uring" ? llmbridge::IoBackend::Uring
-                                                        : llmbridge::IoBackend::Auto;
     Gateways gateways;
     for (int i = 0; i < workers; ++i)
     {
@@ -282,14 +296,16 @@ static int run(int argc, char** argv)
     std::mutex m;
     std::condition_variable cv;
     bool finished = false;
+    bool failed = false; // a worker whose loop never started
     std::vector<std::thread> threads;
     unsigned widx = 0;
     for (auto& g : gateways)
-        threads.emplace_back([gp = g.get(), i = widx++, &m, &cv, &finished] {
+        threads.emplace_back([gp = g.get(), i = widx++, &m, &cv, &finished, &failed] {
             // Before anything the loop logs, so every line names its worker.
             llmbridge::net::log::register_thread("worker", i);
-            gp->run();
+            const int rc = gp->run();
             const std::lock_guard<std::mutex> lk(m);
+            failed = failed || rc != 0;
             finished = true;
             cv.notify_all();
         });
@@ -304,6 +320,11 @@ static int run(int argc, char** argv)
     for (auto& t : threads) t.join();
     // Only this thread is left, so a handler now runs here or not at all.
     g_gateways.store(nullptr);
+    if (failed)
+    {
+        refuse("a worker could not start its event loop (the log above says why), so the gateway stopped");
+        return 1;
+    }
 
     // Aggregate per-worker stats into one profile.
     llmbridge::Stats agg;

@@ -25,13 +25,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace llmbridge::net::uring
 {
-    // Is io_uring usable in this process? Probes by setting up and tearing down a
-    // tiny ring. False on old kernels or seccomp-sandboxed environments; the
-    // gateway falls back to epoll in that case.
-    bool available() noexcept;
+    // 0 if this process can set up a ring (it sets up and tears down a tiny one), else
+    // io_uring_setup's errno: `EPERM` under a seccomp filter or kernel.io_uring_disabled,
+    // `ENOSYS` on a kernel without io_uring.
+    int setup_errno() noexcept;
+    inline bool available() noexcept { return setup_errno() == 0; }
+    // Why setup failed with `err` and what lifts it, for an operator to read.
+    std::string why_unavailable(int err);
 
     class Ring
     {

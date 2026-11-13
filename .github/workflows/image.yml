@@ -1,0 +1,58 @@
+name: Image
+
+# Publishes ghcr.io/kottos-ai/llmbridge from the repository-root Dockerfile, tagged with the
+# release and `latest`, on every vX.Y.Z tag. A manual run builds and starts the image and
+# pushes only when asked, from a tag, so the Dockerfile can be checked on GitHub's runners
+# before a release depends on it.
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push the image (only from a vX.Y.Z tag)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: release image
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          TAG: ${{ github.ref_name }}
+        run: docker build --build-arg VERSION="${TAG#v}" -t llmbridge:ci .
+      - name: Start it
+        run: docker run --rm llmbridge:ci --help > /dev/null
+      # Docker's default seccomp profile blocks io_uring: the image must exit, not serve epoll.
+      - name: Refuse without io_uring
+        run: |
+          if docker run --rm llmbridge:ci --listen 8088 --upstream 127.0.0.1:9 --duration 1 2> err.txt; then
+            cat err.txt; echo "served without io_uring"; exit 1
+          fi
+          grep "never falls back to epoll" err.txt
+      - name: Serve on io_uring
+        run: |
+          docker run --rm --security-opt seccomp=unconfined llmbridge:ci \
+            --listen 8088 --upstream 127.0.0.1:9 --duration 1 2> out.txt || { cat out.txt; exit 1; }
+          grep "active=io_uring" out.txt
+      # The token reaches docker on stdin, never in an argument.
+      - name: Push
+        if: startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.push)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          for t in "$TAG" latest; do
+            docker tag llmbridge:ci "ghcr.io/kottos-ai/llmbridge:$t"
+            docker push "ghcr.io/kottos-ai/llmbridge:$t"
+          done

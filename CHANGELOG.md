@@ -8,6 +8,50 @@ pre-1.0 caveat: **the API is unstable until v1.0.0, so breaking changes may land
 minor (0.x) releases.** Breaking changes are always called out explicitly below.
 
 
+## [0.109.0]. 2026-11-12
+
+A release image, so llmbridge runs from a registry. The ENTERPILOT AI gateway benchmark
+runs every gateway from its public image, and llmbridge had none. The image serves on
+io_uring or not at all, which needed `--io uring` to stop falling back to epoll:
+**breaking** for anyone who passed it where io_uring is blocked.
+
+### Added
+
+- **`Dockerfile`**, at the repository root: a Release build with `-DLLMBRIDGE_TLS=ON` on
+  Ubuntu 24.04, running as the image's unprivileged `ubuntu` user and labelled with its
+  release version: without that, the base image's label made the ENTERPILOT harness
+  report llmbridge as version 24.04. A plain `http://`
+  upstream never touches OpenSSL, so the TLS build costs nothing where TLS is unused.
+  Its entrypoint passes `--io uring`, so under Docker's default seccomp profile, which
+  blocks io_uring, the container exits naming `--security-opt seccomp=unconfined`
+  instead of serving epoll. `--io epoll` after the image name serves on epoll on purpose.
+- **`.github/workflows/image.yml`** publishes it as `ghcr.io/kottos-ai/llmbridge`, tagged
+  with the release and `latest`, on every `vX.Y.Z` tag. A manual run builds and starts the
+  image and pushes only when asked, from a tag.
+
+### Changed
+
+- **Breaking: `--io uring`, and `IoBackend::Uring` in the library, are io_uring or
+  nothing.** They fell back to epoll with a warning where io_uring was unavailable, so
+  whoever asked for io_uring could be served epoll and read its numbers as io_uring's.
+  The CLI now refuses at startup (exit 2), and `Gateway::run` returns 1 without serving,
+  as it does when io_uring sets up and its provided-buffer ring then cannot be
+  registered. `--io auto`, the default, still falls back.
+- Both say why io_uring is unavailable: `kernel.io_uring_disabled` on the host, a seccomp
+  filter (Docker's default profile, with the option that lifts it), or a kernel without
+  io_uring.
+- A worker whose event loop cannot start makes llmbridge exit 1. It exited 0.
+- The README's container example runs the published image.
+
+### Tests
+
+- `no_uring` (gateway/tests) runs a command with `io_uring_setup` or `io_uring_register`
+  refused with `EPERM` by a seccomp filter, as Docker's profile refuses them. Under it the
+  CLI and `Gateway::run` refuse `--io uring` at each of the two places the backend can
+  fail, and `--io auto` serves epoll. Against 0.108.1 the CLI cases ran until killed,
+  serving epoll under `--io uring`.
+
+
 ## [0.108.1]. 2026-11-08
 
 The tier a Responses reply served is the one recorded. Nothing changes for Chat

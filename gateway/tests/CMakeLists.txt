@@ -92,6 +92,23 @@ gtest_discover_tests(gateway_served_tier_test)
 gtest_discover_tests(gateway_alloc_test)
 gtest_discover_tests(gateway_corpus_test PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
+# IoBackend::Uring is io_uring or nothing. no_uring blocks one io_uring syscall the way
+# Docker's default seccomp profile blocks all three, and the strict test runs only under
+# it, so it is not discovered like the others. app/CMakeLists.txt has the CLI half.
+if (LLMBRIDGE_HAVE_URING)
+    add_executable(no_uring no_uring.cpp)
+    add_executable(gateway_uring_strict_test uring_strict_test.cpp)
+    target_link_libraries(gateway_uring_strict_test PRIVATE gateway GTest::gtest_main)
+    add_test(NAME GatewayUringRefusesWhenSetupIsBlocked
+             COMMAND no_uring setup $<TARGET_FILE:gateway_uring_strict_test>
+                     --gtest_filter=UringStrict.Setup*)
+    add_test(NAME GatewayUringRefusesWhenRegisterIsBlocked
+             COMMAND no_uring register $<TARGET_FILE:gateway_uring_strict_test>
+                     --gtest_filter=UringStrict.Register*)
+    set_tests_properties(GatewayUringRefusesWhenSetupIsBlocked GatewayUringRefusesWhenRegisterIsBlocked
+                         PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif ()
+
 # End-to-end TLS tests: only when the TLS transport is compiled in. The mock
 # provider in the test uses OpenSSL directly (SSL_set_fd is fine in test code).
 if (LLMBRIDGE_TLS)

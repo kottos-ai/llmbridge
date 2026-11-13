@@ -57,17 +57,17 @@ namespace llmbridge::detail
 #if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
         flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
 #endif
+        // A failure here is reported, and Engine::run decides what follows.
         if (!_ring.init(kRingDepth, flags) && !_ring.init(kRingDepth, 0))
         {
-            LB_WARN("io_uring init failed; falling back to the other backend");
+            LB_WARN("io_uring ring setup failed");
             return;
         }
         const unsigned count = _e._uring_buf_count ? _e._uring_buf_count : kBufCount;
         if (!_bufring.init(_ring, kBufGroup, count, kBufSize))
         {
             LB_WARN("io_uring provided-buffer ring unavailable (", _bufring.init_stage(),
-                    " errno=", _bufring.init_errno(), " ", std::strerror(_bufring.init_errno()),
-                    "); falling back to the other backend");
+                    " errno=", _bufring.init_errno(), " ", std::strerror(_bufring.init_errno()), ")");
             return;
         }
         _ts.tv_sec = kPollTickMs / 1000;
